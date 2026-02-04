@@ -22,11 +22,13 @@ export function Nav() {
       <div className="container mx-auto px-4">
         <div className="flex h-16 items-center space-x-8">
           <Link href="/dashboard" className="flex items-center space-x-3">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src="/assets/logos/GMC_blackbck.png"
               alt="GMC Logo"
               className="h-10 w-auto dark:block hidden"
             />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src="/assets/logos/GMC_whitebck.png"
               alt="GMC Logo"

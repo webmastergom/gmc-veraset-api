@@ -70,6 +70,7 @@ export default function POIImportPage() {
   // Load filter options on mount
   useEffect(() => {
     loadFilterOptions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadFilterOptions = async () => {

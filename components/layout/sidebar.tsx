@@ -58,12 +58,14 @@ export function Sidebar() {
       <div className="p-6 border-b border-border">
         <div className="mb-2 flex items-center justify-center">
           <div className="bg-secondary rounded-lg p-2 border border-border">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src="/assets/logos/GMC_blackbck.png"
               alt="Garritz"
               className="h-10 w-auto object-contain dark:block hidden"
               style={{ maxWidth: '160px' }}
             />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src="/assets/logos/GMC_whitebck.png"
               alt="Garritz"

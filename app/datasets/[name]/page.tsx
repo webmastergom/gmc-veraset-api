@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { MainLayout } from '@/components/layout/main-layout';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -87,7 +87,7 @@ export default function DatasetAnalysisPage() {
   }, [datasetName]);
 
   // Fetch available POIs for filtering
-  const fetchAvailablePois = async () => {
+  const fetchAvailablePois = useCallback(async () => {
     setLoadingPois(true);
     try {
       // First try to get enriched POIs from Veraset API
@@ -144,7 +144,7 @@ export default function DatasetAnalysisPage() {
     } finally {
       setLoadingPois(false);
     }
-  };
+  }, [datasetName, jobId]);
 
   // Load POIs when dataset changes or when filters are shown
   useEffect(() => {
@@ -161,7 +161,7 @@ export default function DatasetAnalysisPage() {
         fetchAvailablePois();
       }
     }
-  }, [datasetName, showFilters, analysis]);
+  }, [datasetName, showFilters, analysis?.topPois, availablePois.length, loadingPois, fetchAvailablePois]);
 
   const runAnalysis = async () => {
     setLoading(true);

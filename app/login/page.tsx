@@ -48,6 +48,7 @@ export default function LoginPage() {
         {/* Logo */}
         <div className="text-center mb-10">
           <div className="mb-6 flex justify-center">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src="/assets/logos/GMC_blackbck.png"
               alt="Garritz Marketing Cloud"

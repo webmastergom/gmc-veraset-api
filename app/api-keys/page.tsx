@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { MainLayout } from '@/components/layout/main-layout';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -50,11 +50,7 @@ export default function APIKeysPage() {
   const [keyToDelete, setKeyToDelete] = useState<string | null>(null);
   const { toast } = useToast();
 
-  useEffect(() => {
-    fetchKeys();
-  }, []);
-
-  const fetchKeys = async () => {
+  const fetchKeys = useCallback(async () => {
     try {
       const res = await fetch('/api/api-keys');
       if (res.ok) {
@@ -71,7 +67,11 @@ export default function APIKeysPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [toast]);
+
+  useEffect(() => {
+    fetchKeys();
+  }, [fetchKeys]);
 
   const handleCreate = async () => {
     if (!newKeyName.trim()) {
@@ -390,7 +390,7 @@ export default function APIKeysPage() {
             </div>
           </div>
           <DialogFooter>
-            <Button onClick={() => setNewKeyPlain(null)}>I've Saved It</Button>
+            <Button onClick={() => setNewKeyPlain(null)}>I&apos;ve Saved It</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
