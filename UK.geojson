@@ -1,0 +1,53 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "pl-shepherds-bush-1",
+        "name": "PL Shepherds Bush 1",
+        "radius": 40
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-0.228763, 51.511012]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "pl-shepherds-bush-2",
+        "name": "PL Shepherds Bush 2",
+        "radius": 40
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-0.228330, 51.511250]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "south-mimms",
+        "name": "South Mimms",
+        "radius": 40
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-0.2219, 51.6875]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "tvc-television-centre",
+        "name": "TVC Television Centre",
+        "radius": 40
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-0.2258, 51.5107]
+      }
+    }
+  ]
+}

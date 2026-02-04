@@ -1,0 +1,121 @@
+/**
+ * Seed initial jobs data
+ * This file contains the initial job data to populate the jobs.json file
+ */
+
+import type { Job } from './jobs';
+
+export const initialJobsData: Record<string, Job> = {
+  "29f5e76b-7423-4d78-bbfb-1f3de6761f58": {
+    jobId: "29f5e76b-7423-4d78-bbfb-1f3de6761f58",
+    name: "Test Madrid",
+    type: "aggregate",
+    poiCollectionId: undefined,
+    poiCount: 1,
+    dateRange: { from: "2025-10-01", to: "2025-10-05" },
+    radius: 500,
+    schema: "N/A",
+    status: "SUCCESS",
+    s3SourcePath: "s3://veraset-prd-platform-us-west-2/output/garritz/29f5e76b-7423-4d78-bbfb-1f3de6761f58/",
+    s3DestPath: null,
+    syncedAt: null,
+    objectCount: undefined,
+    totalBytes: undefined,
+    createdAt: "2025-10-01T10:00:00Z",
+    updatedAt: "2025-10-05T15:30:00Z",
+    summaryMetrics: "571,057 pings, 143,224 device-days",
+  },
+  "bf5ba123-8207-442a-a6f9-959b68908a16": {
+    jobId: "bf5ba123-8207-442a-a6f9-959b68908a16",
+    name: "E-cigarette Spain (Overture)",
+    type: "pings",
+    poiCollectionId: undefined,
+    poiCount: 273,
+    dateRange: { from: "2026-01-05", to: "2026-02-04" },
+    radius: 10,
+    schema: "BASIC",
+    status: "SUCCESS",
+    s3SourcePath: "s3://veraset-prd-platform-us-west-2/output/garritz/bf5ba123-8207-442a-a6f9-959b68908a16/",
+    s3DestPath: "s3://garritz-veraset-data-us-west-2/ecigarette-spain-jan/",
+    syncedAt: "2026-02-04T12:00:00Z",
+    objectCount: 3823,
+    totalBytes: 14364000,
+    createdAt: "2026-02-04T11:00:00Z",
+    updatedAt: "2026-02-04T12:00:00Z",
+    summaryMetrics: "3,823 objects, 13.7 MB",
+  },
+  "eb77c276-a9dc-4ef6-88fc-01090e375a39": {
+    jobId: "eb77c276-a9dc-4ef6-88fc-01090e375a39",
+    name: "Tobacco Spain (Overture)",
+    type: "pings",
+    poiCollectionId: undefined,
+    poiCount: 1954,
+    dateRange: { from: "2026-01-05", to: "2026-02-04" },
+    radius: 10,
+    schema: "BASIC",
+    status: "SUCCESS",
+    s3SourcePath: "s3://veraset-prd-platform-us-west-2/output/garritz/eb77c276-a9dc-4ef6-88fc-01090e375a39/",
+    s3DestPath: "s3://garritz-veraset-data-us-west-2/tobacco-spain-jan/",
+    syncedAt: "2026-02-04T14:00:00Z",
+    objectCount: 6668,
+    totalBytes: 27828051,
+    createdAt: "2026-02-04T13:00:00Z",
+    updatedAt: "2026-02-04T14:00:00Z",
+    summaryMetrics: "6,668 objects, 27.8 MB",
+  },
+  "93d45013-9e36-44ef-8c73-1b2b2b5efc58": {
+    jobId: "93d45013-9e36-44ef-8c73-1b2b2b5efc58",
+    name: "Spain Nicotine Full (OSM+Overture)",
+    type: "pings",
+    poiCollectionId: undefined,
+    poiCount: 4778,
+    dateRange: { from: "2026-01-05", to: "2026-02-04" },
+    radius: 10,
+    schema: "BASIC",
+    status: "SUCCESS",
+    s3SourcePath: "s3://veraset-prd-platform-us-west-2/output/garritz/93d45013-9e36-44ef-8c73-1b2b2b5efc58/",
+    s3DestPath: "s3://garritz-veraset-data-us-west-2/spain-nicotine-full-jan/",
+    syncedAt: "2026-02-04T16:00:00Z",
+    objectCount: undefined,
+    totalBytes: undefined,
+    createdAt: "2026-02-04T15:30:00Z",
+    updatedAt: "2026-02-04T16:00:00Z",
+    summaryMetrics: "337 e-cig + 4,441 tobacco",
+  },
+};
+
+export const initialUsageData = {
+  "2026-02": {
+    used: 4,
+    limit: 200,
+    lastJobId: "93d45013-9e36-44ef-8c73-1b2b2b5efc58",
+    lastJobAt: "2026-02-04T16:00:00Z",
+  },
+};
+
+export const initialPOICollectionsData = {
+  "spain-ecigarette-combined": {
+    id: "spain-ecigarette-combined",
+    name: "Spain E-cigarette Combined",
+    poiCount: 337,
+    sources: { osm: 94, overture: 243 },
+    geojsonPath: "pois/spain-ecigarette-combined.geojson",
+    createdAt: "2026-02-04T14:00:00Z",
+  },
+  "spain-tobacco-combined": {
+    id: "spain-tobacco-combined",
+    name: "Spain Tobacco Combined",
+    poiCount: 4441,
+    sources: { osm: 3077, overture: 1364 },
+    geojsonPath: "pois/spain-tobacco-combined.geojson",
+    createdAt: "2026-02-04T14:00:00Z",
+  },
+  "spain-nicotine-full": {
+    id: "spain-nicotine-full",
+    name: "Spain Nicotine Full",
+    poiCount: 4778,
+    sources: { osm_ecigarette: 94, osm_tobacco: 3077, overture_ecigarette: 243, overture_tobacco: 1364 },
+    geojsonPath: "pois/spain-nicotine-full.geojson",
+    createdAt: "2026-02-04T15:00:00Z",
+  },
+};
