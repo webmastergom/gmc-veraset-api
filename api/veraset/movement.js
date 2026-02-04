@@ -1,4 +1,4 @@
-// Movement Endpoint - Pings and Devices
+// Movement Endpoint - Pings, Devices, Aggregate
 const VERASET_BASE_URL = 'https://platform.prd.veraset.tech';
 
 export default async function handler(req, res) {
@@ -27,7 +27,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    // type: 'pings' | 'devices' | 'pings-aggregate' | 'devices-aggregate'
     const { type = 'pings', ...body } = req.body;
 
     // Validate required fields
@@ -38,12 +37,14 @@ export default async function handler(req, res) {
       });
     }
 
-    // Determine endpoint based on type
+    // Endpoints from Veraset docs
     const endpoints = {
       'pings': '/v1/movement/job/pings',
       'devices': '/v1/movement/job/devices',
-      'pings-aggregate': '/v1/movement/aggregate/pings',
-      'devices-aggregate': '/v1/movement/aggregate/devices',
+      'aggregate': '/v1/movement/job/aggregate',
+      'pings_by_device': '/v1/movement/job/pings_by_device',
+      'pings_by_ip': '/v1/movement/job/pings_by_ip',
+      'cohort': '/v1/movement/job/cohort',
     };
 
     const endpoint = endpoints[type];
