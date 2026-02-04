@@ -1,5 +1,5 @@
 // Visits Endpoint - Foot Traffic Data
-const VERASET_BASE_URL = 'https://api.veraset.com';
+const VERASET_BASE_URL = 'https://platform.prd.veraset.tech';
 
 export default async function handler(req, res) {
   // Handle CORS
