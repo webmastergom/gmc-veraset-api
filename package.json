@@ -1,0 +1,17 @@
+{
+  "name": "gmc-veraset-api",
+  "version": "1.0.0",
+  "description": "GMC API Proxy for Veraset",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "deploy:preview": "vercel"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
