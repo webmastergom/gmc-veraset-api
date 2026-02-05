@@ -38,6 +38,14 @@ interface SearchFilters {
   zipcode?: string;
 }
 
+interface GeoRadiusSearch {
+  latitude?: string;
+  longitude?: string;
+  distance_in_meters?: string;
+  distance_in_miles?: string;
+  poi_id?: string;
+}
+
 export default function POIImportPage() {
   const router = useRouter();
   const { toast } = useToast();
@@ -56,6 +64,18 @@ export default function POIImportPage() {
   
   // Search filters
   const [filters, setFilters] = useState<SearchFilters>({});
+  
+  // Search mode: 'filters' or 'geo_radius'
+  const [searchMode, setSearchMode] = useState<'filters' | 'geo_radius'>('filters');
+  
+  // Geo radius search parameters
+  const [geoRadiusSearch, setGeoRadiusSearch] = useState<GeoRadiusSearch>({
+    latitude: '',
+    longitude: '',
+    distance_in_meters: '',
+    distance_in_miles: '',
+    poi_id: '',
+  });
   
   // Search results
   const [searchResults, setSearchResults] = useState<VerasetPOI[]>([]);
@@ -202,25 +222,68 @@ export default function POIImportPage() {
     setSelectedPois(new Set());
     
     try {
-      // Clean filters - remove undefined values
-      const cleanFilters: SearchFilters = {};
-      if (filters.category) cleanFilters.category = filters.category;
-      if (filters.subcategory) cleanFilters.subcategory = filters.subcategory;
-      if (filters.brand) cleanFilters.brand = filters.brand;
-      if (filters.country) cleanFilters.country = filters.country;
-      if (filters.state) cleanFilters.state = filters.state;
-      if (filters.city) cleanFilters.city = filters.city;
-      if (filters.zipcode) cleanFilters.zipcode = filters.zipcode;
+      let requestBody: any = {
+        limit: 1000,
+        offset: 0,
+      };
+
+      if (searchMode === 'geo_radius') {
+        // Geo radius search
+        if (!geoRadiusSearch.latitude || !geoRadiusSearch.longitude) {
+          toast({
+            title: 'Invalid Coordinates',
+            description: 'Please provide both latitude and longitude',
+            variant: 'destructive',
+          });
+          setSearching(false);
+          return;
+        }
+
+        if (!geoRadiusSearch.distance_in_meters && !geoRadiusSearch.distance_in_miles) {
+          toast({
+            title: 'Distance Required',
+            description: 'Please provide distance in meters or miles',
+            variant: 'destructive',
+          });
+          setSearching(false);
+          return;
+        }
+
+        requestBody.latitude = parseFloat(geoRadiusSearch.latitude);
+        requestBody.longitude = parseFloat(geoRadiusSearch.longitude);
+        if (geoRadiusSearch.distance_in_meters) {
+          requestBody.distance_in_meters = parseInt(geoRadiusSearch.distance_in_meters);
+        }
+        if (geoRadiusSearch.distance_in_miles) {
+          requestBody.distance_in_miles = parseFloat(geoRadiusSearch.distance_in_miles);
+        }
+        if (geoRadiusSearch.poi_id) {
+          requestBody.geo_radius = [{
+            poi_id: geoRadiusSearch.poi_id,
+            latitude: requestBody.latitude,
+            longitude: requestBody.longitude,
+            distance_in_meters: requestBody.distance_in_meters || 0,
+            distance_in_miles: requestBody.distance_in_miles || 0,
+          }];
+        }
+      } else {
+        // Filter-based search
+        const cleanFilters: SearchFilters = {};
+        if (filters.category) cleanFilters.category = filters.category;
+        if (filters.subcategory) cleanFilters.subcategory = filters.subcategory;
+        if (filters.brand) cleanFilters.brand = filters.brand;
+        if (filters.country) cleanFilters.country = filters.country;
+        if (filters.state) cleanFilters.state = filters.state;
+        if (filters.city) cleanFilters.city = filters.city;
+        if (filters.zipcode) cleanFilters.zipcode = filters.zipcode;
+        Object.assign(requestBody, cleanFilters);
+      }
 
       const res = await fetch('/api/pois/import/veraset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({
-          ...cleanFilters,
-          limit: 1000,
-          offset: 0,
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!res.ok) {
@@ -380,10 +443,116 @@ export default function POIImportPage() {
           <CardHeader>
             <CardTitle>Search Filters</CardTitle>
             <CardDescription>
-              Filter POIs by category, brand, location, etc.
+              Filter POIs by category, brand, location, or search by radius
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {/* Search Mode Toggle */}
+            <div>
+              <Label>Search Mode</Label>
+              <div className="flex gap-2 mt-2">
+                <Button
+                  type="button"
+                  variant={searchMode === 'filters' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setSearchMode('filters')}
+                  className="flex-1"
+                >
+                  Filters
+                </Button>
+                <Button
+                  type="button"
+                  variant={searchMode === 'geo_radius' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setSearchMode('geo_radius')}
+                  className="flex-1"
+                >
+                  <MapPin className="mr-2 h-4 w-4" />
+                  Radius
+                </Button>
+              </div>
+            </div>
+
+            {searchMode === 'geo_radius' ? (
+              <>
+                {/* Geo Radius Search Fields */}
+                <div>
+                  <Label htmlFor="geo-poi-id">POI ID (Optional)</Label>
+                  <Input
+                    id="geo-poi-id"
+                    placeholder="e.g., 70 rue des martyrs in Paris"
+                    value={geoRadiusSearch.poi_id || ''}
+                    onChange={(e) => setGeoRadiusSearch({ ...geoRadiusSearch, poi_id: e.target.value })}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="geo-latitude">Latitude *</Label>
+                  <Input
+                    id="geo-latitude"
+                    type="number"
+                    step="any"
+                    placeholder="e.g., 48.881293"
+                    value={geoRadiusSearch.latitude || ''}
+                    onChange={(e) => setGeoRadiusSearch({ ...geoRadiusSearch, latitude: e.target.value })}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="geo-longitude">Longitude *</Label>
+                  <Input
+                    id="geo-longitude"
+                    type="number"
+                    step="any"
+                    placeholder="e.g., 2.340153"
+                    value={geoRadiusSearch.longitude || ''}
+                    onChange={(e) => setGeoRadiusSearch({ ...geoRadiusSearch, longitude: e.target.value })}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <Label htmlFor="geo-distance-meters">Distance (meters)</Label>
+                    <Input
+                      id="geo-distance-meters"
+                      type="number"
+                      placeholder="e.g., 25"
+                      value={geoRadiusSearch.distance_in_meters || ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setGeoRadiusSearch({ 
+                          ...geoRadiusSearch, 
+                          distance_in_meters: val,
+                          distance_in_miles: val ? '' : geoRadiusSearch.distance_in_miles
+                        });
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="geo-distance-miles">Distance (miles)</Label>
+                    <Input
+                      id="geo-distance-miles"
+                      type="number"
+                      step="any"
+                      placeholder="e.g., 0.015"
+                      value={geoRadiusSearch.distance_in_miles || ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setGeoRadiusSearch({ 
+                          ...geoRadiusSearch, 
+                          distance_in_miles: val,
+                          distance_in_meters: val ? '' : geoRadiusSearch.distance_in_meters
+                        });
+                      }}
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  * Provide either meters or miles (not both)
+                </p>
+              </>
+            ) : (
+              <>
             {/* Category */}
             <div>
               <Label htmlFor="category">Category</Label>
@@ -541,6 +710,8 @@ export default function POIImportPage() {
                 onChange={(e) => setFilters({ ...filters, zipcode: e.target.value })}
               />
             </div>
+            </>
+            )}
 
             <Button
               onClick={handleSearch}
