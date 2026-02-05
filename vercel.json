@@ -13,6 +13,10 @@
     "app/api/external/jobs/**/analysis/route.js": {
       "memory": 1024,
       "maxDuration": 300
+    },
+    "app/api/datasets/**/analyze/route.js": {
+      "memory": 1024,
+      "maxDuration": 300
     }
   },
   "headers": [

@@ -5,43 +5,7 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 export const maxDuration = 300; // Allow up to 5 minutes for Athena queries (Vercel max)
 
-// Handle unsupported methods - return clear error message
-export async function GET(
-  req: NextRequest,
-  { params }: { params: { name: string } }
-) {
-  return NextResponse.json(
-    { 
-      error: 'Method Not Allowed', 
-      message: 'This endpoint only accepts POST requests. Use POST to analyze the dataset.',
-      hint: 'Make sure you are using POST method with a JSON body containing optional filters.'
-    },
-    { status: 405, headers: { 'Allow': 'POST' } }
-  );
-}
-
-// Handle other unsupported methods
-export async function PUT() {
-  return NextResponse.json(
-    { error: 'Method Not Allowed', message: 'This endpoint only accepts POST requests.' },
-    { status: 405, headers: { 'Allow': 'POST' } }
-  );
-}
-
-export async function DELETE() {
-  return NextResponse.json(
-    { error: 'Method Not Allowed', message: 'This endpoint only accepts POST requests.' },
-    { status: 405, headers: { 'Allow': 'POST' } }
-  );
-}
-
-export async function PATCH() {
-  return NextResponse.json(
-    { error: 'Method Not Allowed', message: 'This endpoint only accepts POST requests.' },
-    { status: 405, headers: { 'Allow': 'POST' } }
-  );
-}
-
+// Main POST handler - must be exported first
 export async function POST(
   req: NextRequest,
   { params }: { params: { name: string } }
@@ -81,4 +45,41 @@ export async function POST(
       { status: statusCode }
     );
   }
+}
+
+// Handle unsupported methods - return clear error message
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { name: string } }
+) {
+  return NextResponse.json(
+    { 
+      error: 'Method Not Allowed', 
+      message: 'This endpoint only accepts POST requests. Use POST to analyze the dataset.',
+      hint: 'Make sure you are using POST method with a JSON body containing optional filters.'
+    },
+    { status: 405, headers: { 'Allow': 'POST' } }
+  );
+}
+
+// Handle other unsupported methods
+export async function PUT() {
+  return NextResponse.json(
+    { error: 'Method Not Allowed', message: 'This endpoint only accepts POST requests.' },
+    { status: 405, headers: { 'Allow': 'POST' } }
+  );
+}
+
+export async function DELETE() {
+  return NextResponse.json(
+    { error: 'Method Not Allowed', message: 'This endpoint only accepts POST requests.' },
+    { status: 405, headers: { 'Allow': 'POST' } }
+  );
+}
+
+export async function PATCH() {
+  return NextResponse.json(
+    { error: 'Method Not Allowed', message: 'This endpoint only accepts POST requests.' },
+    { status: 405, headers: { 'Allow': 'POST' } }
+  );
 }
