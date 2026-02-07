@@ -47,9 +47,13 @@ export async function GET(
 
     if (!terminalStatuses.includes(job.status)) {
       try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://gmc-mobility-api.vercel.app';
-        const verasetRes = await fetch(`${apiUrl}/api/veraset/job/${jobId}`, {
+        const verasetApiKey = process.env.VERASET_API_KEY;
+        const verasetRes = await fetch(`https://platform.prd.veraset.tech/v1/job/${jobId}`, {
           cache: 'no-store',
+          headers: {
+            'X-API-Key': verasetApiKey || '',
+            'Content-Type': 'application/json',
+          },
         });
 
         if (verasetRes.ok) {

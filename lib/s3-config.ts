@@ -175,8 +175,8 @@ export async function getPOICollection(collectionId: string): Promise<any | null
     // Use geojsonPath from collection metadata if available, otherwise construct from ID
     const geojsonKey = collection?.geojsonPath || `pois/${collectionId}.geojson`;
 
-    // Try S3 first if credentials are configured and collection exists in config
-    if (collection && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+    // Try S3 first if credentials are configured
+    if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
       try {
         const command = new GetObjectCommand({
           Bucket: BUCKET,

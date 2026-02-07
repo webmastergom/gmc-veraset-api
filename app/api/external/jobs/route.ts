@@ -96,8 +96,7 @@ export async function POST(request: NextRequest) {
       distance_in_meters: body.radius,
     }));
 
-    const verasetConfig = {
-      type: body.type,
+    const verasetBody = {
       date_range: {
         from_date: body.date_range.from,
         to_date: body.date_range.to,
@@ -115,13 +114,31 @@ export async function POST(request: NextRequest) {
       hasWebhook: !!body.webhook_url,
     });
 
-    // 5. Call Veraset movement API
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://gmc-mobility-api.vercel.app';
+    // 5. Call Veraset movement API directly
+    const VERASET_BASE_URL = 'https://platform.prd.veraset.tech';
+    const verasetEndpoints: Record<string, string> = {
+      'pings': '/v1/movement/job/pings',
+      'devices': '/v1/movement/job/devices',
+      'aggregate': '/v1/movement/job/aggregate',
+    };
+    const jobType = body.type || 'pings';
+    const verasetEndpoint = verasetEndpoints[jobType] || verasetEndpoints['pings'];
+    const verasetApiKey = process.env.VERASET_API_KEY;
 
-    const verasetResponse = await fetch(`${apiUrl}/api/veraset/movement`, {
+    if (!verasetApiKey) {
+      return NextResponse.json(
+        { error: 'VERASET_API_KEY not configured' },
+        { status: 500 }
+      );
+    }
+
+    const verasetResponse = await fetch(`${VERASET_BASE_URL}${verasetEndpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(verasetConfig),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': verasetApiKey,
+      },
+      body: JSON.stringify(verasetBody),
     });
 
     const responseText = await verasetResponse.text();
