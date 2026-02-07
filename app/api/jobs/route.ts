@@ -97,7 +97,7 @@ export async function POST(request: NextRequest) {
     }
     
     // Build Veraset payload - extract type from config and send rest to API
-    const verasetPayload = verasetConfig || {
+    const verasetPayload: Record<string, any> = verasetConfig || {
       type,
       date_range: dateRange,
       pois: body.pois || [],
