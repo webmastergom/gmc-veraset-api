@@ -29,9 +29,26 @@ export const createJobSchema = z.object({
   radius: z.number().min(1).max(1000).optional().default(10),
   schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
   verasetConfig: z.object({
-    geo_radius: z.array(z.any()).optional(),
-    place_key: z.array(z.string()).optional(), // For Veraset POIs (uses place_key instead of coordinates)
-  }).optional(),
+    type: z.enum(['pings', 'devices', 'aggregate']).optional(),
+    date_range: z.object({
+      from_date: z.string().optional(),
+      to_date: z.string().optional(),
+      from: z.string().optional(),
+      to: z.string().optional(),
+    }).optional(),
+    schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional(),
+    geo_radius: z.array(z.object({
+      poi_id: z.string(),
+      latitude: z.number(),
+      longitude: z.number(),
+      distance_in_meters: z.number().optional(),
+      distance_in_miles: z.number().optional(),
+    })).optional(),
+    place_key: z.array(z.object({
+      poi_id: z.string(),
+      placekey: z.string(),
+    })).optional(),
+  }).passthrough().optional(), // passthrough allows additional fields
   pois: z.array(z.any()).optional(),
   poiMapping: z.record(z.string()).optional(),
   poiNames: z.record(z.string()).optional(),

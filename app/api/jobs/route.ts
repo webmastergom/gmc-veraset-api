@@ -97,10 +97,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const validation = await validateRequestBody(request, createJobSchema);
     if (!validation.success) {
       console.error('[JOBS POST] Validation failed:', validation.error);
+      console.error('[JOBS POST] Request body:', JSON.stringify(body, null, 2).substring(0, 1000));
       return NextResponse.json(
         { 
           error: 'Validation failed',
-          details: validation.error 
+          details: validation.error,
+          received: {
+            name: body.name,
+            type: body.type,
+            hasDateRange: !!body.dateRange,
+            hasVerasetConfig: !!body.verasetConfig,
+            verasetConfigKeys: body.verasetConfig ? Object.keys(body.verasetConfig) : [],
+          }
         },
         { status: validation.status || 400 }
       );
