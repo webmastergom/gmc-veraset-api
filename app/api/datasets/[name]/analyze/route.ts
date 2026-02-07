@@ -5,9 +5,8 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 export const maxDuration = 300; // Allow up to 5 minutes for Athena queries (Vercel max)
 
-// Export POST handler - must be named export
 export async function POST(
-  request: NextRequest,
+  req: NextRequest,
   { params }: { params: { name: string } }
 ) {
   try {
@@ -20,7 +19,7 @@ export async function POST(
       );
     }
 
-    const body = await request.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({}));
     const filters: AnalysisFilters = body.filters || {};
 
     const result = await analyzeDataset(datasetName, filters);
@@ -28,8 +27,7 @@ export async function POST(
     return NextResponse.json(result);
 
   } catch (error: any) {
-    const datasetName = params?.name || 'unknown';
-    console.error(`POST /api/datasets/${datasetName}/analyze error:`, error);
+    console.error(`POST /api/datasets/${params.name}/analyze error:`, error);
     console.error('Error stack:', error.stack);
     
     // Provide more helpful error messages
@@ -55,4 +53,24 @@ export async function POST(
       { status: statusCode }
     );
   }
+}
+
+// Explicitly handle GET requests to return 405
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { name: string } }
+) {
+  return NextResponse.json(
+    { 
+      error: 'Method Not Allowed', 
+      message: 'This endpoint only accepts POST requests',
+      allowedMethods: ['POST']
+    },
+    { 
+      status: 405,
+      headers: {
+        'Allow': 'POST'
+      }
+    }
+  );
 }
