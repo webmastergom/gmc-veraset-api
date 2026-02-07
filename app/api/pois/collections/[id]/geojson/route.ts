@@ -6,11 +6,14 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
+    console.log(`[GeoJSON] Fetching collection: ${params.id}`);
+    console.log(`[GeoJSON] AWS configured: ${!!process.env.AWS_ACCESS_KEY_ID}`);
     const geojson = await getPOICollection(params.id)
-    
+
     if (!geojson) {
+      console.error(`[GeoJSON] Collection ${params.id} returned null`);
       return NextResponse.json(
-        { error: "POI collection not found" },
+        { error: "POI collection not found", id: params.id },
         { status: 404 }
       )
     }

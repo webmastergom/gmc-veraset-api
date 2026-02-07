@@ -176,25 +176,29 @@ export async function getPOICollection(collectionId: string): Promise<any | null
     const geojsonKey = collection?.geojsonPath || `pois/${collectionId}.geojson`;
 
     // Try S3 first if credentials are configured
+    console.log(`[getPOICollection] id=${collectionId}, key=${geojsonKey}, hasConfig=${!!collection}, bucket=${BUCKET}`);
     if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
       try {
         const command = new GetObjectCommand({
           Bucket: BUCKET,
           Key: geojsonKey,
         });
-        
+
+        console.log(`[getPOICollection] Fetching S3: ${BUCKET}/${geojsonKey}`);
         const response = await s3Client.send(command);
         const body = await response.Body?.transformToString();
-        
+
         if (body) {
+          console.log(`[getPOICollection] Success: ${body.length} bytes from S3`);
           return JSON.parse(body);
         }
+        console.warn(`[getPOICollection] Empty body from S3`);
       } catch (s3Error: any) {
-        if (s3Error.name !== 'NoSuchKey' && s3Error.$metadata?.httpStatusCode !== 404) {
-          console.warn(`S3 error for ${geojsonKey}, trying local fallback:`, s3Error.message);
-        }
+        console.error(`[getPOICollection] S3 error: name=${s3Error.name}, msg=${s3Error.message}, status=${s3Error.$metadata?.httpStatusCode}`);
         // Fall through to local file check
       }
+    } else {
+      console.warn(`[getPOICollection] No AWS credentials`);
     }
 
     // Fallback: Try to read from local POIs directory
