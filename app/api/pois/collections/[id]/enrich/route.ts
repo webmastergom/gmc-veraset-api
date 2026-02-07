@@ -21,8 +21,8 @@ export async function POST(
 ) {
   try {
     const collectionId = params.id;
-    const apiKey = process.env.VERASET_API_KEY;
-
+    const apiKey = process.env.VERASET_API_KEY?.trim();
+    
     if (!apiKey) {
       return NextResponse.json(
         { error: 'VERASET_API_KEY not configured' },

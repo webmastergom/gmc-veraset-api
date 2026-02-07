@@ -17,7 +17,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: true, message: 'Method not allowed' });
   }
 
-  const apiKey = process.env.VERASET_API_KEY;
+  const apiKey = process.env.VERASET_API_KEY?.trim();
   
   if (!apiKey) {
     return res.status(500).json({ 

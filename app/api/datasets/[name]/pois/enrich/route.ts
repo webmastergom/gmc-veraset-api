@@ -17,7 +17,7 @@ export async function GET(
   { params }: { params: { name: string } }
 ) {
   try {
-    const apiKey = process.env.VERASET_API_KEY;
+    const apiKey = process.env.VERASET_API_KEY?.trim();
     
     if (!apiKey) {
       return NextResponse.json(

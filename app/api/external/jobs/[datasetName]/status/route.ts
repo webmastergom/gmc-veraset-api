@@ -47,7 +47,7 @@ export async function GET(
 
     if (!terminalStatuses.includes(job.status)) {
       try {
-        const verasetApiKey = process.env.VERASET_API_KEY;
+        const verasetApiKey = process.env.VERASET_API_KEY?.trim();
         const verasetRes = await fetch(`https://platform.prd.veraset.tech/v1/job/${jobId}`, {
           cache: 'no-store',
           headers: {

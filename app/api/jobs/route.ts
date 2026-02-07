@@ -63,9 +63,6 @@ export async function POST(request: NextRequest) {
 
     const { name, type, poiCount, poiCollectionId, dateRange, radius, schema, verasetConfig, poiMapping, poiNames } = body;
 
-    // 3. Call Veraset API
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://gmc-mobility-api.vercel.app";
-    
     // Log POI count being sent (sanitized in production)
     // Handle hybrid mode: place_key + geo_radius can coexist
     const placeKeyCount = Array.isArray(verasetConfig?.place_key) ? verasetConfig.place_key.length : 0;
@@ -115,7 +112,7 @@ export async function POST(request: NextRequest) {
     };
     const verasetEndpoint = endpoints[jobType] || endpoints['pings'];
 
-    const verasetApiKey = process.env.VERASET_API_KEY;
+    const verasetApiKey = process.env.VERASET_API_KEY?.trim();
     if (!verasetApiKey) {
       return NextResponse.json(
         { error: 'VERASET_API_KEY not configured' },
@@ -123,12 +120,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    logger.log(`Veraset direct call: ${verasetEndpoint}`, {
+    logger.log(`Veraset API call: ${verasetEndpoint}`, {
       bodySize: verasetBody.length,
       geoRadiusCount: verasetBodyObj.geo_radius?.length || 0,
       placeKeyCount: verasetBodyObj.place_key?.length || 0,
     });
 
+    // Call Veraset API directly (server-side, has access to VERASET_API_KEY env var)
     const verasetResponse = await fetch(
       `https://platform.prd.veraset.tech${verasetEndpoint}`,
       {

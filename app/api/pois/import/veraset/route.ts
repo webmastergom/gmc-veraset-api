@@ -11,7 +11,7 @@ export const revalidate = 0;
  */
 export async function POST(request: NextRequest) {
   try {
-    const apiKey = process.env.VERASET_API_KEY;
+    const apiKey = process.env.VERASET_API_KEY?.trim();
     
     if (!apiKey) {
       return NextResponse.json(
@@ -192,7 +192,7 @@ export async function POST(request: NextRequest) {
  */
 export async function GET(request: NextRequest) {
   try {
-    const apiKey = process.env.VERASET_API_KEY;
+    const apiKey = process.env.VERASET_API_KEY?.trim();
     
     if (!apiKey) {
       return NextResponse.json(

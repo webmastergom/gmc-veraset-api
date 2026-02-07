@@ -123,8 +123,8 @@ export async function POST(request: NextRequest) {
     };
     const jobType = body.type || 'pings';
     const verasetEndpoint = verasetEndpoints[jobType] || verasetEndpoints['pings'];
-    const verasetApiKey = process.env.VERASET_API_KEY;
-
+    const verasetApiKey = process.env.VERASET_API_KEY?.trim();
+    
     if (!verasetApiKey) {
       return NextResponse.json(
         { error: 'VERASET_API_KEY not configured' },
