@@ -44,6 +44,12 @@ export interface ResidentialAnalysisResult {
 
 /**
  * Analyze residential zipcodes of visitors in a dataset.
+ * 
+ * This function:
+ * 1. Finds devices that visited POIs
+ * 2. Identifies their nighttime locations (when not at POIs) as potential home locations
+ * 3. Reverse geocodes these locations to Spanish postal codes
+ * 4. Aggregates results by zipcode
  */
 export async function analyzeResidentialZipcodes(
   datasetName: string,
@@ -52,10 +58,49 @@ export async function analyzeResidentialZipcodes(
   const tableName = getTableName(datasetName);
   const minNightPings = filters.minNightPings || 3;
 
+  console.log(`[CATCHMENT] Starting residential analysis for dataset: ${datasetName}`, {
+    filters,
+    minNightPings,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Check AWS credentials
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    throw new Error(
+      'AWS credentials not configured. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.'
+    );
+  }
+
   // Ensure table exists
-  if (!(await tableExists(datasetName))) {
-    console.log(`Creating table for dataset: ${datasetName}`);
-    await createTableForDataset(datasetName);
+  let tableExistsResult = false;
+  try {
+    tableExistsResult = await tableExists(datasetName);
+  } catch (error: any) {
+    if (error.message?.includes('not authorized') || 
+        error.message?.includes('Access denied') ||
+        error.name === 'AccessDeniedException') {
+      throw new Error(
+        `Athena access denied. Please ensure your AWS IAM user has Athena and Glue permissions.\n\n` +
+        `Original error: ${error.message}`
+      );
+    }
+    throw error;
+  }
+
+  if (!tableExistsResult) {
+    console.log(`[CATCHMENT] Creating table for dataset: ${datasetName}`);
+    try {
+      await createTableForDataset(datasetName);
+    } catch (error: any) {
+      if (error.message?.includes('not authorized') || 
+          error.message?.includes('Access denied')) {
+        throw new Error(
+          `Cannot create Athena table: Access denied. Please ensure your IAM user has Glue CreateTable permissions.\n\n` +
+          `Original error: ${error.message}`
+        );
+      }
+      throw error;
+    }
   }
 
   // Build WHERE conditions for date filters
@@ -71,11 +116,14 @@ export async function analyzeResidentialZipcodes(
   // Build POI filter for inclusion (only count devices that visited these POIs)
   let poiFilter = '';
   if (filters.poiIds?.length) {
-    const poiList = filters.poiIds.map(p => `'${p.replace(/'/g, "''")}'`).join(',');
+    const poiList = filters.poiIds.map(p => {
+      const escaped = p.replace(/'/g, "''");
+      return `'${escaped}'`;
+    }).join(',');
     poiFilter = `AND poi_ids[1] IN (${poiList})`;
   }
 
-  console.log(`Starting residential analysis for ${datasetName}...`);
+  console.log(`[CATCHMENT] Running Athena queries for ${datasetName}...`);
 
   // Step 1: Get total unique devices (for context)
   const totalQuery = `
@@ -87,6 +135,7 @@ export async function analyzeResidentialZipcodes(
   // Step 2: Get home location estimates from nighttime pings
   // Night = 22:00-06:00 local time (Spain is UTC+1/+2)
   // We use UTC hours 21-05 to approximate Spanish nighttime
+  // Only consider pings NOT at POIs (likely at home)
   const homeQuery = `
     WITH
     -- First, get devices that visited our POIs
@@ -132,17 +181,40 @@ export async function analyzeResidentialZipcodes(
     LIMIT 10000
   `;
 
-  console.log('Running residential Athena queries...');
-
   // Run both queries in parallel
-  const [totalRes, homeRes] = await Promise.all([
-    runQuery(totalQuery),
-    runQuery(homeQuery),
-  ]);
+  let totalRes, homeRes;
+  try {
+    console.log(`[CATCHMENT] Executing total devices query...`);
+    [totalRes, homeRes] = await Promise.all([
+      runQuery(totalQuery),
+      runQuery(homeQuery),
+    ]);
+  } catch (error: any) {
+    console.error(`[CATCHMENT ERROR] Athena query failed:`, error.message);
+    throw new Error(`Athena query failed: ${error.message}`);
+  }
 
   const totalDevices = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
-  console.log(`Total devices in dataset: ${totalDevices}`);
-  console.log(`Home location clusters found: ${homeRes.rows.length}`);
+  console.log(`[CATCHMENT] Total devices in dataset: ${totalDevices}`);
+  console.log(`[CATCHMENT] Home location clusters found: ${homeRes.rows.length}`);
+
+  if (totalDevices === 0) {
+    console.warn(`[CATCHMENT] No devices found in dataset ${datasetName}`);
+    return {
+      dataset: datasetName,
+      analyzedAt: new Date().toISOString(),
+      filters,
+      summary: {
+        totalDevicesInDataset: 0,
+        devicesWithHomeLocation: 0,
+        devicesMatchedToZipcode: 0,
+        totalZipcodes: 0,
+        topZipcode: null,
+        topCity: null,
+      },
+      zipcodes: [],
+    };
+  }
 
   // Step 3: Reverse geocode home locations
   const homePoints = homeRes.rows.map(r => ({
@@ -152,17 +224,45 @@ export async function analyzeResidentialZipcodes(
   }));
 
   const devicesWithHome = homePoints.reduce((sum, p) => sum + p.deviceCount, 0);
-  console.log(`Devices with estimated home location: ${devicesWithHome}`);
+  console.log(`[CATCHMENT] Devices with estimated home location: ${devicesWithHome}`);
 
-  console.log(`Reverse geocoding ${homePoints.length} location clusters...`);
-  const geocoded = batchReverseGeocode(homePoints);
+  if (devicesWithHome === 0) {
+    console.warn(`[CATCHMENT] No devices with home location found`);
+    return {
+      dataset: datasetName,
+      analyzedAt: new Date().toISOString(),
+      filters,
+      summary: {
+        totalDevicesInDataset: totalDevices,
+        devicesWithHomeLocation: 0,
+        devicesMatchedToZipcode: 0,
+        totalZipcodes: 0,
+        topZipcode: null,
+        topCity: null,
+      },
+      zipcodes: [],
+    };
+  }
+
+  console.log(`[CATCHMENT] Reverse geocoding ${homePoints.length} location clusters...`);
+  let geocoded;
+  try {
+    geocoded = batchReverseGeocode(homePoints);
+  } catch (error: any) {
+    console.error(`[CATCHMENT ERROR] Reverse geocoding failed:`, error.message);
+    throw new Error(`Reverse geocoding failed: ${error.message}`);
+  }
 
   // Step 4: Aggregate by zipcode
   const zipcodes = aggregateByZipcode(geocoded, devicesWithHome);
 
   const devicesMatchedToZipcode = zipcodes.reduce((sum, z) => sum + z.devices, 0);
-  console.log(`Devices matched to Spanish zipcodes: ${devicesMatchedToZipcode}`);
-  console.log(`Unique zipcodes found: ${zipcodes.length}`);
+  console.log(`[CATCHMENT] Devices matched to Spanish zipcodes: ${devicesMatchedToZipcode}`);
+  console.log(`[CATCHMENT] Unique zipcodes found: ${zipcodes.length}`);
+
+  if (zipcodes.length > 0) {
+    console.log(`[CATCHMENT] Top zipcode: ${zipcodes[0].zipcode} (${zipcodes[0].city}) - ${zipcodes[0].devices} devices`);
+  }
 
   return {
     dataset: datasetName,
