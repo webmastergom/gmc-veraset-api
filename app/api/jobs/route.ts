@@ -103,6 +103,16 @@ export async function POST(request: NextRequest) {
 
     // Extract type to determine endpoint, send rest as body
     const { type: jobType = 'pings', ...verasetBodyObj } = verasetPayload;
+    
+    // Ensure date_range format is correct (Veraset expects from_date/to_date)
+    if (verasetBodyObj.date_range) {
+      const dr = verasetBodyObj.date_range;
+      verasetBodyObj.date_range = {
+        from_date: dr.from_date || dr.from || dr.fromDate,
+        to_date: dr.to_date || dr.to || dr.toDate,
+      };
+    }
+    
     const verasetBody = JSON.stringify(verasetBodyObj);
 
     const endpoints: Record<string, string> = {
@@ -114,8 +124,16 @@ export async function POST(request: NextRequest) {
 
     const verasetApiKey = process.env.VERASET_API_KEY?.trim();
     if (!verasetApiKey) {
+      logger.error('VERASET_API_KEY not configured', {
+        nodeEnv: process.env.NODE_ENV,
+        hasEnvVar: !!process.env.VERASET_API_KEY,
+        envVarLength: process.env.VERASET_API_KEY?.length || 0,
+      });
       return NextResponse.json(
-        { error: 'VERASET_API_KEY not configured' },
+        { 
+          error: 'VERASET_API_KEY not configured',
+          hint: 'Please verify VERASET_API_KEY is set in Vercel environment variables for Production environment',
+        },
         { status: 500 }
       );
     }
@@ -124,6 +142,8 @@ export async function POST(request: NextRequest) {
       bodySize: verasetBody.length,
       geoRadiusCount: verasetBodyObj.geo_radius?.length || 0,
       placeKeyCount: verasetBodyObj.place_key?.length || 0,
+      apiKeyConfigured: !!verasetApiKey,
+      apiKeyLength: verasetApiKey.length,
     });
 
     // Call Veraset API directly (server-side, has access to VERASET_API_KEY env var)
@@ -149,12 +169,41 @@ export async function POST(request: NextRequest) {
     }
     
     if (!verasetResponse.ok) {
-      logger.error('Veraset API error response', { status: verasetResponse.status });
+      logger.error('Veraset API error response', { 
+        status: verasetResponse.status,
+        statusText: verasetResponse.statusText,
+        responseText: responseText.substring(0, 1000), // Log full error in production for debugging
+        apiKeyLength: verasetApiKey?.length || 0,
+        apiKeyPrefix: verasetApiKey?.substring(0, 10) || 'missing',
+      });
+      
+      // Parse error response for better error messages
+      let errorDetails: any = {};
+      try {
+        errorDetails = verasetData;
+      } catch {
+        errorDetails = { raw: responseText };
+      }
+      
+      // Provide helpful error messages based on status code
+      if (verasetResponse.status === 401) {
+        return NextResponse.json(
+          { 
+            error: 'Veraset API authentication failed',
+            details: errorDetails.error_message || errorDetails.message || 'Invalid API key',
+            hint: 'Please verify VERASET_API_KEY is correctly set in Vercel environment variables',
+            statusCode: 401,
+          },
+          { status: 502 }
+        );
+      }
+      
       const isProduction = process.env.NODE_ENV === 'production';
       return NextResponse.json(
         { 
           error: 'Veraset API failed', 
-          details: isProduction ? undefined : responseText.substring(0, 500)
+          details: isProduction ? errorDetails.error_message || errorDetails.message : responseText.substring(0, 500),
+          statusCode: verasetResponse.status,
         },
         { status: 502 }
       );

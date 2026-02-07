@@ -64,6 +64,26 @@ export default async function handler(req, res) {
       body: JSON.stringify(body),
     });
 
+    // Log error details for debugging in production
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorData;
+      try {
+        errorData = JSON.parse(errorText);
+      } catch {
+        errorData = { raw: errorText };
+      }
+      
+      console.error('Veraset API error:', {
+        status: response.status,
+        statusText: response.statusText,
+        endpoint,
+        error: errorData.error_message || errorData.message || errorData,
+        apiKeyConfigured: !!apiKey,
+        apiKeyLength: apiKey?.length || 0,
+      });
+    }
+
     const data = await response.json();
     return res.status(response.status).json(data);
 
