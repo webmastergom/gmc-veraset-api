@@ -5,6 +5,7 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 export const maxDuration = 300; // Allow up to 5 minutes for Athena queries (Vercel max)
 
+// POST handler - must be exported as named export
 export async function POST(
   req: NextRequest,
   { params }: { params: { name: string } }
@@ -53,24 +54,4 @@ export async function POST(
       { status: statusCode }
     );
   }
-}
-
-// Explicitly handle GET requests to return 405
-export async function GET(
-  req: NextRequest,
-  { params }: { params: { name: string } }
-) {
-  return NextResponse.json(
-    { 
-      error: 'Method Not Allowed', 
-      message: 'This endpoint only accepts POST requests',
-      allowedMethods: ['POST']
-    },
-    { 
-      status: 405,
-      headers: {
-        'Allow': 'POST'
-      }
-    }
-  );
 }
