@@ -96,19 +96,48 @@ export async function POST(request: NextRequest) {
       );
     }
     
+    // Build Veraset payload - extract type from config and send rest to API
+    const verasetPayload = verasetConfig || {
+      type,
+      date_range: dateRange,
+      pois: body.pois || [],
+      schema: schema || 'BASIC',
+    };
+
+    // Extract type to determine endpoint, send rest as body
+    const { type: jobType = 'pings', ...verasetBodyObj } = verasetPayload;
+    const verasetBody = JSON.stringify(verasetBodyObj);
+
+    const endpoints: Record<string, string> = {
+      'pings': '/v1/movement/job/pings',
+      'devices': '/v1/movement/job/devices',
+      'aggregate': '/v1/movement/job/aggregate',
+    };
+    const verasetEndpoint = endpoints[jobType] || endpoints['pings'];
+
+    const verasetApiKey = process.env.VERASET_API_KEY;
+    if (!verasetApiKey) {
+      return NextResponse.json(
+        { error: 'VERASET_API_KEY not configured' },
+        { status: 500 }
+      );
+    }
+
+    logger.log(`Veraset direct call: ${verasetEndpoint}`, {
+      bodySize: verasetBody.length,
+      geoRadiusCount: verasetBodyObj.geo_radius?.length || 0,
+      placeKeyCount: verasetBodyObj.place_key?.length || 0,
+    });
+
     const verasetResponse = await fetch(
-      `${apiUrl}/api/veraset/movement`,
+      `https://platform.prd.veraset.tech${verasetEndpoint}`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-API-Key": verasetApiKey,
         },
-        body: JSON.stringify(verasetConfig || {
-          type,
-          date_range: dateRange,
-          pois: body.pois || [],
-          schema: schema || 'BASIC',
-        }),
+        body: verasetBody,
       }
     );
     
