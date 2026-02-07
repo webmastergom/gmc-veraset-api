@@ -17,9 +17,17 @@ const DailyActivityChart = dynamic(
 
 const DwellDistributionChart = dynamic(
   () => import('@/components/analysis/dwell-distribution-chart'),
-  { 
+  {
     ssr: false,
     loading: () => <div className="h-64 flex items-center justify-center text-muted-foreground">Loading chart...</div>
+  }
+);
+
+const ResidentialAnalysis = dynamic(
+  () => import('@/components/analysis/residential-analysis'),
+  {
+    ssr: false,
+    loading: () => <div className="h-64 flex items-center justify-center text-muted-foreground">Loading...</div>
   }
 );
 
@@ -163,6 +171,7 @@ export function DatasetAnalysisClient({ datasetName }: DatasetAnalysisClientProp
               <TabsTrigger value="activity">Daily Activity</TabsTrigger>
               <TabsTrigger value="dwell">Dwell Distribution</TabsTrigger>
               <TabsTrigger value="pois">Top POIs</TabsTrigger>
+              <TabsTrigger value="residential">Visitor Origins</TabsTrigger>
             </TabsList>
 
             <TabsContent value="activity">
@@ -196,6 +205,10 @@ export function DatasetAnalysisClient({ datasetName }: DatasetAnalysisClientProp
                   <TopPoisTable data={analysis.topPois} />
                 </CardContent>
               </Card>
+            </TabsContent>
+
+            <TabsContent value="residential">
+              <ResidentialAnalysis datasetName={datasetName} />
             </TabsContent>
           </Tabs>
         </>

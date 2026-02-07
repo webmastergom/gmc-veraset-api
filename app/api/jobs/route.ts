@@ -67,11 +67,14 @@ export async function POST(request: NextRequest) {
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://gmc-mobility-api.vercel.app";
     
     // Log POI count being sent (sanitized in production)
-    // Handle both place_key (Veraset POIs) and geo_radius (GeoJSON POIs)
-    const poisToSend = verasetConfig?.place_key || verasetConfig?.geo_radius || body.pois || [];
-    const poiCountToSend = Array.isArray(poisToSend) ? poisToSend.length : 0;
+    // Handle hybrid mode: place_key + geo_radius can coexist
+    const placeKeyCount = Array.isArray(verasetConfig?.place_key) ? verasetConfig.place_key.length : 0;
+    const geoRadiusCount = Array.isArray(verasetConfig?.geo_radius) ? verasetConfig.geo_radius.length : 0;
+    const poiCountToSend = placeKeyCount + geoRadiusCount || (Array.isArray(body.pois) ? body.pois.length : 0);
     logger.log(`Job Creation: ${name}`, {
       poiCount: poiCountToSend,
+      placeKeyPois: placeKeyCount,
+      geoRadiusPois: geoRadiusCount,
       expectedPoiCount: poiCount || 0,
       dateRange: {
         from: dateRange.from_date || dateRange.from,

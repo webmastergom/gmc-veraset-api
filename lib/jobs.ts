@@ -22,6 +22,9 @@ export interface Job {
   external?: boolean; // true = created outside app, doesn't count toward quota
   poiMapping?: Record<string, string>; // Maps Veraset POI IDs (geo_radius_X) to original GeoJSON IDs
   poiNames?: Record<string, string>; // Maps Veraset POI IDs (geo_radius_X) to human-readable names from GeoJSON properties.name
+  country?: string; // ISO 2-letter country code (e.g., "ES")
+  webhookUrl?: string; // URL to notify when job status changes
+  externalPois?: Array<{ id: string; name?: string; latitude: number; longitude: number }>; // Original POI data from external API
 }
 
 type JobsData = Record<string, Job>;

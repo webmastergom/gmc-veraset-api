@@ -38,6 +38,41 @@ export const createJobSchema = z.object({
 })
 
 /**
+ * External API: POI item schema
+ */
+const externalPoiSchema = z.object({
+  id: z.string().min(1).max(200),
+  name: z.string().max(500).optional(),
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+})
+
+/**
+ * External API: Job creation schema
+ */
+export const externalCreateJobSchema = z.object({
+  name: z.string().min(1).max(200),
+  country: z.string().length(2).toUpperCase(),
+  type: z.enum(['pings', 'devices', 'aggregate']).optional().default('pings'),
+  date_range: z.object({
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  }),
+  radius: z.number().min(1).max(1000).optional().default(10),
+  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
+  pois: z.array(externalPoiSchema).min(1).max(25000),
+  webhook_url: z.string().url().startsWith('https://').optional(),
+}).refine(
+  (data) => {
+    const from = new Date(data.date_range.from)
+    const to = new Date(data.date_range.to)
+    const days = Math.ceil((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24))
+    return days >= 1 && days <= 31
+  },
+  { message: 'Date range must be between 1 and 31 days', path: ['date_range'] }
+)
+
+/**
  * Login schema
  */
 export const loginSchema = z.object({

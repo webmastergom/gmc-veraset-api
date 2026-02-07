@@ -478,41 +478,40 @@ export default function NewJobPage() {
           radius: formData.radius,
           schema: formData.schema,
           verasetConfig: (() => {
-            // Check if POIs have place_key (from Veraset POI import)
-            const hasPlaceKey = pois.some((poi: any) => poi.properties?.place_key);
-            
-            if (hasPlaceKey) {
-              // Use place_key for Veraset POIs (as per Veraset API documentation)
-              return {
-                type: formData.type,
-                date_range: {
-                  from_date: formData.dateRange!.from,
-                  to_date: formData.dateRange!.to,
-                },
-                place_key: pois
-                  .map((poi: any) => poi.properties?.place_key)
-                  .filter((key: string | undefined): key is string => !!key),
-                schema: formData.schema,
-              };
-            } else {
-              // Use geo_radius for GeoJSON POIs (custom POIs)
-              return {
-                type: formData.type,
-                date_range: {
-                  from_date: formData.dateRange!.from,
-                  to_date: formData.dateRange!.to,
-                },
-                geo_radius: pois.map((poi: { latitude: number; longitude: number; radius: number; poiId: string }) => ({
-                  latitude: poi.latitude,
-                  longitude: poi.longitude,
-                  distance_in_meters: poi.radius,
-                  // Include POI ID if Veraset API supports it
-                  // Note: Veraset may still generate its own IDs, but we include ours for reference
-                  id: poi.poiId,
-                })),
-                schema: formData.schema,
-              };
+            // Split POIs into enriched (with place_key) and non-enriched (geo_radius)
+            const enrichedPois = pois.filter((poi: any) => poi.properties?.place_key);
+            const geoRadiusPois = pois.filter((poi: any) => !poi.properties?.place_key);
+
+            const config: Record<string, any> = {
+              type: formData.type,
+              date_range: {
+                from_date: formData.dateRange!.from,
+                to_date: formData.dateRange!.to,
+              },
+              schema: formData.schema,
+            };
+
+            // Add place_key array for enriched POIs
+            if (enrichedPois.length > 0) {
+              config.place_key = enrichedPois.map((poi: any) => ({
+                poi_id: poi.poiId,
+                placekey: poi.properties.place_key,
+              }));
             }
+
+            // Add geo_radius array for non-enriched POIs
+            if (geoRadiusPois.length > 0) {
+              config.geo_radius = geoRadiusPois.map((poi: { latitude: number; longitude: number; radius: number; poiId: string }) => ({
+                poi_id: poi.poiId,
+                latitude: poi.latitude,
+                longitude: poi.longitude,
+                distance_in_meters: poi.radius,
+              }));
+            }
+
+            console.log(`📊 Veraset Config: ${enrichedPois.length} place_key + ${geoRadiusPois.length} geo_radius`);
+
+            return config;
           })(),
           poiMapping: poiMapping, // Include mapping for later reference
           poiNames: poiNames, // Include human-readable names for display
@@ -658,7 +657,7 @@ export default function NewJobPage() {
                       ) : (
                         collections.map((col) => (
                           <SelectItem key={col.id} value={col.id}>
-                            {col.name} ({col.poiCount || 0} POIs)
+                            {col.name} ({col.poiCount || 0} POIs{col.enrichedCount ? `, ${col.enrichedCount} enriched` : ''})
                           </SelectItem>
                         ))
                       )}

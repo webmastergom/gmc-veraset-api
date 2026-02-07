@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAllJobs } from '@/lib/jobs';
+import { getAllJobs, createJob } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { BUCKET } from '@/lib/s3-config';
+import { externalCreateJobSchema, validateRequestBody } from '@/lib/validation';
+import { canCreateJob } from '@/lib/usage';
+import { logger } from '@/lib/logger';
+import { sanitizeError } from '@/lib/security';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+export const maxDuration = 60;
 
 /**
  * GET /api/external/jobs
@@ -12,7 +17,6 @@ export const revalidate = 0;
  */
 export async function GET(request: NextRequest) {
   try {
-    // Validate API key
     const auth = await validateApiKeyFromRequest(request);
     if (!auth.valid) {
       return NextResponse.json(
@@ -21,15 +25,11 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // Get all jobs
     const allJobs = await getAllJobs();
 
-    // Filter successful jobs with valid s3DestPath
     const availableJobs = allJobs
       .filter(job => job.status === 'SUCCESS' && job.s3DestPath)
       .map(job => {
-        // Extract dataset name from s3DestPath
-        // e.g., "s3://bucket/spain-nicotine-full-jan/" -> "spain-nicotine-full-jan"
         const s3Path = job.s3DestPath!.replace('s3://', '').replace(`${BUCKET}/`, '');
         const datasetName = s3Path.split('/').filter(Boolean)[0] || s3Path.replace(/\/$/, '');
 
@@ -48,6 +48,155 @@ export async function GET(request: NextRequest) {
     console.error('GET /api/external/jobs error:', error);
     return NextResponse.json(
       { error: 'Internal Server Error', message: error.message },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * POST /api/external/jobs
+ * Create a new mobility job from external API
+ */
+export async function POST(request: NextRequest) {
+  try {
+    // 1. Validate API key
+    const auth = await validateApiKeyFromRequest(request);
+    if (!auth.valid) {
+      return NextResponse.json(
+        { error: 'Unauthorized', message: auth.error },
+        { status: 401 }
+      );
+    }
+
+    // 2. Validate request body
+    const validation = await validateRequestBody(request, externalCreateJobSchema);
+    if (!validation.success) {
+      return NextResponse.json(
+        { error: validation.error },
+        { status: validation.status }
+      );
+    }
+
+    const body = validation.data;
+
+    // 3. Check usage limit
+    const { allowed, reason, remaining } = await canCreateJob();
+    if (!allowed) {
+      return NextResponse.json(
+        { error: 'Limit reached', message: reason, remaining },
+        { status: 429 }
+      );
+    }
+
+    // 4. Build verasetConfig from POIs
+    const geoRadius = body.pois.map((poi, index) => ({
+      poi_id: poi.id || `poi_${index}`,
+      latitude: poi.latitude,
+      longitude: poi.longitude,
+      distance_in_meters: body.radius,
+    }));
+
+    const verasetConfig = {
+      type: body.type,
+      date_range: {
+        from_date: body.date_range.from,
+        to_date: body.date_range.to,
+      },
+      geo_radius: geoRadius,
+      schema: body.schema,
+    };
+
+    logger.log(`External Job Creation: ${body.name}`, {
+      poiCount: body.pois.length,
+      country: body.country,
+      dateRange: body.date_range,
+      type: body.type,
+      schema: body.schema,
+      hasWebhook: !!body.webhook_url,
+    });
+
+    // 5. Call Veraset movement API
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://gmc-mobility-api.vercel.app';
+
+    const verasetResponse = await fetch(`${apiUrl}/api/veraset/movement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(verasetConfig),
+    });
+
+    const responseText = await verasetResponse.text();
+    let verasetData;
+    try {
+      verasetData = JSON.parse(responseText);
+    } catch {
+      verasetData = { raw: responseText };
+    }
+
+    if (!verasetResponse.ok) {
+      logger.error('Veraset API error (external)', { status: verasetResponse.status });
+      return NextResponse.json(
+        { error: 'Veraset API failed', details: responseText.substring(0, 500) },
+        { status: 502 }
+      );
+    }
+
+    const jobId = verasetData.job_id || verasetData.data?.job_id;
+    if (!jobId) {
+      return NextResponse.json(
+        { error: 'No job_id returned from Veraset' },
+        { status: 502 }
+      );
+    }
+
+    // 6. Build POI mapping and names
+    const poiMapping: Record<string, string> = {};
+    const poiNames: Record<string, string> = {};
+    body.pois.forEach((poi, index) => {
+      const verasetId = `geo_radius_${index}`;
+      poiMapping[verasetId] = poi.id;
+      if (poi.name) {
+        poiNames[verasetId] = poi.name;
+      }
+    });
+
+    // 7. Save job to S3
+    const job = await createJob({
+      jobId,
+      name: body.name,
+      type: body.type as 'pings' | 'aggregate' | 'devices' | 'cohort',
+      poiCount: body.pois.length,
+      dateRange: { from: body.date_range.from, to: body.date_range.to },
+      radius: body.radius ?? 10,
+      schema: (body.schema ?? 'BASIC') as 'BASIC' | 'FULL' | 'ENHANCED' | 'N/A',
+      status: 'QUEUED',
+      s3SourcePath: `s3://veraset-prd-platform-us-west-2/output/garritz/${jobId}/`,
+      external: true,
+      poiMapping,
+      poiNames,
+      country: body.country,
+      webhookUrl: body.webhook_url,
+      externalPois: body.pois,
+    });
+
+    // 8. Return response
+    return NextResponse.json({
+      job_id: jobId,
+      status: 'QUEUED',
+      poi_count: body.pois.length,
+      date_range: body.date_range,
+      created_at: job.createdAt,
+      status_url: `/api/external/jobs/${jobId}/status`,
+      webhook_registered: !!body.webhook_url,
+    }, { status: 201 });
+
+  } catch (error: any) {
+    logger.error('POST /api/external/jobs error:', error);
+    const isProduction = process.env.NODE_ENV === 'production';
+    return NextResponse.json(
+      {
+        error: 'Failed to create job',
+        details: isProduction ? undefined : sanitizeError(error),
+      },
       { status: 500 }
     );
   }
