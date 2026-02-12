@@ -168,9 +168,9 @@ export async function auditJob(jobId: string): Promise<JobAuditResult> {
       };
     }
     
-    const fromDate = new Date(dateRange.from);
-    const toDate = new Date(dateRange.to);
-    const expectedDays = Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+    // Use consistent date calculation
+    const { calculateDaysInclusive } = await import('./s3');
+    const expectedDays = calculateDaysInclusive(dateRange.from, dateRange.to);
     
     // Discover partitions from S3
     const datasetName = jobId;

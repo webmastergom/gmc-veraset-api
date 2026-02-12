@@ -102,7 +102,7 @@ export async function POST(request: NextRequest) {
         to_date: body.date_range.to,
       },
       geo_radius: geoRadius,
-      schema: body.schema,
+      schema_type: body.schema || 'BASIC', // Veraset API expects 'schema_type', not 'schema'
     };
 
     logger.log(`External Job Creation: ${body.name}`, {

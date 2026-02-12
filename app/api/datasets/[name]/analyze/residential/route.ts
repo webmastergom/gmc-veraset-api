@@ -32,6 +32,7 @@ export async function POST(
       dateTo: filters.dateTo,
       poiIds: filters.poiIds,
       minNightPings: filters.minNightPings,
+      minDistinctNights: filters.minDistinctNights,
     });
 
     return NextResponse.json(result);

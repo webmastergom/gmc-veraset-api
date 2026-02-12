@@ -1,17 +1,26 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getJob, markJobSynced } from "@/lib/jobs";
-import { listS3Objects, copyS3Object, parseS3Path } from "@/lib/s3";
+import { NextRequest, NextResponse } from 'next/server';
+import { getJob, updateJob, tryAcquireSyncLock, releaseSyncLock } from '@/lib/jobs';
+import { parseS3Path } from '@/lib/s3';
+import { runSync } from '@/lib/sync/sync-orchestrator';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+export const maxDuration = 600; // 10 min for large syncs
 
 export async function POST(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> | { id: string } }
 ) {
   try {
-    const body = await request.json();
-    const { destPath } = body;
+    const params =
+      typeof context.params === 'object' && context.params instanceof Promise
+        ? await context.params
+        : context.params;
+    const jobId = params.id;
+
+    const body = await request.json().catch(() => ({}));
+    const destPath = body.destPath as string | undefined;
+    const force = body.force === true;
 
     if (!destPath) {
       return NextResponse.json(
@@ -20,23 +29,16 @@ export async function POST(
       );
     }
 
-    // Get job details
-    const job = await getJob(params.id);
-    
+    const job = await getJob(jobId);
     if (!job) {
-      return NextResponse.json(
-        { error: 'Job not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
-
     if (job.status !== 'SUCCESS') {
       return NextResponse.json(
         { error: 'Job must be SUCCESS before syncing' },
         { status: 400 }
       );
     }
-
     if (!job.s3SourcePath) {
       return NextResponse.json(
         { error: 'Job has no source path' },
@@ -44,56 +46,60 @@ export async function POST(
       );
     }
 
-    // Parse S3 paths
-    const sourcePath = parseS3Path(job.s3SourcePath);
-    const destPathParsed = parseS3Path(destPath);
+    // Idempotency: already completed with same destination
+    if (job.syncedAt && job.s3DestPath === destPath && (job.objectCount ?? 0) >= (job.expectedObjectCount ?? 0) && (job.expectedObjectCount ?? 0) > 0) {
+      return NextResponse.json({
+        success: true,
+        message: 'Sync already completed. No re-run.',
+        jobId,
+        alreadyCompleted: true,
+      });
+    }
 
-    // List source objects
-    const sourceObjects = await listS3Objects(sourcePath.bucket, sourcePath.key);
-
-    if (sourceObjects.length === 0) {
+    let acquired = await tryAcquireSyncLock(jobId);
+    if (!acquired && force) {
+      console.log(`[SYNC] Force resync: releasing lock for job ${jobId}`);
+      await releaseSyncLock(jobId);
+      acquired = await tryAcquireSyncLock(jobId);
+    }
+    if (!acquired) {
       return NextResponse.json(
-        { error: 'No objects found in source path' },
-        { status: 404 }
+        {
+          error: 'Another sync is already in progress for this job',
+          code: 'SYNC_IN_PROGRESS',
+        },
+        { status: 409 }
       );
     }
 
-    // Copy objects
-    let copied = 0;
-    let totalBytes = 0;
-    const errors: string[] = [];
+    const sourcePath = parseS3Path(job.s3SourcePath);
+    const destPathParsed = parseS3Path(destPath);
 
-    for (const obj of sourceObjects) {
-      if (!obj.Key) continue;
+    await updateJob(jobId, {
+      objectCount: 0,
+      totalBytes: 0,
+      syncedAt: null,
+    });
 
-      try {
-        const destKey = `${destPathParsed.key}${obj.Key.replace(sourcePath.key, '')}`;
-        await copyS3Object(
-          sourcePath.bucket,
-          obj.Key,
-          destPathParsed.bucket,
-          destKey
-        );
-        copied++;
-        totalBytes += obj.Size || 0;
-      } catch (err: any) {
-        errors.push(`Failed to copy ${obj.Key}: ${err.message || 'Unknown error'}`);
-      }
-    }
-
-    // Update job record
-    await markJobSynced(params.id, destPath, copied, totalBytes);
+    runSync({
+      jobId,
+      sourcePath,
+      destPathParsed,
+      destPath,
+    }).catch((err) => {
+      console.error(`[SYNC] Async sync failed for job ${jobId}:`, err);
+    });
 
     return NextResponse.json({
       success: true,
-      copied,
-      totalBytes,
-      errors: errors.length > 0 ? errors : undefined,
+      message: 'Sync started. Check status endpoint or use SSE stream for progress.',
+      jobId,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Failed to start sync';
     console.error('POST /api/jobs/[id]/sync error:', error);
     return NextResponse.json(
-      { error: 'Failed to sync job', details: error.message },
+      { error: 'Failed to start sync', details: message },
       { status: 500 }
     );
   }

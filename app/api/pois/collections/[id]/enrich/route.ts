@@ -11,9 +11,9 @@ export const maxDuration = 300; // 5 minutes
  * Enrich a POI collection with Veraset placekeys.
  *
  * Body options:
- * - { action: "enrich" } — Run enrichment (default)
- * - { action: "apply", matches: [...] } — Apply enrichment results to GeoJSON
- * - { action: "enrich", limit: 100 } — Enrich only first N POIs (for testing)
+ * - { action: "enrich" } Run enrichment (default)
+ * - { action: "apply", matches: [...] } Apply enrichment results to GeoJSON
+ * - { action: "enrich", limit: 100 } Enrich only first N POIs (for testing)
  */
 export async function POST(
   request: NextRequest,

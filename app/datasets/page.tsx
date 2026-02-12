@@ -3,7 +3,7 @@
 import { useEffect, useState, useMemo } from 'react';
 import Link from 'next/link';
 import { MainLayout } from '@/components/layout/main-layout';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -32,8 +32,24 @@ import {
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
-  Loader2
+  Loader2,
+  FolderOpen,
+  ChevronDown,
+  ChevronRight,
+  RefreshCw,
+  Download,
+  ShieldCheck,
+  AlertTriangle,
+  CheckCircle
 } from 'lucide-react';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { ExportDialog } from '@/components/export/export-dialog';
 
 interface Dataset {
   id: string;
@@ -46,6 +62,20 @@ interface Dataset {
   totalBytes: number;
   dateRange: { from: string; to: string } | null;
   lastModified?: string;
+  syncedAt?: string | null;
+  dateRangeDiscrepancy?: {
+    requestedDays: number;
+    actualDays: number;
+    missingDays: number;
+  } | null;
+  verasetPayload?: {
+    date_range: { from_date: string; to_date: string };
+  } | null;
+  actualDateRange?: {
+    from: string;
+    to: string;
+    days: number;
+  } | null;
 }
 
 type SortField = 'name' | 'date' | 'size' | 'files';
@@ -80,14 +110,37 @@ export default function DatasetsPage() {
   const [sortField, setSortField] = useState<SortField>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [viewMode, setViewMode] = useState<ViewMode>('modern');
+  const [bucketReviewOpen, setBucketReviewOpen] = useState(false);
+  const [bucketList, setBucketList] = useState<{ bucket: string; listedAt: string; items: Array<{ prefix: string; objectCount: number; totalBytes: number; isSystem: boolean }> } | null>(null);
+  const [bucketLoading, setBucketLoading] = useState(false);
+  const [bucketError, setBucketError] = useState<string | null>(null);
+  const [exportDatasetId, setExportDatasetId] = useState<string | null>(null);
+  const [downloadingFullId, setDownloadingFullId] = useState<string | null>(null);
+  const [auditLoadingId, setAuditLoadingId] = useState<string | null>(null);
+  const [auditResult, setAuditResult] = useState<{
+    datasetName: string;
+    jobId: string;
+    jobName: string;
+    sourcePath: string;
+    destPath: string;
+    sourceCount: number;
+    destCount: number;
+    missingInDestCount: number;
+    extraInDestCount: number;
+    missingInDest: string[];
+    extraInDest: string[];
+    symmetric: boolean;
+    message: string;
+  } | null>(null);
 
   useEffect(() => {
-    fetch('/api/datasets', {
-      credentials: 'include',
-    })
-      .then(r => r.json())
-      .then(data => setDatasets(data.datasets || []))
-      .catch(err => {
+    fetch('/api/datasets', { credentials: 'include' })
+      .then((r) => {
+        if (!r.ok) throw new Error(r.statusText || 'Failed to load datasets');
+        return r.json();
+      })
+      .then((data) => setDatasets(data.datasets ?? []))
+      .catch((err) => {
         console.error('Error fetching datasets:', err);
         setDatasets([]);
       })
@@ -151,6 +204,65 @@ export default function DatasetsPage() {
       : <ArrowDown className="h-4 w-4" />;
   };
 
+  const handleDownloadFullDataset = async (datasetId: string) => {
+    setDownloadingFullId(datasetId);
+    try {
+      const res = await fetch(`/api/datasets/${datasetId}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filters: { minDwellTime: null, minPings: null } }),
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.details || 'Export failed');
+      if (data.downloadUrl) {
+        window.open(data.downloadUrl, '_blank', 'noopener,noreferrer');
+      }
+    } catch (err: any) {
+      console.error('Full dataset export failed:', err);
+      alert(err.message || 'Error al descargar el dataset completo');
+    } finally {
+      setDownloadingFullId(null);
+    }
+  };
+
+  const runAudit = async (datasetId: string) => {
+    setAuditLoadingId(datasetId);
+    setAuditResult(null);
+    try {
+      const res = await fetch(`/api/datasets/${encodeURIComponent(datasetId)}/audit`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.details || 'Audit failed');
+      setAuditResult(data);
+    } catch (err: any) {
+      console.error('Audit failed:', err);
+      alert(err.message || 'Audit failed');
+    } finally {
+      setAuditLoadingId(null);
+    }
+  };
+
+  const fetchBucketList = () => {
+    setBucketLoading(true);
+    setBucketError(null);
+    const apiUrl = typeof window !== 'undefined' ? `${window.location.origin}/api/s3/list` : '/api/s3/list';
+    fetch(apiUrl, { credentials: 'include' })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) throw new Error(data.details || data.error);
+        setBucketList(data);
+      })
+      .catch(err => {
+        console.error('Error fetching S3 list:', err);
+        setBucketError(err.message || 'Error al listar el bucket');
+        setBucketList(null);
+      })
+      .finally(() => setBucketLoading(false));
+  };
+
   if (loading) {
     return (
       <MainLayout>
@@ -164,8 +276,12 @@ export default function DatasetsPage() {
   return (
     <MainLayout>
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-        <h1 className="text-3xl font-bold text-white">Datasets</h1>
-
+        <div>
+          <h1 className="text-3xl font-bold text-white">Datasets</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Same name = different job runs. File count is what was synced from Veraset at sync time; use Re-sync on the job to refresh.
+          </p>
+        </div>
         <div className="flex items-center gap-2">
           {/* View Mode Toggle */}
           <div className="flex items-center border border-[#222] rounded-lg p-1 bg-[#0a0a0a]">
@@ -273,8 +389,13 @@ export default function DatasetsPage() {
                   )}
                 </div>
                 {ds.id !== ds.name && (
-                  <p className="text-xs text-gray-500 font-mono truncate mt-1">
+                  <p className="text-xs text-gray-500 font-mono truncate mt-1" title="Job/dataset ID. Same name = different runs; file count depends on what Veraset delivered at sync time.">
                     {ds.id}
+                  </p>
+                )}
+                {ds.syncedAt && (
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Synced: {formatDate(ds.syncedAt)}
                   </p>
                 )}
               </CardHeader>
@@ -289,17 +410,79 @@ export default function DatasetsPage() {
                     {ds.dateRange.from} → {ds.dateRange.to}
                   </div>
                 )}
+                {ds.dateRangeDiscrepancy && ds.dateRangeDiscrepancy.missingDays > 0 && (
+                  <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-md p-2 text-xs">
+                    <div className="flex items-center gap-1 text-yellow-400 font-semibold mb-1">
+                      <AlertTriangle className="h-3 w-3" />
+                      Missing {ds.dateRangeDiscrepancy.missingDays} day{ds.dateRangeDiscrepancy.missingDays !== 1 ? 's' : ''}
+                    </div>
+                    <div className="text-yellow-300/80">
+                      Requested: {ds.dateRangeDiscrepancy.requestedDays} days
+                      {ds.verasetPayload?.date_range && (
+                        <> ({ds.verasetPayload.date_range.from_date} to {ds.verasetPayload.date_range.to_date})</>
+                      )}
+                    </div>
+                    <div className="text-yellow-300/80">
+                      Received: {ds.dateRangeDiscrepancy.actualDays} days
+                      {ds.actualDateRange && (
+                        <> ({ds.actualDateRange.from} to {ds.actualDateRange.to})</>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {ds.poiCount && (
                   <div className="flex items-center gap-2 text-sm text-gray-400">
                     <MapPin className="h-4 w-4 flex-shrink-0" />
                     {ds.poiCount.toLocaleString()} POIs
                   </div>
                 )}
-                <Button asChild className="w-full mt-4">
-                  <Link href={`/datasets/${ds.id}`}>
-                    Analyze
-                  </Link>
-                </Button>
+                <div className="flex flex-col gap-2 mt-4">
+                  <div className="flex gap-2 flex-wrap">
+                    <Button asChild className="flex-1 min-w-0">
+                      <Link href={`/datasets/${ds.id}`}>
+                        Analyze
+                      </Link>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="border-[#333] shrink-0"
+                      onClick={() => setExportDatasetId(ds.id)}
+                      title="Export IDs with filters"
+                    >
+                      <Download className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="border-[#333] shrink-0"
+                      onClick={() => runAudit(ds.id)}
+                      disabled={auditLoadingId === ds.id}
+                      title="Compare with Veraset source; detect asymmetries"
+                    >
+                      {auditLoadingId === ds.id ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ShieldCheck className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full text-gray-400 hover:text-white border border-[#222] hover:border-[#333]"
+                    onClick={() => handleDownloadFullDataset(ds.id)}
+                    disabled={downloadingFullId === ds.id}
+                    title="Descargar todos los device IDs (sin filtros)"
+                  >
+                    {downloadingFullId === ds.id ? (
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin shrink-0" />
+                    ) : (
+                      <Download className="h-4 w-4 mr-2 shrink-0" />
+                    )}
+                    Descargar dataset completo
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           ))}
@@ -347,7 +530,7 @@ export default function DatasetsPage() {
                   </div>
                 </TableHead>
                 <TableHead className="text-gray-400 text-right">POIs</TableHead>
-                <TableHead className="text-gray-400 w-[100px]"></TableHead>
+                <TableHead className="text-gray-400 w-[240px]"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -375,7 +558,14 @@ export default function DatasetsPage() {
                   </TableCell>
                   <TableCell className="text-gray-400">
                     {ds.dateRange ? (
-                      <span>{ds.dateRange.from} → {ds.dateRange.to}</span>
+                      <div className="flex items-center gap-2">
+                        <span>{ds.dateRange.from} → {ds.dateRange.to}</span>
+                        {ds.dateRangeDiscrepancy && ds.dateRangeDiscrepancy.missingDays > 0 && (
+                          <span className="text-yellow-400" title={`Missing ${ds.dateRangeDiscrepancy.missingDays} days: Requested ${ds.dateRangeDiscrepancy.requestedDays}, received ${ds.dateRangeDiscrepancy.actualDays}`}>
+                            <AlertTriangle className="h-4 w-4" />
+                          </span>
+                        )}
+                      </div>
                     ) : (
                       <span className="text-gray-600">-</span>
                     )}
@@ -390,11 +580,53 @@ export default function DatasetsPage() {
                     {ds.poiCount ? ds.poiCount.toLocaleString() : '-'}
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button asChild size="sm" variant="outline" className="border-[#333]">
-                      <Link href={`/datasets/${ds.id}`}>
-                        Analyze
-                      </Link>
-                    </Button>
+                    <div className="flex items-center justify-end gap-2 flex-wrap">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="border-[#333]"
+                        onClick={() => setExportDatasetId(ds.id)}
+                        title="Exportar IDs con filtros"
+                      >
+                        <Download className="h-4 w-4 mr-1" />
+                        Exportar IDs
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="border-[#333]"
+                        onClick={() => handleDownloadFullDataset(ds.id)}
+                        disabled={downloadingFullId === ds.id}
+                        title="Descargar todos los device IDs (sin filtros)"
+                      >
+                        {downloadingFullId === ds.id ? (
+                          <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                        ) : (
+                          <Download className="h-4 w-4 mr-1" />
+                        )}
+                        Dataset completo
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="border-[#333]"
+                        onClick={() => runAudit(ds.id)}
+                        disabled={auditLoadingId === ds.id}
+                        title="Compare with Veraset source"
+                      >
+                        {auditLoadingId === ds.id ? (
+                          <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                        ) : (
+                          <ShieldCheck className="h-4 w-4 mr-1" />
+                        )}
+                        Audit
+                      </Button>
+                      <Button asChild size="sm" variant="outline" className="border-[#333]">
+                        <Link href={`/datasets/${ds.id}`}>
+                          Analyze
+                        </Link>
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -402,6 +634,157 @@ export default function DatasetsPage() {
           </Table>
         </Card>
       )}
+
+      {exportDatasetId && (
+        <ExportDialog
+          datasetName={exportDatasetId}
+          open={!!exportDatasetId}
+          onOpenChange={(open) => !open && setExportDatasetId(null)}
+        />
+      )}
+
+      <Dialog open={!!auditResult} onOpenChange={(open) => !open && setAuditResult(null)}>
+        <DialogContent className="max-w-md bg-[#111] border-[#222] text-white">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              {auditResult?.symmetric ? (
+                <CheckCircle className="h-5 w-5 text-green-500" />
+              ) : (
+                <AlertTriangle className="h-5 w-5 text-amber-500" />
+              )}
+              Audit: {auditResult?.jobName || auditResult?.datasetName}
+            </DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {auditResult?.message}
+            </DialogDescription>
+          </DialogHeader>
+          {auditResult && (
+            <div className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-2">
+                <span className="text-gray-500">Veraset source</span>
+                <span className="font-mono">{auditResult.sourceCount} files</span>
+                <span className="text-gray-500">Our S3</span>
+                <span className="font-mono">{auditResult.destCount} files</span>
+              </div>
+              {!auditResult.symmetric && (
+                <>
+                  <div className="rounded border border-[#333] p-2 bg-[#0a0a0a]">
+                    <span className="text-amber-500 font-medium">Missing in our S3:</span>{' '}
+                    {auditResult.missingInDestCount}
+                    {auditResult.missingInDest.length > 0 && (
+                      <ul className="mt-1 text-xs font-mono text-gray-400 max-h-24 overflow-y-auto">
+                        {auditResult.missingInDest.slice(0, 10).map((k, i) => (
+                          <li key={i} className="truncate">{k}</li>
+                        ))}
+                        {auditResult.missingInDestCount > 10 && (
+                          <li>... and {auditResult.missingInDestCount - 10} more</li>
+                        )}
+                      </ul>
+                    )}
+                  </div>
+                  <div className="rounded border border-[#333] p-2 bg-[#0a0a0a]">
+                    <span className="text-gray-400 font-medium">Extra in our S3:</span>{' '}
+                    {auditResult.extraInDestCount}
+                  </div>
+                  <Button asChild className="w-full mt-2">
+                    <Link
+                      href={`/sync?jobId=${encodeURIComponent(auditResult.jobId)}&destPath=${encodeURIComponent(auditResult.destPath)}`}
+                    >
+                      Re-sync to fix
+                    </Link>
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Revisión directa del bucket S3 */}
+      <Card className="mt-8 bg-[#0a0a0a] border-[#222]">
+        <CardHeader>
+          <button
+            type="button"
+            onClick={() => {
+              setBucketReviewOpen(prev => !prev);
+              if (!bucketReviewOpen && !bucketList && !bucketLoading) fetchBucketList();
+            }}
+            className="flex items-center gap-2 text-left w-full"
+          >
+            {bucketReviewOpen ? <ChevronDown className="h-5 w-5 text-gray-400" /> : <ChevronRight className="h-5 w-5 text-gray-400" />}
+            <FolderOpen className="h-5 w-5 text-gray-400" />
+            <CardTitle className="text-lg text-white">Revisión directa del bucket S3 (Garritz)</CardTitle>
+          </button>
+          <CardDescription className="text-gray-500">
+            Lista de prefijos en el bucket sin pasar por el mapeo de jobs
+          </CardDescription>
+        </CardHeader>
+        {bucketReviewOpen && (
+          <CardContent className="pt-0">
+            <div className="flex items-center gap-2 mb-4">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={fetchBucketList}
+                disabled={bucketLoading}
+                className="border-[#333]"
+              >
+                {bucketLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                Actualizar lista
+              </Button>
+              {bucketList && (
+                <span className="text-sm text-gray-500">
+                  Bucket: <span className="font-mono">{bucketList.bucket}</span>
+                  {bucketList.listedAt && (
+                    <> · Listado: {new Date(bucketList.listedAt).toLocaleString()}</>
+                  )}
+                </span>
+              )}
+            </div>
+            {bucketLoading && !bucketList && (
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="h-8 w-8 animate-spin text-gray-500" />
+              </div>
+            )}
+            {bucketList?.items && (
+              <div className="rounded-md border border-[#222] overflow-hidden">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="border-[#222] hover:bg-transparent">
+                      <TableHead className="text-gray-400">Prefijo</TableHead>
+                      <TableHead className="text-gray-400 text-right">Objetos</TableHead>
+                      <TableHead className="text-gray-400 text-right">Tamaño</TableHead>
+                      <TableHead className="text-gray-400 w-[80px]">Tipo</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {bucketList.items.map((item) => (
+                      <TableRow key={item.prefix} className="border-[#222] hover:bg-[#111]">
+                        <TableCell className="font-mono text-sm text-white">{item.prefix}</TableCell>
+                        <TableCell className="text-right text-gray-400">{item.objectCount.toLocaleString()}</TableCell>
+                        <TableCell className="text-right text-gray-400">{formatBytes(item.totalBytes)}</TableCell>
+                        <TableCell>
+                          {item.isSystem ? (
+                            <span className="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">Sistema</span>
+                          ) : (
+                            <span className="text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20">Dataset</span>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+            {bucketList && (!bucketList.items || bucketList.items.length === 0) && (
+              <p className="text-sm text-gray-500 py-4">No se encontraron prefijos en el bucket.</p>
+            )}
+            {bucketError && (
+              <p className="text-sm text-destructive py-4">{bucketError}</p>
+            )}
+          </CardContent>
+        )}
+      </Card>
     </MainLayout>
   );
 }

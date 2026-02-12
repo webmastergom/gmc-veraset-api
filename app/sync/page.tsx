@@ -1,31 +1,193 @@
 "use client"
 
-import { useState, useEffect, Suspense } from "react"
+import { useState, useEffect, useRef, useCallback, Suspense } from "react"
 import { useSearchParams } from "next/navigation"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Progress } from "@/components/ui/progress"
 import { useToast } from "@/hooks/use-toast"
-import { Loader2 } from "lucide-react"
+import { Loader2, RefreshCw, CheckCircle, AlertCircle, Square } from "lucide-react"
+import { ProfessionalLoader } from "@/components/sync/professional-loader"
 import { useRouter } from "next/navigation"
+
+interface SyncStatus {
+  status: 'not_started' | 'syncing' | 'completed' | 'cancelled' | 'error'
+  message: string
+  progress: number
+  total: number
+  totalBytes: number
+  copied: number
+  copiedBytes: number
+  syncProgress?: {
+    currentDay?: string
+    currentFile?: number
+    totalFilesInCurrentDay?: number
+    dayProgress?: Record<string, {
+      date: string
+      totalFiles: number
+      copiedFiles: number
+      failedFiles: number
+      totalBytes: number
+      copiedBytes: number
+      status: 'pending' | 'copying' | 'completed' | 'failed'
+      errors?: Array<{ file: string; error: string }>
+    }>
+    lastUpdated?: string
+  } | null
+}
 
 function SyncPageContent() {
   const searchParams = useSearchParams()
-  const router = useRouter()
-  const { toast } = useToast()
   const jobId = searchParams.get("jobId")
   const [loading, setLoading] = useState(false)
   const [destPath, setDestPath] = useState("")
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
+  const [isPolling, setIsPolling] = useState(false)
+  const intervalRef = useRef<NodeJS.Timeout | null>(null)
+  const [retryDelay, setRetryDelay] = useState(15000)
+  const [sseFailed, setSseFailed] = useState(false) // Fallback to polling if SSE errors
+  const [syncConflict, setSyncConflict] = useState(false) // 409: lock held, need to cancel first
+  const { toast } = useToast()
+  const router = useRouter()
 
   useEffect(() => {
     if (jobId) {
-      // Generate default path from job ID
-      setDestPath(`s3://garritz-veraset-data-us-west-2/job-${jobId.slice(0, 8)}/`)
+      const destFromQuery = searchParams.get("destPath")
+      if (destFromQuery) {
+        try {
+          setDestPath(decodeURIComponent(destFromQuery))
+        } catch {
+          setDestPath(`s3://garritz-veraset-data-us-west-2/job-${jobId.slice(0, 8)}/`)
+        }
+      } else {
+        setDestPath(`s3://garritz-veraset-data-us-west-2/job-${jobId.slice(0, 8)}/`)
+      }
+      checkSyncStatus()
     }
+    
+    // Cleanup on unmount
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId])
 
-  const handleSync = async () => {
+  const applyStatus = useCallback((status: SyncStatus) => {
+    setSyncStatus(status)
+    if (status.status === 'completed') {
+      setIsPolling(false)
+      setLoading(false)
+      setSyncConflict(false)
+      toast({
+        title: "Sync Complete",
+        description: `Synced ${status.copied} objects (${(status.totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB)`,
+      })
+      setTimeout(() => router.push(`/jobs/${jobId}`), 2000)
+    } else if (status.status === 'error') {
+      setIsPolling(false)
+      setLoading(false)
+      setSyncConflict(false)
+      toast({
+        title: "Sync Error",
+        description: status.message || "Sync failed",
+        variant: "destructive",
+      })
+    } else if (status.status === 'cancelled') {
+      setIsPolling(false)
+      setLoading(false)
+      setSyncConflict(false)
+      toast({
+        title: "Sync Stopped",
+        description: status.message || "Sync was stopped by user",
+      })
+    }
+  }, [toast, router, jobId])
+
+  const checkSyncStatus = useCallback(async () => {
+    if (!jobId) return
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/sync/status`, { cache: 'no-store' })
+      if (response.status === 429) {
+        setRetryDelay(prev => Math.min(prev * 2, 60000))
+        return
+      }
+      if (response.ok) {
+        setRetryDelay(15000)
+        const status = await response.json() as SyncStatus
+        setSyncStatus(status)
+        if (status.status === 'syncing' && !isPolling) setIsPolling(true)
+        if (status.status === 'completed' || status.status === 'error' || status.status === 'cancelled') {
+          applyStatus(status)
+        }
+      }
+    } catch (error) {
+      console.error('Error checking sync status:', error)
+    }
+  }, [jobId, isPolling, applyStatus])
+
+  // SSE for progress when syncing; fallback to polling if EventSource fails
+  const eventSourceRef = useRef<EventSource | null>(null)
+  useEffect(() => {
+    if (!isPolling || !jobId) {
+      eventSourceRef.current?.close()
+      eventSourceRef.current = null
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+      return
+    }
+
+    if (sseFailed) {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+      intervalRef.current = setInterval(checkSyncStatus, Math.max(retryDelay, 15000))
+      return () => {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current)
+          intervalRef.current = null
+        }
+      }
+    }
+
+    const url = `/api/jobs/${jobId}/sync/stream`
+    const es = new EventSource(url)
+    eventSourceRef.current = es
+    es.addEventListener('progress', (e: MessageEvent) => {
+      try {
+        const status = JSON.parse(e.data) as SyncStatus
+        setSyncStatus(status)
+        if (status.status === 'completed' || status.status === 'error' || status.status === 'cancelled') {
+          es.close()
+          eventSourceRef.current = null
+          setIsPolling(false)
+          applyStatus(status)
+        }
+      } catch {
+        // ignore parse errors
+      }
+    })
+    es.onerror = () => {
+      es.close()
+      eventSourceRef.current = null
+      setSseFailed(true)
+    }
+
+    return () => {
+      es.close()
+      eventSourceRef.current = null
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }
+  }, [isPolling, jobId, retryDelay, sseFailed, checkSyncStatus, applyStatus])
+
+  const handleSync = async (force = false) => {
     if (!jobId || !destPath) {
       toast({
         title: "Error",
@@ -36,6 +198,8 @@ function SyncPageContent() {
     }
 
     setLoading(true)
+    setIsPolling(true)
+    setSseFailed(false)
 
     try {
       const response = await fetch(`/api/jobs/${jobId}/sync`, {
@@ -43,31 +207,87 @@ function SyncPageContent() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ destPath }),
+        body: JSON.stringify({ destPath, force }),
       })
+
+      if (response.status === 409) {
+        const data = await response.json()
+        setLoading(false)
+        setIsPolling(false)
+        setSyncConflict(true)
+        toast({
+          title: "Sync bloqueado",
+          description: data.error || "Otra sincronización está en curso o quedó bloqueada. Usa «Liberar y resincronizar» para desbloquear.",
+          variant: "destructive",
+        })
+        await checkSyncStatus()
+        return
+      }
+
+      setSyncConflict(false)
 
       if (!response.ok) {
         const error = await response.json()
         throw new Error(error.error || "Failed to sync")
       }
 
-      const result = await response.json()
-
-      toast({
-        title: "Sync Complete",
-        description: `Synced ${result.copied} objects (${(result.totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB)`,
-      })
-
-      router.push(`/jobs/${jobId}`)
+      await checkSyncStatus()
+      
+      // Polling is now handled by the useEffect hook above
+      // We just need to wait for the status to change
+      
     } catch (error) {
+      setIsPolling(false)
+      setLoading(false)
       toast({
         title: "Error",
         description: error instanceof Error ? error.message : "Failed to sync",
         variant: "destructive",
       })
-    } finally {
-      setLoading(false)
     }
+  }
+
+  const handleStopSync = async () => {
+    if (!jobId) return
+
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/sync/cancel`, {
+        method: "POST",
+      })
+
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.error || "Failed to stop sync")
+      }
+
+      const data = await response.json()
+      setIsPolling(false)
+      setLoading(false)
+      setSyncConflict(false)
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+
+      toast({
+        title: data.action === "completed" ? "Sync Complete" : "Sync Stopped",
+        description: data.message,
+      })
+
+      await checkSyncStatus()
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to stop sync",
+        variant: "destructive",
+      })
+    }
+  }
+
+  const handleForceResync = async () => {
+    if (!jobId || !destPath) return
+    setSyncConflict(false)
+    await handleSync(true)
   }
 
   return (
@@ -119,17 +339,113 @@ function SyncPageContent() {
             </div>
           </div>
 
-          <div className="flex justify-end space-x-4">
+          {/* Sync Status */}
+          {syncStatus && (
+            <Card>
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <CardTitle className="text-base">Sync Status</CardTitle>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={checkSyncStatus}
+                    disabled={loading}
+                  >
+                    <RefreshCw className={`h-4 w-4 ${isPolling ? 'animate-spin' : ''}`} />
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center space-x-2">
+                  {syncStatus.status === 'completed' && (
+                    <CheckCircle className="h-5 w-5 text-green-500" />
+                  )}
+                  {syncStatus.status === 'error' && (
+                    <AlertCircle className="h-5 w-5 text-red-500" />
+                  )}
+                  {syncStatus.status === 'cancelled' && (
+                    <Square className="h-5 w-5 text-amber-500" />
+                  )}
+                  {(syncStatus.status === 'syncing' || syncStatus.status === 'not_started') && (
+                    <Loader2 className="h-5 w-5 animate-spin text-blue-500" />
+                  )}
+                  <p className="text-sm font-medium">{syncStatus.message}</p>
+                </div>
+                
+                {/* Professional Loader - Shows detailed day-by-day progress */}
+                {syncStatus.status === 'syncing' && syncStatus.syncProgress && (
+                  <ProfessionalLoader
+                    syncProgress={syncStatus.syncProgress}
+                    overallProgress={syncStatus.progress}
+                    copied={syncStatus.copied}
+                    total={syncStatus.total}
+                    copiedBytes={syncStatus.copiedBytes}
+                    totalBytes={syncStatus.totalBytes}
+                  />
+                )}
+                
+                {/* Fallback: Simple progress if detailed progress not available */}
+                {syncStatus.total > 0 && (!syncStatus.syncProgress || syncStatus.status !== 'syncing') && (
+                  <>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-sm">
+                        <span className="text-muted-foreground">Progress</span>
+                        <span className="font-medium">{syncStatus.progress}%</span>
+                      </div>
+                      <Progress value={syncStatus.progress} className="h-2" />
+                    </div>
+                    
+                    <div className="grid grid-cols-2 gap-4 text-sm">
+                      <div>
+                        <p className="text-muted-foreground">Objects</p>
+                        <p className="font-medium">
+                          {syncStatus.copied.toLocaleString()} / {syncStatus.total.toLocaleString()}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Data</p>
+                        <p className="font-medium">
+                          {(syncStatus.copiedBytes / 1024 / 1024 / 1024).toFixed(2)} GB / {(syncStatus.totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB
+                        </p>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          <div className="flex justify-end flex-wrap gap-2">
             <Button
               variant="outline"
               onClick={() => router.back()}
-              disabled={loading}
+              disabled={loading || isPolling}
             >
-              Cancel
+              Back
             </Button>
-            <Button onClick={handleSync} disabled={loading || !destPath}>
-              {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Start Sync
+            {(syncStatus?.status === 'syncing' || isPolling || syncConflict) && (
+              <Button
+                variant="destructive"
+                onClick={handleStopSync}
+                disabled={loading}
+              >
+                <Square className="mr-2 h-4 w-4" />
+                Stop Sync
+              </Button>
+            )}
+            {syncConflict && (
+              <Button
+                variant="default"
+                onClick={handleForceResync}
+                disabled={loading}
+              >
+                {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                Liberar y resincronizar
+              </Button>
+            )}
+            <Button onClick={() => handleSync()} disabled={loading || !destPath || isPolling || syncConflict}>
+              {loading && !syncConflict && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {syncStatus?.status === 'syncing' ? 'Syncing...' : 'Start Sync'}
             </Button>
           </div>
         </CardContent>

@@ -12,6 +12,17 @@ export const s3Client = new S3Client({
 
 export const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 
+/** S3 config for health checks */
+export async function getS3Config(): Promise<{ bucket: string; region: string } | null> {
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    return null;
+  }
+  return {
+    bucket: BUCKET,
+    region: process.env.AWS_REGION || 'us-west-2',
+  };
+}
+
 /**
  * Check if config file exists in S3
  */

@@ -2,8 +2,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
-import { ArrowLeft, RefreshCw, Database, ExternalLink, Info } from "lucide-react"
+import { ArrowLeft, RefreshCw, Database, ExternalLink, Info, AlertTriangle, ShieldCheck } from "lucide-react"
 import { JobStatusPolling } from "@/components/jobs/job-status-polling"
+import { S3StorageSection } from "@/components/jobs/s3-storage-section"
+import { JobAuditDialog } from "@/components/jobs/job-audit-dialog"
 import { MainLayout } from "@/components/layout/main-layout"
 import dynamic from "next/dynamic"
 
@@ -39,6 +41,10 @@ async function getJob(id: string) {
       error_message: job.errorMessage,
       s3_source_path: job.s3SourcePath,
       s3_dest_path: job.s3DestPath || null,
+      veraset_payload: job.verasetPayload,
+      actual_date_range: job.actualDateRange,
+      date_range_discrepancy: job.dateRangeDiscrepancy,
+      has_audit_trail: !!job.auditTrail,
     };
   } catch (error) {
     console.error("Error fetching job:", error);
@@ -123,6 +129,34 @@ export default async function JobDetailPage({
         </div>
       )}
 
+      {/* Date Range Discrepancy Warning */}
+      {job.date_range_discrepancy && job.date_range_discrepancy.missingDays > 0 && (
+        <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4 mb-6">
+          <div className="flex items-center gap-2 text-yellow-400">
+            <AlertTriangle className="w-4 h-4" />
+            <span className="font-medium">Date Range Discrepancy</span>
+          </div>
+          <p className="text-sm text-yellow-300/80 mt-1">
+            <strong>Requested:</strong> {job.date_range_discrepancy.requestedDays} days
+            {job.veraset_payload?.date_range && (
+              <> ({job.veraset_payload.date_range.from_date} to {job.veraset_payload.date_range.to_date})</>
+            )}
+          </p>
+          <p className="text-sm text-yellow-300/80">
+            <strong>Received:</strong> {job.date_range_discrepancy.actualDays} days
+            {job.actual_date_range && (
+              <> ({job.actual_date_range.from} to {job.actual_date_range.to})</>
+            )}
+          </p>
+          <p className="text-sm text-yellow-300/80 font-semibold mt-2">
+            ⚠️ Missing {job.date_range_discrepancy.missingDays} day{job.date_range_discrepancy.missingDays !== 1 ? 's' : ''} of data
+          </p>
+          <p className="text-xs text-yellow-300/60 mt-2">
+            This discrepancy indicates that Veraset did not return all requested days. Check the Veraset API response or contact support.
+          </p>
+        </div>
+      )}
+
       <div className="grid gap-6 md:grid-cols-2">
         <Card>
           <CardHeader>
@@ -181,47 +215,12 @@ export default async function JobDetailPage({
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>S3 Storage</CardTitle>
-            <CardDescription>Data location and sync status</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div>
-              <p className="text-sm font-medium text-muted-foreground">Source Path</p>
-              <p className="mt-1 font-mono text-sm break-all">
-                {job.s3_source_path}
-              </p>
-            </div>
-            {job.s3_dest_path ? (
-              <>
-                <div>
-                  <p className="text-sm font-medium text-muted-foreground">Destination Path</p>
-                  <p className="mt-1 font-mono text-sm break-all">
-                    {job.s3_dest_path}
-                  </p>
-                </div>
-                <Link href={`/datasets/${job.s3_dest_path.split('/').pop()}`}>
-                  <Button>
-                    <Database className="mr-2 h-4 w-4" />
-                    View Dataset
-                  </Button>
-                </Link>
-              </>
-            ) : job.status === "SUCCESS" ? (
-              <Link href={`/sync?jobId=${job.job_id}`}>
-                <Button>
-                  <Database className="mr-2 h-4 w-4" />
-                  Sync to S3
-                </Button>
-              </Link>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                Sync available after job completes
-              </p>
-            )}
-          </CardContent>
-        </Card>
+        <S3StorageSection
+          jobId={job.job_id}
+          initialStatus={job.status}
+          s3SourcePath={job.s3_source_path || ''}
+          s3DestPath={job.s3_dest_path}
+        />
       </div>
 
       {/* Status Polling Component */}
@@ -245,6 +244,25 @@ export default async function JobDetailPage({
         </CardHeader>
         <CardContent>
           <RefreshStatusButton jobId={job.job_id} />
+        </CardContent>
+      </Card>
+
+      {/* Payload Verification Audit */}
+      <Card className="mt-6">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5" />
+            Payload Verification
+          </CardTitle>
+          <CardDescription>
+            Verify that Veraset received exactly what you requested. Compare user input with the payload sent to Veraset.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <JobAuditDialog jobId={job.job_id} />
+          <p className="text-xs text-muted-foreground mt-2">
+            This audit trail captures the exact payload sent to Veraset and compares it with your request to ensure data integrity.
+          </p>
         </CardContent>
       </Card>
     </MainLayout>

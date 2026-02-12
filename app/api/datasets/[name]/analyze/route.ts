@@ -1,119 +1,128 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { analyzeDataset, AnalysisFilters } from '@/lib/dataset-analyzer';
+import { runFullAnalysis } from '@/lib/dataset-analysis';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-export const maxDuration = 300;
+export const maxDuration = 600; // 10 minutes - allows time to wait for all partitions (10 attempts * 30s = 5min max wait)
 
 /**
  * POST /api/datasets/[name]/analyze
- * Analyze a dataset with optional filters
+ * Analyzes the dataset reading all days (partitions) without exception.
+ * Returns dailyData (one row per day), visitsByPoi, and summary.
  */
 export async function POST(
   request: NextRequest,
   context: { params: Promise<{ name: string }> | { name: string } }
 ): Promise<NextResponse> {
   let datasetName: string | undefined;
-  
+
   try {
-    // Handle params - Next.js 14+ may pass params as Promise, 13 uses direct object
-    let params: { name: string };
-    if (context.params instanceof Promise) {
-      params = await context.params;
-    } else {
-      params = context.params;
-    }
+    const params = await (typeof context.params === 'object' && context.params instanceof Promise
+      ? context.params
+      : Promise.resolve(context.params as { name: string }));
     datasetName = params.name;
 
     if (!datasetName || typeof datasetName !== 'string') {
       return NextResponse.json(
-        { 
-          error: 'Dataset name is required',
-          received: datasetName 
-        },
+        { error: 'Dataset name is required', received: datasetName },
         { status: 400 }
       );
     }
 
-    // Parse request body
-    let body: { filters?: AnalysisFilters } = {};
-    try {
-      body = await request.json();
-    } catch (e) {
-      // Body is optional, continue with empty filters
-      console.log('No body provided, using empty filters');
-    }
-
-    const filters: AnalysisFilters = body.filters || {};
-
-    console.log(`[ANALYZE] Starting analysis for dataset: ${datasetName}`, {
-      filters,
-      timestamp: new Date().toISOString()
-    });
-
-    // Run analysis
-    const result = await analyzeDataset(datasetName, filters);
-
-    console.log(`[ANALYZE] Analysis completed successfully for: ${datasetName}`);
-
+    const result = await runFullAnalysis(datasetName);
     return NextResponse.json(result, {
       status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
     });
-
   } catch (error: any) {
-    const errorDatasetName = datasetName || 'unknown';
-    console.error(`[ANALYZE ERROR] POST /api/datasets/${errorDatasetName}/analyze:`, {
-      error: error.message,
-      stack: error.stack,
-      name: error.name,
-    });
-    
-    // Determine status code and error message
-    let errorMessage = error.message || 'Unknown error occurred';
+    const name = datasetName || 'unknown';
+    const errorMsg = error?.message || String(error) || 'Analysis failed';
+    console.error(`[ANALYZE] POST /api/datasets/${name}/analyze error:`, errorMsg);
+    console.error(`[ANALYZE] Error stack:`, error?.stack);
+
     let statusCode = 500;
-    
-    if (errorMessage.includes('AWS credentials not configured') || 
-        errorMessage.includes('AWS_ACCESS_KEY_ID') ||
-        errorMessage.includes('AWS_SECRET_ACCESS_KEY')) {
+    let message = errorMsg;
+    let actionableSteps: string[] = [];
+
+    // Categorize errors and provide actionable guidance
+    if (
+      message.includes('AWS credentials not configured') ||
+      message.includes('AWS_ACCESS_KEY_ID') ||
+      message.includes('AWS_SECRET_ACCESS_KEY')
+    ) {
       statusCode = 503;
-      errorMessage = 'AWS credentials not configured. Please configure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in Vercel environment variables.';
-    } else if (errorMessage.includes('database') || 
-               errorMessage.includes('Database') ||
-               errorMessage.includes('veraset')) {
+      message = 'AWS credentials not configured.';
+      actionableSteps = [
+        'Set AWS_ACCESS_KEY_ID environment variable',
+        'Set AWS_SECRET_ACCESS_KEY environment variable',
+        'Verify credentials have access to S3 and Athena services',
+      ];
+    } else if (message.includes('database') || message.includes('veraset') || message.includes('Database')) {
       statusCode = 503;
-      errorMessage = `Athena database 'veraset' not found. Please create it in AWS Glue:\n\naws glue create-database --database-input '{"Name": "veraset"}' --region us-west-2`;
-    } else if (errorMessage.includes('Access denied') || 
-               errorMessage.includes('not authorized') ||
-               errorMessage.includes('AccessDeniedException')) {
+      message = `Athena database 'veraset' not found.`;
+      actionableSteps = [
+        'Create the database in AWS Glue Console',
+        'Or run: CREATE DATABASE IF NOT EXISTS veraset; in Athena',
+        'Verify AWS Glue permissions are configured',
+      ];
+    } else if (
+      message.includes('Access denied') ||
+      message.includes('not authorized') ||
+      message.includes('AccessDeniedException') ||
+      message.includes('Access Denied')
+    ) {
       statusCode = 403;
-      errorMessage = `Athena access denied. Please ensure your AWS IAM user has the following permissions:\n\n` +
-        `- Athena: StartQueryExecution, GetQueryExecution, GetQueryResults\n` +
-        `- Glue: GetDatabase, CreateTable, GetTable, BatchCreatePartition\n` +
-        `- S3: GetObject, PutObject, ListBucket (on garritz-veraset-data-us-west-2)\n\n` +
-        `See ATHENA_SETUP.md for detailed instructions.`;
-    } else if (errorMessage.includes('table') || errorMessage.includes('Table')) {
+      message = 'Access denied to AWS services.';
+      actionableSteps = [
+        'Check IAM user/role has Athena QueryExecution permissions',
+        'Check IAM user/role has Glue GetPartitions and GetTable permissions',
+        'Check IAM user/role has S3 ListObjects and GetObject permissions',
+        'Verify bucket policies allow access',
+      ];
+    } else if (message.includes('table') || message.includes('Table') || message.includes('does not exist')) {
       statusCode = 404;
-      errorMessage = `Table not found for dataset: ${errorDatasetName}. The dataset may not exist or may not have been processed yet.`;
+      message = `Table not found or not accessible for dataset: ${name}.`;
+      actionableSteps = [
+        'Verify the dataset exists in S3',
+        'Check that partitions are properly formatted (date=YYYY-MM-DD)',
+        'Try running sync again to ensure data is available',
+      ];
+    } else if (message.includes('partition') || message.includes('Partition')) {
+      statusCode = 500;
+      message = `Partition error: ${message}`;
+      actionableSteps = [
+        'Verify S3 partitions are correctly formatted',
+        'Check that partition dates match expected format (date=YYYY-MM-DD)',
+        'Try running MSCK REPAIR TABLE manually in Athena',
+      ];
+    } else if (message.includes('timeout') || message.includes('Timeout')) {
+      statusCode = 504;
+      message = 'Analysis query timed out.';
+      actionableSteps = [
+        'Large datasets may take longer to analyze',
+        'Try reducing the date range',
+        'Check Athena query execution limits',
+        'Contact support if the issue persists',
+      ];
+    } else if (message.includes('No partitions found') || message.includes('No partitions')) {
+      statusCode = 404;
+      message = `No partitions found for dataset: ${name}.`;
+      actionableSteps = [
+        'Verify the dataset has been synced from Veraset',
+        'Check that S3 path contains partition folders (date=YYYY-MM-DD)',
+        'Ensure sync completed successfully',
+      ];
     }
-    
+
     return NextResponse.json(
-      { 
+      {
         error: 'Analysis failed',
-        details: errorMessage,
-        dataset: errorDatasetName,
-        hint: errorMessage.includes('database') 
-          ? 'Run: aws glue create-database --database-input \'{"Name": "veraset"}\' --region us-west-2'
-          : undefined
+        details: message,
+        dataset: name,
+        ...(actionableSteps.length > 0 && { actionableSteps }),
+        timestamp: new Date().toISOString(),
       },
-      { 
-        status: statusCode,
-        headers: {
-          'Content-Type': 'application/json',
-        }
-      }
+      { status: statusCode, headers: { 'Content-Type': 'application/json' } }
     );
   }
 }

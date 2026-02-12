@@ -2,6 +2,7 @@
 
 import { useState, useRef, DragEvent } from "react"
 import { useRouter } from "next/navigation"
+import Papa from "papaparse"
 import { MainLayout } from "@/components/layout/main-layout"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -10,6 +11,61 @@ import { Label } from "@/components/ui/label"
 import Link from "next/link"
 import { ArrowLeft, Upload, File, X, Loader2 } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
+
+const ACCEPTED_EXTENSIONS = [".geojson", ".json", ".csv"]
+const ACCEPT_ATTR = ".geojson,.json,.csv"
+
+interface GeoJSONFeature {
+  type: "Feature"
+  id?: string | number
+  geometry: { type: "Point"; coordinates: [number, number] }
+  properties: Record<string, string | number>
+}
+
+/** Parse CSV to GeoJSON FeatureCollection. Expects columns: lat/latitude, lon/longitude/lng, optionally name, id, address, etc. */
+function csvToGeoJSON(text: string): { type: "FeatureCollection"; features: GeoJSONFeature[] } | null {
+  const result = Papa.parse<string[]>(text, { skipEmptyLines: true })
+  const rows = result.data
+  if (!rows || rows.length < 2) return null
+
+  const headers = rows[0].map((h) => String(h || "").trim().toLowerCase())
+  const latCol = headers.findIndex((h) => ["lat", "latitude", "y"].includes(h))
+  const lonCol = headers.findIndex((h) => ["lon", "lng", "longitude", "long", "x"].includes(h))
+  if (latCol < 0 || lonCol < 0) return null
+
+  const nameCol = headers.findIndex((h) => ["name", "poi_name", "nombre", "title"].includes(h))
+  const idCol = headers.findIndex((h) => ["id", "poi_id", "identifier"].includes(h))
+
+  const features: GeoJSONFeature[] = []
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i]
+    const lat = parseFloat(String(row[latCol] ?? "").trim())
+    const lon = parseFloat(String(row[lonCol] ?? "").trim())
+    if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) continue
+
+    const props: Record<string, string | number> = {}
+    headers.forEach((h, j) => {
+      if (j !== latCol && j !== lonCol && row[j] !== undefined && row[j] !== "") {
+        const val = String(row[j]).trim()
+        const num = parseFloat(val)
+        props[h] = isNaN(num) || val !== String(num) ? val : num
+      }
+    })
+    const name = nameCol >= 0 ? String(row[nameCol] ?? "").trim() : undefined
+    const id = idCol >= 0 ? String(row[idCol] ?? "").trim() : `poi-${i}`
+
+    if (name) props.name = name
+    if (id) props.id = id
+
+    features.push({
+      type: "Feature",
+      id: id || `poi-${i}`,
+      geometry: { type: "Point", coordinates: [lon, lat] },
+      properties: props,
+    })
+  }
+  return features.length > 0 ? { type: "FeatureCollection", features } : null
+}
 
 export default function POIUploadPage() {
   const router = useRouter()
@@ -48,18 +104,43 @@ export default function POIUploadPage() {
     }
   }
 
+  const isValidPoint = (f: any) =>
+    f.geometry &&
+    f.geometry.type === "Point" &&
+    Array.isArray(f.geometry.coordinates) &&
+    f.geometry.coordinates.length >= 2 &&
+    typeof f.geometry.coordinates[0] === "number" &&
+    typeof f.geometry.coordinates[1] === "number" &&
+    !isNaN(f.geometry.coordinates[0]) &&
+    !isNaN(f.geometry.coordinates[1]) &&
+    f.geometry.coordinates[0] >= -180 &&
+    f.geometry.coordinates[0] <= 180 &&
+    f.geometry.coordinates[1] >= -90 &&
+    f.geometry.coordinates[1] <= 90
+
+  const setNameFromFile = (filename: string) => {
+    if (collectionName) return
+    const nameFromFile = filename
+      .replace(/\.(geojson|json|csv)$/i, "")
+      .replace(/[^a-z0-9]+/gi, " ")
+      .trim()
+      .split(" ")
+      .map((w: string) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+      .join(" ")
+    setCollectionName(nameFromFile)
+  }
+
   const handleFile = async (selectedFile: File) => {
-    // Validate file type
-    if (!selectedFile.name.endsWith('.geojson') && !selectedFile.name.endsWith('.json')) {
+    const ext = "." + selectedFile.name.split(".").pop()?.toLowerCase()
+    if (!ACCEPTED_EXTENSIONS.includes(ext)) {
       toast({
         title: "Invalid File Type",
-        description: "Please upload a GeoJSON file (.geojson or .json)",
+        description: "Please upload a GeoJSON (.geojson, .json) or CSV (.csv) file",
         variant: "destructive",
       })
       return
     }
 
-    // Validate file size (50MB max)
     if (selectedFile.size > 50 * 1024 * 1024) {
       toast({
         title: "File Too Large",
@@ -71,68 +152,52 @@ export default function POIUploadPage() {
 
     setFile(selectedFile)
 
-    // Preview file content
     try {
       const text = await selectedFile.text()
-      const geojson = JSON.parse(text)
+      let geojson: any
 
-      // Validate GeoJSON structure
-      if (!geojson.type || geojson.type !== 'FeatureCollection') {
-        toast({
-          title: "Invalid GeoJSON",
-          description: "File must be a FeatureCollection",
-          variant: "destructive",
-        })
-        setPreview({ poiCount: 0, isValid: false })
-        return
+      if (ext === ".csv") {
+        geojson = csvToGeoJSON(text)
+        if (!geojson) {
+          toast({
+            title: "Invalid CSV",
+            description: "CSV must have headers with lat/latitude and lon/longitude/lng columns",
+            variant: "destructive",
+          })
+          setPreview({ poiCount: 0, isValid: false })
+          return
+        }
+      } else {
+        geojson = JSON.parse(text)
+        if (!geojson.type || geojson.type !== "FeatureCollection") {
+          toast({
+            title: "Invalid GeoJSON",
+            description: "File must be a FeatureCollection",
+            variant: "destructive",
+          })
+          setPreview({ poiCount: 0, isValid: false })
+          return
+        }
       }
 
-      // Count valid Point features
-      const validPoints = (geojson.features || []).filter((f: any) => {
-        return (
-          f.geometry &&
-          f.geometry.type === 'Point' &&
-          Array.isArray(f.geometry.coordinates) &&
-          f.geometry.coordinates.length >= 2 &&
-          typeof f.geometry.coordinates[0] === 'number' &&
-          typeof f.geometry.coordinates[1] === 'number' &&
-          !isNaN(f.geometry.coordinates[0]) &&
-          !isNaN(f.geometry.coordinates[1]) &&
-          f.geometry.coordinates[0] >= -180 &&
-          f.geometry.coordinates[0] <= 180 &&
-          f.geometry.coordinates[1] >= -90 &&
-          f.geometry.coordinates[1] <= 90
-        )
-      }).length
-
-      setPreview({
-        poiCount: validPoints,
-        isValid: validPoints > 0,
-      })
+      const validPoints = (geojson.features || []).filter(isValidPoint).length
+      setPreview({ poiCount: validPoints, isValid: validPoints > 0 })
 
       if (validPoints === 0) {
         toast({
           title: "No Valid POIs",
-          description: "The file doesn't contain any valid Point geometries",
+          description: ext === ".csv"
+            ? "CSV must have numeric lat/lon columns. Check column names."
+            : "The file doesn't contain any valid Point geometries",
           variant: "destructive",
         })
       } else {
-        // Auto-generate collection name from filename if not set
-        if (!collectionName) {
-          const nameFromFile = selectedFile.name
-            .replace(/\.(geojson|json)$/i, '')
-            .replace(/[^a-z0-9]+/gi, ' ')
-            .trim()
-            .split(' ')
-            .map((word: string) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-            .join(' ')
-          setCollectionName(nameFromFile)
-        }
+        setNameFromFile(selectedFile.name)
       }
     } catch (error) {
       toast({
         title: "Error Reading File",
-        description: "Failed to parse GeoJSON file. Please check the file format.",
+        description: "Failed to parse file. Please check the format.",
         variant: "destructive",
       })
       setPreview({ poiCount: 0, isValid: false })
@@ -145,7 +210,7 @@ export default function POIUploadPage() {
     if (!file) {
       toast({
         title: "No File Selected",
-        description: "Please select a GeoJSON file to upload",
+        description: "Please select a GeoJSON or CSV file to upload",
         variant: "destructive",
       })
       return
@@ -172,9 +237,16 @@ export default function POIUploadPage() {
     setLoading(true)
 
     try {
-      // Read file content
       const text = await file.text()
-      const geojson = JSON.parse(text)
+      const ext = "." + file.name.split(".").pop()?.toLowerCase()
+      const geojson =
+        ext === ".csv"
+          ? csvToGeoJSON(text)
+          : JSON.parse(text)
+
+      if (!geojson) {
+        throw new Error("Invalid CSV format")
+      }
 
       // Create collection via API
       const response = await fetch('/api/pois/collections', {
@@ -235,7 +307,7 @@ export default function POIUploadPage() {
         </Link>
         <h1 className="text-3xl font-bold text-white">Upload POIs</h1>
         <p className="text-gray-500 mt-2">
-          Upload GeoJSON files containing Points of Interest
+          Upload GeoJSON or CSV files containing Points of Interest
         </p>
       </div>
 
@@ -243,14 +315,14 @@ export default function POIUploadPage() {
         <CardHeader>
           <CardTitle>File Upload</CardTitle>
           <CardDescription>
-            Upload a GeoJSON file (.geojson) containing Point features. Maximum file size: 50MB.
+            Upload a GeoJSON (.geojson, .json) or CSV file with lat/lon columns. Maximum file size: 50MB.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-6">
             {/* File Upload Area */}
             <div className="space-y-2">
-              <Label>GeoJSON File *</Label>
+              <Label>GeoJSON or CSV File *</Label>
               <div
                 className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
                   dragActive
@@ -297,7 +369,7 @@ export default function POIUploadPage() {
                     <Upload className="h-12 w-12 mx-auto text-muted-foreground" />
                     <div>
                       <p className="text-muted-foreground mb-4">
-                        Drag and drop your GeoJSON file here, or click to browse
+                        Drag and drop a GeoJSON or CSV file here, or click to browse
                       </p>
                       <Button
                         type="button"
@@ -312,13 +384,13 @@ export default function POIUploadPage() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".geojson,.json"
+                  accept={ACCEPT_ATTR}
                   onChange={handleFileSelect}
                   className="hidden"
                 />
               </div>
               <p className="text-sm text-muted-foreground">
-                Only FeatureCollection GeoJSON files with Point geometries are supported.
+                GeoJSON: FeatureCollection with Point geometries. CSV: headers with lat/latitude and lon/longitude/lng.
               </p>
             </div>
 

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllJobs } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
-import { analyzeDataset } from '@/lib/dataset-analyzer';
+import { runFullAnalysis } from '@/lib/dataset-analysis';
 import { getPOICollection } from '@/lib/s3-config';
 import { BUCKET } from '@/lib/s3-config';
 import { runQuery, createTableForDataset, tableExists, getTableName } from '@/lib/athena';
@@ -16,8 +16,13 @@ export const maxDuration = 300; // Allow up to 5 minutes for Athena queries
  */
 export async function GET(
   request: NextRequest,
-  { params }: { params: { datasetName: string } }
+  context: { params: Promise<{ datasetName: string }> | { datasetName: string } }
 ) {
+  const params = await (typeof context.params === 'object' && context.params instanceof Promise
+    ? context.params
+    : Promise.resolve(context.params as { datasetName: string }));
+  const datasetName = params.datasetName;
+
   try {
     // Validate API key
     const auth = await validateApiKeyFromRequest(request);
@@ -27,8 +32,6 @@ export async function GET(
         { status: 401 }
       );
     }
-
-    const datasetName = params.datasetName;
 
     // Find job by dataset name
     const allJobs = await getAllJobs();
@@ -46,10 +49,10 @@ export async function GET(
       );
     }
 
-    // Run analysis
+    // Run analysis (all days, no exceptions)
     let analysisResult;
     try {
-      analysisResult = await analyzeDataset(datasetName, {});
+      analysisResult = await runFullAnalysis(datasetName);
     } catch (error: any) {
       console.error(`Analysis failed for ${datasetName}:`, error);
       return NextResponse.json(
@@ -62,13 +65,13 @@ export async function GET(
       );
     }
 
-    // Transform dailyActivity into separate arrays
-    const dailyPings = analysisResult.dailyActivity.map(day => ({
+    // Transform dailyData into separate arrays
+    const dailyPings = analysisResult.dailyData.map(day => ({
       date: day.date,
       pings: day.pings,
     }));
 
-    const dailyDevices = analysisResult.dailyActivity.map(day => ({
+    const dailyDevices = analysisResult.dailyData.map(day => ({
       date: day.date,
       devices: day.devices,
     }));
@@ -102,9 +105,8 @@ export async function GET(
         const poisResult = await runQuery(poisQuery);
         activePoiIds = poisResult.rows.map((row: any) => String(row.poi_id || '')).filter(Boolean);
       } catch (error) {
-        console.warn(`Could not query all POIs, using topPois as fallback:`, error);
-        // Fallback to topPois if query fails
-        activePoiIds = analysisResult.topPois.map(p => p.poiId);
+        console.warn(`Could not query all POIs, using visitsByPoi as fallback:`, error);
+        activePoiIds = analysisResult.visitsByPoi.map(p => p.poiId);
       }
 
       // Get POI mapping and names from job metadata
@@ -172,7 +174,7 @@ export async function GET(
       },
     });
   } catch (error: any) {
-    console.error(`GET /api/external/jobs/${params.datasetName}/analysis error:`, error);
+    console.error(`GET /api/external/jobs/${datasetName}/analysis error:`, error);
     return NextResponse.json(
       { error: 'Internal Server Error', message: error.message },
       { status: 500 }

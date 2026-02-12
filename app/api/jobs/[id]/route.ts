@@ -21,39 +21,48 @@ export async function GET(
     // If job is QUEUED, RUNNING, or SCHEDULED, check Veraset for status update
     if (job.status === 'QUEUED' || job.status === 'RUNNING' || job.status === 'SCHEDULED') {
       try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://gmc-mobility-api.vercel.app";
-        console.log(`🔄 Checking Veraset status for job ${params.id} (current: ${job.status})`);
-        const verasetResponse = await fetch(
-          `${apiUrl}/api/veraset/job/${params.id}`,
-          {
-            cache: 'no-store', // Always fetch fresh status
-          }
-        );
+        const apiKey = process.env.VERASET_API_KEY?.trim();
         
-        if (verasetResponse.ok) {
-          const verasetData = await verasetResponse.json();
-          const newStatus = verasetData.status || verasetData.data?.status;
+        if (apiKey) {
+          console.log(`🔄 Checking Veraset status for job ${params.id} (current: ${job.status})`);
+          const verasetResponse = await fetch(
+            `https://platform.prd.veraset.tech/v1/job/${params.id}`,
+            {
+              cache: 'no-store', // Always fetch fresh status
+              headers: {
+                'X-API-Key': apiKey,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
           
-          console.log(`📊 Veraset API response for ${params.id}:`, {
-            currentStatus: job.status,
-            newStatus: newStatus,
-            fullResponse: verasetData
-          });
-          
-          if (newStatus && newStatus !== job.status) {
-            console.log(`✅ Status changed: ${job.status} -> ${newStatus}`);
-            const updatedJob = await updateJobStatus(
-              params.id,
-              newStatus as any,
-              verasetData.error_message || verasetData.data?.error_message
-            );
-            return NextResponse.json(updatedJob);
-          } else if (newStatus) {
-            console.log(`ℹ️ Status unchanged: ${newStatus}`);
+          if (verasetResponse.ok) {
+            const verasetData = await verasetResponse.json();
+            const newStatus = verasetData.status || verasetData.data?.status;
+            
+            console.log(`📊 Veraset API response for ${params.id}:`, {
+              currentStatus: job.status,
+              newStatus: newStatus,
+              fullResponse: verasetData
+            });
+            
+            if (newStatus && newStatus !== job.status) {
+              console.log(`✅ Status changed: ${job.status} -> ${newStatus}`);
+              const updatedJob = await updateJobStatus(
+                params.id,
+                newStatus as any,
+                verasetData.error_message || verasetData.data?.error_message
+              );
+              return NextResponse.json(updatedJob);
+            } else if (newStatus) {
+              console.log(`ℹ️ Status unchanged: ${newStatus}`);
+            }
+          } else {
+            const errorText = await verasetResponse.text();
+            console.warn(`⚠️ Veraset API returned ${verasetResponse.status} for ${params.id}:`, errorText);
           }
         } else {
-          const errorText = await verasetResponse.text();
-          console.warn(`⚠️ Veraset API returned ${verasetResponse.status} for ${params.id}:`, errorText);
+          console.warn(`⚠️ VERASET_API_KEY not configured, skipping status check`);
         }
       } catch (verasetError: any) {
         // Continue with stored status if Veraset API fails

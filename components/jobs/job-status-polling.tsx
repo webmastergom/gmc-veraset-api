@@ -31,13 +31,41 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
     }
   }, [])
 
-  const fetchStatus = useCallback(async () => {
+  const fetchStatus = useCallback(async (forceRefresh = false) => {
     if (!isMountedRef.current) return
     
     try {
       setLoading(true)
       setError(null)
-      console.log(`🔄 Fetching status for job ${jobId}...`)
+      console.log(`🔄 Fetching status for job ${jobId}${forceRefresh ? ' (force refresh)' : ''}...`)
+      
+      // If force refresh, call the refresh endpoint first
+      if (forceRefresh) {
+        try {
+          const refreshResponse = await fetch(`/api/jobs/${jobId}/refresh`, {
+            method: 'POST',
+            cache: 'no-store',
+            headers: {
+              'Cache-Control': 'no-cache',
+            },
+          })
+          
+          if (!refreshResponse.ok) {
+            const errorData = await refreshResponse.json().catch(() => ({}))
+            console.warn(`⚠️ Refresh endpoint returned ${refreshResponse.status}:`, errorData)
+            // Continue with normal fetch even if refresh fails
+          } else {
+            const refreshData = await refreshResponse.json()
+            console.log(`✅ Refresh successful:`, refreshData)
+            // Small delay to ensure DB is updated
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
+        } catch (refreshError) {
+          console.warn(`⚠️ Refresh endpoint error (continuing with normal fetch):`, refreshError)
+          // Continue with normal fetch even if refresh fails
+        }
+      }
+      
       const jobStatus = await getJobStatus(jobId)
       
       if (!isMountedRef.current) return
@@ -101,7 +129,7 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
     return (
       <div className="space-y-2">
         <p className="text-sm text-destructive">{error}</p>
-        <Button onClick={fetchStatus} variant="outline" size="sm">
+        <Button onClick={() => { void fetchStatus(); }} variant="outline" size="sm">
           <RefreshCw className="mr-2 h-4 w-4" />
           Retry
         </Button>
@@ -124,7 +152,12 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
             </p>
           )}
         </div>
-        <Button onClick={fetchStatus} variant="outline" size="sm" disabled={loading}>
+        <Button 
+          onClick={() => fetchStatus(true)} 
+          variant="outline" 
+          size="sm" 
+          disabled={loading}
+        >
           <RefreshCw className={`mr-2 h-4 w-4 ${loading ? "animate-spin" : ""}`} />
           Refresh
         </Button>

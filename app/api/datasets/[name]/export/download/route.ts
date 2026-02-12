@@ -1,23 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { s3Client, BUCKET } from '@/lib/s3-config';
+import { isAuthenticated } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'us-west-2',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-  },
-});
-
-const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
-
 export async function GET(
   req: NextRequest,
-  { params }: { params: { name: string } }
+  context: { params: Promise<{ name: string }> | { name: string } }
 ) {
+  if (!isAuthenticated(req)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const params = await (typeof context.params === 'object' && context.params instanceof Promise
+    ? context.params
+    : Promise.resolve(context.params as { name: string }));
+  const datasetName = params.name;
+
   try {
     const searchParams = req.nextUrl.searchParams;
     const fileName = searchParams.get('file');
@@ -34,6 +35,14 @@ export async function GET(
       return NextResponse.json(
         { error: 'Invalid filename' },
         { status: 400 }
+      );
+    }
+
+    // Validate that the file belongs to this dataset
+    if (!fileName.startsWith(`${datasetName}-`)) {
+      return NextResponse.json(
+        { error: 'File does not belong to this dataset' },
+        { status: 403 }
       );
     }
     

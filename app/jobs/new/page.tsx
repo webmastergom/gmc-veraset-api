@@ -191,15 +191,26 @@ export default function NewJobPage() {
       return
     }
 
-    // Validate date range (max 31 days)
+    // Validate date range (max 31 days) - use consistent inclusive calculation
     const from = new Date(formData.dateRange.from)
     const to = new Date(formData.dateRange.to)
-    const daysDiff = Math.ceil((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24))
+    const diffMs = to.getTime() - from.getTime()
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+    const daysDiff = diffDays + 1 // +1 because both dates are inclusive
+    
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+      toast({
+        title: "Validation Error",
+        description: "Invalid date values",
+        variant: "destructive",
+      })
+      return
+    }
     
     if (daysDiff > 31) {
       toast({
         title: "Validation Error",
-        description: "Date range cannot exceed 31 days",
+        description: `Date range cannot exceed 31 days. You selected ${daysDiff} days.`,
         variant: "destructive",
       })
       return
@@ -211,6 +222,46 @@ export default function NewJobPage() {
         description: "End date must be after start date",
         variant: "destructive",
       })
+      return
+    }
+    
+    // Get POI count for validation (without fetching full GeoJSON yet)
+    let poiCount = 0;
+    if (poiSource === "upload" && uploadPreview) {
+      poiCount = uploadPreview.poiCount || 0;
+    } else if (poiSource === "collection" && formData.poiCollection) {
+      const collection = collections.find((c: any) => c.id === formData.poiCollection);
+      poiCount = collection?.poiCount || 0;
+    }
+    
+    // Validate POI count
+    if (poiCount === 0) {
+      toast({
+        title: "Validation Error",
+        description: "Please add at least one POI before creating the job",
+        variant: "destructive",
+      })
+      return
+    }
+    
+    // Show confirmation dialog for expensive operations
+    const estimatedCost = daysDiff * poiCount; // Rough estimate
+    const confirmMessage = `⚠️ ALERTA MÁXIMA ⚠️\n\n` +
+      `Estás a punto de crear un job que costará más que tu primer carro:\n\n` +
+      `📊 Detalles del crimen:\n` +
+      `   • ${poiCount} POIs (cada uno más caro que un café en Starbucks)\n` +
+      `   • ${daysDiff} días de datos (${formData.dateRange.from} a ${formData.dateRange.to})\n` +
+      `   • Tipo: ${formData.type}\n` +
+      `   • Schema: ${formData.schema}\n\n` +
+      `💰 ESTIMADO: ~$${estimatedCost.toLocaleString()} en créditos Veraset\n\n` +
+      `💀 ADVERTENCIA: Este job es tan caro que:\n` +
+      `   • Tu jefe te va a preguntar "¿por qué?"\n` +
+      `   • Tu cuenta bancaria va a llorar\n` +
+      `   • Veraset va a comprar una isla con tu dinero\n\n` +
+      `🤡 ¿Estás SEGURO que quieres proceder?\n` +
+      `   (Presiona Cancelar si valoras tu presupuesto)`;
+    
+    if (!window.confirm(confirmMessage)) {
       return
     }
 
@@ -301,7 +352,7 @@ export default function NewJobPage() {
       
       // Validate and filter POIs - only include features with valid Point geometry
       const totalFeatures = geojson.features?.length || 0
-      const pois = (geojson.features || [])
+      let pois = (geojson.features || [])
         .filter((f: any) => {
           // Only process Point geometries with valid coordinates
           return (
@@ -349,6 +400,50 @@ export default function NewJobPage() {
       
       const invalidFeatures = totalFeatures - pois.length
       const actualValidPoiCount = pois.length // Use actual count after filtering
+      
+      // Validate POI count after filtering
+      if (actualValidPoiCount === 0) {
+        toast({
+          title: "Validation Error",
+          description: "No valid POIs found in the collection. Please ensure the GeoJSON contains Point geometries with valid coordinates.",
+          variant: "destructive",
+        })
+        setLoading(false)
+        return
+      }
+      
+      // Validate POI coordinates (double-check)
+      const invalidPois = pois.filter((poi: any) => {
+        const lat = poi.latitude;
+        const lng = poi.longitude;
+        return typeof lat !== 'number' || isNaN(lat) || lat < -90 || lat > 90 ||
+               typeof lng !== 'number' || isNaN(lng) || lng < -180 || lng > 180;
+      });
+      
+      if (invalidPois.length > 0) {
+        toast({
+          title: "Validation Error",
+          description: `${invalidPois.length} POI(s) have invalid coordinates and will be skipped`,
+          variant: "destructive",
+        })
+        // Filter out invalid POIs
+        pois = pois.filter((poi: any) => {
+          const lat = poi.latitude;
+          const lng = poi.longitude;
+          return typeof lat === 'number' && !isNaN(lat) && lat >= -90 && lat <= 90 &&
+                 typeof lng === 'number' && !isNaN(lng) && lng >= -180 && lng <= 180;
+        });
+        
+        if (pois.length === 0) {
+          toast({
+            title: "Error",
+            description: "All POIs were invalid. Cannot create job.",
+            variant: "destructive",
+          })
+          setLoading(false)
+          return
+        }
+      }
       
       // Create mapping from Veraset auto-generated IDs to original GeoJSON IDs
       // Veraset generates IDs as geo_radius_0, geo_radius_1, etc. based on array index
@@ -483,12 +578,12 @@ export default function NewJobPage() {
             const geoRadiusPois = pois.filter((poi: any) => !poi.properties?.place_key);
 
             const config: Record<string, any> = {
-              type: formData.type,
+              type: formData.type, // Used for endpoint selection, not sent to Veraset
               date_range: {
                 from_date: formData.dateRange!.from,
                 to_date: formData.dateRange!.to,
               },
-              schema: formData.schema,
+              schema_type: formData.schema, // Veraset API expects 'schema_type', not 'schema'
             };
 
             // Add place_key array for enriched POIs
@@ -509,7 +604,26 @@ export default function NewJobPage() {
               }));
             }
 
+            // Calculate days difference for logging - use consistent inclusive calculation
+            const fromDate = new Date(formData.dateRange!.from);
+            const toDate = new Date(formData.dateRange!.to);
+            const diffMs = toDate.getTime() - fromDate.getTime();
+            const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+            const daysDiff = diffDays + 1; // +1 because both dates are inclusive
+            
             console.log(`📊 Veraset Config: ${enrichedPois.length} place_key + ${geoRadiusPois.length} geo_radius`);
+            console.log(`📊 Date Range: ${formData.dateRange?.from} to ${formData.dateRange?.to} (${daysDiff} days)`);
+            console.log(`📊 Total POIs: ${pois.length} (${enrichedPois.length} with placekey, ${geoRadiusPois.length} with geo_radius)`);
+            
+            // Final validation before sending
+            if (!config.date_range.from_date || !config.date_range.to_date) {
+              throw new Error('Date range is missing');
+            }
+            
+            if ((!config.geo_radius || config.geo_radius.length === 0) && 
+                (!config.place_key || config.place_key.length === 0)) {
+              throw new Error('No POIs to send');
+            }
 
             return config;
           })(),
@@ -532,14 +646,24 @@ export default function NewJobPage() {
         throw new Error(error.error || "Failed to create job")
       }
 
-      const job = await createResponse.json()
+      const response = await createResponse.json()
+      
+      // Extract job from response (API returns { success: true, job: {...}, remaining: ... })
+      const job = response.job || response
+      const jobId = job?.jobId || job?.id
+      const jobName = job?.name || 'Unknown'
+      
+      if (!jobId) {
+        console.error('[JOB CREATION] No jobId in response:', response)
+        throw new Error('Job created but no jobId returned')
+      }
       
       toast({
         title: "Job Created",
-        description: `Job ${job.jobId} has been created successfully`,
+        description: `Job "${jobName}" (${jobId}) has been created successfully`,
       })
 
-      router.push(`/jobs/${job.jobId}`)
+      router.push(`/jobs/${jobId}`)
     } catch (error) {
       toast({
         title: "Error",
@@ -733,36 +857,103 @@ export default function NewJobPage() {
               )}
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="from">Start Date *</Label>
-                <Input
-                  id="from"
-                  type="date"
-                  value={formData.dateRange?.from}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      dateRange: { ...formData.dateRange!, from: e.target.value },
-                    })
-                  }
-                  required
-                />
+                <Label>Quick Select</Label>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const yesterday = new Date()
+                      yesterday.setTime(yesterday.getTime() - (1 * 24 * 60 * 60 * 1000)) // Yesterday
+                      const daysAgo = new Date(yesterday)
+                      daysAgo.setTime(daysAgo.getTime() - (6 * 24 * 60 * 60 * 1000)) // 7 days ago from yesterday (7 days total: 6 days back + yesterday)
+                      setFormData({
+                        ...formData,
+                        dateRange: {
+                          from: daysAgo.toISOString().split('T')[0],
+                          to: yesterday.toISOString().split('T')[0],
+                        },
+                      })
+                    }}
+                  >
+                    Últimos 7 días
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const yesterday = new Date()
+                      yesterday.setTime(yesterday.getTime() - (1 * 24 * 60 * 60 * 1000)) // Yesterday
+                      const daysAgo = new Date(yesterday)
+                      daysAgo.setTime(daysAgo.getTime() - (14 * 24 * 60 * 60 * 1000)) // 15 days ago from yesterday (15 days total: 14 days back + yesterday)
+                      setFormData({
+                        ...formData,
+                        dateRange: {
+                          from: daysAgo.toISOString().split('T')[0],
+                          to: yesterday.toISOString().split('T')[0],
+                        },
+                      })
+                    }}
+                  >
+                    Últimos 15 días
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const yesterday = new Date()
+                      yesterday.setTime(yesterday.getTime() - (1 * 24 * 60 * 60 * 1000)) // Yesterday
+                      const daysAgo = new Date(yesterday)
+                      daysAgo.setTime(daysAgo.getTime() - (29 * 24 * 60 * 60 * 1000)) // 30 days ago from yesterday (30 days total: 29 days back + yesterday)
+                      setFormData({
+                        ...formData,
+                        dateRange: {
+                          from: daysAgo.toISOString().split('T')[0],
+                          to: yesterday.toISOString().split('T')[0],
+                        },
+                      })
+                    }}
+                  >
+                    Últimos 30 días
+                  </Button>
+                </div>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="to">End Date *</Label>
-                <Input
-                  id="to"
-                  type="date"
-                  value={formData.dateRange?.to}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      dateRange: { ...formData.dateRange!, to: e.target.value },
-                    })
-                  }
-                  required
-                />
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="from">Start Date *</Label>
+                  <Input
+                    id="from"
+                    type="date"
+                    value={formData.dateRange?.from}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        dateRange: { ...formData.dateRange!, from: e.target.value },
+                      })
+                    }
+                    required
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="to">End Date *</Label>
+                  <Input
+                    id="to"
+                    type="date"
+                    value={formData.dateRange?.to}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        dateRange: { ...formData.dateRange!, to: e.target.value },
+                      })
+                    }
+                    required
+                  />
+                </div>
               </div>
             </div>
 

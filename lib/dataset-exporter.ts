@@ -3,17 +3,10 @@
  */
 
 import { runQuery, createTableForDataset, tableExists, getTableName } from './athena';
-import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { s3Client, BUCKET } from './s3-config';
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION || 'us-west-2',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-  },
-});
-
-const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
+const EXPORT_MAX_ROWS = 500000;
 
 export interface ExportFilters {
   minDwellTime?: number | null;  // seconds
@@ -21,6 +14,8 @@ export interface ExportFilters {
   dateFrom?: string;
   dateTo?: string;
   poiIds?: string[];
+  /** 'maids' = filename maids-*.csv; otherwise full-*.csv */
+  format?: 'full' | 'maids';
 }
 
 export interface ExportResult {
@@ -33,6 +28,24 @@ export interface ExportResult {
   createdAt: string;
 }
 
+function sanitizeDate(d: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+    throw new Error(`Invalid date format: ${d}. Expected YYYY-MM-DD.`);
+  }
+  return d;
+}
+
+function validateFilters(filters: ExportFilters): void {
+  if (filters.minDwellTime != null) {
+    const val = Number(filters.minDwellTime);
+    if (!Number.isFinite(val) || val < 0) throw new Error('Invalid minDwellTime');
+  }
+  if (filters.minPings != null) {
+    const val = Number(filters.minPings);
+    if (!Number.isInteger(val) || val < 0) throw new Error('Invalid minPings');
+  }
+}
+
 /**
  * Export devices matching filters using Athena
  */
@@ -40,6 +53,8 @@ export async function exportDevices(
   datasetName: string,
   filters: ExportFilters = {}
 ): Promise<ExportResult> {
+  validateFilters(filters);
+
   const tableName = getTableName(datasetName);
 
   // Ensure table exists
@@ -47,103 +62,152 @@ export async function exportDevices(
     await createTableForDataset(datasetName);
   }
 
-  // Build date filter
+  // Date conditions as fragments (no WHERE - integrate with AND)
   const dateConditions: string[] = [];
   if (filters.dateFrom) {
-    dateConditions.push(`date >= '${filters.dateFrom}'`);
+    dateConditions.push(`date >= '${sanitizeDate(filters.dateFrom)}'`);
   }
   if (filters.dateTo) {
-    dateConditions.push(`date <= '${filters.dateTo}'`);
+    dateConditions.push(`date <= '${sanitizeDate(filters.dateTo)}'`);
   }
-  const dateWhere = dateConditions.length ? `WHERE ${dateConditions.join(' AND ')}` : '';
 
-  // Build POI filter
+  // POI filter: always require visitors to POIs
   let poiFilter = '';
   if (filters.poiIds?.length) {
-    const poiList = filters.poiIds.map(p => {
+    const poiList = filters.poiIds.map((p) => {
+      if (!/^[\w\-. ]+$/.test(p)) {
+        throw new Error(`Invalid POI ID format: ${p}`);
+      }
       const escaped = p.replace(/'/g, "''");
       return `'${escaped}'`;
     }).join(',');
     poiFilter = `AND poi_ids[1] IN (${poiList})`;
   }
 
-  // Build HAVING clause for dwell/ping filters
+  const basePoiFilter = `poi_ids[1] IS NOT NULL${poiFilter ? ` ${poiFilter}` : ''}`;
+  const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+  // HAVING conditions for dwell time / ping count
   const havingConditions: string[] = [];
-  
-  // If minDwellTime is null, include all devices
-  // If minDwellTime is 0, require some dwell (dwell_seconds > 0)
-  // If minDwellTime > 0, require at least that many seconds
-  if (filters.minDwellTime !== null && filters.minDwellTime !== undefined) {
-    if (filters.minDwellTime === 0) {
-      havingConditions.push('dwell_seconds > 0');
-    } else {
-      havingConditions.push(`dwell_seconds >= ${filters.minDwellTime}`);
-    }
+  if (filters.minDwellTime != null) {
+    const dwellExpr = "date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp))";
+    havingConditions.push(
+      filters.minDwellTime === 0
+        ? `${dwellExpr} > 0`
+        : `${dwellExpr} >= ${Number(filters.minDwellTime)}`
+    );
   }
-  
-  if (filters.minPings !== null && filters.minPings !== undefined) {
-    havingConditions.push(`ping_count >= ${filters.minPings}`);
+  if (filters.minPings != null) {
+    havingConditions.push(`COUNT(*) >= ${Number(filters.minPings)}`);
   }
-  
-  const havingClause = havingConditions.length ? `HAVING ${havingConditions.join(' AND ')}` : '';
 
-  // Query to get qualifying devices
-  let sql: string;
-  
-  if (filters.minDwellTime === null && filters.minPings === null) {
-    // Simple query for all devices
-    sql = `
-      SELECT DISTINCT ad_id
-      FROM ${tableName}
-      ${dateWhere}
-      ${poiFilter ? `AND poi_ids[1] IS NOT NULL ${poiFilter}` : ''}
-    `;
-  } else {
-    // Need to calculate dwell time
-    sql = `
-      WITH device_stats AS (
-        SELECT 
-          ad_id,
-          poi_ids[1] as poi_id,
-          COUNT(*) as ping_count,
-          date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds
+  let result: { columns: string[]; rows: Record<string, any>[] };
+  let csvContent: string;
+  const suffix = filters.format === 'maids' ? 'maids' : 'full';
+
+  if (filters.format === 'maids') {
+    // MAIDs format: only ad_ids
+    let sql: string;
+    if (!filters.minDwellTime && !filters.minPings) {
+      sql = `
+        SELECT DISTINCT ad_id
         FROM ${tableName}
+        WHERE ${basePoiFilter}
         ${dateWhere}
-        ${poiFilter ? `AND poi_ids[1] IS NOT NULL ${poiFilter}` : 'WHERE poi_ids[1] IS NOT NULL'}
-        GROUP BY ad_id, poi_ids[1]
-        ${havingClause}
-      )
-      SELECT DISTINCT ad_id
-      FROM device_stats
+      `;
+    } else {
+      sql = `
+        WITH device_stats AS (
+          SELECT
+            ad_id,
+            poi_ids[1] as poi_id,
+            COUNT(*) as ping_count,
+            date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds
+          FROM ${tableName}
+          WHERE ${basePoiFilter}
+          ${dateWhere}
+          GROUP BY ad_id, poi_ids[1]
+          ${havingConditions.length ? `HAVING ${havingConditions.join(' AND ')}` : ''}
+        )
+        SELECT DISTINCT ad_id
+        FROM device_stats
+      `;
+    }
+
+    result = await runQuery(sql);
+    console.log(`[EXPORT] Query returned ${result.rows.length} unique ad_ids`);
+
+    if (result.rows.length > EXPORT_MAX_ROWS) {
+      console.warn(`[EXPORT] Truncating export to ${EXPORT_MAX_ROWS} rows (original: ${result.rows.length})`);
+      result.rows = result.rows.slice(0, EXPORT_MAX_ROWS);
+    }
+
+    csvContent = 'ad_id\n' + result.rows.map((r) => r.ad_id).join('\n');
+  } else {
+    // Full export: enriched data per device-POI
+    const fullSql = `
+      SELECT
+        ad_id,
+        poi_ids[1] as poi_id,
+        COUNT(*) as ping_count,
+        date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds,
+        MIN(utc_timestamp) as first_seen,
+        MAX(utc_timestamp) as last_seen,
+        ROUND(APPROX_PERCENTILE(TRY_CAST(latitude AS DOUBLE), 0.5), 5) as median_lat,
+        ROUND(APPROX_PERCENTILE(TRY_CAST(longitude AS DOUBLE), 0.5), 5) as median_lng
+      FROM ${tableName}
+      WHERE ${basePoiFilter}
+      ${dateWhere}
+      GROUP BY ad_id, poi_ids[1]
+      ${havingConditions.length ? `HAVING ${havingConditions.join(' AND ')}` : ''}
+      ORDER BY 1, 5
     `;
+    result = await runQuery(fullSql);
+    console.log(`[EXPORT] Full query returned ${result.rows.length} rows`);
+
+    if (result.rows.length > EXPORT_MAX_ROWS) {
+      console.warn(`[EXPORT] Truncating export to ${EXPORT_MAX_ROWS} rows (original: ${result.rows.length})`);
+      result.rows = result.rows.slice(0, EXPORT_MAX_ROWS);
+    }
+
+    const headers = ['ad_id', 'poi_id', 'ping_count', 'dwell_seconds', 'first_seen', 'last_seen', 'median_lat', 'median_lng'];
+    csvContent = headers.join(',') + '\n' +
+      result.rows.map((r) => headers.map((h) => r[h] ?? '').join(',')).join('\n');
   }
 
-  const result = await runQuery(sql);
   const deviceCount = result.rows.length;
 
-  // Get total devices for comparison
-  const totalRes = await runQuery(`
+  // Total devices: only visitors to POIs
+  const totalSql = `
     SELECT COUNT(DISTINCT ad_id) as total
     FROM ${tableName}
-    ${dateWhere}
-  `);
+    WHERE poi_ids[1] IS NOT NULL
+    ${poiFilter}
+    ${dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : ''}
+  `;
+  const totalRes = await runQuery(totalSql);
   const totalDevices = parseInt(String(totalRes.rows[0]?.total)) || 0;
 
-  // Export to CSV in S3
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const fileName = `${datasetName}-export-${timestamp}.csv`;
+  const fileName = `${datasetName}-${suffix}-${timestamp}.csv`;
   const exportKey = `exports/${fileName}`;
 
-  // Create CSV content
-  const csvContent = 'ad_id\n' + result.rows.map(r => r.ad_id).join('\n');
+  // TODO: Configure S3 Lifecycle Rule for prefix "exports/" with 7-day expiration
+  // aws s3api put-bucket-lifecycle-configuration --bucket $BUCKET --lifecycle-configuration '{
+  //   "Rules": [{"ID": "ExpireExports", "Prefix": "exports/", "Status": "Enabled",
+  //     "Expiration": {"Days": 7}}]
+  // }'
 
-  // Upload to S3
-  const { PutObjectCommand } = await import('@aws-sdk/client-s3');
-  await s3.send(new PutObjectCommand({
+  await s3Client.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: exportKey,
     Body: csvContent,
     ContentType: 'text/csv',
+    Metadata: {
+      'export-dataset': datasetName,
+      'export-created': new Date().toISOString(),
+    },
+    Expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
   }));
 
   return {

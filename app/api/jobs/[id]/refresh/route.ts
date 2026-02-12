@@ -24,13 +24,26 @@ export async function POST(
     
     console.log(`🔄 Force refreshing status for job ${params.id} (current: ${job.status})`);
     
-    // Always check Veraset API, regardless of current status
+    // Always check Veraset API directly, regardless of current status
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://gmc-mobility-api.vercel.app";
+      const apiKey = process.env.VERASET_API_KEY?.trim();
+      
+      if (!apiKey) {
+        return NextResponse.json({
+          success: false,
+          error: 'VERASET_API_KEY not configured',
+          job: job,
+        }, { status: 500 });
+      }
+      
       const verasetResponse = await fetch(
-        `${apiUrl}/api/veraset/job/${params.id}`,
+        `https://platform.prd.veraset.tech/v1/job/${params.id}`,
         {
           cache: 'no-store',
+          headers: {
+            'X-API-Key': apiKey,
+            'Content-Type': 'application/json',
+          },
         }
       );
       

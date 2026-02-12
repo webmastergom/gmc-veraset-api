@@ -99,8 +99,9 @@ export async function GET(
     
     console.log(`[CATCHMENT] Dataset name extracted: ${datasetName} from path: ${job.s3DestPath}`);
 
-    // 4. Check for cached result
-    const cacheKey = `catchment-${jobId}`;
+    // 4. Check for cached result (v3 = Spain bbox, foreign vs unmatched_domestic, nominatim truncated)
+    const CATCHMENT_VERSION = 'v3';
+    const cacheKey = `catchment-${CATCHMENT_VERSION}-${jobId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
       if (cached) {
@@ -163,17 +164,21 @@ export async function GET(
       );
     }
 
-    // 6. Build response according to API documentation
+    // 6. Build response — backward compatible, new fields additive
     const response = {
       job_id: jobId,
       analyzed_at: result.analyzedAt,
+      methodology: result.methodology,
+      coverage: result.coverage,
       summary: {
-        total_devices_analyzed: result.summary.totalDevicesInDataset,
-        devices_with_home_location: result.summary.devicesWithHomeLocation,
-        devices_matched_to_zipcode: result.summary.devicesMatchedToZipcode,
+        total_devices_analyzed: result.coverage.totalDevicesVisitedPois,
+        devices_with_home_location: result.coverage.devicesWithHomeEstimate,
+        devices_matched_to_zipcode: result.coverage.devicesMatchedToSpanishZipcode,
+        devices_foreign_origin: result.coverage.devicesForeignOrigin,
         total_zipcodes: result.summary.totalZipcodes,
         top_zipcode: result.summary.topZipcode,
         top_city: result.summary.topCity,
+        classification_rate: result.coverage.classificationRatePercent,
       },
       zipcodes: result.zipcodes,
     };
