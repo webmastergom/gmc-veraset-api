@@ -10,9 +10,9 @@ export function getAllowedOrigins(): string[] {
   const allowedOrigins = process.env.ALLOWED_ORIGINS;
   
   if (!allowedOrigins) {
-    // Default to same origin in production, allow all in development
-    return process.env.NODE_ENV === 'production' 
-      ? [] 
+    // Default: allow the Vercel deployment origin in production, localhost in dev
+    return process.env.NODE_ENV === 'production'
+      ? ['https://gmc-mobility-api.vercel.app']
       : ['http://localhost:3000', 'http://127.0.0.1:3000'];
   }
   
