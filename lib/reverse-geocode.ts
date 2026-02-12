@@ -1,7 +1,7 @@
 /**
  * Reverse geocoding for catchment — postal codes from any country.
- * Spain: local GeoJSON (fast). Other countries: Nominatim API.
- * Distinguishes foreign vs unmatched_domestic via Spain bounding box.
+ * Local GeoJSON (fast) when available. Nominatim API for others.
+ * Global: no country-specific bounding boxes.
  */
 
 import * as fs from 'fs';
@@ -10,21 +10,6 @@ import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
 import { point as turfPoint } from '@turf/helpers';
 import type { ResidentialZipcode } from './catchment-types';
 import { MAX_NOMINATIM_CALLS } from './catchment-types';
-
-// N3+N4: Spain bounding boxes — distinguish foreign vs unmatched_domestic
-const SPAIN_BBOX = {
-  peninsula: { minLat: 35.8, maxLat: 43.8, minLng: -9.4, maxLng: 4.4 },
-  baleares: { minLat: 38.6, maxLat: 40.1, minLng: 1.1, maxLng: 4.4 },
-  canarias: { minLat: 27.5, maxLat: 29.5, minLng: -18.2, maxLng: -13.3 },
-  ceuta: { minLat: 35.85, maxLat: 35.92, minLng: -5.38, maxLng: -5.26 },
-  melilla: { minLat: 35.26, maxLat: 35.32, minLng: -2.97, maxLng: -2.92 },
-};
-
-function isPointInSpainBbox(lat: number, lng: number): boolean {
-  return Object.values(SPAIN_BBOX).some(
-    (box) => lat >= box.minLat && lat <= box.maxLat && lng >= box.minLng && lng <= box.maxLng
-  );
-}
 
 export { MAX_NOMINATIM_CALLS } from './catchment-types';
 
@@ -49,10 +34,10 @@ interface ZipcodeFeature {
 }
 
 export type GeocodeClassification =
-  | { type: 'spanish_local'; country: string; postcode: string; city: string; province: string; region: string; devices: number }
+  | { type: 'geojson_local'; country: string; postcode: string; city: string; province: string; region: string; devices: number }
   | { type: 'nominatim_match'; country: string; postcode: string; city: string; province: string; region: string; devices: number }
   | { type: 'foreign'; country: string; devices: number }
-  | { type: 'unmatched_domestic'; devices: number }
+  | { type: 'unmatched'; devices: number }
   | { type: 'nominatim_truncated'; devices: number; lat: number; lng: number };
 
 // Module-level cache for the loaded GeoJSON data
@@ -83,22 +68,24 @@ function parseDescription(description: string): { postcode: string; city: string
 }
 
 /**
- * Load Spain zipcode boundary data from the local GeoJSON file.
+ * Load zipcode boundary data from local GeoJSON file(s).
+ * Supports data/ES_zipcodes.geojson or ZIPCODE_GEOJSON_PATH.
  * Cached in memory after first load.
  */
 function loadZipcodeData(): ZipcodeFeature[] {
   if (cachedFeatures) return cachedFeatures;
 
-  const filePath = path.join(process.cwd(), 'data', 'ES_zipcodes.geojson');
+  const basePath = process.env.ZIPCODE_GEOJSON_PATH || path.join(process.cwd(), 'data', 'ES_zipcodes.geojson');
+  const filePath = path.isAbsolute(basePath) ? basePath : path.join(process.cwd(), basePath);
 
   if (!fs.existsSync(filePath)) {
     throw new Error(
-      `Spain zipcode data not found at ${filePath}. ` +
-      `Please place ES_zipcodes.geojson in the data/ directory.`
+      `Zipcode GeoJSON not found at ${filePath}. ` +
+      `Set ZIPCODE_GEOJSON_PATH or place a zipcodes GeoJSON in data/ directory.`
     );
   }
 
-  console.log('[CATCHMENT] Loading Spain zipcode boundaries...');
+  console.log('[CATCHMENT] Loading zipcode boundaries...');
   const raw = fs.readFileSync(filePath, 'utf-8');
   const geojson = JSON.parse(raw);
   cachedFeatures = geojson.features as ZipcodeFeature[];
@@ -109,7 +96,7 @@ function loadZipcodeData(): ZipcodeFeature[] {
 
 /**
  * Get the zipcode for a given lat/lng coordinate.
- * Returns null if the point is not within any Spanish postal code polygon.
+ * Returns null if the point is not within any postal code polygon in the loaded GeoJSON.
  */
 export function getZipcode(lat: number, lng: number): ZipcodeResult | null {
   const cacheKey = `${lat.toFixed(4)},${lng.toFixed(4)}`;
@@ -151,9 +138,8 @@ export function getZipcode(lat: number, lng: number): ZipcodeResult | null {
 }
 
 /**
- * Batch reverse geocode. N1: State encapsulated per invocation — no race conditions.
- * N3+N4: Distinguishes foreign vs unmatched_domestic via Spain bbox.
- * N2: nominatim_truncated when limit reached.
+ * Batch reverse geocode. State encapsulated per invocation — no race conditions.
+ * When Nominatim returns null: unmatched (unknown location). No country-specific assumptions.
  */
 export async function batchReverseGeocode(
   points: Array<{ lat: number; lng: number; deviceCount: number }>
@@ -212,7 +198,7 @@ export async function batchReverseGeocode(
     const localResult = getZipcode(p.lat, p.lng);
     if (localResult) {
       results.push({
-        type: 'spanish_local',
+        type: 'geojson_local',
         country: localResult.country,
         postcode: localResult.postcode,
         city: localResult.city,
@@ -231,27 +217,19 @@ export async function batchReverseGeocode(
     }
 
     if (nom.result) {
-      if (nom.result.country === 'ES') {
-        results.push({
-          type: 'nominatim_match',
-          country: nom.result.country,
-          postcode: nom.result.postcode,
-          city: nom.result.city,
-          province: '',
-          region: nom.result.country,
-          devices: p.deviceCount,
-        });
-      } else {
-        results.push({ type: 'foreign', country: nom.result.country, devices: p.deviceCount });
-      }
+      results.push({
+        type: 'nominatim_match',
+        country: nom.result.country,
+        postcode: nom.result.postcode,
+        city: nom.result.city,
+        province: '',
+        region: nom.result.country,
+        devices: p.deviceCount,
+      });
       continue;
     }
 
-    if (isPointInSpainBbox(p.lat, p.lng)) {
-      results.push({ type: 'unmatched_domestic', devices: p.deviceCount });
-    } else {
-      results.push({ type: 'foreign', country: 'UNKNOWN', devices: p.deviceCount });
-    }
+    results.push({ type: 'unmatched', devices: p.deviceCount });
   }
 
   return results;
@@ -276,7 +254,7 @@ export function aggregateByZipcode(
   let nominatimTruncated = 0;
 
   for (const item of classified) {
-    if (item.type === 'spanish_local') {
+    if (item.type === 'geojson_local') {
       const key = `${item.country}-${item.postcode}`;
       const existing = zipcodeMap.get(key);
       const src: 'geojson' | 'nominatim' = 'geojson';
@@ -310,7 +288,7 @@ export function aggregateByZipcode(
       }
     } else if (item.type === 'foreign') {
       foreignDevices += item.devices;
-    } else if (item.type === 'unmatched_domestic') {
+    } else if (item.type === 'unmatched') {
       unmatchedDomestic += item.devices;
     } else if (item.type === 'nominatim_truncated') {
       nominatimTruncated += item.devices;

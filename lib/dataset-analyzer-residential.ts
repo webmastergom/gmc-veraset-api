@@ -5,7 +5,7 @@
  * 1. Query Athena for nighttime pings (20:00-04:00 UTC → 22:00-06:00 local CET/CEST)
  * 2. Median lat/lng per device to estimate "home" (robust vs outliers)
  * 3. Require pings in ≥2 distinct nights (filters tourists in hotels)
- * 4. Reverse geocode home locations — classify Spanish CP, foreign, unmatched
+ * 4. Reverse geocode home locations — classify by postal code (any country), foreign, unmatched
  * 5. Aggregate by zipcode with device counts and percentOfTotal/percentOfClassified
  */
 
@@ -29,7 +29,7 @@ const ACCURACY_THRESHOLD_METERS = 200;
  * This function:
  * 1. Finds devices that visited POIs
  * 2. Identifies their nighttime locations (when not at POIs) as potential home locations
- * 3. Reverse geocodes these locations — Spanish CP, foreign, or unmatched domestic
+ * 3. Reverse geocodes these locations — postal code (any country), foreign, or unmatched
  * 4. Aggregates results by zipcode with coverage and methodology metadata
  */
 export async function analyzeResidentialZipcodes(
@@ -286,9 +286,9 @@ export async function analyzeResidentialZipcodes(
   const coverage: CatchmentCoverage = {
     totalDevicesVisitedPois: totalDevices,
     devicesWithHomeEstimate: devicesWithHome,
-    devicesMatchedToSpanishZipcode: devicesMatchedToZipcode,
+    devicesMatchedToZipcode: devicesMatchedToZipcode,
     devicesForeignOrigin: foreignDevices,
-    devicesUnmatchedDomestic: unmatchedDomestic,
+    devicesUnmatched: unmatchedDomestic,
     devicesNominatimTruncated: nominatimTruncated,
     devicesInsufficientNightData: noHomeLocation,
     classificationRatePercent,
@@ -332,9 +332,9 @@ function buildEmptyResult(datasetName: string, filters: ResidentialFilters): Res
     coverage: {
       totalDevicesVisitedPois: 0,
       devicesWithHomeEstimate: 0,
-      devicesMatchedToSpanishZipcode: 0,
+      devicesMatchedToZipcode: 0,
       devicesForeignOrigin: 0,
-      devicesUnmatchedDomestic: 0,
+      devicesUnmatched: 0,
       devicesNominatimTruncated: 0,
       devicesInsufficientNightData: 0,
       classificationRatePercent: 0,
@@ -376,9 +376,9 @@ function buildResultWithNoHome(
     coverage: {
       totalDevicesVisitedPois: totalDevices,
       devicesWithHomeEstimate: 0,
-      devicesMatchedToSpanishZipcode: 0,
+      devicesMatchedToZipcode: 0,
       devicesForeignOrigin: 0,
-      devicesUnmatchedDomestic: 0,
+      devicesUnmatched: 0,
       devicesNominatimTruncated: 0,
       devicesInsufficientNightData: noHomeLocation,
       classificationRatePercent: 0,

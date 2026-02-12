@@ -173,7 +173,7 @@ export async function GET(
       summary: {
         total_devices_analyzed: result.coverage.totalDevicesVisitedPois,
         devices_with_home_location: result.coverage.devicesWithHomeEstimate,
-        devices_matched_to_zipcode: result.coverage.devicesMatchedToSpanishZipcode,
+        devices_matched_to_zipcode: result.coverage.devicesMatchedToZipcode,
         devices_foreign_origin: result.coverage.devicesForeignOrigin,
         total_zipcodes: result.summary.totalZipcodes,
         top_zipcode: result.summary.topZipcode,

@@ -37,6 +37,7 @@ import {
 } from '@/components/ui/dialog';
 import type { DailyData, VisitByPoi } from '@/lib/dataset-analysis';
 import type { ResidentialZipcode } from '@/lib/dataset-analyzer-residential';
+import { MovementMap } from '@/components/analysis/movement-map';
 import type { CatchmentCoverage, CatchmentMethodology } from '@/lib/catchment-types';
 import { MAX_NOMINATIM_CALLS } from '@/lib/catchment-types';
 import { ChevronDown, ChevronRight, Globe } from 'lucide-react';
@@ -259,7 +260,7 @@ export default function DatasetAnalysisPage() {
         methodology: data.methodology,
         summary: {
           totalZipcodes: data.summary?.totalZipcodes ?? 0,
-          devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToSpanishZipcode ?? 0,
+          devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
         },
       });
     } catch (e: any) {
@@ -292,9 +293,9 @@ export default function DatasetAnalysisPage() {
     const cov = catchment.coverage;
     const hasZipcodes = (catchment.zipcodes?.length ?? 0) > 0;
     const hasForeign = cov && cov.devicesForeignOrigin > 0;
-    const hasUnmatchedDomestic = cov && cov.devicesUnmatchedDomestic > 0;
+    const hasUnmatched = cov && cov.devicesUnmatched > 0;
     const hasTruncated = cov && (cov.devicesNominatimTruncated ?? 0) > 0;
-    const hasAnyUnmatched = hasForeign || hasUnmatchedDomestic || hasTruncated;
+    const hasAnyUnmatched = hasForeign || hasUnmatched || hasTruncated;
     if (!hasZipcodes && !hasAnyUnmatched) return;
     const rows: (string | number)[][] = (catchment.zipcodes || []).map((z) => [
       z.zipcode,
@@ -310,8 +311,8 @@ export default function DatasetAnalysisPage() {
     if (hasForeign) {
       rows.push(['foreign', 'Origen extranjero', '', '', cov!.devicesForeignOrigin, 'foreign', `${((cov!.devicesForeignOrigin / total) * 100).toFixed(2)}%`, '']);
     }
-    if (hasUnmatchedDomestic) {
-      rows.push(['unmatched_domestic', 'España sin cobertura GeoJSON', '', '', cov!.devicesUnmatchedDomestic, '', `${((cov!.devicesUnmatchedDomestic / total) * 100).toFixed(2)}%`, '']);
+    if (hasUnmatched) {
+      rows.push(['unmatched', 'Unmatched (no postal code)', '', '', cov!.devicesUnmatched, '', `${((cov!.devicesUnmatched / total) * 100).toFixed(2)}%`, '']);
     }
     if (hasTruncated) {
       rows.push(['nominatim_truncated', 'Truncado por límite Nominatim', '', '', cov!.devicesNominatimTruncated, 'truncated', `${((cov!.devicesNominatimTruncated / total) * 100).toFixed(2)}%`, '']);
@@ -449,6 +450,14 @@ export default function DatasetAnalysisPage() {
             </CardContent>
           </Card>
 
+          <div className="mb-6">
+            <MovementMap
+              datasetName={datasetName}
+              dateFrom={analysis.summary.dateRange.from}
+              dateTo={analysis.summary.dateRange.to}
+            />
+          </div>
+
           <div className="grid gap-6 md:grid-cols-2">
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
@@ -537,7 +546,7 @@ export default function DatasetAnalysisPage() {
                       !catchment ||
                       ((catchment.zipcodes?.length ?? 0) === 0 &&
                         (catchment.coverage?.devicesForeignOrigin ?? 0) === 0 &&
-                        (catchment.coverage?.devicesUnmatchedDomestic ?? 0) === 0 &&
+                        (catchment.coverage?.devicesUnmatched ?? 0) === 0 &&
                         (catchment.coverage?.devicesNominatimTruncated ?? 0) === 0)
                     }
                   >
@@ -568,16 +577,16 @@ export default function DatasetAnalysisPage() {
                             : 0}%)
                         </p>
                         <p className="text-sm">
-                          <strong className="text-green-600 dark:text-green-500">{catchment.coverage.devicesMatchedToSpanishZipcode.toLocaleString()}</strong> matched to postal code
+                          <strong className="text-green-600 dark:text-green-500">{catchment.coverage.devicesMatchedToZipcode.toLocaleString()}</strong> matched to postal code
                         </p>
                         {catchment.coverage.devicesForeignOrigin > 0 && (
                           <p className="text-sm text-amber-600 dark:text-amber-500">
                             {catchment.coverage.devicesForeignOrigin.toLocaleString()} origen extranjero
                           </p>
                         )}
-                        {catchment.coverage.devicesUnmatchedDomestic > 0 && (
+                        {catchment.coverage.devicesUnmatched > 0 && (
                           <p className="text-sm text-yellow-600 dark:text-yellow-500">
-                            {catchment.coverage.devicesUnmatchedDomestic.toLocaleString()} España sin cobertura GeoJSON
+                            {catchment.coverage.devicesUnmatched.toLocaleString()} unmatched (no postal code)
                           </p>
                         )}
                         {(catchment.coverage.devicesNominatimTruncated ?? 0) > 0 && (
@@ -592,9 +601,9 @@ export default function DatasetAnalysisPage() {
                         )}
                         <div className="flex h-3 w-full overflow-hidden rounded bg-muted">
                           {[
-                            { pct: (catchment.coverage.devicesMatchedToSpanishZipcode / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-green-600', label: 'CP' },
+                            { pct: (catchment.coverage.devicesMatchedToZipcode / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-green-600', label: 'CP' },
                             { pct: (catchment.coverage.devicesForeignOrigin / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-amber-600', label: 'foreign' },
-                            { pct: (catchment.coverage.devicesUnmatchedDomestic / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-yellow-600', label: 'unmatched domestic' },
+                            { pct: (catchment.coverage.devicesUnmatched / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-yellow-600', label: 'unmatched' },
                             { pct: ((catchment.coverage.devicesNominatimTruncated ?? 0) / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-orange-600', label: 'truncated' },
                             { pct: (catchment.coverage.devicesInsufficientNightData / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-gray-600', label: 'insufficient night' },
                           ]
@@ -671,15 +680,15 @@ export default function DatasetAnalysisPage() {
                                 </TableCell>
                               </TableRow>
                             )}
-                            {catchment.coverage && catchment.coverage.devicesUnmatchedDomestic > 0 && (
+                            {catchment.coverage && catchment.coverage.devicesUnmatched > 0 && (
                               <TableRow className="bg-yellow-500/5">
                                 <TableCell colSpan={3} className="font-medium">
-                                  España sin cobertura GeoJSON
+                                  Unmatched (no postal code)
                                 </TableCell>
-                                <TableCell className="text-right">{catchment.coverage.devicesUnmatchedDomestic}</TableCell>
+                                <TableCell className="text-right">{catchment.coverage.devicesUnmatched}</TableCell>
                                 <TableCell className="text-right">
                                   {catchment.coverage.totalDevicesVisitedPois > 0
-                                    ? ((catchment.coverage.devicesUnmatchedDomestic / catchment.coverage.totalDevicesVisitedPois) * 100).toFixed(1)
+                                    ? ((catchment.coverage.devicesUnmatched / catchment.coverage.totalDevicesVisitedPois) * 100).toFixed(1)
                                     : 0}%
                                 </TableCell>
                               </TableRow>

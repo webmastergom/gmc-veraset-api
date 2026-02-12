@@ -19,19 +19,19 @@ export interface ResidentialZipcode {
   province: string;
   region: string;
   devices: number;
-  percentOfClassified: number; // % over classified devices (spanish + foreign)
+  percentOfClassified: number; // % over classified devices (matched + foreign)
   percentOfTotal: number; // % over ALL visitors — scientifically correct metric
   /** @deprecated Use percentOfTotal. Kept for backward compatibility. */
   percentage?: number; // = percentOfTotal
-  /** Origin of geocoding: GeoJSON (Spain), Nominatim, or mixed */
+  /** Origin of geocoding: GeoJSON (local), Nominatim, or mixed */
   source?: 'geojson' | 'nominatim' | 'mixed';
 }
 
 /** Classification of a device's home location after reverse geocoding */
 export type HomeClassification =
-  | { type: 'spanish'; zipcode: string; city: string; province: string; region: string; devices: number }
+  | { type: 'geojson_local'; zipcode: string; city: string; province: string; region: string; devices: number }
   | { type: 'foreign'; devices: number }
-  | { type: 'unmatched_domestic'; devices: number };
+  | { type: 'unmatched'; devices: number };
 
 export interface CatchmentClassification {
   zipcodes: ResidentialZipcode[];
@@ -55,9 +55,9 @@ export interface CatchmentMethodology {
 export interface CatchmentCoverage {
   totalDevicesVisitedPois: number;
   devicesWithHomeEstimate: number;
-  devicesMatchedToSpanishZipcode: number; // GeoJSON + Nominatim with country=ES
+  devicesMatchedToZipcode: number; // GeoJSON + Nominatim (any country)
   devicesForeignOrigin: number;
-  devicesUnmatchedDomestic: number;
+  devicesUnmatched: number; // could not geocode
   devicesNominatimTruncated: number; // not geocoded due to Nominatim API limit
   devicesInsufficientNightData: number;
   classificationRatePercent: number;

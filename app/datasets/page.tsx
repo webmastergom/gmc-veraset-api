@@ -133,15 +133,19 @@ export default function DatasetsPage() {
     message: string;
   } | null>(null);
 
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
   useEffect(() => {
     fetch('/api/datasets', { credentials: 'include' })
-      .then((r) => {
-        if (!r.ok) throw new Error(r.statusText || 'Failed to load datasets');
-        return r.json();
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || data.details || r.statusText || 'Failed to load datasets');
+        return data;
       })
       .then((data) => setDatasets(data.datasets ?? []))
       .catch((err) => {
         console.error('Error fetching datasets:', err);
+        setFetchError(err.message || 'Unknown error');
         setDatasets([]);
       })
       .finally(() => setLoading(false));
@@ -350,9 +354,15 @@ export default function DatasetsPage() {
         <Card>
           <CardContent className="py-12 text-center">
             <Database className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
-            <p className="text-muted-foreground">
-              No datasets available. Sync a completed job to create a dataset.
-            </p>
+            {fetchError ? (
+              <p className="text-red-400">
+                Error loading datasets: {fetchError}
+              </p>
+            ) : (
+              <p className="text-muted-foreground">
+                No datasets available. Sync a completed job to create a dataset.
+              </p>
+            )}
           </CardContent>
         </Card>
       ) : filteredDatasets.length === 0 ? (
