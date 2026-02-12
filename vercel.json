@@ -2,7 +2,7 @@
   "version": 2,
   "name": "gmc-mobility-api",
   "regions": ["iad1"],
-  "buildCommand": "npm run build",
+  "buildCommand": "rm -rf .next && npm run build",
   "outputDirectory": ".next",
   "framework": "nextjs",
   "headers": [
