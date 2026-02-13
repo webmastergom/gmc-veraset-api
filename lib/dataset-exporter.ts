@@ -81,10 +81,12 @@ export async function exportDevices(
       const escaped = p.replace(/'/g, "''");
       return `'${escaped}'`;
     }).join(',');
-    poiFilter = `AND poi_ids[1] IN (${poiList})`;
+    poiFilter = `AND poi_id IN (${poiList})`;
   }
 
-  const basePoiFilter = `poi_ids[1] IS NOT NULL${poiFilter ? ` ${poiFilter}` : ''}`;
+  // UNNEST poi_ids: every ping is counted for ALL POIs it belongs to.
+  // We use a CTE to flatten the array once, then filter/aggregate from it.
+  const basePoiFilter = `poi_id IS NOT NULL AND poi_id != ''${poiFilter ? ` ${poiFilter}` : ''}`;
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
   // HAVING conditions for dwell time / ping count
@@ -112,21 +114,27 @@ export async function exportDevices(
       sql = `
         SELECT DISTINCT ad_id
         FROM ${tableName}
+        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
         WHERE ${basePoiFilter}
         ${dateWhere}
       `;
     } else {
       sql = `
-        WITH device_stats AS (
-          SELECT
-            ad_id,
-            poi_ids[1] as poi_id,
-            COUNT(*) as ping_count,
-            date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds
+        WITH unnested AS (
+          SELECT ad_id, poi_id, utc_timestamp
           FROM ${tableName}
+          CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
           WHERE ${basePoiFilter}
           ${dateWhere}
-          GROUP BY ad_id, poi_ids[1]
+        ),
+        device_stats AS (
+          SELECT
+            ad_id,
+            poi_id,
+            COUNT(*) as ping_count,
+            date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds
+          FROM unnested
+          GROUP BY ad_id, poi_id
           ${havingConditions.length ? `HAVING ${havingConditions.join(' AND ')}` : ''}
         )
         SELECT DISTINCT ad_id
@@ -144,21 +152,26 @@ export async function exportDevices(
 
     csvContent = 'ad_id\n' + result.rows.map((r) => r.ad_id).join('\n');
   } else {
-    // Full export: enriched data per device-POI
+    // Full export: enriched data per device-POI (UNNEST for all POI assignments)
     const fullSql = `
+      WITH unnested AS (
+        SELECT ad_id, poi_id, utc_timestamp, latitude, longitude
+        FROM ${tableName}
+        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+        WHERE ${basePoiFilter}
+        ${dateWhere}
+      )
       SELECT
         ad_id,
-        poi_ids[1] as poi_id,
+        poi_id,
         COUNT(*) as ping_count,
         date_diff('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds,
         MIN(utc_timestamp) as first_seen,
         MAX(utc_timestamp) as last_seen,
         ROUND(APPROX_PERCENTILE(TRY_CAST(latitude AS DOUBLE), 0.5), 5) as median_lat,
         ROUND(APPROX_PERCENTILE(TRY_CAST(longitude AS DOUBLE), 0.5), 5) as median_lng
-      FROM ${tableName}
-      WHERE ${basePoiFilter}
-      ${dateWhere}
-      GROUP BY ad_id, poi_ids[1]
+      FROM unnested
+      GROUP BY ad_id, poi_id
       ${havingConditions.length ? `HAVING ${havingConditions.join(' AND ')}` : ''}
       ORDER BY 1, 5
     `;
@@ -177,12 +190,12 @@ export async function exportDevices(
 
   const deviceCount = result.rows.length;
 
-  // Total devices: only visitors to POIs
+  // Total devices: only visitors to POIs (UNNEST for complete coverage)
   const totalSql = `
     SELECT COUNT(DISTINCT ad_id) as total
     FROM ${tableName}
-    WHERE poi_ids[1] IS NOT NULL
-    ${poiFilter}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE ${basePoiFilter}
     ${dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : ''}
   `;
   const totalRes = await runQuery(totalSql);

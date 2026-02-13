@@ -393,26 +393,34 @@ export async function runFullAnalysis(datasetName: string): Promise<AnalysisResu
     ORDER BY date ASC
   `;
 
+  // UNNEST poi_ids so every ping is counted for ALL POIs it belongs to, not just the first.
+  // unique_pois uses UNNEST to count all distinct POI IDs across the full array.
   const summarySql = `
-    SELECT 
+    SELECT
       COUNT(*) as total_pings,
       COUNT(DISTINCT ad_id) as unique_devices,
-      COUNT(DISTINCT CASE WHEN poi_ids[1] IS NOT NULL AND poi_ids[1] != '' THEN poi_ids[1] END) as unique_pois
+      COUNT(DISTINCT poi_id) as unique_pois
     FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
     WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
       AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+      AND poi_id IS NOT NULL AND poi_id != ''
   `;
 
+  // UNNEST poi_ids: each ping is counted for every POI it belongs to.
+  // This gives the true traffic per POI (a ping near 3 POIs counts for all 3).
+  // Note: SUM(visits) across POIs will be >= total_pings due to overlap — this is correct.
   const visitsByPoiSql = `
-    SELECT 
-      poi_ids[1] as poi_id,
+    SELECT
+      poi_id,
       COUNT(*) as visits,
       COUNT(DISTINCT ad_id) as devices
     FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
     WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
-      AND poi_ids[1] IS NOT NULL AND poi_ids[1] != ''
+      AND poi_id IS NOT NULL AND poi_id != ''
       AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-    GROUP BY poi_ids[1]
+    GROUP BY poi_id
     ORDER BY visits DESC
   `;
 

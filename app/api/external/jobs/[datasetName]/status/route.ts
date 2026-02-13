@@ -216,11 +216,13 @@ async function getJobResults(jobId: string, job: any): Promise<Record<string, an
     const poiMapping = job.poiMapping || {};
     const poiNames = job.poiNames || {};
 
+    // UNNEST poi_ids: count each ping for ALL POIs it belongs to (not just first)
     const poiResult = await runQuery(`
-      SELECT poi_ids[1] as poi_id, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
+      SELECT poi_id, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
       FROM ${tableName}
-      WHERE poi_ids[1] IS NOT NULL
-      GROUP BY poi_ids[1]
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+      GROUP BY poi_id
       ORDER BY pings DESC
     `);
     results.poi_summary = poiResult.rows.map((row: any) => {

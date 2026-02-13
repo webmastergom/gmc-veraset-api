@@ -30,15 +30,16 @@ export async function GET(
       await createTableForDataset(datasetName);
     }
 
-    // Query to get all unique POIs with their stats
+    // Query to get all unique POIs with their stats (UNNEST for complete coverage)
     const sql = `
-      SELECT 
-        poi_ids[1] as poi_id,
+      SELECT
+        poi_id,
         COUNT(*) as pings,
         COUNT(DISTINCT ad_id) as devices
       FROM ${tableName}
-      WHERE poi_ids[1] IS NOT NULL
-      GROUP BY poi_ids[1]
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+      GROUP BY poi_id
       ORDER BY COUNT(DISTINCT ad_id) DESC
     `;
 

@@ -112,16 +112,18 @@ export async function analyzeResidentialZipcodes(
       const escaped = p.replace(/'/g, "''");
       return `'${escaped}'`;
     }).join(',');
-    poiFilter = `AND poi_ids[1] IN (${poiList})`;
+    poiFilter = `AND poi_id IN (${poiList})`;
   }
 
   console.log(`[CATCHMENT] Running Athena queries for ${datasetName}...`);
 
-  // Step 1: Get total unique devices (visitors to POIs)
+  // Step 1: Get total unique devices (visitors to POIs) — UNNEST for complete coverage
   const totalQuery = `
     SELECT COUNT(DISTINCT ad_id) as total_devices
     FROM ${tableName}
-    WHERE 1=1 ${dateWhere} ${poiFilter ? `AND poi_ids[1] IS NOT NULL ${poiFilter}` : ''}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      ${dateWhere} ${poiFilter}
   `;
 
   // Step 2: Get home location estimates from nighttime pings
@@ -135,7 +137,8 @@ export async function analyzeResidentialZipcodes(
     poi_visitors AS (
       SELECT DISTINCT ad_id
       FROM ${tableName}
-      WHERE poi_ids[1] IS NOT NULL
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
         ${dateWhere}
         ${poiFilter}
     ),
@@ -148,7 +151,7 @@ export async function analyzeResidentialZipcodes(
       FROM ${tableName} t
       INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
       WHERE (HOUR(t.utc_timestamp) >= 20 OR HOUR(t.utc_timestamp) < 4)
-        AND (t.poi_ids[1] IS NULL OR CARDINALITY(t.poi_ids) = 0)
+        AND CARDINALITY(t.poi_ids) = 0
         AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}

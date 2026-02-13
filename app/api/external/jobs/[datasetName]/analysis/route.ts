@@ -96,10 +96,12 @@ export async function GET(
           await createTableForDataset(datasetName);
         }
         
+        // UNNEST poi_ids to discover ALL POI IDs across the full array
         const poisQuery = `
-          SELECT DISTINCT poi_ids[1] as poi_id
+          SELECT DISTINCT poi_id
           FROM ${tableName}
-          WHERE poi_ids[1] IS NOT NULL
+          CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+          WHERE poi_id IS NOT NULL AND poi_id != ''
         `;
         
         const poisResult = await runQuery(poisQuery);

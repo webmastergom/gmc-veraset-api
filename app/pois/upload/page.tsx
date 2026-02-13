@@ -248,32 +248,89 @@ export default function POIUploadPage() {
         throw new Error("Invalid CSV format")
       }
 
-      // Create collection via API
-      const response = await fetch('/api/pois/collections', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({
-          name: collectionName.trim(),
-          description: description.trim(),
-          geojson: geojson,
-          poiCount: preview.poiCount,
-        }),
-      })
+      const collectionId = collectionName.trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
+      const geojsonStr = JSON.stringify(geojson)
+      const geojsonSizeMB = geojsonStr.length / (1024 * 1024)
 
-      if (!response.ok) {
-        const error = await response.json()
-        throw new Error(error.error || 'Failed to create collection')
+      // For large files (>3MB), use presigned URL to bypass Vercel body limit
+      if (geojsonSizeMB > 3) {
+        // Step 1: Get presigned S3 upload URL
+        const urlRes = await fetch('/api/pois/upload-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ collectionId }),
+        })
+
+        if (!urlRes.ok) {
+          const err = await urlRes.json()
+          throw new Error(err.error || 'Failed to get upload URL')
+        }
+
+        const { uploadUrl } = await urlRes.json()
+
+        // Step 2: Upload GeoJSON directly to S3 (no Vercel limit)
+        const s3Res = await fetch(uploadUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: geojsonStr,
+        })
+
+        if (!s3Res.ok) {
+          throw new Error(`S3 upload failed: ${s3Res.status} ${s3Res.statusText}`)
+        }
+
+        // Step 3: Create collection metadata (small payload, no GeoJSON)
+        const response = await fetch('/api/pois/collections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            id: collectionId,
+            name: collectionName.trim(),
+            description: description.trim(),
+            poiCount: preview.poiCount,
+            // No geojson — already uploaded directly to S3
+          }),
+        })
+
+        if (!response.ok) {
+          const error = await response.json()
+          throw new Error(error.error || 'Failed to create collection')
+        }
+
+        const collection = await response.json()
+
+        toast({
+          title: "Collection Created",
+          description: `Successfully created "${collection.name}" with ${preview.poiCount.toLocaleString()} POIs (${geojsonSizeMB.toFixed(1)}MB uploaded)`,
+        })
+      } else {
+        // Small files: send everything in one request (original flow)
+        const response = await fetch('/api/pois/collections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            name: collectionName.trim(),
+            description: description.trim(),
+            geojson: geojson,
+            poiCount: preview.poiCount,
+          }),
+        })
+
+        if (!response.ok) {
+          const error = await response.json()
+          throw new Error(error.error || 'Failed to create collection')
+        }
+
+        const collection = await response.json()
+
+        toast({
+          title: "Collection Created",
+          description: `Successfully created "${collection.name}" with ${preview.poiCount.toLocaleString()} POIs`,
+        })
       }
-
-      const collection = await response.json()
-
-      toast({
-        title: "Collection Created",
-        description: `Successfully created "${collection.name}" with ${preview.poiCount.toLocaleString()} POIs`,
-      })
 
       // Redirect to POIs page
       router.push('/pois')

@@ -124,7 +124,7 @@ export default async function JobDetailPage({
             <span className="font-medium">External Job</span>
           </div>
           <p className="text-sm text-blue-300/80 mt-1">
-            This job was created outside the platform and does not count toward your monthly API quota.
+            This job was created via the external API.
           </p>
         </div>
       )}

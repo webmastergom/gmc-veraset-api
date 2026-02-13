@@ -51,16 +51,16 @@ export async function getDeviceMovements(
     await createTableForDataset(datasetName);
   }
 
-  // Step 1: Get random sample of ad_ids that visited POIs
+  // Step 1: Get random sample of ad_ids that visited POIs (UNNEST for complete coverage)
   const sampleSql = `
     SELECT ad_id
     FROM (
-      SELECT ad_id
+      SELECT DISTINCT ad_id
       FROM ${tableName}
-      WHERE poi_ids[1] IS NOT NULL
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
         AND date >= '${dateFrom}'
         AND date <= '${dateTo}'
-      GROUP BY ad_id
       LIMIT 500
     )
     ORDER BY RANDOM()
