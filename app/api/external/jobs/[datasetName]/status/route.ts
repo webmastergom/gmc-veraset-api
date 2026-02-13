@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { waitUntil } from '@vercel/functions';
 import { getJob, updateJobStatus, markJobSynced } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { notifyWebhook } from '@/lib/webhooks';
@@ -71,17 +72,23 @@ export async function GET(
 
             logger.log(`Job ${jobId} status: ${oldStatus} -> ${newStatus}`);
 
-            // Auto-sync when job becomes SUCCESS
+            // Auto-sync when job becomes SUCCESS (run in background via waitUntil
+            // so the status response is not blocked by potentially large S3 copies)
             if (newStatus === 'SUCCESS' && !job.s3DestPath) {
-              await autoSyncJob(jobId, job.s3SourcePath);
+              waitUntil(
+                autoSyncJob(jobId, job.s3SourcePath)
+                  .catch(err => logger.warn(`Auto-sync background task failed for ${jobId}`, { error: err.message }))
+              );
             }
 
             // Notify webhook if registered (fire-and-forget)
-            notifyWebhook(
-              { ...job, status: newStatus },
-              oldStatus,
-              newStatus
-            ).catch(err => logger.warn('Webhook notification failed', { error: err.message }));
+            waitUntil(
+              notifyWebhook(
+                { ...job, status: newStatus },
+                oldStatus,
+                newStatus
+              ).catch(err => logger.warn('Webhook notification failed', { error: err.message }))
+            );
           }
         }
       } catch (err: any) {

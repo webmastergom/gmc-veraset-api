@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { waitUntil } from '@vercel/functions';
 import { getJob, updateJob, tryAcquireSyncLock, releaseSyncLock } from '@/lib/jobs';
 import { parseS3Path } from '@/lib/s3';
 import { runSync } from '@/lib/sync/sync-orchestrator';
@@ -81,7 +82,10 @@ export async function POST(
       syncedAt: null,
     });
 
-    runSync({
+    // Use waitUntil to keep the serverless function alive after sending the response.
+    // Without this, Vercel kills the process as soon as the response is sent,
+    // and the sync never completes.
+    const syncPromise = runSync({
       jobId,
       sourcePath,
       destPathParsed,
@@ -89,6 +93,8 @@ export async function POST(
     }).catch((err) => {
       console.error(`[SYNC] Async sync failed for job ${jobId}:`, err);
     });
+
+    waitUntil(syncPromise);
 
     return NextResponse.json({
       success: true,
