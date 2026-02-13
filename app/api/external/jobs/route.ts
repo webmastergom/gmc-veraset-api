@@ -182,7 +182,7 @@ export async function POST(request: NextRequest) {
     const job = await createJob({
       jobId,
       name: body.name,
-      type: body.type as 'pings' | 'aggregate' | 'devices' | 'cohort',
+      type: body.type as 'pings' | 'aggregate' | 'devices' | 'cohort' | 'pings_by_device',
       poiCount: body.pois.length,
       dateRange: { from: body.date_range.from, to: body.date_range.to },
       radius: body.radius ?? 10,
