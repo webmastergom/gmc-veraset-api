@@ -98,6 +98,8 @@ export async function GET(
         created_at: job.createdAt,
         completed_at: job.updatedAt,
         results,
+        // Original POIs with coordinates for downstream validation
+        pois: job.externalPois || [],
       });
     }
 
@@ -107,6 +109,7 @@ export async function GET(
         status: currentStatus,
         created_at: job.createdAt,
         error: job.errorMessage || 'Job processing failed',
+        pois: job.externalPois || [],
       });
     }
 
@@ -116,6 +119,7 @@ export async function GET(
       status: currentStatus,
       created_at: job.createdAt,
       updated_at: job.updatedAt,
+      pois: job.externalPois || [],
     });
 
   } catch (error: any) {
