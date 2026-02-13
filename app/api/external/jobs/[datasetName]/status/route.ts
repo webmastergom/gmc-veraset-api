@@ -184,6 +184,10 @@ async function getJobResults(jobId: string, job: any): Promise<Record<string, an
       available: true,
       url: `/api/external/jobs/${jobId}/catchment`,
     },
+    od_analysis: {
+      available: true,
+      url: `/api/external/jobs/${jobId}/od`,
+    },
   };
 
   // Get dataset name from s3DestPath

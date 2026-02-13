@@ -57,7 +57,7 @@ const nextConfig = {
               "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
               "img-src 'self' data: https:",
               "font-src 'self' data: https://fonts.gstatic.com",
-              "connect-src 'self' https://platform.prd.veraset.tech",
+              "connect-src 'self' https://platform.prd.veraset.tech https://*.s3.us-west-2.amazonaws.com https://*.s3.amazonaws.com",
               "frame-ancestors 'none'",
             ].join('; ')
           },
