@@ -8,6 +8,11 @@ export const s3Client = new S3Client({
     accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
   },
+  // Disable automatic CRC32 checksum in presigned URLs — AWS SDK v3.654+
+  // adds x-amz-checksum-crc32 params by default, which causes CORS preflight
+  // failures when browsers PUT directly to S3 via presigned URLs.
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  responseChecksumValidation: 'WHEN_REQUIRED',
 });
 
 export const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
