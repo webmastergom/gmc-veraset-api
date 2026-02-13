@@ -120,6 +120,8 @@ export async function POST(request: NextRequest) {
       'pings': '/v1/movement/job/pings',
       'devices': '/v1/movement/job/devices',
       'aggregate': '/v1/movement/job/aggregate',
+      'cohort': '/v1/movement/job/cohort',
+      'pings_by_device': '/v1/movement/job/pings_by_device',
     };
     const jobType = body.type || 'pings';
     const verasetEndpoint = verasetEndpoints[jobType] || verasetEndpoints['pings'];

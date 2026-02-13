@@ -3,7 +3,7 @@ import { getConfig, putConfig, initConfigIfNeeded } from './s3-config';
 export interface Job {
   jobId: string;
   name: string;
-  type: 'pings' | 'aggregate' | 'devices' | 'cohort';
+  type: 'pings' | 'aggregate' | 'devices' | 'cohort' | 'pings_by_device';
   poiCount: number;
   poiCollectionId?: string;
   dateRange: { from: string; to: string };

@@ -66,14 +66,14 @@ export const dateRangeSchema = z.object({
  */
 export const createJobSchema = z.object({
   name: z.string().min(1).max(200),
-  type: z.enum(['pings', 'devices', 'aggregate']),
+  type: z.enum(['pings', 'devices', 'aggregate', 'cohort', 'pings_by_device']),
   poiCount: z.number().int().min(0).optional(),
   poiCollectionId: z.string().optional(),
   dateRange: dateRangeSchema,
   radius: z.number().min(1).max(1000).optional().default(10),
   schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
   verasetConfig: z.object({
-    type: z.enum(['pings', 'devices', 'aggregate']).optional(),
+    type: z.enum(['pings', 'devices', 'aggregate', 'cohort', 'pings_by_device']).optional(),
     date_range: z.object({
       from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'from_date must be in YYYY-MM-DD format').optional(),
       to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'to_date must be in YYYY-MM-DD format').optional(),
@@ -121,7 +121,7 @@ const externalPoiSchema = z.object({
 export const externalCreateJobSchema = z.object({
   name: z.string().min(1).max(200),
   country: z.string().length(2).toUpperCase(),
-  type: z.enum(['pings', 'devices', 'aggregate']).optional().default('pings'),
+  type: z.enum(['pings', 'devices', 'aggregate', 'cohort', 'pings_by_device']).optional().default('pings'),
   date_range: z.object({
     from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),

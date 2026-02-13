@@ -6,7 +6,7 @@ const API_BASE_URL = typeof window === 'undefined'
 
 export interface VerasetJobConfig {
   name: string;
-  type: 'pings' | 'aggregate' | 'devices' | 'cohort';
+  type: 'pings' | 'aggregate' | 'devices' | 'cohort' | 'pings_by_device';
   poiCollection: string;
   dateRange: {
     from: string; // YYYY-MM-DD

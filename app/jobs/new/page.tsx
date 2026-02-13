@@ -723,7 +723,8 @@ export default function NewJobPage() {
                   <SelectItem value="pings">Pings</SelectItem>
                   <SelectItem value="aggregate">Aggregate</SelectItem>
                   <SelectItem value="devices">Devices</SelectItem>
-                  <SelectItem value="cohort">Cohort</SelectItem>
+                  <SelectItem value="cohort">Cohort (Full Trajectories)</SelectItem>
+                  <SelectItem value="pings_by_device">Pings by Device</SelectItem>
                 </SelectContent>
               </Select>
             </div>
