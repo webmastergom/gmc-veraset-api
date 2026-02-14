@@ -1,6 +1,9 @@
 /**
  * Sync orchestrator: list → copy → verify. Uses S3BatchCopier, SyncProgressTracker, SyncVerifier.
  * Checks abort signal (from registry) between batches; records partial state on cancel.
+ *
+ * Progress writes are serialized: only one updateJob at a time, at most every 5s.
+ * This prevents S3 race conditions (concurrent read-modify-write on jobs.json).
  */
 
 import { getJob, updateJob, initializeSync, releaseSyncLock } from '@/lib/jobs';
@@ -23,7 +26,8 @@ import {
 } from './sync-progress-tracker';
 import { verifySync } from './sync-verifier';
 
-const PROGRESS_UPDATE_INTERVAL_MS = 500;
+/** Min interval between progress writes to S3 (avoids race conditions). */
+const PROGRESS_WRITE_INTERVAL_MS = 5_000;
 
 export interface SyncOrchestratorParams {
   jobId: string;
@@ -92,9 +96,35 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       },
     });
 
+    // ---------- Serialized progress writer ----------
+    // Only one S3 write in flight at a time. If a write is pending, the latest
+    // snapshot is queued and written when the current write completes.
     let currentDayIndex = 0;
     let currentFileInDay = 0;
-    let lastProgressUpdate = 0;
+    let lastWriteTime = Date.now();
+    let writeInFlight = false;
+    let pendingWrite: Record<string, unknown> | null = null;
+
+    const flushProgress = async (payload: Record<string, unknown>) => {
+      if (writeInFlight) {
+        pendingWrite = payload; // overwrite — only latest matters
+        return;
+      }
+      writeInFlight = true;
+      lastWriteTime = Date.now();
+      try {
+        await updateJob(jobId, payload as any);
+      } catch (e) {
+        console.warn('[SYNC] Progress write failed:', e instanceof Error ? e.message : e);
+      }
+      writeInFlight = false;
+      // If a newer snapshot was queued while we were writing, flush it now
+      if (pendingWrite) {
+        const next = pendingWrite;
+        pendingWrite = null;
+        await flushProgress(next);
+      }
+    };
 
     const result = await copyS3ObjectsBatch(
       copies,
@@ -107,14 +137,20 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
         );
         currentDayIndex = dayIdx;
         currentFileInDay = fileInDay;
+
         const now = Date.now();
-        const shouldUpdate =
-          now - lastProgressUpdate >= PROGRESS_UPDATE_INTERVAL_MS || copied === total || copied % 50 === 0;
-        if (shouldUpdate) {
-          lastProgressUpdate = now;
+        const shouldWrite = now - lastWriteTime >= PROGRESS_WRITE_INTERVAL_MS || copied === total;
+        if (shouldWrite) {
           const currentDay = dates[currentDayIndex] ?? null;
           const totalInDay = currentDay ? dayProgress[currentDay]?.totalFiles : undefined;
-          updateJob(jobId, {
+          const pct = ((copied / total) * 100).toFixed(1);
+          const elapsed = (Date.now() - syncStartTime) / 1000;
+          const speed = elapsed > 0 ? (bytes / elapsed / 1024 / 1024).toFixed(2) : '0';
+          console.log(
+            `[SYNC] Progress: ${pct}% (${copied}/${total}), ${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB @ ${speed} MB/s`
+          );
+          // Fire-and-forget but serialized — won't pile up
+          flushProgress({
             objectCount: copied,
             totalBytes: bytes,
             expectedObjectCount: totalObjects,
@@ -125,18 +161,16 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
               currentFileInDay,
               totalInDay
             ),
-          }).then(() => {
-            const pct = ((copied / total) * 100).toFixed(1);
-            const elapsed = (Date.now() - syncStartTime) / 1000;
-            const speed = elapsed > 0 ? (bytes / elapsed / 1024 / 1024).toFixed(2) : '0';
-            console.log(
-              `[SYNC] Progress: ${pct}% (${copied}/${total}), ${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB @ ${speed} MB/s`
-            );
           });
         }
       },
       controller.signal
     );
+
+    // Wait for any in-flight progress write to finish before proceeding
+    while (writeInFlight || pendingWrite) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
 
     console.log(`[SYNC] CHECK 2 - Copy done: ${result.copied} ok, ${result.failed} failed`);
 
