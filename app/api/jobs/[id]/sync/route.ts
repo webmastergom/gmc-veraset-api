@@ -47,8 +47,8 @@ export async function POST(
       );
     }
 
-    // Idempotency: already completed with same destination
-    if (job.syncedAt && job.s3DestPath === destPath && (job.objectCount ?? 0) >= (job.expectedObjectCount ?? 0) && (job.expectedObjectCount ?? 0) > 0) {
+    // Idempotency: already completed with same destination (skip if force resync)
+    if (!force && job.syncedAt && job.s3DestPath === destPath && (job.objectCount ?? 0) >= (job.expectedObjectCount ?? 0) && (job.expectedObjectCount ?? 0) > 0) {
       return NextResponse.json({
         success: true,
         message: 'Sync already completed. No re-run.',

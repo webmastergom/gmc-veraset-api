@@ -453,20 +453,28 @@ function SyncPageContent() {
                 Stop Sync
               </Button>
             )}
-            {syncConflict && (
+            {(syncConflict || syncStatus?.status === 'completed' || syncStatus?.status === 'error' || syncStatus?.status === 'cancelled') && !isPolling && (
               <Button
                 variant="default"
                 onClick={handleForceResync}
                 disabled={loading}
               >
                 {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-                Liberar y resincronizar
+                {syncConflict ? 'Liberar y resincronizar' : 'Resincronizar'}
               </Button>
             )}
-            <Button onClick={() => handleSync()} disabled={loading || !destPath || isPolling || syncConflict}>
-              {loading && !syncConflict && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {syncStatus?.status === 'syncing' ? 'Syncing...' : 'Start Sync'}
-            </Button>
+            {!syncStatus && (
+              <Button onClick={() => handleSync()} disabled={loading || !destPath || isPolling}>
+                {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Start Sync
+              </Button>
+            )}
+            {syncStatus?.status === 'not_started' && (
+              <Button onClick={() => handleSync()} disabled={loading || !destPath || isPolling}>
+                {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Start Sync
+              </Button>
+            )}
           </div>
         </CardContent>
       </Card>
