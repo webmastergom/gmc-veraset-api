@@ -16,6 +16,9 @@ export const maxDuration = 300;
  * GET /api/external/jobs/[datasetName]/status
  * Get job status with auto-refresh from Veraset API.
  * The datasetName param here is actually a jobId.
+ *
+ * When a job transitions to SUCCESS, auto-sync runs INLINE (not background)
+ * to ensure results are available in the same response.
  */
 export async function GET(
   request: NextRequest,
@@ -34,7 +37,7 @@ export async function GET(
     }
 
     // 2. Find job
-    const job = await getJob(jobId);
+    let job = await getJob(jobId);
     if (!job) {
       return NextResponse.json(
         { error: 'Not Found', message: `Job '${jobId}' not found.` },
@@ -72,16 +75,16 @@ export async function GET(
 
             logger.log(`Job ${jobId} status: ${oldStatus} -> ${newStatus}`);
 
-            // Auto-sync when job becomes SUCCESS (run in background via waitUntil
-            // so the status response is not blocked by potentially large S3 copies)
+            // Auto-sync INLINE when job becomes SUCCESS — ensures results
+            // are available in this same response instead of a background
+            // task that may die on Vercel.
             if (newStatus === 'SUCCESS' && !job.s3DestPath) {
-              waitUntil(
-                autoSyncJob(jobId, job.s3SourcePath)
-                  .catch(err => logger.warn(`Auto-sync background task failed for ${jobId}`, { error: err.message }))
-              );
+              await autoSyncJob(jobId, job.s3SourcePath);
+              // Re-read job to get updated s3DestPath
+              job = (await getJob(jobId)) || job;
             }
 
-            // Notify webhook if registered (fire-and-forget)
+            // Notify webhook if registered (fire-and-forget is fine here)
             waitUntil(
               notifyWebhook(
                 { ...job, status: newStatus },
@@ -96,17 +99,37 @@ export async function GET(
       }
     }
 
-    // 4. Build response based on status
+    // 4. If SUCCESS but never synced, try sync now (covers jobs that became
+    //    SUCCESS in a previous request where the background sync failed)
+    if (currentStatus === 'SUCCESS' && !job.s3DestPath) {
+      await autoSyncJob(jobId, job.s3SourcePath);
+      job = (await getJob(jobId)) || job;
+    }
+
+    const synced = !!(job.s3DestPath && job.syncedAt);
+
+    // 5. Build response based on status
     if (currentStatus === 'SUCCESS') {
-      const results = await getJobResults(jobId, job);
+      const results = synced
+        ? await getJobResults(jobId, job)
+        : {
+            date_range: job.dateRange,
+            poi_count: job.poiCount,
+            total_pings: null,
+            total_devices: null,
+            poi_summary: [],
+            catchment: { available: false, url: `/api/external/jobs/${jobId}/catchment` },
+            od_analysis: { available: false, url: `/api/external/jobs/${jobId}/od` },
+          };
+
       return NextResponse.json({
         job_id: jobId,
         name: job.name || null,
         status: currentStatus,
+        synced,
         created_at: job.createdAt,
         completed_at: job.updatedAt,
         results,
-        // Original POIs with coordinates for downstream validation
         pois: job.externalPois || [],
       });
     }
@@ -116,6 +139,7 @@ export async function GET(
         job_id: jobId,
         name: job.name || null,
         status: currentStatus,
+        synced: false,
         created_at: job.createdAt,
         error: job.errorMessage || 'Job processing failed',
         pois: job.externalPois || [],
@@ -127,6 +151,7 @@ export async function GET(
       job_id: jobId,
       name: job.name || null,
       status: currentStatus,
+      synced: false,
       created_at: job.createdAt,
       updated_at: job.updatedAt,
       pois: job.externalPois || [],
@@ -142,7 +167,8 @@ export async function GET(
 }
 
 /**
- * Auto-sync job data from Veraset S3 to our S3 bucket
+ * Auto-sync job data from Veraset S3 to our S3 bucket.
+ * Runs inline (awaited) so the caller gets results in the same request.
  */
 async function autoSyncJob(jobId: string, s3SourcePath?: string): Promise<void> {
   if (!s3SourcePath) return;
@@ -177,12 +203,16 @@ async function autoSyncJob(jobId: string, s3SourcePath?: string): Promise<void> 
 }
 
 /**
- * Get job results (metrics) from Athena
+ * Get job results (metrics) from Athena.
+ * Returns numeric values (never NaN) — uses 0 as fallback.
  */
 async function getJobResults(jobId: string, job: any): Promise<Record<string, any>> {
   const results: Record<string, any> = {
     date_range: job.dateRange,
     poi_count: job.poiCount,
+    total_pings: 0,
+    total_devices: 0,
+    poi_summary: [],
     catchment: {
       available: true,
       url: `/api/external/jobs/${jobId}/catchment`,
@@ -215,15 +245,16 @@ async function getJobResults(jobId: string, job: any): Promise<Record<string, an
       FROM ${tableName}
     `);
     if (summaryResult.rows.length > 0) {
-      results.total_pings = Number(summaryResult.rows[0].total_pings) || 0;
-      results.total_devices = Number(summaryResult.rows[0].total_devices) || 0;
+      const pings = Number(summaryResult.rows[0].total_pings);
+      const devices = Number(summaryResult.rows[0].total_devices);
+      results.total_pings = isNaN(pings) ? 0 : pings;
+      results.total_devices = isNaN(devices) ? 0 : devices;
     }
 
     // Query per-POI summary
     const poiMapping = job.poiMapping || {};
     const poiNames = job.poiNames || {};
 
-    // UNNEST poi_ids: count each ping for ALL POIs it belongs to (not just first)
     const poiResult = await runQuery(`
       SELECT poi_id, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
       FROM ${tableName}
@@ -235,18 +266,18 @@ async function getJobResults(jobId: string, job: any): Promise<Record<string, an
     results.poi_summary = poiResult.rows.map((row: any) => {
       const verasetId = String(row.poi_id);
       const originalId = poiMapping[verasetId] || verasetId;
+      const p = Number(row.pings);
+      const d = Number(row.devices);
       return {
         poi_id: originalId,
         name: poiNames[verasetId] || originalId,
-        pings: Number(row.pings) || 0,
-        devices: Number(row.devices) || 0,
+        pings: isNaN(p) ? 0 : p,
+        devices: isNaN(d) ? 0 : d,
       };
     });
   } catch (err: any) {
     logger.warn(`Failed to get results for job ${jobId}`, { error: err.message });
-    results.total_pings = null;
-    results.total_devices = null;
-    results.poi_summary = [];
+    // Keep defaults (0, not null/NaN) so downstream never sees NaN
   }
 
   return results;
