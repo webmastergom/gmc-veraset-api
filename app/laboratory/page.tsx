@@ -306,6 +306,7 @@ export default function LaboratoryPage() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let gotResult = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -325,6 +326,7 @@ export default function LaboratoryPage() {
               if (eventType === 'progress') {
                 setProgress(data);
               } else if (eventType === 'result') {
+                gotResult = true;
                 setResult(data);
                 setPhase('results');
                 setProgress(null);
@@ -335,9 +337,10 @@ export default function LaboratoryPage() {
         }
       }
 
-      // If stream ended without result event
-      if (!result) {
-        setPhase('results');
+      // If stream ended without a result event, go back to recipe
+      if (!gotResult) {
+        setError('Analysis completed but no results were returned. Please try again.');
+        setPhase('recipe');
         setProgress(null);
       }
     } catch (err: any) {
@@ -723,6 +726,28 @@ export default function LaboratoryPage() {
         {phase === 'running' && progress && (
           <Card className="border-border overflow-hidden">
             <CardContent className="pt-8 pb-6">
+              {/* Recipe summary */}
+              <div className="flex items-center gap-3 p-3 mb-6 rounded-xl bg-secondary/50 border border-border">
+                <Beaker className="w-4 h-4 text-theme-accent shrink-0" />
+                <div className="flex-1 min-w-0 flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-medium truncate">
+                    {recipeName || 'Experiment'}
+                  </span>
+                  <span className="text-xs text-muted-foreground">|</span>
+                  <span className="text-xs text-muted-foreground truncate">
+                    {selectedDataset?.name || 'Dataset'}
+                  </span>
+                  <span className="text-xs text-muted-foreground">|</span>
+                  <span className="text-xs text-muted-foreground">
+                    {selectedCountry && COUNTRY_FLAGS[selectedCountry]} {selectedCountry}
+                  </span>
+                  <span className="text-xs text-muted-foreground">|</span>
+                  <span className="text-xs text-muted-foreground">
+                    {recipeSteps.filter(s => s.categories.length > 0).length} step{recipeSteps.filter(s => s.categories.length > 0).length !== 1 ? 's' : ''} ({recipeLogic}{recipeOrdered ? ', ordered' : ''})
+                  </span>
+                </div>
+                <Loader2 className="w-4 h-4 animate-spin text-theme-accent shrink-0" />
+              </div>
               <div className="flex items-center justify-between mb-8">
                 {PROGRESS_STEPS.map((step, i) => {
                   const isComplete = currentStepIndex > i;
@@ -776,6 +801,20 @@ export default function LaboratoryPage() {
                   Cancel
                 </Button>
               </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* ── Phase: Results (no data fallback) ────────────────────── */}
+        {phase === 'results' && !result && (
+          <Card className="border-border">
+            <CardContent className="py-12 text-center space-y-4">
+              <X className="w-8 h-8 text-muted-foreground mx-auto" />
+              <p className="text-sm text-muted-foreground">No results were returned. The analysis may have failed silently.</p>
+              <Button variant="outline" size="sm" onClick={() => { setPhase('recipe'); setResult(null); }} className="rounded-xl">
+                <RotateCcw className="w-3.5 h-3.5 mr-1" />
+                Back to Recipe
+              </Button>
             </CardContent>
           </Card>
         )}
