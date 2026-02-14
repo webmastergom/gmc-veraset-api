@@ -36,11 +36,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import type { DailyData, VisitByPoi } from '@/lib/dataset-analysis';
-import type { ResidentialZipcode } from '@/lib/dataset-analyzer-residential';
 import { MovementMap } from '@/components/analysis/movement-map';
-import type { CatchmentCoverage, CatchmentMethodology } from '@/lib/catchment-types';
-import { MAX_NOMINATIM_CALLS } from '@/lib/catchment-types';
-import { ChevronDown, ChevronRight, Globe } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 interface DatasetInfo {
@@ -89,12 +85,24 @@ export default function DatasetAnalysisPage() {
   const [downloadingFull, setDownloadingFull] = useState(false);
   const [downloadingMaids, setDownloadingMaids] = useState(false);
   const [catchment, setCatchment] = useState<{
-    zipcodes: ResidentialZipcode[];
-    coverage?: CatchmentCoverage;
-    methodology?: CatchmentMethodology;
+    zipcodes: Array<{
+      zipcode: string;
+      city: string;
+      province: string;
+      region: string;
+      devices: number;
+      percentOfTotal: number;
+      percentage?: number;
+      source?: string;
+    }>;
+    coverage?: {
+      totalDevicesVisitedPois: number;
+      devicesMatchedToZipcode: number;
+      geocodingComplete: boolean;
+      classificationRatePercent: number;
+    };
     summary: { totalZipcodes: number; devicesMatchedToZipcode: number };
   } | null>(null);
-  const [methodologyExpanded, setMethodologyExpanded] = useState(false);
   const [loadingCatchment, setLoadingCatchment] = useState(false);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditResult, setAuditResult] = useState<{
@@ -257,7 +265,6 @@ export default function DatasetAnalysisPage() {
       setCatchment({
         zipcodes: data.zipcodes || [],
         coverage: data.coverage,
-        methodology: data.methodology,
         summary: {
           totalZipcodes: data.summary?.totalZipcodes ?? 0,
           devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
@@ -289,37 +296,18 @@ export default function DatasetAnalysisPage() {
   };
 
   const handleReportCatchment = () => {
-    if (!catchment) return;
-    const cov = catchment.coverage;
-    const hasZipcodes = (catchment.zipcodes?.length ?? 0) > 0;
-    const hasForeign = cov && cov.devicesForeignOrigin > 0;
-    const hasUnmatched = cov && cov.devicesUnmatched > 0;
-    const hasTruncated = cov && (cov.devicesNominatimTruncated ?? 0) > 0;
-    const hasAnyUnmatched = hasForeign || hasUnmatched || hasTruncated;
-    if (!hasZipcodes && !hasAnyUnmatched) return;
-    const rows: (string | number)[][] = (catchment.zipcodes || []).map((z) => [
+    if (!catchment || !catchment.zipcodes?.length) return;
+    const rows: (string | number)[][] = catchment.zipcodes.map((z) => [
       z.zipcode,
       z.city,
       z.province,
       z.region,
       z.devices,
-      z.source ?? '',
       `${(z.percentOfTotal ?? z.percentage ?? 0).toFixed(2)}%`,
-      `${(z.percentOfClassified ?? 0).toFixed(2)}%`,
     ]);
-    const total = cov?.totalDevicesVisitedPois || 1;
-    if (hasForeign) {
-      rows.push(['foreign', 'Origen extranjero', '', '', cov!.devicesForeignOrigin, 'foreign', `${((cov!.devicesForeignOrigin / total) * 100).toFixed(2)}%`, '']);
-    }
-    if (hasUnmatched) {
-      rows.push(['unmatched', 'Unmatched (no postal code)', '', '', cov!.devicesUnmatched, '', `${((cov!.devicesUnmatched / total) * 100).toFixed(2)}%`, '']);
-    }
-    if (hasTruncated) {
-      rows.push(['nominatim_truncated', 'Truncado por límite Nominatim', '', '', cov!.devicesNominatimTruncated, 'truncated', `${((cov!.devicesNominatimTruncated / total) * 100).toFixed(2)}%`, '']);
-    }
     downloadCsv(
-      `${datasetName}-catchment-codigo-postal-${new Date().toISOString().slice(0, 10)}.csv`,
-      ['postal_code', 'city', 'province', 'region', 'devices', 'source', 'percent_of_total', 'percent_of_classified'],
+      `${datasetName}-origen-codigo-postal-${new Date().toISOString().slice(0, 10)}.csv`,
+      ['postal_code', 'city', 'province', 'region', 'devices', 'percent_of_total'],
       rows
     );
   };
@@ -520,9 +508,9 @@ export default function DatasetAnalysisPage() {
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
                 <div>
-                  <CardTitle>Report: Catchment by postal code</CardTitle>
+                  <CardTitle>Report: Origin by postal code</CardTitle>
                   <CardDescription>
-                    Visitor residential origin. Generate report and download CSV.
+                    Where do visitors come from? First GPS ping of each device-day, geocoded to postal code.
                   </CardDescription>
                 </div>
                 <div className="flex gap-2">
@@ -542,13 +530,7 @@ export default function DatasetAnalysisPage() {
                     variant="outline"
                     size="sm"
                     onClick={handleReportCatchment}
-                    disabled={
-                      !catchment ||
-                      ((catchment.zipcodes?.length ?? 0) === 0 &&
-                        (catchment.coverage?.devicesForeignOrigin ?? 0) === 0 &&
-                        (catchment.coverage?.devicesUnmatched ?? 0) === 0 &&
-                        (catchment.coverage?.devicesNominatimTruncated ?? 0) === 0)
-                    }
+                    disabled={!catchment || (catchment.zipcodes?.length ?? 0) === 0}
                   >
                     <FileText className="mr-2 h-4 w-4" />
                     Download CSV
@@ -562,84 +544,19 @@ export default function DatasetAnalysisPage() {
                       <div className="mb-4 space-y-3">
                         {catchment.coverage.geocodingComplete === false && (
                           <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
-                            ⚠️ La geocodificación fue truncada: {(catchment.coverage.devicesNominatimTruncated ?? 0).toLocaleString()} dispositivos
-                            no pudieron ser clasificados por límite de llamadas a Nominatim ({MAX_NOMINATIM_CALLS}).
-                            Los resultados pueden estar incompletos.
+                            Geocoding was truncated due to Nominatim API limits. Results may be incomplete.
                           </div>
                         )}
                         <p className="text-sm text-muted-foreground">
-                          <strong className="text-foreground">{catchment.coverage.totalDevicesVisitedPois.toLocaleString()}</strong> dispositivos visitaron tus POIs
-                        </p>
-                        <p className="text-sm text-muted-foreground">
-                          <strong className="text-foreground">{catchment.coverage.devicesWithHomeEstimate.toLocaleString()}</strong> tienen ubicación residencial estimada (
-                          {catchment.coverage.totalDevicesVisitedPois > 0
-                            ? ((catchment.coverage.devicesWithHomeEstimate / catchment.coverage.totalDevicesVisitedPois) * 100).toFixed(1)
-                            : 0}%)
+                          <strong className="text-foreground">{catchment.coverage.totalDevicesVisitedPois.toLocaleString()}</strong> devices visited your POIs
                         </p>
                         <p className="text-sm">
                           <strong className="text-green-600 dark:text-green-500">{catchment.coverage.devicesMatchedToZipcode.toLocaleString()}</strong> matched to postal code
+                          ({catchment.coverage.classificationRatePercent.toFixed(1)}%)
                         </p>
-                        {catchment.coverage.devicesForeignOrigin > 0 && (
-                          <p className="text-sm text-amber-600 dark:text-amber-500">
-                            {catchment.coverage.devicesForeignOrigin.toLocaleString()} origen extranjero
-                          </p>
-                        )}
-                        {catchment.coverage.devicesUnmatched > 0 && (
-                          <p className="text-sm text-yellow-600 dark:text-yellow-500">
-                            {catchment.coverage.devicesUnmatched.toLocaleString()} unmatched (no postal code)
-                          </p>
-                        )}
-                        {(catchment.coverage.devicesNominatimTruncated ?? 0) > 0 && (
-                          <p className="text-sm text-orange-600 dark:text-orange-500">
-                            {catchment.coverage.devicesNominatimTruncated!.toLocaleString()} truncado (límite Nominatim)
-                          </p>
-                        )}
-                        {catchment.coverage.devicesInsufficientNightData > 0 && (
-                          <p className="text-sm text-muted-foreground">
-                            {catchment.coverage.devicesInsufficientNightData.toLocaleString()} sin suficientes pings nocturnos
-                          </p>
-                        )}
-                        <div className="flex h-3 w-full overflow-hidden rounded bg-muted">
-                          {[
-                            { pct: (catchment.coverage.devicesMatchedToZipcode / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-green-600', label: 'CP' },
-                            { pct: (catchment.coverage.devicesForeignOrigin / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-amber-600', label: 'foreign' },
-                            { pct: (catchment.coverage.devicesUnmatched / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-yellow-600', label: 'unmatched' },
-                            { pct: ((catchment.coverage.devicesNominatimTruncated ?? 0) / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-orange-600', label: 'truncated' },
-                            { pct: (catchment.coverage.devicesInsufficientNightData / catchment.coverage.totalDevicesVisitedPois) * 100, color: 'bg-gray-600', label: 'insufficient night' },
-                          ]
-                            .filter((s) => s.pct > 0)
-                            .map((s, i) => (
-                              <div
-                                key={i}
-                                className={s.color}
-                                style={{ width: `${s.pct}%` }}
-                                title={`${s.label}: ${s.pct.toFixed(1)}%`}
-                              />
-                            ))}
-                        </div>
-                        {catchment.methodology && (
-                          <div className="mt-2 rounded border border-border p-2">
-                            <button
-                              type="button"
-                              className="flex w-full items-center gap-2 text-left text-sm font-medium text-muted-foreground hover:text-foreground"
-                              onClick={() => setMethodologyExpanded(!methodologyExpanded)}
-                            >
-                              {methodologyExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                              Metodología
-                            </button>
-                            {methodologyExpanded && (
-                              <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
-                                <li>Ventana nocturna: {catchment.methodology.nightWindowUtc} ({catchment.methodology.nightWindowLocal})</li>
-                                <li>Mín. pings nocturnos: {catchment.methodology.minNightPings} • Mín. noches distintas: {catchment.methodology.minDistinctNights}</li>
-                                <li>Estimación home: {catchment.methodology.homeEstimationMethod}</li>
-                                <li>Umbral accuracy: {catchment.methodology.accuracyThresholdMeters}m</li>
-                                {catchment.methodology.privacyMinDevices > 0 && (
-                                  <li>Privacidad: mín. {catchment.methodology.privacyMinDevices} dispositivos por CP</li>
-                                )}
-                              </ul>
-                            )}
-                          </div>
-                        )}
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Methodology: first GPS ping of each device-day, reverse geocoded to postal code
+                        </p>
                       </div>
                     )}
                     {catchment.zipcodes?.length ? (
@@ -649,8 +566,7 @@ export default function DatasetAnalysisPage() {
                             <TableRow>
                               <TableHead>Code</TableHead>
                               <TableHead>City</TableHead>
-                              <TableHead className="text-right">Source</TableHead>
-                              <TableHead className="text-right">Dispositivos</TableHead>
+                              <TableHead className="text-right">Devices</TableHead>
                               <TableHead className="text-right">% total</TableHead>
                             </TableRow>
                           </TableHeader>
@@ -659,53 +575,12 @@ export default function DatasetAnalysisPage() {
                               <TableRow key={z.zipcode}>
                                 <TableCell>{z.zipcode}</TableCell>
                                 <TableCell>{z.city}</TableCell>
-                                <TableCell className="text-right text-muted-foreground">{z.source ?? '-'}</TableCell>
-                                <TableCell className="text-right">{z.devices}</TableCell>
+                                <TableCell className="text-right">{z.devices.toLocaleString()}</TableCell>
                                 <TableCell className="text-right">
                                   {(z.percentOfTotal ?? z.percentage ?? 0).toFixed(1)}%
                                 </TableCell>
                               </TableRow>
                             ))}
-                            {catchment.coverage && catchment.coverage.devicesForeignOrigin > 0 && (
-                              <TableRow className="bg-amber-500/5">
-                                <TableCell colSpan={3} className="font-medium">
-                                  <Globe className="mr-1 inline h-4 w-4" />
-                                  Origen extranjero
-                                </TableCell>
-                                <TableCell className="text-right">{catchment.coverage.devicesForeignOrigin}</TableCell>
-                                <TableCell className="text-right">
-                                  {catchment.coverage.totalDevicesVisitedPois > 0
-                                    ? ((catchment.coverage.devicesForeignOrigin / catchment.coverage.totalDevicesVisitedPois) * 100).toFixed(1)
-                                    : 0}%
-                                </TableCell>
-                              </TableRow>
-                            )}
-                            {catchment.coverage && catchment.coverage.devicesUnmatched > 0 && (
-                              <TableRow className="bg-yellow-500/5">
-                                <TableCell colSpan={3} className="font-medium">
-                                  Unmatched (no postal code)
-                                </TableCell>
-                                <TableCell className="text-right">{catchment.coverage.devicesUnmatched}</TableCell>
-                                <TableCell className="text-right">
-                                  {catchment.coverage.totalDevicesVisitedPois > 0
-                                    ? ((catchment.coverage.devicesUnmatched / catchment.coverage.totalDevicesVisitedPois) * 100).toFixed(1)
-                                    : 0}%
-                                </TableCell>
-                              </TableRow>
-                            )}
-                            {catchment.coverage && (catchment.coverage.devicesNominatimTruncated ?? 0) > 0 && (
-                              <TableRow className="bg-orange-500/5">
-                                <TableCell colSpan={3} className="font-medium">
-                                  Truncado (límite Nominatim)
-                                </TableCell>
-                                <TableCell className="text-right">{catchment.coverage.devicesNominatimTruncated}</TableCell>
-                                <TableCell className="text-right">
-                                  {catchment.coverage.totalDevicesVisitedPois > 0
-                                    ? (((catchment.coverage.devicesNominatimTruncated ?? 0) / catchment.coverage.totalDevicesVisitedPois) * 100).toFixed(1)
-                                    : 0}%
-                                </TableCell>
-                              </TableRow>
-                            )}
                           </TableBody>
                         </Table>
                         {catchment.zipcodes.length > 30 && (
@@ -715,12 +590,12 @@ export default function DatasetAnalysisPage() {
                         )}
                       </div>
                     ) : (
-                      <p className="text-muted-foreground">No catchment results.</p>
+                      <p className="text-muted-foreground">No origin results.</p>
                     )}
                   </>
                 ) : (
                   <p className="text-muted-foreground">
-                    Click &quot;Generate report&quot; to compute catchment by postal code.
+                    Click &quot;Generate report&quot; to compute visitor origins by postal code.
                   </p>
                 )}
               </CardContent>

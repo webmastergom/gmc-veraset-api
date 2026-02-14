@@ -2,24 +2,18 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getJob } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { logger } from '@/lib/logger';
-import { analyzeResidentialZipcodes } from '@/lib/dataset-analyzer-residential';
+import { analyzeOriginDestination } from '@/lib/dataset-analyzer-od';
 import { getConfig, putConfig, BUCKET } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-export const maxDuration = 300; // 5 minutes for Athena queries + reverse geocoding
+export const maxDuration = 300;
 
 /**
  * GET /api/external/jobs/[datasetName]/catchment
- * Get residential zipcode catchment analysis for a job.
- * 
- * This endpoint:
- * 1. Validates API key
- * 2. Finds the job and verifies it's completed
- * 3. Extracts dataset name from job's S3 path
- * 4. Runs residential zipcode analysis (cached if available)
- * 5. Returns catchment data showing where visitors come from
- * 
+ * Catchment analysis: origin of visitors by postal code.
+ * Uses OD methodology: first ping of each device-day = origin, reverse geocoded.
+ *
  * The datasetName param here is actually a jobId.
  */
 export async function GET(
@@ -27,9 +21,8 @@ export async function GET(
   context: { params: Promise<{ datasetName: string }> | { datasetName: string } }
 ): Promise<NextResponse> {
   let jobId: string | undefined;
-  
+
   try {
-    // Handle params - Next.js 14+ may pass params as Promise
     let params: { datasetName: string };
     if (context.params instanceof Promise) {
       params = await context.params;
@@ -38,26 +31,24 @@ export async function GET(
     }
     jobId = params.datasetName;
 
-    console.log(`[CATCHMENT] GET /api/external/jobs/${jobId}/catchment`);
+    console.log(`[CATCHMENT-OD] GET /api/external/jobs/${jobId}/catchment`);
 
     // 1. Validate API key
     const auth = await validateApiKeyFromRequest(request);
     if (!auth.valid) {
-      console.error(`[CATCHMENT] Unauthorized: ${auth.error}`);
+      console.error(`[CATCHMENT-OD] Unauthorized: ${auth.error}`);
       return NextResponse.json(
         { error: 'Unauthorized', message: auth.error },
         { status: 401 }
       );
     }
 
-    console.log(`[CATCHMENT] API key validated for key: ${auth.keyId}`);
-
     // 2. Find job and verify status
     let job;
     try {
       job = await getJob(jobId);
     } catch (error: any) {
-      console.error(`[CATCHMENT] Error fetching job ${jobId}:`, error.message);
+      console.error(`[CATCHMENT-OD] Error fetching job ${jobId}:`, error.message);
       return NextResponse.json(
         { error: 'Internal Server Error', message: 'Failed to fetch job' },
         { status: 500 }
@@ -65,14 +56,11 @@ export async function GET(
     }
 
     if (!job) {
-      console.error(`[CATCHMENT] Job not found: ${jobId}`);
       return NextResponse.json(
         { error: 'Not Found', message: `Job '${jobId}' not found.` },
         { status: 404 }
       );
     }
-
-    console.log(`[CATCHMENT] Job found: ${jobId}, status: ${job.status}`);
 
     if (job.status !== 'SUCCESS') {
       return NextResponse.json(
@@ -87,7 +75,6 @@ export async function GET(
 
     // 3. Get dataset name from s3DestPath
     if (!job.s3DestPath) {
-      console.error(`[CATCHMENT] Job ${jobId} has no s3DestPath`);
       return NextResponse.json(
         { error: 'Job data not synced yet. Please try again later.' },
         { status: 409 }
@@ -96,47 +83,41 @@ export async function GET(
 
     const s3Path = job.s3DestPath.replace('s3://', '').replace(`${BUCKET}/`, '');
     const datasetName = s3Path.split('/').filter(Boolean)[0] || s3Path.replace(/\/$/, '');
-    
-    console.log(`[CATCHMENT] Dataset name extracted: ${datasetName} from path: ${job.s3DestPath}`);
 
-    // 4. Check for cached result (v3 = Spain bbox, foreign vs unmatched_domestic, nominatim truncated)
-    const CATCHMENT_VERSION = 'v3';
+    // 4. Check cache (v4 = OD-based catchment)
+    const CATCHMENT_VERSION = 'v4';
     const cacheKey = `catchment-${CATCHMENT_VERSION}-${jobId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
       if (cached) {
-        console.log(`[CATCHMENT] Serving cached result for job ${jobId}`);
-        logger.log(`Serving cached catchment for job ${jobId}`);
+        console.log(`[CATCHMENT-OD] Serving cached result for job ${jobId}`);
+        logger.log(`Serving cached catchment-od for job ${jobId}`);
         return NextResponse.json(cached, {
           status: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Cache': 'HIT',
-          },
+          headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' },
         });
       }
-    } catch (error: any) {
-      console.log(`[CATCHMENT] No cache found (this is OK): ${error.message}`);
-      // No cache, continue to compute
+    } catch {
+      // No cache, continue
     }
 
-    // 5. Run residential analysis
-    console.log(`[CATCHMENT] Computing catchment for job ${jobId}, dataset: ${datasetName}`);
-    logger.log(`Computing catchment for job ${jobId}, dataset: ${datasetName}`);
+    // 5. Run OD analysis
+    console.log(`[CATCHMENT-OD] Computing origin analysis for job ${jobId}, dataset: ${datasetName}`);
+    logger.log(`Computing catchment-od for job ${jobId}, dataset: ${datasetName}`);
 
-    let result;
+    let od;
     try {
-      result = await analyzeResidentialZipcodes(datasetName, {});
+      od = await analyzeOriginDestination(datasetName, {});
     } catch (error: any) {
-      console.error(`[CATCHMENT ERROR] Analysis failed:`, error.message);
-      logger.error(`Catchment analysis failed for job ${jobId}`, { error: error.message });
+      console.error(`[CATCHMENT-OD ERROR] Analysis failed:`, error.message);
+      logger.error(`Catchment-OD analysis failed for job ${jobId}`, { error: error.message });
 
-      if (error.message?.includes('Access Denied') || 
+      if (error.message?.includes('Access Denied') ||
           error.message?.includes('AccessDeniedException') ||
           error.message?.includes('not authorized')) {
         return NextResponse.json(
-          { 
-            error: 'Dataset not accessible', 
+          {
+            error: 'Dataset not accessible',
             message: 'The job data may not be synced yet or AWS permissions are insufficient.',
             details: error.message,
           },
@@ -146,17 +127,17 @@ export async function GET(
 
       if (error.message?.includes('AWS credentials not configured')) {
         return NextResponse.json(
-          { 
+          {
             error: 'Configuration Error',
-            message: 'AWS credentials not configured. Please configure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.',
+            message: 'AWS credentials not configured.',
           },
           { status: 503 }
         );
       }
 
       return NextResponse.json(
-        { 
-          error: 'Internal Server Error', 
+        {
+          error: 'Internal Server Error',
           message: 'Failed to compute catchment analysis',
           details: error.message,
         },
@@ -164,71 +145,72 @@ export async function GET(
       );
     }
 
-    // 6. Build response — backward compatible, new fields additive
+    // 6. Build response — backward compatible with cloud-garritz
+    const zipcodes = od.origins.map((z) => ({
+      zipcode: z.zipcode,
+      city: z.city,
+      province: z.province,
+      region: z.region,
+      devices: z.devices,
+      percentage: z.percentOfTotal,
+      percentOfTotal: z.percentOfTotal,
+      source: z.source,
+    }));
+
+    const totalMatched = zipcodes.reduce((s, z) => s + z.devices, 0);
+
     const response = {
       job_id: jobId,
-      analyzed_at: result.analyzedAt,
-      methodology: result.methodology,
-      coverage: result.coverage,
-      summary: {
-        total_devices_analyzed: result.coverage.totalDevicesVisitedPois,
-        devices_with_home_location: result.coverage.devicesWithHomeEstimate,
-        devices_matched_to_zipcode: result.coverage.devicesMatchedToZipcode,
-        devices_foreign_origin: result.coverage.devicesForeignOrigin,
-        total_zipcodes: result.summary.totalZipcodes,
-        top_zipcode: result.summary.topZipcode,
-        top_city: result.summary.topCity,
-        classification_rate: result.coverage.classificationRatePercent,
+      analyzed_at: od.analyzedAt,
+      methodology: {
+        approach: 'origin_destination',
+        description: 'First GPS ping of each device-day, reverse geocoded to postal code.',
+        accuracyThresholdMeters: od.methodology.accuracyThresholdMeters,
+        coordinatePrecision: od.methodology.coordinatePrecision,
       },
-      zipcodes: result.zipcodes,
+      coverage: {
+        totalDevicesVisitedPois: od.coverage.totalDevicesVisitedPois,
+        totalDeviceDays: od.coverage.totalDeviceDays,
+        devicesWithOrigin: od.coverage.devicesWithOrigin,
+        devicesMatchedToZipcode: totalMatched,
+        originZipcodes: od.coverage.originZipcodes,
+        coverageRatePercent: od.coverage.coverageRatePercent,
+        geocodingComplete: od.coverage.geocodingComplete,
+      },
+      summary: {
+        total_devices_analyzed: od.coverage.totalDevicesVisitedPois,
+        devices_matched_to_zipcode: totalMatched,
+        total_zipcodes: zipcodes.length,
+        top_zipcode: zipcodes[0]?.zipcode ?? null,
+        top_city: zipcodes[0]?.city ?? null,
+      },
+      zipcodes,
     };
 
-    console.log(`[CATCHMENT] Analysis completed successfully`, {
-      totalDevices: response.summary.total_devices_analyzed,
-      matchedDevices: response.summary.devices_matched_to_zipcode,
-      zipcodes: response.summary.total_zipcodes,
-    });
-
-    // 7. Cache result in S3
+    // 7. Cache result
     try {
       await putConfig(cacheKey, response);
-      console.log(`[CATCHMENT] Cached result for job ${jobId}`);
-      logger.log(`Cached catchment for job ${jobId}`);
+      logger.log(`Cached catchment-od for job ${jobId}`);
     } catch (err: any) {
-      console.warn(`[CATCHMENT] Failed to cache result: ${err.message}`);
-      logger.warn(`Failed to cache catchment for job ${jobId}`, { error: err.message });
-      // Continue even if caching fails
+      logger.warn(`Failed to cache catchment-od for job ${jobId}`, { error: err.message });
     }
 
     return NextResponse.json(response, {
       status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Cache': 'MISS',
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Cache': 'MISS' },
     });
 
   } catch (error: any) {
     const errorJobId = jobId || 'unknown';
-    console.error(`[CATCHMENT ERROR] GET /api/external/jobs/${errorJobId}/catchment:`, {
-      error: error.message,
-      stack: error.stack,
-      name: error.name,
-    });
-    
+    console.error(`[CATCHMENT-OD ERROR] GET /api/external/jobs/${errorJobId}/catchment:`, error.message);
     logger.error(`GET /api/external/jobs/${errorJobId}/catchment error:`, error);
 
     return NextResponse.json(
-      { 
-        error: 'Internal Server Error', 
+      {
+        error: 'Internal Server Error',
         message: error.message || 'An unexpected error occurred',
       },
-      { 
-        status: 500,
-        headers: {
-          'Content-Type': 'application/json',
-        }
-      }
+      { status: 500 }
     );
   }
 }
