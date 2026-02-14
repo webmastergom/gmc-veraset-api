@@ -177,7 +177,7 @@ export default function LaboratoryPage() {
     id: newStepId(),
     categories: [],
   }]);
-  const [recipeLogic, setRecipeLogic] = useState<'AND' | 'OR'>('OR');
+  const [recipeLogic, setRecipeLogic] = useState<'AND' | 'OR'>('AND');
   const [recipeOrdered, setRecipeOrdered] = useState(false);
   const [recipeName, setRecipeName] = useState('');
 
@@ -1247,7 +1247,7 @@ function RecipeStepCard({
 }) {
   const [showTimeWindow, setShowTimeWindow] = useState(!!step.timeWindow);
   const [showDwell, setShowDwell] = useState(step.minDwellMinutes != null || step.maxDwellMinutes != null);
-  const [showFrequency, setShowFrequency] = useState(step.minFrequency != null && step.minFrequency > 1);
+  const [showFrequency, setShowFrequency] = useState(true);
 
   return (
     <div className="rounded-xl border border-border bg-secondary/30 overflow-hidden">
