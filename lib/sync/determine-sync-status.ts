@@ -93,7 +93,7 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
   if (isLockStale && copied > 0 && copied < totalObjects) {
     return {
       status: 'error',
-      message: `Sync appears stalled (no progress in ${Math.round(lockAge / 60000)} min). Use "Resincronizar" to retry.`,
+      message: `Sync appears stalled (no progress in ${Math.round(lockAge / 60000)} min). Use "Resync" to retry.`,
       progress,
       total: totalObjects,
       totalBytes,

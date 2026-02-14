@@ -75,6 +75,7 @@ function SyncPageContent() {
         clearInterval(intervalRef.current)
         intervalRef.current = null
       }
+      // Don't abort the sync stream on unmount — let the backend finish
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId])
@@ -142,8 +143,8 @@ function SyncPageContent() {
           intervalRef.current = null
         }
         toast({
-          title: "Conexión perdida",
-          description: "No se pudo verificar el estado del sync después de varios intentos. Revisa tu conexión y recarga la página.",
+          title: "Connection Lost",
+          description: "Could not check sync status after several attempts. Check your connection and reload the page.",
           variant: "destructive",
         })
       }
@@ -207,6 +208,9 @@ function SyncPageContent() {
     }
   }, [isPolling, jobId, retryDelay, sseFailed, checkSyncStatus, applyStatus])
 
+  // Ref to keep the sync stream connection alive (AbortController)
+  const syncAbortRef = useRef<AbortController | null>(null)
+
   const handleSync = async (force = false) => {
     if (!jobId || !destPath) {
       toast({
@@ -222,12 +226,18 @@ function SyncPageContent() {
     setSseFailed(false)
 
     try {
+      // Abort any previous sync stream
+      syncAbortRef.current?.abort()
+      const controller = new AbortController()
+      syncAbortRef.current = controller
+
       const response = await fetch(`/api/jobs/${jobId}/sync`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ destPath, force }),
+        signal: controller.signal,
       })
 
       if (response.status === 409) {
@@ -236,8 +246,8 @@ function SyncPageContent() {
         setIsPolling(false)
         setSyncConflict(true)
         toast({
-          title: "Sync bloqueado",
-          description: data.error || "Otra sincronización está en curso o quedó bloqueada. Usa «Liberar y resincronizar» para desbloquear.",
+          title: "Sync Blocked",
+          description: data.error || "Another sync is in progress or locked. Use 'Release & Resync' to unblock.",
           variant: "destructive",
         })
         await checkSyncStatus()
@@ -251,12 +261,32 @@ function SyncPageContent() {
         throw new Error(error.error || "Failed to sync")
       }
 
+      // The POST now returns a streaming response that keeps the Vercel
+      // function alive. We need to consume the stream in the background
+      // (otherwise the browser may close the connection and Vercel kills the function).
+      // Progress is tracked via the separate SSE /stream endpoint.
+      if (response.body) {
+        const reader = response.body.getReader()
+        // Read in background — don't await, just keep the connection open
+        const readStream = async () => {
+          try {
+            while (true) {
+              const { done } = await reader.read()
+              if (done) break
+            }
+          } catch {
+            // Stream closed (abort, network error) — expected
+          }
+        }
+        readStream() // fire and forget — keeps connection alive
+      }
+
       await checkSyncStatus()
-      
-      // Polling is now handled by the useEffect hook above
-      // We just need to wait for the status to change
-      
+
+      // Polling/SSE is handled by the useEffect hook above
+
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       setIsPolling(false)
       setLoading(false)
       toast({
@@ -460,7 +490,7 @@ function SyncPageContent() {
                 disabled={loading}
               >
                 {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-                {syncConflict ? 'Liberar y resincronizar' : 'Resincronizar'}
+                {syncConflict ? 'Release & Resync' : 'Resync'}
               </Button>
             )}
             {!syncStatus && (

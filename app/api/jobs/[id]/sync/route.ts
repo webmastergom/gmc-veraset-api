@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { waitUntil } from '@vercel/functions';
 import { getJob, updateJob, tryAcquireSyncLock, releaseSyncLock } from '@/lib/jobs';
 import { parseS3Path } from '@/lib/s3';
 import { runSync } from '@/lib/sync/sync-orchestrator';
@@ -84,24 +83,58 @@ export async function POST(
       errorMessage: '',
     });
 
-    // Use waitUntil to keep the serverless function alive after sending the response.
-    // Without this, Vercel kills the process as soon as the response is sent,
-    // and the sync never completes.
-    const syncPromise = runSync({
-      jobId,
-      sourcePath,
-      destPathParsed,
-      destPath,
-    }).catch((err) => {
-      console.error(`[SYNC] Async sync failed for job ${jobId}:`, err);
+    // Use a streaming response to keep the Vercel function alive.
+    // waitUntil() is unreliable for long-running tasks — Vercel can freeze/evict
+    // the function after the response is sent. By streaming, we keep the
+    // connection open and Vercel keeps the function running until maxDuration.
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        // Send initial message
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ status: 'started', jobId })}\n\n`)
+        );
+
+        // Keepalive: send a heartbeat every 10s so the connection stays open
+        const heartbeat = setInterval(() => {
+          try {
+            controller.enqueue(encoder.encode(`: heartbeat\n\n`));
+          } catch {
+            // Stream closed by client — ignore
+            clearInterval(heartbeat);
+          }
+        }, 10000);
+
+        try {
+          await runSync({
+            jobId,
+            sourcePath,
+            destPathParsed,
+            destPath,
+          });
+
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ status: 'completed', jobId })}\n\n`)
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Sync failed';
+          console.error(`[SYNC] Sync failed for job ${jobId}:`, msg);
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ status: 'error', jobId, error: msg })}\n\n`)
+          );
+        } finally {
+          clearInterval(heartbeat);
+          controller.close();
+        }
+      },
     });
 
-    waitUntil(syncPromise);
-
-    return NextResponse.json({
-      success: true,
-      message: 'Sync started. Check status endpoint or use SSE stream for progress.',
-      jobId,
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Failed to start sync';
