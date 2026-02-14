@@ -5,7 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import Link from 'next/link';
-import { MapPin, Zap } from 'lucide-react';
+import { MapPin, Zap, Trash2, Loader2 } from 'lucide-react';
 import { EnrichmentDialog } from './enrichment-dialog';
 
 interface CollectionCardProps {
@@ -16,13 +16,30 @@ interface CollectionCardProps {
     poi_count: number;
     sources?: Record<string, number | string>;
     enrichedCount?: number;
-    enrichedAt?: string;
+    enrichedAt?: string | null;
   };
+  onDelete?: (id: string, name: string) => Promise<void>;
 }
 
-export function CollectionCard({ collection }: CollectionCardProps) {
+export function CollectionCard({ collection, onDelete }: CollectionCardProps) {
   const [enrichOpen, setEnrichOpen] = useState(false);
   const [enrichedCount, setEnrichedCount] = useState(collection.enrichedCount || 0);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const handleDelete = async () => {
+    if (!confirmDelete) {
+      setConfirmDelete(true);
+      return;
+    }
+    setDeleting(true);
+    try {
+      await onDelete?.(collection.id, collection.name);
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  };
 
   return (
     <>
@@ -53,7 +70,7 @@ export function CollectionCard({ collection }: CollectionCardProps) {
               )}
             </div>
 
-            {collection.sources && (
+            {collection.sources && Object.keys(collection.sources).length > 0 && (
               <div className="space-y-1">
                 <p className="text-sm font-medium">Sources:</p>
                 <div className="flex flex-wrap gap-2">
@@ -81,7 +98,27 @@ export function CollectionCard({ collection }: CollectionCardProps) {
                   View Details
                 </Button>
               </Link>
+              {onDelete && (
+                <Button
+                  variant={confirmDelete ? "destructive" : "outline"}
+                  size="sm"
+                  onClick={handleDelete}
+                  onBlur={() => setConfirmDelete(false)}
+                  disabled={deleting}
+                >
+                  {deleting ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
             </div>
+            {confirmDelete && (
+              <p className="text-xs text-destructive text-center">
+                Click again to confirm deletion
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -93,8 +130,7 @@ export function CollectionCard({ collection }: CollectionCardProps) {
         collectionName={collection.name}
         poiCount={collection.poi_count}
         onEnrichmentApplied={() => {
-          // Refresh the enrichment count
-          setEnrichedCount(prev => prev + 1); // Will get actual count on page refresh
+          setEnrichedCount(prev => prev + 1);
         }}
       />
     </>

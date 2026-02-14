@@ -1,10 +1,61 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getConfig, initConfigIfNeeded } from "@/lib/s3-config"
 import { initialPOICollectionsData } from "@/lib/seed-jobs"
-import { putConfig } from "@/lib/s3-config"
+import { putConfig, s3Client, BUCKET } from "@/lib/s3-config"
+import { DeleteObjectCommand } from "@aws-sdk/client-s3"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
+
+export async function DELETE(
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id: collectionId } = await params
+
+    const rawCollections =
+      (await initConfigIfNeeded("poi-collections", initialPOICollectionsData)) ||
+      {}
+    const collectionsData = rawCollections as Record<string, any>
+
+    const collection = collectionsData[collectionId]
+    if (!collection) {
+      return NextResponse.json(
+        { error: "Collection not found" },
+        { status: 404 }
+      )
+    }
+
+    // Delete GeoJSON file from S3
+    const geojsonKey = collection.geojsonPath || `pois/${collectionId}.geojson`
+    try {
+      await s3Client.send(
+        new DeleteObjectCommand({ Bucket: BUCKET, Key: geojsonKey })
+      )
+      console.log(`🗑️ Deleted S3 object: ${geojsonKey}`)
+    } catch (s3Err: any) {
+      // Log but don't fail — the config entry is more important to remove
+      console.warn(`⚠️ Could not delete S3 object ${geojsonKey}:`, s3Err.message)
+    }
+
+    // Remove from config
+    delete collectionsData[collectionId]
+    await putConfig("poi-collections", collectionsData)
+
+    console.log(`✅ Deleted POI collection: ${collectionId}`)
+    return NextResponse.json({ success: true, id: collectionId })
+  } catch (error: any) {
+    console.error("Error deleting POI collection:", error)
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Failed to delete collection",
+        details: error.message,
+      },
+      { status: 500 }
+    )
+  }
+}
 
 export async function PATCH(
   request: NextRequest,
