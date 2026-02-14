@@ -287,6 +287,7 @@ export async function initializeSync(
     expectedTotalBytes,
     syncedAt: null,
     syncCancelledAt: null, // Clear cancellation when starting new sync
+    errorMessage: '', // Clear previous errors when starting new sync
   });
 }
 

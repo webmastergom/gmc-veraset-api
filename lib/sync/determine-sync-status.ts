@@ -55,6 +55,21 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
     };
   }
 
+  // Error: errorMessage is set and sync is NOT complete (no syncedAt)
+  // This catches: copy failures, verification failures, orchestrator exceptions
+  if (job.errorMessage && !job.syncedAt) {
+    return {
+      status: 'error',
+      message: job.errorMessage,
+      progress,
+      total: totalObjects,
+      totalBytes,
+      copied,
+      copiedBytes,
+      syncProgress: job.syncProgress ?? null,
+    };
+  }
+
   const isComplete = !!job.syncedAt;
   const looksComplete = totalObjects > 0 && copied >= totalObjects;
 
@@ -67,6 +82,23 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
       totalBytes: totalBytes || copiedBytes,
       copied: copied || totalObjects || 0,
       copiedBytes: copiedBytes || totalBytes || 0,
+      syncProgress: job.syncProgress ?? null,
+    };
+  }
+
+  // Check if sync lock is stale (no progress update in >10 min = function died)
+  const lockAge = job.syncLock ? Date.now() - new Date(job.syncLock).getTime() : 0;
+  const isLockStale = lockAge > 10 * 60 * 1000; // 10 min = maxDuration
+
+  if (isLockStale && copied > 0 && copied < totalObjects) {
+    return {
+      status: 'error',
+      message: `Sync appears stalled (no progress in ${Math.round(lockAge / 60000)} min). Use "Resincronizar" to retry.`,
+      progress,
+      total: totalObjects,
+      totalBytes,
+      copied,
+      copiedBytes,
       syncProgress: job.syncProgress ?? null,
     };
   }

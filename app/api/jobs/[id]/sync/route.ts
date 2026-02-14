@@ -80,6 +80,8 @@ export async function POST(
       objectCount: 0,
       totalBytes: 0,
       syncedAt: null,
+      syncCancelledAt: null,
+      errorMessage: '',
     });
 
     // Use waitUntil to keep the serverless function alive after sending the response.
