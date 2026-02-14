@@ -1,5 +1,4 @@
 import { getConfig, putConfig, initConfigIfNeeded } from './s3-config';
-import { getAllJobs } from './jobs';
 
 export interface MonthUsage {
   used: number;
@@ -23,20 +22,15 @@ export function getCurrentMonth(): string {
 }
 
 /**
- * Get usage for current month with initialization
+ * Get usage for current month with initialization.
+ * All jobs (internal and external) count toward the monthly quota.
  */
-export async function getUsage(): Promise<MonthUsage & { month: string; remaining: number; externalJobs: number }> {
-  const [data, jobs] = await Promise.all([
-    initConfigIfNeeded<UsageData>('usage', DEFAULT_USAGE),
-    getAllJobs()
-  ]);
-  
+export async function getUsage(): Promise<MonthUsage & { month: string; remaining: number }> {
+  const data = await initConfigIfNeeded<UsageData>('usage', DEFAULT_USAGE);
+
   const month = getCurrentMonth();
   const monthData = data[month] || { used: 0, limit: 200 };
-  
-  // Count external jobs (for display only, not subtracted)
-  const externalJobs = jobs.filter(job => job.external === true).length;
-  
+
   return {
     month,
     used: monthData.used,
@@ -44,7 +38,6 @@ export async function getUsage(): Promise<MonthUsage & { month: string; remainin
     remaining: monthData.limit - monthData.used,
     lastJobId: monthData.lastJobId,
     lastJobAt: monthData.lastJobAt,
-    externalJobs,
   };
 }
 

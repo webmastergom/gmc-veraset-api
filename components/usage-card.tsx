@@ -10,7 +10,6 @@ interface UsageData {
   limit: number
   remaining: number
   percentage: number
-  externalJobs?: number
 }
 
 export function UsageCard({ usage }: { usage: UsageData }) {
@@ -32,12 +31,7 @@ export function UsageCard({ usage }: { usage: UsageData }) {
         <p className="text-xs text-muted-foreground mt-1">
           {usage.used} of {usage.limit} calls used this month
         </p>
-        {usage.externalJobs && usage.externalJobs > 0 && (
-          <p className="text-xs text-blue-400 mt-2">
-            + {usage.externalJobs} external job{usage.externalJobs > 1 ? 's' : ''} (not counted)
-          </p>
-        )}
-        <Progress 
+        <Progress
           value={usage.percentage} 
           className={cn(
             "mt-2",

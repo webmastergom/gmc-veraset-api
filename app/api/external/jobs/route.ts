@@ -3,7 +3,7 @@ import { getAllJobs, createJob } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { BUCKET } from '@/lib/s3-config';
 import { externalCreateJobSchema, validateRequestBody } from '@/lib/validation';
-import { canCreateJob } from '@/lib/usage';
+import { canCreateJob, incrementUsage } from '@/lib/usage';
 import { logger } from '@/lib/logger';
 import { sanitizeError } from '@/lib/security';
 
@@ -197,7 +197,10 @@ export async function POST(request: NextRequest) {
       externalPois: body.pois,
     });
 
-    // 8. Return response
+    // 8. Increment usage — external jobs consume a real Veraset API call
+    await incrementUsage(jobId);
+
+    // 9. Return response
     return NextResponse.json({
       job_id: jobId,
       status: 'QUEUED',

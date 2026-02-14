@@ -40,7 +40,6 @@ async function getDashboardStats() {
         limit: usage.limit,
         remaining: usage.remaining,
         percentage: Math.round((usage.used / usage.limit) * 100),
-        externalJobs: usage.externalJobs || 0,
       },
       activeJobs,
       totalPOIs,
@@ -50,7 +49,7 @@ async function getDashboardStats() {
   } catch (error) {
     console.error("Error fetching dashboard stats:", error);
     return {
-      apiUsage: { used: 0, limit: 200, remaining: 200, percentage: 0, externalJobs: 0 },
+      apiUsage: { used: 0, limit: 200, remaining: 200, percentage: 0 },
       activeJobs: 0,
       totalPOIs: 0,
       totalDevices: 0,

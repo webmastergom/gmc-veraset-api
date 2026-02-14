@@ -1165,10 +1165,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       name: job.name,
     });
 
-    // 8. Increment usage
-    if (!job.external) {
-      await incrementUsage(jobId);
-    }
+    // 8. Increment usage — all jobs count (internal and external)
+    await incrementUsage(jobId);
 
     // 9. Return success
     console.log('[JOBS POST] Job creation completed successfully', {
