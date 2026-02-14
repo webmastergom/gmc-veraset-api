@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { analyzeOriginDestination } from '@/lib/dataset-analyzer-od';
+import { analyzeOrigins } from '@/lib/dataset-analyzer-od';
 import type { ODFilters } from '@/lib/od-types';
 
 export const dynamic = 'force-dynamic';
@@ -9,7 +9,7 @@ export const maxDuration = 300;
 /**
  * GET /api/datasets/[name]/catchment
  * Reporte: origen de visitantes por código postal.
- * Usa metodología OD: primer ping del día = origen, geocodificado a CP.
+ * Usa primer ping del día por dispositivo, geocodificado a CP.
  * Query params: dateFrom, dateTo, poiIds (comma-separated)
  */
 export async function GET(
@@ -38,17 +38,16 @@ export async function GET(
     const poiIds = searchParams.get('poiIds');
     if (poiIds) filters.poiIds = poiIds.split(',').map((s) => s.trim()).filter(Boolean);
 
-    const od = await analyzeOriginDestination(datasetName, filters);
+    const res = await analyzeOrigins(datasetName, filters);
 
-    // Transform OD origins → catchment format expected by frontend
-    const zipcodes = od.origins.map((z) => ({
+    const zipcodes = res.origins.map((z) => ({
       zipcode: z.zipcode,
       city: z.city,
       province: z.province,
       region: z.region,
       devices: z.devices,
       percentOfTotal: z.percentOfTotal,
-      percentOfClassified: z.percentOfTotal, // same in OD context
+      percentOfClassified: z.percentOfTotal,
       percentage: z.percentOfTotal,
       source: z.source,
     }));
@@ -56,26 +55,21 @@ export async function GET(
     const totalMatched = zipcodes.reduce((s, z) => s + z.devices, 0);
 
     const result = {
-      dataset: od.dataset,
-      analyzedAt: od.analyzedAt,
-      filters: od.filters,
+      dataset: res.dataset,
+      analyzedAt: res.analyzedAt,
       methodology: {
-        approach: 'origin_destination',
+        approach: 'origin_first_ping',
         description: 'First GPS ping of each device-day, reverse geocoded to postal code.',
-        accuracyThresholdMeters: od.methodology.accuracyThresholdMeters,
-        coordinatePrecision: od.methodology.coordinatePrecision,
       },
       coverage: {
-        totalDevicesVisitedPois: od.coverage.totalDevicesVisitedPois,
-        totalDeviceDays: od.coverage.totalDeviceDays,
+        totalDevicesVisitedPois: res.totalDevicesVisitedPois,
+        totalDeviceDays: res.totalDeviceDays,
         devicesMatchedToZipcode: totalMatched,
-        devicesWithOrigin: od.coverage.devicesWithOrigin,
-        originZipcodes: od.coverage.originZipcodes,
-        geocodingComplete: od.coverage.geocodingComplete,
-        classificationRatePercent: od.coverage.coverageRatePercent,
+        geocodingComplete: res.geocodingComplete,
+        classificationRatePercent: res.coverageRatePercent,
       },
       summary: {
-        totalDevicesInDataset: od.coverage.totalDevicesVisitedPois,
+        totalDevicesInDataset: res.totalDevicesVisitedPois,
         devicesMatchedToZipcode: totalMatched,
         totalZipcodes: zipcodes.length,
         topZipcode: zipcodes[0]?.zipcode ?? null,

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getJob } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { logger } from '@/lib/logger';
-import { analyzeOriginDestination } from '@/lib/dataset-analyzer-od';
+import { analyzeOrigins } from '@/lib/dataset-analyzer-od';
 import { getConfig, putConfig, BUCKET } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
@@ -105,9 +105,9 @@ export async function GET(
     console.log(`[CATCHMENT-OD] Computing origin analysis for job ${jobId}, dataset: ${datasetName}`);
     logger.log(`Computing catchment-od for job ${jobId}, dataset: ${datasetName}`);
 
-    let od;
+    let res;
     try {
-      od = await analyzeOriginDestination(datasetName, {});
+      res = await analyzeOrigins(datasetName, {});
     } catch (error: any) {
       console.error(`[CATCHMENT-OD ERROR] Analysis failed:`, error.message);
       logger.error(`Catchment-OD analysis failed for job ${jobId}`, { error: error.message });
@@ -146,7 +146,7 @@ export async function GET(
     }
 
     // 6. Build response — backward compatible with cloud-garritz
-    const zipcodes = od.origins.map((z) => ({
+    const zipcodes = res.origins.map((z) => ({
       zipcode: z.zipcode,
       city: z.city,
       province: z.province,
@@ -161,24 +161,20 @@ export async function GET(
 
     const response = {
       job_id: jobId,
-      analyzed_at: od.analyzedAt,
+      analyzed_at: res.analyzedAt,
       methodology: {
-        approach: 'origin_destination',
+        approach: 'origin_first_ping',
         description: 'First GPS ping of each device-day, reverse geocoded to postal code.',
-        accuracyThresholdMeters: od.methodology.accuracyThresholdMeters,
-        coordinatePrecision: od.methodology.coordinatePrecision,
       },
       coverage: {
-        totalDevicesVisitedPois: od.coverage.totalDevicesVisitedPois,
-        totalDeviceDays: od.coverage.totalDeviceDays,
-        devicesWithOrigin: od.coverage.devicesWithOrigin,
+        totalDevicesVisitedPois: res.totalDevicesVisitedPois,
+        totalDeviceDays: res.totalDeviceDays,
         devicesMatchedToZipcode: totalMatched,
-        originZipcodes: od.coverage.originZipcodes,
-        coverageRatePercent: od.coverage.coverageRatePercent,
-        geocodingComplete: od.coverage.geocodingComplete,
+        coverageRatePercent: res.coverageRatePercent,
+        geocodingComplete: res.geocodingComplete,
       },
       summary: {
-        total_devices_analyzed: od.coverage.totalDevicesVisitedPois,
+        total_devices_analyzed: res.totalDevicesVisitedPois,
         devices_matched_to_zipcode: totalMatched,
         total_zipcodes: zipcodes.length,
         top_zipcode: zipcodes[0]?.zipcode ?? null,

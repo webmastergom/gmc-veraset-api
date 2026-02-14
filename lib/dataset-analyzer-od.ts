@@ -378,6 +378,175 @@ export async function analyzeOriginDestination(
   };
 }
 
+/**
+ * Lightweight origin-only analysis for catchment.
+ * Uses MIN_BY instead of window functions — much faster for large datasets.
+ * Only computes origins (first ping of each device-day), not destinations.
+ */
+export interface OriginsResult {
+  dataset: string;
+  analyzedAt: string;
+  totalDevicesVisitedPois: number;
+  totalDeviceDays: number;
+  origins: ODZipcode[];
+  geocodingComplete: boolean;
+  coverageRatePercent: number;
+}
+
+export async function analyzeOrigins(
+  datasetName: string,
+  filters: ODFilters = {}
+): Promise<OriginsResult> {
+  const tableName = getTableName(datasetName);
+
+  console.log(`[ORIGINS] Starting origin analysis for dataset: ${datasetName}`);
+
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    throw new Error('AWS credentials not configured.');
+  }
+
+  // Ensure table exists
+  try {
+    await createTableForDataset(datasetName);
+  } catch (error: any) {
+    if (!error.message?.includes('already exists')) {
+      if (error.message?.includes('not authorized') || error.message?.includes('Access denied')) {
+        throw new Error(`Athena access denied. Original error: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  // Build WHERE conditions
+  const dateConditions: string[] = [];
+  if (filters.dateFrom) dateConditions.push(`date >= '${filters.dateFrom}'`);
+  if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
+  const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+  let poiFilter = '';
+  if (filters.poiIds?.length) {
+    const poiList = filters.poiIds.map(p => `'${p.replace(/'/g, "''")}'`).join(',');
+    poiFilter = `AND poi_id IN (${poiList})`;
+  }
+
+  // Optimized query: MIN_BY to get first ping coordinates per device-day
+  // No window functions, no self-join on all_pings — just one pass
+  const originsQuery = `
+    WITH
+    poi_visitors AS (
+      SELECT DISTINCT ad_id
+      FROM ${tableName}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${dateWhere} ${poiFilter}
+    ),
+    valid_pings AS (
+      SELECT
+        t.ad_id,
+        t.date,
+        t.utc_timestamp,
+        TRY_CAST(t.latitude AS DOUBLE) as lat,
+        TRY_CAST(t.longitude AS DOUBLE) as lng
+      FROM ${tableName} t
+      INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
+      WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        ${dateWhere}
+    ),
+    first_pings AS (
+      SELECT
+        ad_id,
+        date,
+        MIN_BY(lat, utc_timestamp) as origin_lat,
+        MIN_BY(lng, utc_timestamp) as origin_lng
+      FROM valid_pings
+      GROUP BY ad_id, date
+    )
+    SELECT
+      ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      COUNT(*) as device_days
+    FROM first_pings
+    GROUP BY
+      ROUND(origin_lat, ${COORDINATE_PRECISION}),
+      ROUND(origin_lng, ${COORDINATE_PRECISION})
+    ORDER BY device_days DESC
+    LIMIT 100000
+  `;
+
+  const totalQuery = `
+    SELECT COUNT(DISTINCT ad_id) as total_devices
+    FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      ${dateWhere} ${poiFilter}
+  `;
+
+  console.log(`[ORIGINS] Executing queries in parallel...`);
+  const [originsRes, totalRes] = await Promise.all([
+    runQuery(originsQuery),
+    runQuery(totalQuery),
+  ]);
+
+  const totalDevices = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
+  console.log(`[ORIGINS] Total devices: ${totalDevices}, origin clusters: ${originsRes.rows.length}`);
+
+  if (totalDevices === 0 || originsRes.rows.length === 0) {
+    return {
+      dataset: datasetName,
+      analyzedAt: new Date().toISOString(),
+      totalDevicesVisitedPois: totalDevices,
+      totalDeviceDays: 0,
+      origins: [],
+      geocodingComplete: true,
+      coverageRatePercent: 0,
+    };
+  }
+
+  let totalDeviceDays = 0;
+  const originPoints = originsRes.rows.map(row => {
+    const deviceDays = parseInt(String(row.device_days)) || 0;
+    totalDeviceDays += deviceDays;
+    return {
+      lat: parseFloat(String(row.origin_lat)),
+      lng: parseFloat(String(row.origin_lng)),
+      deviceCount: deviceDays,
+    };
+  }).filter(p => !isNaN(p.lat) && !isNaN(p.lng));
+
+  console.log(`[ORIGINS] Reverse geocoding ${originPoints.length} origin clusters...`);
+  const classified = await batchReverseGeocode(originPoints);
+  const agg = aggregateByZipcode(classified, totalDeviceDays);
+
+  const origins: ODZipcode[] = agg.zipcodes.map(z => ({
+    zipcode: z.zipcode,
+    city: z.city,
+    province: z.province,
+    region: z.region,
+    devices: z.devices,
+    percentOfTotal: z.percentOfTotal,
+    source: z.source,
+  }));
+
+  const devicesWithOrigin = origins.reduce((s, z) => s + z.devices, 0);
+
+  console.log(`[ORIGINS] Done: ${origins.length} zipcodes, ${devicesWithOrigin} device-days matched`);
+
+  return {
+    dataset: datasetName,
+    analyzedAt: new Date().toISOString(),
+    totalDevicesVisitedPois: totalDevices,
+    totalDeviceDays,
+    origins,
+    geocodingComplete: agg.nominatimTruncated === 0,
+    coverageRatePercent: totalDeviceDays > 0
+      ? Math.round((devicesWithOrigin / totalDeviceDays) * 10000) / 100
+      : 0,
+  };
+}
+
 function buildEmptyResult(datasetName: string, filters: ODFilters): ODAnalysisResult {
   return {
     dataset: datasetName,
