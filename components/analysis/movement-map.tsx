@@ -29,6 +29,17 @@ function getDeviceColor(index: number): string {
   return COLORS[index % COLORS.length];
 }
 
+export const POI_COLORS = [
+  { label: 'Red', fill: '#ef4444', border: '#b91c1c' },
+  { label: 'Blue', fill: '#3b82f6', border: '#1d4ed8' },
+  { label: 'Green', fill: '#22c55e', border: '#15803d' },
+  { label: 'Orange', fill: '#f97316', border: '#c2410c' },
+  { label: 'Purple', fill: '#a855f7', border: '#7e22ce' },
+  { label: 'Cyan', fill: '#06b6d4', border: '#0e7490' },
+  { label: 'Pink', fill: '#ec4899', border: '#be185d' },
+  { label: 'Yellow', fill: '#eab308', border: '#a16207' },
+];
+
 const MapContent = dynamic(
   () => import('./movement-map-inner').then((m) => m.MovementMapInner),
   {
@@ -55,6 +66,8 @@ export function MovementMap({ datasetName, dateFrom, dateTo }: MovementMapProps)
   const [filterOpen, setFilterOpen] = useState(true);
   const [showPois, setShowPois] = useState(true);
   const [poiPositions, setPoiPositions] = useState<Array<{ poiId: string; lat: number; lng: number; name?: string }>>([]);
+  const [poiRadius, setPoiRadius] = useState(8);
+  const [poiColorIndex, setPoiColorIndex] = useState(0);
 
   const fetchMovements = useCallback(async () => {
     setLoading(true);
@@ -127,6 +140,8 @@ export function MovementMap({ datasetName, dateFrom, dateTo }: MovementMapProps)
     return filteredDevices.map((d) => idxMap.get(d.adId) ?? 0);
   }, [data, filteredDevices]);
 
+  const poiColor = POI_COLORS[poiColorIndex];
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -141,15 +156,49 @@ export function MovementMap({ datasetName, dateFrom, dateTo }: MovementMapProps)
         </div>
         <div className="flex items-center gap-4">
           {poiPositions.length > 0 ? (
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
               <Switch
                 id="show-pois"
                 checked={showPois}
                 onCheckedChange={setShowPois}
               />
               <Label htmlFor="show-pois" className="text-sm cursor-pointer whitespace-nowrap">
-                POIs on map ({poiPositions.length})
+                POIs ({poiPositions.length})
               </Label>
+              {showPois && (
+                <>
+                  {/* Color picker */}
+                  <div className="flex items-center gap-1">
+                    {POI_COLORS.map((c, i) => (
+                      <button
+                        key={c.label}
+                        type="button"
+                        title={c.label}
+                        className="h-4 w-4 rounded-full border transition-transform"
+                        style={{
+                          backgroundColor: c.fill,
+                          borderColor: i === poiColorIndex ? '#fff' : c.border,
+                          transform: i === poiColorIndex ? 'scale(1.3)' : 'scale(1)',
+                        }}
+                        onClick={() => setPoiColorIndex(i)}
+                      />
+                    ))}
+                  </div>
+                  {/* Size slider */}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">Size</span>
+                    <input
+                      type="range"
+                      min={2}
+                      max={20}
+                      value={poiRadius}
+                      onChange={(e) => setPoiRadius(Number(e.target.value))}
+                      className="w-16 h-4 accent-current"
+                      style={{ accentColor: poiColor.fill }}
+                    />
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <span className="text-xs text-muted-foreground" title="POI positions come from job config. External or place_key jobs may not have coordinates.">
@@ -245,6 +294,9 @@ export function MovementMap({ datasetName, dateFrom, dateTo }: MovementMapProps)
                   deviceIndices={deviceIndices}
                   getColor={getDeviceColor}
                   pois={showPois ? poiPositions : []}
+                  poiRadius={poiRadius}
+                  poiFillColor={poiColor.fill}
+                  poiBorderColor={poiColor.border}
                 />
               </div>
             </div>

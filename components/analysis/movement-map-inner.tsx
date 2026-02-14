@@ -24,6 +24,9 @@ interface MovementMapInnerProps {
   deviceIndices: number[];
   getColor: (index: number) => string;
   pois?: PoiPosition[];
+  poiRadius?: number;
+  poiFillColor?: string;
+  poiBorderColor?: string;
 }
 
 function FitBounds({ devices }: { devices: DeviceMovement[] }) {
@@ -45,7 +48,15 @@ function FitBounds({ devices }: { devices: DeviceMovement[] }) {
   return null;
 }
 
-export function MovementMapInner({ devices, deviceIndices, getColor, pois = [] }: MovementMapInnerProps) {
+export function MovementMapInner({
+  devices,
+  deviceIndices,
+  getColor,
+  pois = [],
+  poiRadius = 8,
+  poiFillColor = '#ef4444',
+  poiBorderColor = '#b91c1c',
+}: MovementMapInnerProps) {
   return (
     <MapContainer
       center={[40.4, -3.7]}
@@ -78,11 +89,11 @@ export function MovementMapInner({ devices, deviceIndices, getColor, pois = [] }
         <CircleMarker
           key={p.poiId}
           center={[p.lat, p.lng]}
-          radius={12}
+          radius={poiRadius}
           pathOptions={{
-            color: '#b91c1c',
-            fillColor: '#ef4444',
-            fillOpacity: 0.9,
+            color: poiBorderColor,
+            fillColor: poiFillColor,
+            fillOpacity: 0.85,
             weight: 2,
           }}
         >
