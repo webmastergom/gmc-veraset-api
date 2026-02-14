@@ -307,39 +307,52 @@ export default function LaboratoryPage() {
       const decoder = new TextDecoder();
       let buffer = '';
       let gotResult = false;
+      let backendError = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
 
-        let eventType = '';
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            eventType = line.slice(7).trim();
-          } else if (line.startsWith('data: ') && eventType) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (eventType === 'progress') {
-                setProgress(data);
-              } else if (eventType === 'result') {
-                gotResult = true;
-                setResult(data);
-                setPhase('results');
-                setProgress(null);
-              }
-            } catch { /* ignore parse errors */ }
-            eventType = '';
+        // SSE messages are delimited by double newlines
+        const messages = buffer.split('\n\n');
+        buffer = messages.pop() || ''; // keep incomplete message in buffer
+
+        for (const msg of messages) {
+          const lines = msg.split('\n');
+          let eventType = '';
+          let dataStr = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              dataStr += line.slice(6);
+            }
           }
+          if (!eventType || !dataStr) continue;
+          try {
+            const data = JSON.parse(dataStr);
+            if (eventType === 'progress') {
+              // Detect backend error sent as progress event
+              if (data.step === 'error') {
+                backendError = data.message || 'Analysis failed';
+              } else {
+                setProgress(data);
+              }
+            } else if (eventType === 'result') {
+              gotResult = true;
+              setResult(data);
+              setPhase('results');
+              setProgress(null);
+            }
+          } catch { /* ignore parse errors */ }
         }
       }
 
-      // If stream ended without a result event, go back to recipe
+      // Handle end of stream
       if (!gotResult) {
-        setError('Analysis completed but no results were returned. Please try again.');
+        setError(backendError || 'Analysis completed but no results were returned. Please try again.');
         setPhase('recipe');
         setProgress(null);
       }
@@ -727,26 +740,55 @@ export default function LaboratoryPage() {
           <Card className="border-border overflow-hidden">
             <CardContent className="pt-8 pb-6">
               {/* Recipe summary */}
-              <div className="flex items-center gap-3 p-3 mb-6 rounded-xl bg-secondary/50 border border-border">
-                <Beaker className="w-4 h-4 text-theme-accent shrink-0" />
-                <div className="flex-1 min-w-0 flex items-center gap-2 flex-wrap">
-                  <span className="text-sm font-medium truncate">
-                    {recipeName || 'Experiment'}
-                  </span>
+              <div className="mb-6 rounded-xl bg-secondary/50 border border-border overflow-hidden">
+                {/* Header row */}
+                <div className="flex items-center gap-3 px-4 py-3 border-b border-border/50">
+                  <Beaker className="w-4 h-4 text-theme-accent shrink-0" />
+                  <span className="text-sm font-semibold">{recipeName || 'Experiment'}</span>
                   <span className="text-xs text-muted-foreground">|</span>
-                  <span className="text-xs text-muted-foreground truncate">
-                    {selectedDataset?.name || 'Dataset'}
-                  </span>
+                  <span className="text-xs text-muted-foreground truncate">{selectedDataset?.name || 'Dataset'}</span>
                   <span className="text-xs text-muted-foreground">|</span>
-                  <span className="text-xs text-muted-foreground">
-                    {selectedCountry && COUNTRY_FLAGS[selectedCountry]} {selectedCountry}
-                  </span>
+                  <span className="text-xs text-muted-foreground">{selectedCountry && COUNTRY_FLAGS[selectedCountry]} {selectedCountry}</span>
                   <span className="text-xs text-muted-foreground">|</span>
                   <span className="text-xs text-muted-foreground">
                     {recipeSteps.filter(s => s.categories.length > 0).length} step{recipeSteps.filter(s => s.categories.length > 0).length !== 1 ? 's' : ''} ({recipeLogic}{recipeOrdered ? ', ordered' : ''})
                   </span>
+                  <div className="flex-1" />
+                  <Loader2 className="w-4 h-4 animate-spin text-theme-accent shrink-0" />
                 </div>
-                <Loader2 className="w-4 h-4 animate-spin text-theme-accent shrink-0" />
+                {/* Step details */}
+                <div className="px-4 py-3 space-y-2">
+                  {recipeSteps.filter(s => s.categories.length > 0).map((step, i) => (
+                    <div key={step.id} className="flex items-start gap-2 text-xs">
+                      <span className="text-theme-accent font-mono font-medium shrink-0 mt-0.5">
+                        {recipeSteps.filter(s => s.categories.length > 0).length > 1 ? `S${i + 1}` : '#'}
+                      </span>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-foreground font-medium">
+                          {step.categories.map(c => CATEGORY_LABELS[c]).join(', ')}
+                        </span>
+                        {step.timeWindow && (
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 border-muted-foreground/30">
+                            <Clock className="w-2.5 h-2.5 mr-0.5" />
+                            {String(step.timeWindow.hourFrom).padStart(2, '0')}:00–{String(step.timeWindow.hourTo).padStart(2, '0')}:00
+                          </Badge>
+                        )}
+                        {(step.minDwellMinutes || step.maxDwellMinutes) && (
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 border-muted-foreground/30">
+                            <Timer className="w-2.5 h-2.5 mr-0.5" />
+                            {step.minDwellMinutes ? `${step.minDwellMinutes}min` : '0'}–{step.maxDwellMinutes ? `${step.maxDwellMinutes}min` : '\u221e'}
+                          </Badge>
+                        )}
+                        {step.minFrequency && step.minFrequency > 1 && (
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 border-muted-foreground/30">
+                            <Hash className="w-2.5 h-2.5 mr-0.5" />
+                            {step.minFrequency}+ visits
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
               <div className="flex items-center justify-between mb-8">
                 {PROGRESS_STEPS.map((step, i) => {
