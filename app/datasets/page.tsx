@@ -174,8 +174,8 @@ export default function DatasetsPage() {
           comparison = a.name.localeCompare(b.name);
           break;
         case 'date':
-          const dateA = a.dateRange?.to || a.lastModified || '0000';
-          const dateB = b.dateRange?.to || b.lastModified || '0000';
+          const dateA = a.syncedAt || a.lastModified || '0000';
+          const dateB = b.syncedAt || b.lastModified || '0000';
           comparison = dateA.localeCompare(dateB);
           break;
         case 'size':

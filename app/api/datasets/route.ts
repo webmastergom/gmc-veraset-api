@@ -98,10 +98,10 @@ export async function GET() {
       }
     }
 
-    // Sort by date descending (newest first)
+    // Sort by sync date descending (most recently synced first)
     datasets.sort((a, b) => {
-      const dateA = a.dateRange?.to || a.lastModified || '0000';
-      const dateB = b.dateRange?.to || b.lastModified || '0000';
+      const dateA = a.syncedAt || a.lastModified || '0000';
+      const dateB = b.syncedAt || b.lastModified || '0000';
       return dateB.localeCompare(dateA);
     });
 
