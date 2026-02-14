@@ -84,8 +84,8 @@ export async function GET(
     const s3Path = job.s3DestPath.replace('s3://', '').replace(`${BUCKET}/`, '');
     const datasetName = s3Path.split('/').filter(Boolean)[0] || s3Path.replace(/\/$/, '');
 
-    // 4. Check cache (v4 = OD-based catchment)
-    const CATCHMENT_VERSION = 'v4';
+    // 4. Check cache (v5 = multi-country GeoJSON, no Nominatim)
+    const CATCHMENT_VERSION = 'v5';
     const cacheKey = `catchment-${CATCHMENT_VERSION}-${jobId}`;
     try {
       const cached = await getConfig<any>(cacheKey);

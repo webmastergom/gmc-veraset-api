@@ -11,7 +11,8 @@ import {
   LogOut,
   ChevronRight,
   ShieldCheck,
-  Key
+  Key,
+  FlaskConical,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -21,6 +22,7 @@ const navigation = [
   { name: 'POIs', href: '/pois', icon: MapPin },
   { name: 'Jobs', href: '/jobs', icon: Briefcase },
   { name: 'Datasets', href: '/datasets', icon: Database },
+  { name: 'Laboratory', href: '/laboratory', icon: FlaskConical },
   { name: 'Audit', href: '/audit', icon: ShieldCheck },
   { name: 'API Keys', href: '/api-keys', icon: Key },
 ]

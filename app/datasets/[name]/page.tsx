@@ -26,6 +26,10 @@ import {
   ShieldCheck,
   AlertTriangle,
   CheckCircle,
+  Database,
+  Search,
+  MapPinned,
+  BarChart3,
 } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -37,6 +41,7 @@ import {
 } from '@/components/ui/dialog';
 import type { DailyData, VisitByPoi } from '@/lib/dataset-analysis';
 import { MovementMap } from '@/components/analysis/movement-map';
+import { Progress } from '@/components/ui/progress';
 import { useToast } from '@/hooks/use-toast';
 
 interface DatasetInfo {
@@ -104,6 +109,12 @@ export default function DatasetAnalysisPage() {
     summary: { totalZipcodes: number; devicesMatchedToZipcode: number };
   } | null>(null);
   const [loadingCatchment, setLoadingCatchment] = useState(false);
+  const [catchmentProgress, setCatchmentProgress] = useState<{
+    step: string;
+    percent: number;
+    message: string;
+    detail?: string;
+  } | null>(null);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditResult, setAuditResult] = useState<{
     datasetName: string;
@@ -250,31 +261,76 @@ export default function DatasetAnalysisPage() {
     );
   };
 
-  const loadCatchment = async () => {
+  const loadCatchment = () => {
     setLoadingCatchment(true);
     setCatchment(null);
-    try {
-      const res = await fetch(`/api/datasets/${datasetName}/catchment`, {
-        credentials: 'include',
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.details || err.error || res.statusText);
-      }
-      const data = await res.json();
-      setCatchment({
-        zipcodes: data.zipcodes || [],
-        coverage: data.coverage,
-        summary: {
-          totalZipcodes: data.summary?.totalZipcodes ?? 0,
-          devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
-        },
-      });
-    } catch (e: any) {
-      alert(`Catchment failed: ${e.message || 'Unknown error'}`);
-    } finally {
+    setCatchmentProgress({ step: 'initializing', percent: 0, message: 'Starting analysis...' });
+
+    const es = new EventSource(`/api/datasets/${datasetName}/catchment/stream`);
+
+    es.addEventListener('progress', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setCatchmentProgress({
+          step: data.step,
+          percent: data.percent,
+          message: data.message,
+          detail: data.detail,
+        });
+        if (data.step === 'error') {
+          es.close();
+          setLoadingCatchment(false);
+          alert(`Catchment failed: ${data.message}`);
+        }
+      } catch { /* ignore parse errors */ }
+    });
+
+    es.addEventListener('result', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setCatchment({
+          zipcodes: data.zipcodes || [],
+          coverage: data.coverage,
+          summary: {
+            totalZipcodes: data.summary?.totalZipcodes ?? 0,
+            devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
+          },
+        });
+      } catch { /* ignore */ }
+      es.close();
       setLoadingCatchment(false);
-    }
+      setCatchmentProgress(null);
+    });
+
+    es.onerror = () => {
+      es.close();
+      // If we didn't get a result yet, try the regular endpoint as fallback
+      if (!catchment) {
+        setCatchmentProgress({ step: 'running_queries', percent: 50, message: 'Reconnecting...', detail: 'Falling back to standard request' });
+        fetch(`/api/datasets/${datasetName}/catchment`, { credentials: 'include' })
+          .then((res) => {
+            if (!res.ok) throw new Error(res.statusText);
+            return res.json();
+          })
+          .then((data) => {
+            setCatchment({
+              zipcodes: data.zipcodes || [],
+              coverage: data.coverage,
+              summary: {
+                totalZipcodes: data.summary?.totalZipcodes ?? 0,
+                devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
+              },
+            });
+          })
+          .catch((e) => {
+            alert(`Catchment failed: ${e.message || 'Unknown error'}`);
+          })
+          .finally(() => {
+            setLoadingCatchment(false);
+            setCatchmentProgress(null);
+          });
+      }
+    };
   };
 
   const runAudit = async () => {
@@ -538,7 +594,52 @@ export default function DatasetAnalysisPage() {
                 </div>
               </CardHeader>
               <CardContent>
-                {catchment ? (
+                {loadingCatchment && catchmentProgress ? (
+                  <div className="space-y-4 py-2">
+                    {/* Step indicators */}
+                    <div className="space-y-2">
+                      {[
+                        { key: 'initializing', label: 'Initializing', icon: Database },
+                        { key: 'preparing_table', label: 'Preparing table', icon: Database },
+                        { key: 'running_queries', label: 'Running Athena queries', icon: Search },
+                        { key: 'geocoding', label: 'Geocoding coordinates', icon: MapPinned },
+                        { key: 'aggregating', label: 'Aggregating results', icon: BarChart3 },
+                      ].map((s, i) => {
+                        const stepOrder = ['initializing', 'preparing_table', 'running_queries', 'geocoding', 'aggregating', 'completed'];
+                        const currentIdx = stepOrder.indexOf(catchmentProgress.step);
+                        const thisIdx = stepOrder.indexOf(s.key);
+                        const isActive = catchmentProgress.step === s.key;
+                        const isDone = currentIdx > thisIdx;
+                        const Icon = s.icon;
+                        return (
+                          <div key={s.key} className={`flex items-center gap-3 text-sm transition-all ${isActive ? 'text-white' : isDone ? 'text-green-500' : 'text-muted-foreground/40'}`}>
+                            {isDone ? (
+                              <CheckCircle className="h-4 w-4 shrink-0 text-green-500" />
+                            ) : isActive ? (
+                              <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                            ) : (
+                              <Icon className="h-4 w-4 shrink-0" />
+                            )}
+                            <span className={isActive ? 'font-medium' : ''}>{s.label}</span>
+                            {isActive && catchmentProgress.detail && (
+                              <span className="ml-auto text-xs text-muted-foreground truncate max-w-[200px]">
+                                {catchmentProgress.detail}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {/* Progress bar */}
+                    <div className="space-y-1">
+                      <Progress value={catchmentProgress.percent} className="h-2" />
+                      <div className="flex justify-between text-xs text-muted-foreground">
+                        <span>{catchmentProgress.message}</span>
+                        <span>{catchmentProgress.percent}%</span>
+                      </div>
+                    </div>
+                  </div>
+                ) : catchment ? (
                   <>
                     {catchment.coverage && (
                       <div className="mb-4 space-y-3">

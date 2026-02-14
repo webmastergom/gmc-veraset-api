@@ -393,12 +393,23 @@ export interface OriginsResult {
   coverageRatePercent: number;
 }
 
+/** Progress callback for streaming updates during analysis */
+export type OriginsProgressCallback = (progress: {
+  step: 'initializing' | 'preparing_table' | 'running_queries' | 'geocoding' | 'aggregating' | 'completed' | 'error';
+  percent: number;
+  message: string;
+  detail?: string;
+}) => void;
+
 export async function analyzeOrigins(
   datasetName: string,
-  filters: ODFilters = {}
+  filters: ODFilters = {},
+  onProgress?: OriginsProgressCallback
 ): Promise<OriginsResult> {
   const tableName = getTableName(datasetName);
+  const report = onProgress || (() => {});
 
+  report({ step: 'initializing', percent: 0, message: 'Validating configuration...' });
   console.log(`[ORIGINS] Starting origin analysis for dataset: ${datasetName}`);
 
   if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
@@ -406,6 +417,7 @@ export async function analyzeOrigins(
   }
 
   // Ensure table exists
+  report({ step: 'preparing_table', percent: 5, message: 'Preparing Athena table...', detail: tableName });
   try {
     await createTableForDataset(datasetName);
   } catch (error: any) {
@@ -416,6 +428,7 @@ export async function analyzeOrigins(
       throw error;
     }
   }
+  report({ step: 'preparing_table', percent: 10, message: 'Table ready' });
 
   // Build WHERE conditions
   const dateConditions: string[] = [];
@@ -484,16 +497,19 @@ export async function analyzeOrigins(
       ${dateWhere} ${poiFilter}
   `;
 
+  report({ step: 'running_queries', percent: 15, message: 'Running Athena queries...', detail: 'Scanning origin pings and counting devices' });
   console.log(`[ORIGINS] Executing queries in parallel...`);
   const [originsRes, totalRes] = await Promise.all([
     runQuery(originsQuery),
     runQuery(totalQuery),
   ]);
+  report({ step: 'running_queries', percent: 60, message: 'Queries complete', detail: `${originsRes.rows.length} origin clusters found` });
 
   const totalDevices = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
   console.log(`[ORIGINS] Total devices: ${totalDevices}, origin clusters: ${originsRes.rows.length}`);
 
   if (totalDevices === 0 || originsRes.rows.length === 0) {
+    report({ step: 'completed', percent: 100, message: 'No data found' });
     return {
       dataset: datasetName,
       analyzedAt: new Date().toISOString(),
@@ -516,8 +532,12 @@ export async function analyzeOrigins(
     };
   }).filter(p => !isNaN(p.lat) && !isNaN(p.lng));
 
+  report({ step: 'geocoding', percent: 65, message: 'Reverse geocoding origins...', detail: `${originPoints.length} coordinate clusters → postal codes` });
   console.log(`[ORIGINS] Reverse geocoding ${originPoints.length} origin clusters...`);
   const classified = await batchReverseGeocode(originPoints);
+  report({ step: 'geocoding', percent: 85, message: 'Geocoding complete' });
+
+  report({ step: 'aggregating', percent: 90, message: 'Aggregating by postal code...' });
   const agg = aggregateByZipcode(classified, totalDeviceDays);
 
   const origins: ODZipcode[] = agg.zipcodes.map(z => ({
@@ -533,6 +553,7 @@ export async function analyzeOrigins(
   const devicesWithOrigin = origins.reduce((s, z) => s + z.devices, 0);
 
   console.log(`[ORIGINS] Done: ${origins.length} zipcodes, ${devicesWithOrigin} device-days matched`);
+  report({ step: 'completed', percent: 100, message: 'Analysis complete', detail: `${origins.length} postal codes identified` });
 
   return {
     dataset: datasetName,

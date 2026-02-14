@@ -29,6 +29,10 @@ Thumbs.db
 *.log
 npm-debug.log*
 
+# GeoJSON country data (271MB — copied from cloud-garritz, not tracked in git)
+# Deploy via `cp ~/dev/py/GMC/cloud-garritz/src/data/geojson/*.geojson data/geojson/`
+data/geojson/
+
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
