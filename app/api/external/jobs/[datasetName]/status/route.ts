@@ -101,6 +101,7 @@ export async function GET(
       const results = await getJobResults(jobId, job);
       return NextResponse.json({
         job_id: jobId,
+        name: job.name || null,
         status: currentStatus,
         created_at: job.createdAt,
         completed_at: job.updatedAt,
@@ -113,6 +114,7 @@ export async function GET(
     if (currentStatus === 'FAILED') {
       return NextResponse.json({
         job_id: jobId,
+        name: job.name || null,
         status: currentStatus,
         created_at: job.createdAt,
         error: job.errorMessage || 'Job processing failed',
@@ -123,6 +125,7 @@ export async function GET(
     // QUEUED or RUNNING
     return NextResponse.json({
       job_id: jobId,
+      name: job.name || null,
       status: currentStatus,
       created_at: job.createdAt,
       updated_at: job.updatedAt,
