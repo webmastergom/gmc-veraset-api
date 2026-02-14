@@ -1,33 +1,25 @@
 /**
  * Affinity Index Laboratory types.
  *
- * The laboratory computes affinity indices (0–100) by postal code based on
- * visits to different POI categories.
+ * The laboratory is a workspace for building "recipes" — combinations of
+ * POI categories × time windows × dwell time thresholds — that produce:
  *
- * The affinity index combines three normalized signals:
+ *   1. Segments of ad_ids matching the criteria
+ *   2. Affinity indices (0–100) by postal code of origin
  *
- *   1. Visit Concentration (40%):
- *      How much a postal code over-indexes on a category vs national average.
- *      Raw ratio capped at 5x, then scaled 0–100.
+ * Data flow:
+ *   Movement dataset (from synced job)
+ *     → pings near real POIs (from pois_gmc parquets, spatial join)
+ *       → filter by category + time + dwell
+ *         → segment of ad_ids + origin geocode → affinity by zipcode
  *
- *   2. Frequency Score (35%):
- *      Average visits per unique device — measures repeat behavior / loyalty.
- *      log2(avgFreq) normalized to 0–100 with cap at 16 visits/device.
- *
- *   3. Time-of-Day Relevance (25%):
- *      Optional boost if visits align with configured time windows
- *      (e.g. gym visits 6–9am score higher than gym visits 2am).
- *      If no time windows configured, evenly distributed.
- *
- *   Final Affinity = 0.40 * concentration + 0.35 * frequency + 0.25 * temporal
- *   Rounded to integer 0–100.
- *
- *   0  = no affinity (no visits or far below average)
- *   50 = average affinity
- *   100 = maximum affinity (strong concentration + high frequency + relevant timing)
+ * Affinity index 0–100 combines:
+ *   - Concentration (40%): zipcode over-index vs national average
+ *   - Frequency (35%): avg visits per device (repeat behavior)
+ *   - Dwell depth (25%): avg dwell time vs category median
  */
 
-// ── POI categories (27 from Overture/GMC) ──────────────────────────────
+// ── POI categories (27 real categories from pois_gmc parquets) ─────────
 export const POI_CATEGORIES = [
   'restaurant', 'hotel', 'clothing_store', 'bar', 'supermarket',
   'gym', 'cafe', 'pharmacy', 'gas_station', 'fast_food_restaurant',
@@ -39,7 +31,6 @@ export const POI_CATEGORIES = [
 
 export type PoiCategory = typeof POI_CATEGORIES[number];
 
-// Human-readable category labels
 export const CATEGORY_LABELS: Record<PoiCategory, string> = {
   restaurant: 'Restaurants',
   hotel: 'Hotels',
@@ -75,7 +66,7 @@ export interface CategoryGroup {
   label: string;
   icon: string;
   categories: PoiCategory[];
-  color: string; // tailwind color class
+  color: string;
 }
 
 export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
@@ -123,7 +114,6 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
   },
 };
 
-// Reverse lookup: category → group key
 export function getCategoryGroup(cat: PoiCategory): string {
   for (const [key, g] of Object.entries(CATEGORY_GROUPS)) {
     if (g.categories.includes(cat)) return key;
@@ -131,94 +121,71 @@ export function getCategoryGroup(cat: PoiCategory): string {
   return 'other';
 }
 
-// ── Supported countries ────────────────────────────────────────────────
-export interface LabCountry {
-  code: string;        // ISO 2-letter (FR, DE, ES)
-  name: string;
-  flag: string;        // emoji
-  datasetName: string; // Athena dataset name — must match S3 prefix
-  poiParquetKey: string;  // S3 key for POI parquet
-  totalPois: number;
-  cities: string[];    // Top cities
+// ── Recipe: a single category criterion ────────────────────────────────
+export interface RecipeStep {
+  id: string;
+  categories: PoiCategory[];         // one or more categories (OR within step)
+  timeWindow?: {
+    hourFrom: number;                 // 0-23
+    hourTo: number;                   // 0-23
+  };
+  minDwellMinutes?: number;           // minimum dwell time in minutes
+  maxDwellMinutes?: number;           // maximum dwell time
+  minFrequency?: number;              // minimum visits in date range
 }
 
-export const LAB_COUNTRIES: LabCountry[] = [
-  {
-    code: 'FR',
-    name: 'France',
-    flag: '🇫🇷',
-    datasetName: 'france_gmc_25k',
-    poiParquetKey: 'pois_gmc/france_pois_gmc.parquet',
-    totalPois: 645989,
-    cities: ['Paris', 'Marseille', 'Lyon', 'Toulouse', 'Nice', 'Nantes', 'Strasbourg', 'Montpellier', 'Bordeaux', 'Lille'],
-  },
-  {
-    code: 'DE',
-    name: 'Germany',
-    flag: '🇩🇪',
-    datasetName: 'germany_gmc_25k',
-    poiParquetKey: 'pois_gmc/germany_pois_gmc.parquet',
-    totalPois: 465054,
-    cities: ['Berlin', 'Hamburg', 'Munich', 'Cologne', 'Frankfurt', 'Stuttgart', 'Düsseldorf', 'Dortmund', 'Essen', 'Leipzig'],
-  },
-  {
-    code: 'ES',
-    name: 'Spain',
-    flag: '🇪🇸',
-    datasetName: 'spain_gmc_25k',
-    poiParquetKey: 'pois_gmc/spain_pois_gmc.parquet',
-    totalPois: 346514,
-    cities: ['Madrid', 'Barcelona', 'Valencia', 'Seville', 'Zaragoza', 'Málaga', 'Murcia', 'Palma', 'Las Palmas', 'Bilbao'],
-  },
-];
+// ── Recipe: the full experiment ────────────────────────────────────────
+export interface Recipe {
+  id: string;
+  name: string;
+  steps: RecipeStep[];
+  logic: 'AND' | 'OR';               // how steps combine
+  ordered: boolean;                   // if AND, must visits happen in step order?
+}
 
-// ── Filters ────────────────────────────────────────────────────────────
-export interface LabFilters {
-  country: string;            // ISO code
-  categories: PoiCategory[];  // selected categories (empty = all 27)
+// ── Lab configuration (wizard output) ──────────────────────────────────
+export interface LabConfig {
+  datasetId: string;                  // S3 folder name (e.g. "job-fa899c22")
+  datasetName: string;                // human-readable name
+  jobId: string;                      // Veraset job ID for poiMapping lookup
+  country: string;                    // ISO 2-letter code for geocoding + POI parquet
   dateFrom?: string;
   dateTo?: string;
-  cities?: string[];          // filter to specific cities
-  minVisits?: number;         // min visits per postal code (noise filter, default 5)
-  timeWindows?: TimeWindow[];
+  recipe: Recipe;
+  minVisitsPerZipcode: number;        // noise filter (default 5)
+  spatialJoinRadiusMeters: number;    // max distance ping↔real POI (default 200m)
 }
 
-export interface TimeWindow {
-  id: string;
-  label: string;         // e.g. "Morning commute"
-  hourFrom: number;      // 0-23 UTC
-  hourTo: number;        // 0-23 UTC
-  weight: number;        // 0-1 weight for temporal score
+// ── Analysis results ───────────────────────────────────────────────────
+
+/** A single device that matched the recipe */
+export interface SegmentDevice {
+  adId: string;
+  matchedSteps: number;               // how many recipe steps matched
+  totalVisits: number;                 // total POI visits
+  avgDwellMinutes: number;             // average dwell time across visits
+  categories: PoiCategory[];           // categories visited
 }
 
-// ── Affinity weights ───────────────────────────────────────────────────
-export const AFFINITY_WEIGHTS = {
-  concentration: 0.40,
-  frequency: 0.35,
-  temporal: 0.25,
-} as const;
-
-export const CONCENTRATION_CAP = 5;  // ratio capped at 5x national avg
-export const FREQUENCY_CAP = 16;     // cap at 16 visits/device
-export const MIN_VISITS_DEFAULT = 5; // min visits to compute affinity
-
-// ── Results ────────────────────────────────────────────────────────────
+/** Affinity record: one postal code × one category */
 export interface AffinityRecord {
   zipcode: string;
   city: string;
   province: string;
   region: string;
   category: PoiCategory;
-  visits: number;            // device-days visiting this category from this zipcode
-  uniqueDevices: number;     // unique devices from this zipcode
-  frequency: number;         // visits / uniqueDevices
-  totalVisits: number;       // total device-days from this zipcode (all categories)
-  concentrationScore: number;  // 0-100
-  frequencyScore: number;     // 0-100
-  temporalScore: number;      // 0-100
-  affinityIndex: number;      // 0-100 composite
+  visits: number;
+  uniqueDevices: number;
+  avgDwellMinutes: number;
+  frequency: number;                   // visits / uniqueDevices
+  totalVisitsFromZipcode: number;
+  concentrationScore: number;          // 0-100
+  frequencyScore: number;              // 0-100
+  dwellScore: number;                  // 0-100
+  affinityIndex: number;               // 0-100 composite
 }
 
+/** Aggregated profile for a postal code */
 export interface ZipcodeProfile {
   zipcode: string;
   city: string;
@@ -226,29 +193,37 @@ export interface ZipcodeProfile {
   region: string;
   totalVisits: number;
   uniqueDevices: number;
-  affinities: Partial<Record<PoiCategory, number>>;  // category → affinity 0-100
+  avgDwellMinutes: number;
+  affinities: Partial<Record<PoiCategory, number>>;
   topCategory: PoiCategory;
   topAffinity: number;
-  dominantGroup: string;  // category group with highest average affinity
+  dominantGroup: string;
 }
 
+/** Full result of a laboratory analysis */
 export interface LabAnalysisResult {
-  country: string;
-  countryName: string;
-  dataset: string;
+  config: LabConfig;
   analyzedAt: string;
-  filters: LabFilters;
+  // Segment
+  segment: {
+    totalDevices: number;
+    devices: SegmentDevice[];           // top N for display (full list exported via CSV)
+  };
+  // Affinity
   records: AffinityRecord[];
   profiles: ZipcodeProfile[];
   stats: LabStats;
 }
 
 export interface LabStats {
-  totalDeviceDays: number;
-  totalUniqueDevices: number;
+  totalPingsAnalyzed: number;
+  totalDevicesInDataset: number;
+  segmentSize: number;                  // devices matching recipe
+  segmentPercent: number;               // % of total
   totalPostalCodes: number;
   categoriesAnalyzed: number;
   avgAffinityIndex: number;
+  avgDwellMinutes: number;
   categoryBreakdown: CategoryStat[];
   topHotspots: AffinityHotspot[];
 }
@@ -258,6 +233,8 @@ export interface CategoryStat {
   label: string;
   group: string;
   visits: number;
+  uniqueDevices: number;
+  avgDwellMinutes: number;
   percentOfTotal: number;
   postalCodesWithVisits: number;
   avgAffinity: number;
@@ -274,20 +251,26 @@ export interface AffinityHotspot {
   affinityIndex: number;
   visits: number;
   uniqueDevices: number;
+  avgDwellMinutes: number;
 }
 
-// ── Progress callback ──────────────────────────────────────────────────
+// ── Affinity weights ───────────────────────────────────────────────────
+export const AFFINITY_WEIGHTS = {
+  concentration: 0.40,
+  frequency: 0.35,
+  dwell: 0.25,
+} as const;
+
+export const CONCENTRATION_CAP = 5;
+export const FREQUENCY_CAP = 16;
+export const DWELL_CAP_MINUTES = 120;   // 2h cap for dwell score normalization
+export const MIN_VISITS_DEFAULT = 5;
+export const SPATIAL_JOIN_RADIUS_DEFAULT = 200; // meters
+
+// ── Progress ───────────────────────────────────────────────────────────
 export type LabProgressCallback = (progress: {
-  step: 'initializing' | 'loading_pois' | 'querying_visits' | 'geocoding' | 'computing_affinity' | 'aggregating' | 'completed' | 'error';
+  step: 'initializing' | 'loading_pois' | 'spatial_join' | 'querying_visits' | 'computing_dwell' | 'geocoding' | 'computing_affinity' | 'building_segments' | 'completed' | 'error';
   percent: number;
   message: string;
   detail?: string;
 }) => void;
-
-// ── CSV export headers ─────────────────────────────────────────────────
-export const LAB_CSV_HEADERS = [
-  'postal_code', 'city', 'province', 'region', 'category',
-  'visits', 'unique_devices', 'frequency',
-  'concentration_score', 'frequency_score', 'temporal_score',
-  'affinity_index',
-] as const;

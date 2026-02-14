@@ -1,64 +1,35 @@
 import { NextRequest } from 'next/server';
 import { analyzeLaboratory } from '@/lib/laboratory-analyzer';
-import type { LabFilters, PoiCategory } from '@/lib/laboratory-types';
-import { POI_CATEGORIES } from '@/lib/laboratory-types';
+import type { LabConfig, PoiCategory, RecipeStep, Recipe } from '@/lib/laboratory-types';
+import { POI_CATEGORIES, SPATIAL_JOIN_RADIUS_DEFAULT, MIN_VISITS_DEFAULT } from '@/lib/laboratory-types';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 export const maxDuration = 300;
 
 /**
- * GET /api/laboratory/analyze/stream
- * SSE endpoint for laboratory affinity analysis with progress updates.
- * Streams progress events while running, then sends a final "result" event.
- *
- * Query params:
- *   country  - ISO 2-letter code (FR, DE, ES) [required]
- *   categories - comma-separated category list (empty = all)
- *   dateFrom - start date (YYYY-MM-DD)
- *   dateTo   - end date (YYYY-MM-DD)
- *   cities   - comma-separated city names
- *   minVisits - minimum visits per postal code (default 5)
- *   timeWindows - JSON array of TimeWindow objects
+ * POST /api/laboratory/analyze/stream
+ * SSE endpoint for laboratory affinity analysis.
+ * Accepts LabConfig as JSON body, streams progress + final result.
  */
-export async function GET(request: NextRequest): Promise<Response> {
-  const { searchParams } = new URL(request.url);
-
-  const country = searchParams.get('country');
-  if (!country) {
-    return new Response('Country is required', { status: 400 });
+export async function POST(request: NextRequest): Promise<Response> {
+  let config: LabConfig;
+  try {
+    config = await request.json();
+  } catch {
+    return new Response('Invalid JSON body', { status: 400 });
   }
 
-  // Parse filters
-  const filters: LabFilters = {
-    country: country.toUpperCase(),
-    categories: [],
-  };
-
-  const categoriesParam = searchParams.get('categories');
-  if (categoriesParam) {
-    filters.categories = categoriesParam.split(',')
-      .map(s => s.trim())
-      .filter(s => POI_CATEGORIES.includes(s as PoiCategory)) as PoiCategory[];
+  if (!config.datasetId) {
+    return new Response('datasetId is required', { status: 400 });
+  }
+  if (!config.recipe?.steps?.length) {
+    return new Response('recipe with at least one step is required', { status: 400 });
   }
 
-  const dateFrom = searchParams.get('dateFrom');
-  const dateTo = searchParams.get('dateTo');
-  if (dateFrom) filters.dateFrom = dateFrom;
-  if (dateTo) filters.dateTo = dateTo;
-
-  const cities = searchParams.get('cities');
-  if (cities) filters.cities = cities.split(',').map(s => s.trim()).filter(Boolean);
-
-  const minVisits = searchParams.get('minVisits');
-  if (minVisits) filters.minVisits = parseInt(minVisits) || 5;
-
-  const timeWindowsParam = searchParams.get('timeWindows');
-  if (timeWindowsParam) {
-    try {
-      filters.timeWindows = JSON.parse(timeWindowsParam);
-    } catch { /* ignore invalid JSON */ }
-  }
+  // Defaults
+  config.minVisitsPerZipcode = config.minVisitsPerZipcode || MIN_VISITS_DEFAULT;
+  config.spatialJoinRadiusMeters = config.spatialJoinRadiusMeters || SPATIAL_JOIN_RADIUS_DEFAULT;
 
   const encoder = new TextEncoder();
 
@@ -69,12 +40,9 @@ export async function GET(request: NextRequest): Promise<Response> {
           controller.enqueue(
             encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
           );
-        } catch {
-          // Stream may already be closed
-        }
+        } catch { /* stream closed */ }
       };
 
-      // Listen for client disconnect
       let aborted = false;
       request.signal.addEventListener('abort', () => {
         aborted = true;
@@ -82,7 +50,7 @@ export async function GET(request: NextRequest): Promise<Response> {
       });
 
       try {
-        const result = await analyzeLaboratory(filters, (progress) => {
+        const result = await analyzeLaboratory(config, (progress) => {
           if (aborted) return;
           send('progress', {
             step: progress.step,
@@ -93,8 +61,6 @@ export async function GET(request: NextRequest): Promise<Response> {
         });
 
         if (aborted) return;
-
-        // Send the full result
         send('result', result as unknown as Record<string, unknown>);
       } catch (error: any) {
         if (!aborted) {

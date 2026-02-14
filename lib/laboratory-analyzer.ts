@@ -1,19 +1,19 @@
 /**
  * Affinity Index Laboratory — Analysis Engine.
  *
- * Computes affinity indices (0–100) per postal code × POI category.
- * Uses Athena queries on movement datasets + reverse geocoding to GeoJSON polygons.
- *
- * The heavy lifting is a single Athena query that returns:
- *   origin_lat, origin_lng, poi_category, device_count, visit_count, hour_bucket
- *
- * Then we geocode origins → postal codes, and compute three-signal affinity.
+ * Data flow:
+ *   1. Load real POIs from pois_gmc parquet (Athena external table)
+ *   2. Spatial join: movement pings ↔ real POIs within radius
+ *   3. Compute dwell time per visit (consecutive pings near same POI)
+ *   4. Apply recipe filters (category × time window × dwell × frequency)
+ *   5. Build segment of matching ad_ids
+ *   6. Geocode origins → postal codes → compute affinity indices
  */
 
 import { runQuery, createTableForDataset, getTableName } from './athena';
 import { batchReverseGeocode, aggregateByZipcode } from './reverse-geocode';
 import type {
-  LabFilters,
+  LabConfig,
   LabAnalysisResult,
   LabProgressCallback,
   AffinityRecord,
@@ -21,311 +21,343 @@ import type {
   LabStats,
   CategoryStat,
   AffinityHotspot,
+  SegmentDevice,
   PoiCategory,
-  TimeWindow,
+  RecipeStep,
 } from './laboratory-types';
 import {
   POI_CATEGORIES,
   CATEGORY_LABELS,
   CATEGORY_GROUPS,
-  LAB_COUNTRIES,
   AFFINITY_WEIGHTS,
   CONCENTRATION_CAP,
   FREQUENCY_CAP,
-  MIN_VISITS_DEFAULT,
+  DWELL_CAP_MINUTES,
   getCategoryGroup,
 } from './laboratory-types';
 
 const ACCURACY_THRESHOLD_METERS = 500;
 const COORDINATE_PRECISION = 4;
+const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 
-// ── Types for intermediate data ────────────────────────────────────────
-
-interface RawOriginRow {
-  origin_lat: number;
-  origin_lng: number;
-  category: string;
-  device_count: number;
-  visit_count: number;
-  hour_bucket: number; // 0-23
-}
-
-interface GeocodedVisit {
-  zipcode: string;
-  city: string;
-  province: string;
-  region: string;
-  category: PoiCategory;
-  devices: number;
-  visits: number;
-  hourBucket: number;
-}
-
-// ── Main analysis function ─────────────────────────────────────────────
+// ── Main entry point ───────────────────────────────────────────────────
 
 export async function analyzeLaboratory(
-  filters: LabFilters,
+  config: LabConfig,
   onProgress?: LabProgressCallback
 ): Promise<LabAnalysisResult> {
   const report = onProgress || (() => {});
-  const countryInfo = LAB_COUNTRIES.find(c => c.code === filters.country);
-  if (!countryInfo) {
-    throw new Error(`Unsupported country: ${filters.country}. Supported: ${LAB_COUNTRIES.map(c => c.code).join(', ')}`);
+  const { datasetId, recipe, country } = config;
+  const tableName = getTableName(datasetId);
+  const spatialRadius = config.spatialJoinRadiusMeters || 200;
+  const minVisits = config.minVisitsPerZipcode || 5;
+
+  // Collect all categories needed across recipe steps
+  const allCategories = new Set<PoiCategory>();
+  for (const step of recipe.steps) {
+    for (const cat of step.categories) allCategories.add(cat);
   }
+  const categoryList = Array.from(allCategories);
 
-  const datasetName = countryInfo.datasetName;
-  const tableName = getTableName(datasetName);
-  const categories = filters.categories.length > 0 ? filters.categories : [...POI_CATEGORIES];
-  const minVisits = filters.minVisits ?? MIN_VISITS_DEFAULT;
+  report({ step: 'initializing', percent: 0, message: 'Validating configuration...', detail: `Dataset: ${config.datasetName}` });
 
-  report({ step: 'initializing', percent: 0, message: 'Initializing analysis...', detail: `${countryInfo.name} — ${categories.length} categories` });
-
-  // ── 1. Ensure Athena table ───────────────────────────────────────────
   if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
     throw new Error('AWS credentials not configured.');
   }
 
-  report({ step: 'loading_pois', percent: 5, message: 'Preparing Athena table...', detail: tableName });
+  // ── 1. Ensure movement data table ────────────────────────────────────
+  report({ step: 'initializing', percent: 3, message: 'Preparing movement data table...', detail: tableName });
   try {
-    await createTableForDataset(datasetName);
+    await createTableForDataset(datasetId);
   } catch (error: any) {
-    if (!error.message?.includes('already exists')) {
-      throw error;
-    }
+    if (!error.message?.includes('already exists')) throw error;
   }
-  report({ step: 'loading_pois', percent: 10, message: 'Table ready' });
 
-  // ── 2. Build and run Athena query ────────────────────────────────────
-  const dateConditions: string[] = [];
-  if (filters.dateFrom) dateConditions.push(`date >= '${filters.dateFrom}'`);
-  if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
-  const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
-
-  // Build POI category filter
-  // We need the POI parquet loaded as an Athena table to join with movement data.
-  // But POI categories are in a separate parquet. We'll use a two-step approach:
-  // 1. First query: get POI IDs + categories from the POI parquet
-  // 2. Second query: join with movement data to get origins per category
-  //
-  // Actually, the movement data has poi_ids array. We need to match those to
-  // the POI parquet which has id + category. Let's create a POI lookup table.
-
-  report({ step: 'loading_pois', percent: 12, message: 'Creating POI lookup table...', detail: `${countryInfo.totalPois.toLocaleString()} POIs` });
-
-  // Create the POI lookup table from the parquet
-  const poiTableName = `lab_pois_${countryInfo.code.toLowerCase()}`;
-  const poiTableSql = `
-    CREATE EXTERNAL TABLE IF NOT EXISTS ${poiTableName} (
-      id STRING,
-      name STRING,
-      category STRING,
-      city STRING,
-      postal_code STRING,
-      country STRING,
-      latitude DOUBLE,
-      longitude DOUBLE
-    )
-    STORED AS PARQUET
-    LOCATION 's3://${process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2'}/${countryInfo.poiParquetKey.replace(/\/[^/]+$/, '/')}'
-  `;
-
+  // ── 2. Ensure POI parquet table ──────────────────────────────────────
+  report({ step: 'loading_pois', percent: 8, message: 'Preparing POI catalog table...', detail: `Real POIs from pois_gmc` });
+  const poiTableName = 'lab_pois_gmc';
   try {
-    await runQuery(poiTableSql);
+    await runQuery(`
+      CREATE EXTERNAL TABLE IF NOT EXISTS ${poiTableName} (
+        id STRING,
+        name STRING,
+        category STRING,
+        city STRING,
+        postal_code STRING,
+        country STRING,
+        latitude DOUBLE,
+        longitude DOUBLE
+      )
+      STORED AS PARQUET
+      LOCATION 's3://${BUCKET}/pois_gmc/'
+    `);
   } catch (error: any) {
     if (!error.message?.includes('already exists')) {
       console.warn(`[LAB] Warning creating POI table:`, error.message);
     }
   }
+  report({ step: 'loading_pois', percent: 12, message: 'POI catalog ready' });
 
-  report({ step: 'querying_visits', percent: 15, message: 'Running Athena queries...', detail: 'Joining movement data with POI categories' });
+  // ── 3. Build date filters ────────────────────────────────────────────
+  const dateConditions: string[] = [];
+  if (config.dateFrom) dateConditions.push(`date >= '${config.dateFrom}'`);
+  if (config.dateTo) dateConditions.push(`date <= '${config.dateTo}'`);
+  const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
-  // Build category filter SQL
-  const categoryFilter = categories.length < POI_CATEGORIES.length
-    ? `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`
-    : '';
+  // Category filter for POI table
+  const catFilter = `AND p.category IN (${categoryList.map(c => `'${c}'`).join(',')})`;
+  // Country filter for POI table
+  const countryFilter = country ? `AND p.country = '${country.toUpperCase()}'` : '';
 
-  // Main query: for each device-day with a POI visit, get the first ping (origin),
-  // the visited POI's category, and the hour of the visit.
-  // This is the KEY query that powers the entire laboratory.
-  const labQuery = `
+  // ── 4. Spatial join + dwell time query ───────────────────────────────
+  // This is the core query. For each ping in the movement data:
+  //   - Find the nearest real POI within spatialRadius meters
+  //   - Group consecutive pings near same POI into visits
+  //   - Compute dwell time per visit
+  //
+  // Haversine approximation in Athena:
+  //   distance_m ≈ 111320 * SQRT(POW(lat1-lat2,2) + POW((lng1-lng2)*COS(RADIANS((lat1+lat2)/2)),2))
+
+  report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m` });
+
+  const spatialQuery = `
     WITH
-    -- Step 1: Explode POI visits and join with POI categories
-    poi_visits AS (
-      SELECT
-        t.ad_id,
-        t.date,
-        t.utc_timestamp,
-        poi_id,
-        p.category
-      FROM ${tableName} t
-      CROSS JOIN UNNEST(t.poi_ids) AS x(poi_id)
-      INNER JOIN ${poiTableName} p ON poi_id = p.id
-      WHERE poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        AND p.category IS NOT NULL
-        ${dateWhere}
-        ${categoryFilter}
-    ),
-    -- Step 2: Per device-day-category, count visits and get visit hour
-    device_day_category AS (
+    -- Step 1: All pings from devices in the movement dataset
+    pings AS (
       SELECT
         ad_id,
         date,
+        utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${tableName}
+      WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${dateWhere}
+    ),
+    -- Step 2: Real POIs filtered by categories and country
+    real_pois AS (
+      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng
+      FROM ${poiTableName} p
+      WHERE p.category IS NOT NULL
+        ${catFilter}
+        ${countryFilter}
+    ),
+    -- Step 3: Spatial join — match each ping to nearest real POI within radius
+    -- Using Haversine approximation for speed
+    matched AS (
+      SELECT
+        k.ad_id,
+        k.date,
+        k.utc_timestamp,
+        k.lat,
+        k.lng,
+        p.poi_id,
+        p.category,
+        111320 * SQRT(
+          POW(k.lat - p.poi_lat, 2) +
+          POW((k.lng - p.poi_lng) * COS(RADIANS((k.lat + p.poi_lat) / 2)), 2)
+        ) as distance_m
+      FROM pings k
+      CROSS JOIN real_pois p
+      WHERE ABS(k.lat - p.poi_lat) < ${(spatialRadius / 111320 * 1.5).toFixed(6)}
+        AND ABS(k.lng - p.poi_lng) < ${(spatialRadius / (111320 * 0.6) * 1.5).toFixed(6)}
+    ),
+    -- Step 4: Keep only closest POI per ping (within radius)
+    closest AS (
+      SELECT
+        ad_id, date, utc_timestamp, lat, lng, poi_id, category, distance_m,
+        ROW_NUMBER() OVER (PARTITION BY ad_id, utc_timestamp ORDER BY distance_m) as rn
+      FROM matched
+      WHERE distance_m <= ${spatialRadius}
+    ),
+    poi_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng, poi_id, category
+      FROM closest WHERE rn = 1
+    ),
+    -- Step 5: Group into visits — consecutive pings at same POI
+    -- A visit = all consecutive pings by same device at same POI on same day
+    visits AS (
+      SELECT
+        ad_id,
+        date,
+        poi_id,
         category,
-        COUNT(*) as visit_count,
-        HOUR(MIN(utc_timestamp)) as first_visit_hour
-      FROM poi_visits
-      GROUP BY ad_id, date, category
+        MIN(utc_timestamp) as visit_start,
+        MAX(utc_timestamp) as visit_end,
+        COUNT(*) as ping_count,
+        ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes,
+        HOUR(MIN(utc_timestamp)) as visit_hour
+      FROM poi_pings
+      GROUP BY ad_id, date, poi_id, category
     ),
-    -- Step 3: Get distinct devices that visited POIs
-    poi_device_ids AS (
-      SELECT DISTINCT ad_id FROM device_day_category
-    ),
-    -- Step 4: For each device-day, get origin (first ping of the day)
+    -- Step 6: Get origin (first ping of day) for each device-day
     origins AS (
       SELECT
-        t.ad_id,
-        t.date,
-        MIN_BY(TRY_CAST(t.latitude AS DOUBLE), t.utc_timestamp) as origin_lat,
-        MIN_BY(TRY_CAST(t.longitude AS DOUBLE), t.utc_timestamp) as origin_lng
-      FROM ${tableName} t
-      INNER JOIN poi_device_ids v ON t.ad_id = v.ad_id
-      WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
-        ${dateWhere}
-      GROUP BY t.ad_id, t.date
-    ),
-    -- Step 5: Join origins with category visits
-    origin_category AS (
-      SELECT
-        o.ad_id,
-        ROUND(o.origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
-        ROUND(o.origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
-        d.category,
-        d.visit_count,
-        d.first_visit_hour
-      FROM origins o
-      INNER JOIN device_day_category d ON o.ad_id = d.ad_id AND o.date = d.date
-      WHERE o.origin_lat IS NOT NULL AND o.origin_lng IS NOT NULL
+        ad_id,
+        date,
+        MIN_BY(lat, utc_timestamp) as origin_lat,
+        MIN_BY(lng, utc_timestamp) as origin_lng
+      FROM (
+        SELECT ad_id, date, utc_timestamp,
+          TRY_CAST(latitude AS DOUBLE) as lat,
+          TRY_CAST(longitude AS DOUBLE) as lng
+        FROM ${tableName}
+        WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+          AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+          AND TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+          ${dateWhere}
+      )
+      GROUP BY ad_id, date
     )
-    -- Step 6: Aggregate by origin location × category × hour
+    -- Final: join visits with origins
     SELECT
-      origin_lat,
-      origin_lng,
-      category,
-      COUNT(DISTINCT ad_id) as device_count,
-      SUM(visit_count) as visit_count,
-      first_visit_hour as hour_bucket
-    FROM origin_category
-    GROUP BY origin_lat, origin_lng, category, first_visit_hour
-    ORDER BY device_count DESC
-    LIMIT 500000
+      v.ad_id,
+      v.date,
+      v.poi_id,
+      v.category,
+      v.dwell_minutes,
+      v.visit_hour,
+      v.ping_count,
+      ROUND(o.origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(o.origin_lng, ${COORDINATE_PRECISION}) as origin_lng
+    FROM visits v
+    INNER JOIN origins o ON v.ad_id = o.ad_id AND v.date = o.date
+    WHERE v.dwell_minutes >= 0
+    ORDER BY v.ad_id, v.date, v.visit_start
   `;
 
-  // Total devices query (for coverage)
-  const totalQuery = `
-    SELECT
-      COUNT(DISTINCT ad_id) as total_devices,
-      COUNT(*) as total_records
+  // Total devices in dataset
+  const totalDevicesQuery = `
+    SELECT COUNT(DISTINCT ad_id) as total
     FROM ${tableName}
-    CROSS JOIN UNNEST(poi_ids) AS x(poi_id)
-    INNER JOIN ${poiTableName} p ON poi_id = p.id
-    WHERE poi_id IS NOT NULL AND poi_id != ''
-      AND p.category IS NOT NULL
-      ${dateWhere}
-      ${categoryFilter}
+    WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+    ${dateWhere}
   `;
 
-  console.log(`[LAB] Executing laboratory queries for ${countryInfo.name}...`);
-  let labRes, totalRes;
+  console.log(`[LAB] Running spatial join + origins query...`);
+  let spatialRes, totalRes;
   try {
-    [labRes, totalRes] = await Promise.all([
-      runQuery(labQuery),
-      runQuery(totalQuery),
+    [spatialRes, totalRes] = await Promise.all([
+      runQuery(spatialQuery),
+      runQuery(totalDevicesQuery),
     ]);
   } catch (error: any) {
-    // If the POI table failed because location points to directory but parquet
-    // is a single file, try with direct file path
-    if (error.message?.includes('not found') || error.message?.includes('does not exist')) {
-      console.warn(`[LAB] Query failed, trying to recreate POI table with direct file path...`);
-      const directPoiSql = `
-        CREATE EXTERNAL TABLE IF NOT EXISTS ${poiTableName} (
-          id STRING,
-          name STRING,
-          category STRING,
-          city STRING,
-          postal_code STRING,
-          country STRING,
-          latitude DOUBLE,
-          longitude DOUBLE
-        )
-        STORED AS PARQUET
-        LOCATION 's3://${process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2'}/pois_gmc/'
-      `;
-      try {
-        await runQuery(`DROP TABLE IF EXISTS ${poiTableName}`);
-        await runQuery(directPoiSql);
-        [labRes, totalRes] = await Promise.all([
-          runQuery(labQuery),
-          runQuery(totalQuery),
-        ]);
-      } catch (retryError: any) {
-        throw new Error(`Laboratory query failed: ${retryError.message}`);
+    report({ step: 'error', percent: 0, message: error.message });
+    throw new Error(`Laboratory query failed: ${error.message}`);
+  }
+
+  const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total)) || 0;
+  report({ step: 'spatial_join', percent: 50, message: 'Spatial join complete', detail: `${spatialRes.rows.length} visits found` });
+
+  if (spatialRes.rows.length === 0) {
+    report({ step: 'completed', percent: 100, message: 'No visits found matching criteria' });
+    return buildEmptyResult(config);
+  }
+
+  // ── 5. Parse visits and apply recipe ─────────────────────────────────
+  report({ step: 'computing_dwell', percent: 55, message: 'Applying recipe filters...', detail: `${recipe.steps.length} steps, logic: ${recipe.logic}` });
+
+  interface ParsedVisit {
+    adId: string;
+    date: string;
+    poiId: string;
+    category: PoiCategory;
+    dwellMinutes: number;
+    visitHour: number;
+    originLat: number;
+    originLng: number;
+  }
+
+  const allVisits: ParsedVisit[] = spatialRes.rows.map(row => ({
+    adId: String(row.ad_id),
+    date: String(row.date),
+    poiId: String(row.poi_id),
+    category: String(row.category) as PoiCategory,
+    dwellMinutes: parseFloat(String(row.dwell_minutes)) || 0,
+    visitHour: parseInt(String(row.visit_hour)) || 0,
+    originLat: parseFloat(String(row.origin_lat)),
+    originLng: parseFloat(String(row.origin_lng)),
+  })).filter(v => !isNaN(v.originLat) && !isNaN(v.originLng));
+
+  // Group visits by device
+  const deviceVisits = new Map<string, ParsedVisit[]>();
+  for (const v of allVisits) {
+    const list = deviceVisits.get(v.adId) || [];
+    list.push(v);
+    deviceVisits.set(v.adId, list);
+  }
+
+  // Apply recipe to each device
+  const segmentDevices: SegmentDevice[] = [];
+  const matchedVisits: ParsedVisit[] = []; // visits from devices in segment
+
+  for (const [adId, visits] of deviceVisits.entries()) {
+    const stepMatches = recipe.steps.map(step => matchStep(step, visits));
+
+    let matches: boolean;
+    if (recipe.logic === 'AND') {
+      matches = stepMatches.every(m => m);
+      if (matches && recipe.ordered) {
+        // Check order: first matching visit of step[i] must be before step[i+1]
+        matches = checkOrder(recipe.steps, visits);
       }
     } else {
-      throw new Error(`Laboratory query failed: ${error.message}`);
+      matches = stepMatches.some(m => m);
+    }
+
+    if (matches) {
+      const matchedStepCount = stepMatches.filter(m => m).length;
+      const cats = new Set<PoiCategory>();
+      let totalDwell = 0;
+      for (const v of visits) {
+        cats.add(v.category);
+        totalDwell += v.dwellMinutes;
+      }
+
+      segmentDevices.push({
+        adId,
+        matchedSteps: matchedStepCount,
+        totalVisits: visits.length,
+        avgDwellMinutes: Math.round((totalDwell / visits.length) * 10) / 10,
+        categories: Array.from(cats),
+      });
+
+      matchedVisits.push(...visits);
     }
   }
 
-  report({ step: 'querying_visits', percent: 55, message: 'Queries complete', detail: `${labRes.rows.length} origin-category clusters` });
+  report({ step: 'building_segments', percent: 65, message: 'Segment built', detail: `${segmentDevices.length} devices matched out of ${deviceVisits.size}` });
 
-  const totalDevices = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
-  console.log(`[LAB] Total devices: ${totalDevices}, clusters: ${labRes.rows.length}`);
-
-  if (totalDevices === 0 || labRes.rows.length === 0) {
-    report({ step: 'completed', percent: 100, message: 'No data found' });
-    return buildEmptyResult(countryInfo, filters);
+  if (segmentDevices.length === 0) {
+    report({ step: 'completed', percent: 100, message: 'No devices matched the recipe' });
+    return buildEmptyResult(config, totalDevicesInDataset);
   }
 
-  // ── 3. Parse query results ───────────────────────────────────────────
-  const rawRows: RawOriginRow[] = labRes.rows.map(row => ({
-    origin_lat: parseFloat(String(row.origin_lat)),
-    origin_lng: parseFloat(String(row.origin_lng)),
-    category: String(row.category),
-    device_count: parseInt(String(row.device_count)) || 0,
-    visit_count: parseInt(String(row.visit_count)) || 0,
-    hour_bucket: parseInt(String(row.hour_bucket)) || 0,
-  })).filter(r => !isNaN(r.origin_lat) && !isNaN(r.origin_lng) && r.device_count > 0);
+  // ── 6. Geocode origins → postal codes ────────────────────────────────
+  report({ step: 'geocoding', percent: 68, message: 'Geocoding device origins...', detail: 'Resolving to postal codes' });
 
-  // ── 4. Reverse geocode unique origin points ──────────────────────────
-  report({ step: 'geocoding', percent: 60, message: 'Geocoding origin coordinates...', detail: `Resolving to postal codes` });
-
-  // Aggregate by unique coordinate (across all categories) for geocoding
-  const coordMap = new Map<string, { lat: number; lng: number; totalDevices: number }>();
-  for (const row of rawRows) {
-    const key = `${row.origin_lat},${row.origin_lng}`;
+  // Aggregate unique origin coordinates from matched visits
+  const coordMap = new Map<string, { lat: number; lng: number; devices: number }>();
+  for (const v of matchedVisits) {
+    const key = `${v.originLat},${v.originLng}`;
     const existing = coordMap.get(key);
     if (existing) {
-      existing.totalDevices += row.device_count;
+      existing.devices++;
     } else {
-      coordMap.set(key, { lat: row.origin_lat, lng: row.origin_lng, totalDevices: row.device_count });
+      coordMap.set(key, { lat: v.originLat, lng: v.originLng, devices: 1 });
     }
   }
 
   const geocodePoints = Array.from(coordMap.values()).map(p => ({
-    lat: p.lat,
-    lng: p.lng,
-    deviceCount: p.totalDevices,
+    lat: p.lat, lng: p.lng, deviceCount: p.devices,
   }));
 
-  console.log(`[LAB] Geocoding ${geocodePoints.length} unique coordinate clusters...`);
   const geocoded = await batchReverseGeocode(geocodePoints);
 
-  // Build coordinate → zipcode lookup
   const coordToZip = new Map<string, { zipcode: string; city: string; province: string; region: string }>();
-
-  // Results are returned in the same order as input points
   for (let i = 0; i < geocodePoints.length; i++) {
     const result = geocoded[i];
     const point = geocodePoints[i];
@@ -340,142 +372,102 @@ export async function analyzeLaboratory(
     }
   }
 
-  report({ step: 'geocoding', percent: 75, message: 'Geocoding complete', detail: `${coordToZip.size}/${geocodePoints.length} points matched` });
+  report({ step: 'geocoding', percent: 78, message: 'Geocoding complete', detail: `${coordToZip.size}/${geocodePoints.length} points matched` });
 
-  // ── 5. Build geocoded visit records ──────────────────────────────────
-  report({ step: 'computing_affinity', percent: 78, message: 'Computing affinity indices...', detail: 'Building postal code profiles' });
+  // ── 7. Compute affinity indices ──────────────────────────────────────
+  report({ step: 'computing_affinity', percent: 82, message: 'Computing affinity indices...' });
 
-  const geocodedVisits: GeocodedVisit[] = [];
-  for (const row of rawRows) {
-    const key = `${row.origin_lat},${row.origin_lng}`;
-    const geo = coordToZip.get(key);
-    if (!geo) continue;
-    if (!POI_CATEGORIES.includes(row.category as PoiCategory)) continue;
-
-    geocodedVisits.push({
-      zipcode: geo.zipcode,
-      city: geo.city,
-      province: geo.province,
-      region: geo.region,
-      category: row.category as PoiCategory,
-      devices: row.device_count,
-      visits: row.visit_count,
-      hourBucket: row.hour_bucket,
-    });
-  }
-
-  // ── 6. Compute affinity indices ──────────────────────────────────────
-  const result = computeAffinityIndices(geocodedVisits, categories, minVisits, filters.timeWindows);
-
-  report({ step: 'aggregating', percent: 90, message: 'Building result profiles...', detail: `${result.profiles.length} postal codes profiled` });
-
-  // ── 7. Build final result ────────────────────────────────────────────
-  const stats = computeStats(result.records, result.profiles, totalDevices);
-
-  report({ step: 'completed', percent: 100, message: 'Analysis complete', detail: `${result.profiles.length} postal codes × ${categories.length} categories` });
-
-  return {
-    country: countryInfo.code,
-    countryName: countryInfo.name,
-    dataset: datasetName,
-    analyzedAt: new Date().toISOString(),
-    filters,
-    records: result.records,
-    profiles: result.profiles,
-    stats,
-  };
-}
-
-
-// ── Affinity computation ───────────────────────────────────────────────
-
-function computeAffinityIndices(
-  visits: GeocodedVisit[],
-  categories: PoiCategory[],
-  minVisits: number,
-  timeWindows?: TimeWindow[]
-): { records: AffinityRecord[]; profiles: ZipcodeProfile[] } {
-
-  // Aggregate: zipcode × category → { devices, visits, hourBuckets }
+  // Build: zipcode × category → { visits, devices, totalDwell }
   const zipCatMap = new Map<string, {
     zipcode: string; city: string; province: string; region: string;
     category: PoiCategory;
-    devices: number; visits: number; hourCounts: Map<number, number>;
+    visits: number; devices: Set<string>; totalDwell: number;
   }>();
 
-  for (const v of visits) {
-    const key = `${v.zipcode}|${v.category}`;
+  for (const v of matchedVisits) {
+    const coordKey = `${v.originLat},${v.originLng}`;
+    const geo = coordToZip.get(coordKey);
+    if (!geo) continue;
+
+    const key = `${geo.zipcode}|${v.category}`;
     const existing = zipCatMap.get(key);
     if (existing) {
-      existing.devices += v.devices;
-      existing.visits += v.visits;
-      existing.hourCounts.set(v.hourBucket, (existing.hourCounts.get(v.hourBucket) || 0) + v.visits);
+      existing.visits++;
+      existing.devices.add(v.adId);
+      existing.totalDwell += v.dwellMinutes;
     } else {
-      const hourCounts = new Map<number, number>();
-      hourCounts.set(v.hourBucket, v.visits);
       zipCatMap.set(key, {
-        zipcode: v.zipcode, city: v.city, province: v.province, region: v.region,
-        category: v.category,
-        devices: v.devices, visits: v.visits, hourCounts,
+        ...geo, category: v.category,
+        visits: 1, devices: new Set([v.adId]), totalDwell: v.dwellMinutes,
       });
     }
   }
 
-  // Compute totals per zipcode and per category (nationally)
-  const zipTotals = new Map<string, { totalVisits: number; totalDevices: number; city: string; province: string; region: string }>();
-  const catTotals = new Map<PoiCategory, { totalVisits: number; totalDevices: number }>();
-  let grandTotalVisits = 0;
+  // Totals for affinity calculation
+  const zipTotals = new Map<string, { total: number; devices: Set<string>; city: string; province: string; region: string; totalDwell: number }>();
+  const catTotals = new Map<PoiCategory, { total: number; totalDwell: number }>();
+  let grandTotal = 0;
 
   for (const entry of zipCatMap.values()) {
     // Zipcode totals
-    const zt = zipTotals.get(entry.zipcode) || { totalVisits: 0, totalDevices: 0, city: entry.city, province: entry.province, region: entry.region };
-    zt.totalVisits += entry.visits;
-    zt.totalDevices += entry.devices;
+    const zt = zipTotals.get(entry.zipcode) || { total: 0, devices: new Set<string>(), city: entry.city, province: entry.province, region: entry.region, totalDwell: 0 };
+    zt.total += entry.visits;
+    for (const d of entry.devices) zt.devices.add(d);
+    zt.totalDwell += entry.totalDwell;
     zipTotals.set(entry.zipcode, zt);
 
-    // Category totals (national)
-    const ct = catTotals.get(entry.category) || { totalVisits: 0, totalDevices: 0 };
-    ct.totalVisits += entry.visits;
-    ct.totalDevices += entry.devices;
+    // Category totals
+    const ct = catTotals.get(entry.category) || { total: 0, totalDwell: 0 };
+    ct.total += entry.visits;
+    ct.totalDwell += entry.totalDwell;
     catTotals.set(entry.category, ct);
 
-    grandTotalVisits += entry.visits;
+    grandTotal += entry.visits;
   }
 
-  // National share per category
+  // National shares
   const nationalShares = new Map<PoiCategory, number>();
-  for (const [cat, totals] of catTotals.entries()) {
-    nationalShares.set(cat, grandTotalVisits > 0 ? totals.totalVisits / grandTotalVisits : 0);
+  for (const [cat, t] of catTotals.entries()) {
+    nationalShares.set(cat, grandTotal > 0 ? t.total / grandTotal : 0);
   }
 
-  // Compute affinity records
+  // Category median dwell times (for dwell score)
+  const catMedianDwell = new Map<PoiCategory, number>();
+  for (const [cat, t] of catTotals.entries()) {
+    catMedianDwell.set(cat, t.total > 0 ? t.totalDwell / t.total : 0);
+  }
+
+  // Build affinity records
   const records: AffinityRecord[] = [];
 
   for (const entry of zipCatMap.values()) {
     const zt = zipTotals.get(entry.zipcode)!;
-    if (zt.totalVisits < minVisits) continue;
+    if (zt.total < minVisits) continue;
 
-    const localShare = zt.totalVisits > 0 ? entry.visits / zt.totalVisits : 0;
+    const devCount = entry.devices.size;
+    const avgDwell = entry.visits > 0 ? entry.totalDwell / entry.visits : 0;
+    const freq = devCount > 0 ? entry.visits / devCount : 0;
+
+    const localShare = zt.total > 0 ? entry.visits / zt.total : 0;
     const natShare = nationalShares.get(entry.category) || 0;
 
-    // Signal 1: Concentration (0–100)
+    // Concentration score (0-100)
     const rawRatio = natShare > 0 ? localShare / natShare : 0;
-    const cappedRatio = Math.min(rawRatio, CONCENTRATION_CAP);
-    const concentrationScore = Math.round((cappedRatio / CONCENTRATION_CAP) * 100);
+    const concentrationScore = Math.round(Math.min(rawRatio / CONCENTRATION_CAP, 1) * 100);
 
-    // Signal 2: Frequency (0–100)
-    const avgFreq = entry.devices > 0 ? entry.visits / entry.devices : 0;
-    const freqNorm = avgFreq > 0 ? Math.log2(avgFreq) / Math.log2(FREQUENCY_CAP) : 0;
+    // Frequency score (0-100)
+    const freqNorm = freq > 0 ? Math.log2(freq) / Math.log2(FREQUENCY_CAP) : 0;
     const frequencyScore = Math.round(Math.min(Math.max(freqNorm, 0), 1) * 100);
 
-    // Signal 3: Temporal relevance (0–100)
-    const temporalScore = computeTemporalScore(entry.hourCounts, entry.visits, timeWindows);
+    // Dwell score (0-100): how does avg dwell compare to category median
+    const medianDwell = catMedianDwell.get(entry.category) || 1;
+    const dwellRatio = medianDwell > 0 ? avgDwell / medianDwell : 0;
+    const dwellScore = Math.round(Math.min(dwellRatio / (DWELL_CAP_MINUTES / medianDwell), 1) * 100);
 
-    // Composite affinity index (0–100)
     const affinityIndex = Math.round(
       AFFINITY_WEIGHTS.concentration * concentrationScore +
       AFFINITY_WEIGHTS.frequency * frequencyScore +
-      AFFINITY_WEIGHTS.temporal * temporalScore
+      AFFINITY_WEIGHTS.dwell * dwellScore
     );
 
     records.push({
@@ -485,22 +477,21 @@ function computeAffinityIndices(
       region: entry.region,
       category: entry.category,
       visits: entry.visits,
-      uniqueDevices: entry.devices,
-      frequency: Math.round(avgFreq * 100) / 100,
-      totalVisits: zt.totalVisits,
+      uniqueDevices: devCount,
+      avgDwellMinutes: Math.round(avgDwell * 10) / 10,
+      frequency: Math.round(freq * 100) / 100,
+      totalVisitsFromZipcode: zt.total,
       concentrationScore,
       frequencyScore,
-      temporalScore,
+      dwellScore,
       affinityIndex,
     });
   }
 
-  // Sort by affinity index descending
   records.sort((a, b) => b.affinityIndex - a.affinityIndex);
 
   // Build zipcode profiles
   const profileMap = new Map<string, ZipcodeProfile>();
-
   for (const rec of records) {
     let profile = profileMap.get(rec.zipcode);
     if (!profile) {
@@ -510,8 +501,9 @@ function computeAffinityIndices(
         city: rec.city,
         province: rec.province,
         region: rec.region,
-        totalVisits: zt.totalVisits,
-        uniqueDevices: zt.totalDevices,
+        totalVisits: zt.total,
+        uniqueDevices: zt.devices.size,
+        avgDwellMinutes: zt.total > 0 ? Math.round((zt.totalDwell / zt.total) * 10) / 10 : 0,
         affinities: {},
         topCategory: rec.category,
         topAffinity: rec.affinityIndex,
@@ -519,16 +511,14 @@ function computeAffinityIndices(
       };
       profileMap.set(rec.zipcode, profile);
     }
-
     profile.affinities[rec.category] = rec.affinityIndex;
     if (rec.affinityIndex > profile.topAffinity) {
       profile.topAffinity = rec.affinityIndex;
       profile.topCategory = rec.category;
-      profile.dominantGroup = getCategoryGroup(rec.category);
     }
   }
 
-  // Recompute dominantGroup as group with highest AVERAGE affinity
+  // Recompute dominantGroup
   for (const profile of profileMap.values()) {
     const groupScores = new Map<string, { sum: number; count: number }>();
     for (const [cat, score] of Object.entries(profile.affinities)) {
@@ -542,55 +532,95 @@ function computeAffinityIndices(
     let bestAvg = 0;
     for (const [group, gs] of groupScores.entries()) {
       const avg = gs.sum / gs.count;
-      if (avg > bestAvg) {
-        bestAvg = avg;
-        bestGroup = group;
-      }
+      if (avg > bestAvg) { bestAvg = avg; bestGroup = group; }
     }
     profile.dominantGroup = bestGroup;
   }
 
-  const profiles = Array.from(profileMap.values())
-    .sort((a, b) => b.topAffinity - a.topAffinity);
+  const profiles = Array.from(profileMap.values()).sort((a, b) => b.topAffinity - a.topAffinity);
 
-  return { records, profiles };
+  report({ step: 'computing_affinity', percent: 92, message: 'Affinity computation complete', detail: `${profiles.length} postal codes profiled` });
+
+  // ── 8. Build stats ───────────────────────────────────────────────────
+  const stats = computeStats(records, profiles, segmentDevices, matchedVisits, totalDevicesInDataset);
+
+  // Sort segment by totalVisits desc, limit to top 1000 for response
+  segmentDevices.sort((a, b) => b.totalVisits - a.totalVisits);
+  const segmentForResponse = segmentDevices.slice(0, 1000);
+
+  report({ step: 'completed', percent: 100, message: 'Analysis complete', detail: `${segmentDevices.length} devices in segment, ${profiles.length} postal codes` });
+
+  return {
+    config,
+    analyzedAt: new Date().toISOString(),
+    segment: {
+      totalDevices: segmentDevices.length,
+      devices: segmentForResponse,
+    },
+    records,
+    profiles,
+    stats,
+  };
 }
 
 
-// ── Temporal score ─────────────────────────────────────────────────────
+// ── Recipe matching helpers ────────────────────────────────────────────
 
-function computeTemporalScore(
-  hourCounts: Map<number, number>,
-  totalVisits: number,
-  timeWindows?: TimeWindow[]
-): number {
-  if (!timeWindows || timeWindows.length === 0) {
-    // No time windows configured → base score of 50 (neutral)
-    return 50;
-  }
+function matchStep(step: RecipeStep, visits: { category: PoiCategory; dwellMinutes: number; visitHour: number }[]): boolean {
+  const matching = visits.filter(v => {
+    // Category match (OR within step)
+    if (!step.categories.includes(v.category)) return false;
 
-  // For each time window, compute what % of visits fall within it
-  let weightedScore = 0;
-  let totalWeight = 0;
-
-  for (const tw of timeWindows) {
-    let windowVisits = 0;
-    for (const [hour, count] of hourCounts.entries()) {
-      if (tw.hourFrom <= tw.hourTo) {
-        // Normal range (e.g., 6–18)
-        if (hour >= tw.hourFrom && hour < tw.hourTo) windowVisits += count;
+    // Time window
+    if (step.timeWindow) {
+      const { hourFrom, hourTo } = step.timeWindow;
+      if (hourFrom <= hourTo) {
+        if (v.visitHour < hourFrom || v.visitHour >= hourTo) return false;
       } else {
-        // Wrapping range (e.g., 22–6)
-        if (hour >= tw.hourFrom || hour < tw.hourTo) windowVisits += count;
+        // Wrapping (e.g. 22-6)
+        if (v.visitHour < hourFrom && v.visitHour >= hourTo) return false;
       }
     }
-    const windowShare = totalVisits > 0 ? windowVisits / totalVisits : 0;
-    weightedScore += windowShare * tw.weight * 100;
-    totalWeight += tw.weight;
-  }
 
-  if (totalWeight === 0) return 50;
-  return Math.round(Math.min(weightedScore / totalWeight, 100));
+    // Dwell time
+    if (step.minDwellMinutes != null && v.dwellMinutes < step.minDwellMinutes) return false;
+    if (step.maxDwellMinutes != null && v.dwellMinutes > step.maxDwellMinutes) return false;
+
+    return true;
+  });
+
+  // Frequency check
+  const minFreq = step.minFrequency || 1;
+  return matching.length >= minFreq;
+}
+
+function checkOrder(steps: RecipeStep[], visits: { category: PoiCategory; date: string; visitHour: number; dwellMinutes: number }[]): boolean {
+  // For ordered AND: the first qualifying visit of step[i] must be on a date
+  // <= the first qualifying visit of step[i+1]
+  let lastDate = '';
+  for (const step of steps) {
+    const qualifying = visits
+      .filter(v => {
+        if (!step.categories.includes(v.category)) return false;
+        if (step.timeWindow) {
+          const { hourFrom, hourTo } = step.timeWindow;
+          if (hourFrom <= hourTo) {
+            if (v.visitHour < hourFrom || v.visitHour >= hourTo) return false;
+          } else {
+            if (v.visitHour < hourFrom && v.visitHour >= hourTo) return false;
+          }
+        }
+        if (step.minDwellMinutes != null && v.dwellMinutes < step.minDwellMinutes) return false;
+        return true;
+      })
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    if (qualifying.length === 0) return false;
+    const firstDate = qualifying[0].date;
+    if (lastDate && firstDate < lastDate) return false;
+    lastDate = firstDate;
+  }
+  return true;
 }
 
 
@@ -599,49 +629,50 @@ function computeTemporalScore(
 function computeStats(
   records: AffinityRecord[],
   profiles: ZipcodeProfile[],
-  totalDevices: number
+  segment: SegmentDevice[],
+  matchedVisits: { category: PoiCategory; dwellMinutes: number }[],
+  totalDevicesInDataset: number
 ): LabStats {
-  const totalDeviceDays = records.reduce((sum, r) => sum + r.visits, 0);
-  const totalUniqueDevices = totalDevices;
-  const totalPostalCodes = profiles.length;
+  const totalPingsAnalyzed = matchedVisits.length;
+  const segmentSize = segment.length;
+  const totalDwell = matchedVisits.reduce((s, v) => s + v.dwellMinutes, 0);
 
-  // Category breakdown
   const catMap = new Map<PoiCategory, {
-    visits: number; records: AffinityRecord[]; maxAffinity: number; maxRec: AffinityRecord | null;
+    visits: number; devices: Set<string>; totalDwell: number;
+    records: AffinityRecord[]; maxAffinity: number; maxRec: AffinityRecord | null;
   }>();
 
   for (const rec of records) {
-    const cat = catMap.get(rec.category) || { visits: 0, records: [], maxAffinity: 0, maxRec: null };
-    cat.visits += rec.visits;
-    cat.records.push(rec);
-    if (rec.affinityIndex > cat.maxAffinity) {
-      cat.maxAffinity = rec.affinityIndex;
-      cat.maxRec = rec;
-    }
-    catMap.set(rec.category, cat);
+    const c = catMap.get(rec.category) || {
+      visits: 0, devices: new Set<string>(), totalDwell: 0,
+      records: [], maxAffinity: 0, maxRec: null,
+    };
+    c.visits += rec.visits;
+    c.totalDwell += rec.avgDwellMinutes * rec.visits;
+    c.records.push(rec);
+    if (rec.affinityIndex > c.maxAffinity) { c.maxAffinity = rec.affinityIndex; c.maxRec = rec; }
+    catMap.set(rec.category, c);
   }
+
+  const totalVisits = records.reduce((s, r) => s + r.visits, 0);
 
   const categoryBreakdown: CategoryStat[] = Array.from(catMap.entries()).map(([cat, data]) => ({
     category: cat,
     label: CATEGORY_LABELS[cat],
     group: getCategoryGroup(cat),
     visits: data.visits,
-    percentOfTotal: totalDeviceDays > 0 ? Math.round((data.visits / totalDeviceDays) * 10000) / 100 : 0,
+    uniqueDevices: new Set(data.records.flatMap(r => Array(r.uniqueDevices).fill(r.zipcode))).size,
+    avgDwellMinutes: data.visits > 0 ? Math.round((data.totalDwell / data.visits) * 10) / 10 : 0,
+    percentOfTotal: totalVisits > 0 ? Math.round((data.visits / totalVisits) * 10000) / 100 : 0,
     postalCodesWithVisits: new Set(data.records.map(r => r.zipcode)).size,
-    avgAffinity: data.records.length > 0
-      ? Math.round(data.records.reduce((s, r) => s + r.affinityIndex, 0) / data.records.length)
-      : 0,
+    avgAffinity: data.records.length > 0 ? Math.round(data.records.reduce((s, r) => s + r.affinityIndex, 0) / data.records.length) : 0,
     maxAffinity: data.maxAffinity,
     maxAffinityZipcode: data.maxRec?.zipcode || '',
     maxAffinityCity: data.maxRec?.city || '',
   })).sort((a, b) => b.visits - a.visits);
 
-  // Unique categories in records
-  const uniqueCategories = new Set(records.map(r => r.category));
-
-  // Top hotspots (highest affinity indices)
   const topHotspots: AffinityHotspot[] = records
-    .filter(r => r.affinityIndex >= 70)
+    .filter(r => r.affinityIndex >= 60)
     .slice(0, 25)
     .map(r => ({
       zipcode: r.zipcode,
@@ -651,44 +682,46 @@ function computeStats(
       affinityIndex: r.affinityIndex,
       visits: r.visits,
       uniqueDevices: r.uniqueDevices,
+      avgDwellMinutes: r.avgDwellMinutes,
     }));
 
-  const avgAffinityIndex = records.length > 0
+  const avgAffinity = records.length > 0
     ? Math.round(records.reduce((s, r) => s + r.affinityIndex, 0) / records.length)
     : 0;
 
   return {
-    totalDeviceDays,
-    totalUniqueDevices,
-    totalPostalCodes,
-    categoriesAnalyzed: uniqueCategories.size,
-    avgAffinityIndex,
+    totalPingsAnalyzed,
+    totalDevicesInDataset,
+    segmentSize,
+    segmentPercent: totalDevicesInDataset > 0 ? Math.round((segmentSize / totalDevicesInDataset) * 10000) / 100 : 0,
+    totalPostalCodes: profiles.length,
+    categoriesAnalyzed: new Set(records.map(r => r.category)).size,
+    avgAffinityIndex: avgAffinity,
+    avgDwellMinutes: totalPingsAnalyzed > 0 ? Math.round((totalDwell / totalPingsAnalyzed) * 10) / 10 : 0,
     categoryBreakdown,
     topHotspots,
   };
 }
 
 
-// ── Empty result builder ───────────────────────────────────────────────
+// ── Empty result ───────────────────────────────────────────────────────
 
-function buildEmptyResult(
-  countryInfo: { code: string; name: string; datasetName: string },
-  filters: LabFilters
-): LabAnalysisResult {
+function buildEmptyResult(config: LabConfig, totalDevices = 0): LabAnalysisResult {
   return {
-    country: countryInfo.code,
-    countryName: countryInfo.name,
-    dataset: countryInfo.datasetName,
+    config,
     analyzedAt: new Date().toISOString(),
-    filters,
+    segment: { totalDevices: 0, devices: [] },
     records: [],
     profiles: [],
     stats: {
-      totalDeviceDays: 0,
-      totalUniqueDevices: 0,
+      totalPingsAnalyzed: 0,
+      totalDevicesInDataset: totalDevices,
+      segmentSize: 0,
+      segmentPercent: 0,
       totalPostalCodes: 0,
       categoriesAnalyzed: 0,
       avgAffinityIndex: 0,
+      avgDwellMinutes: 0,
       categoryBreakdown: [],
       topHotspots: [],
     },
