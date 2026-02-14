@@ -49,6 +49,8 @@ function SyncPageContent() {
   const [retryDelay, setRetryDelay] = useState(15000)
   const [sseFailed, setSseFailed] = useState(false) // Fallback to polling if SSE errors
   const [syncConflict, setSyncConflict] = useState(false) // 409: lock held, need to cancel first
+  const consecutiveErrorsRef = useRef(0)
+  const MAX_CONSECUTIVE_ERRORS = 5
   const { toast } = useToast()
   const router = useRouter()
 
@@ -117,6 +119,7 @@ function SyncPageContent() {
         return
       }
       if (response.ok) {
+        consecutiveErrorsRef.current = 0
         setRetryDelay(15000)
         const status = await response.json() as SyncStatus
         setSyncStatus(status)
@@ -124,11 +127,28 @@ function SyncPageContent() {
         if (status.status === 'completed' || status.status === 'error' || status.status === 'cancelled') {
           applyStatus(status)
         }
+      } else {
+        consecutiveErrorsRef.current++
       }
     } catch (error) {
-      console.error('Error checking sync status:', error)
+      consecutiveErrorsRef.current++
+      console.error(`Error checking sync status (${consecutiveErrorsRef.current}/${MAX_CONSECUTIVE_ERRORS}):`, error)
+      if (consecutiveErrorsRef.current >= MAX_CONSECUTIVE_ERRORS) {
+        console.error('Too many consecutive network errors, stopping polling')
+        setIsPolling(false)
+        setLoading(false)
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current)
+          intervalRef.current = null
+        }
+        toast({
+          title: "Conexión perdida",
+          description: "No se pudo verificar el estado del sync después de varios intentos. Revisa tu conexión y recarga la página.",
+          variant: "destructive",
+        })
+      }
     }
-  }, [jobId, isPolling, applyStatus])
+  }, [jobId, isPolling, applyStatus, toast])
 
   // SSE for progress when syncing; fallback to polling if EventSource fails
   const eventSourceRef = useRef<EventSource | null>(null)
