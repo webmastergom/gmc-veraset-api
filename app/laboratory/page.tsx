@@ -196,6 +196,11 @@ export default function LaboratoryPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
+  // POI count preview
+  const [poiCount, setPoiCount] = useState<{ count: number; breakdown: Record<string, number> } | null>(null);
+  const [loadingPoiCount, setLoadingPoiCount] = useState(false);
+  const poiCountAbortRef = useRef<AbortController | null>(null);
+
   // ── Fetch datasets ──────────────────────────────────────────────────
   useEffect(() => {
     fetch('/api/datasets', { credentials: 'include' })
@@ -209,6 +214,58 @@ export default function LaboratoryPage() {
       })
       .catch(() => setLoadingDatasets(false));
   }, []);
+
+  // ── Fetch POI count (debounced) ────────────────────────────────────
+  const allRecipeCategories = useMemo(() => {
+    const cats = new Set<string>();
+    for (const step of recipeSteps) {
+      for (const c of step.categories) cats.add(c);
+    }
+    return Array.from(cats);
+  }, [recipeSteps]);
+
+  useEffect(() => {
+    // Reset if no country or categories
+    if (!selectedCountry || allRecipeCategories.length === 0) {
+      setPoiCount(null);
+      setLoadingPoiCount(false);
+      return;
+    }
+
+    setLoadingPoiCount(true);
+
+    const timer = setTimeout(() => {
+      // Abort previous request
+      poiCountAbortRef.current?.abort();
+      const abort = new AbortController();
+      poiCountAbortRef.current = abort;
+
+      fetch('/api/laboratory/poi-count', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categories: allRecipeCategories, country: selectedCountry }),
+        credentials: 'include',
+        signal: abort.signal,
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (!abort.signal.aborted) {
+            setPoiCount(data.error ? null : data);
+            setLoadingPoiCount(false);
+          }
+        })
+        .catch(() => {
+          if (!abort.signal.aborted) {
+            setPoiCount(null);
+            setLoadingPoiCount(false);
+          }
+        });
+    }, 600);
+
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [selectedCountry, allRecipeCategories]);
 
   // ── Derived ─────────────────────────────────────────────────────────
   const selectedDataset = datasets.find(d => d.id === selectedDatasetId);
@@ -501,7 +558,7 @@ export default function LaboratoryPage() {
               </Badge>
               <Badge variant="outline" className="text-xs px-3 py-1 border-muted-foreground/30">
                 <Target className="w-3 h-3 mr-1" />
-                27 POI categories
+                195 POI categories
               </Badge>
               <Badge variant="outline" className="text-xs px-3 py-1 border-muted-foreground/30">
                 <Beaker className="w-3 h-3 mr-1" />
@@ -731,6 +788,52 @@ export default function LaboratoryPage() {
                       </div>
                     ))}
                   </div>
+
+                  {/* POI count preview */}
+                  {selectedCountry && allRecipeCategories.length > 0 && (
+                    <div className={`flex items-center gap-3 p-3 rounded-xl border transition-all ${
+                      loadingPoiCount
+                        ? 'bg-secondary/50 border-border'
+                        : poiCount && poiCount.count > 0
+                        ? 'bg-emerald-500/5 border-emerald-500/20'
+                        : poiCount && poiCount.count === 0
+                        ? 'bg-red-500/5 border-red-500/20'
+                        : 'bg-secondary/50 border-border'
+                    }`}>
+                      {loadingPoiCount ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin text-muted-foreground shrink-0" />
+                          <span className="text-xs text-muted-foreground">Counting POIs in {COUNTRY_FLAGS[selectedCountry]} {selectedCountry}...</span>
+                        </>
+                      ) : poiCount ? (
+                        <>
+                          <MapPinned className={`w-4 h-4 shrink-0 ${poiCount.count > 0 ? 'text-emerald-400' : 'text-red-400'}`} />
+                          <div className="flex-1 min-w-0">
+                            <span className={`text-sm font-semibold ${poiCount.count > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                              {poiCount.count.toLocaleString()} POIs
+                            </span>
+                            <span className="text-xs text-muted-foreground ml-2">
+                              found in {COUNTRY_FLAGS[selectedCountry]} {selectedCountry}
+                            </span>
+                            {poiCount.count > 0 && Object.keys(poiCount.breakdown).length > 0 && (
+                              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                                {Object.entries(poiCount.breakdown).map(([cat, cnt]) => (
+                                  <Badge key={cat} variant="outline" className="text-[9px] px-1.5 py-0 h-4 border-emerald-500/20 text-emerald-400/80">
+                                    {CATEGORY_LABELS[cat as PoiCategory] || cat}: {cnt.toLocaleString()}
+                                  </Badge>
+                                ))}
+                              </div>
+                            )}
+                            {poiCount.count === 0 && (
+                              <p className="text-[10px] text-red-400/70 mt-0.5">
+                                No POIs match these categories in this country. The analysis will return no results.
+                              </p>
+                            )}
+                          </div>
+                        </>
+                      ) : null}
+                    </div>
+                  )}
 
                   {/* Add step + Run */}
                   <div className="flex items-center gap-3 pt-2">
