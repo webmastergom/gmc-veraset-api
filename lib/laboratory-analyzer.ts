@@ -110,26 +110,33 @@ export async function analyzeLaboratory(
   const countryFilter = country ? `AND p.country = '${country.toUpperCase()}'` : '';
 
   // ── 4. Spatial join + dwell time query ───────────────────────────────
-  // This is the core query. For each ping in the movement data:
-  //   - Find the nearest real POI within spatialRadius meters
-  //   - Group consecutive pings near same POI into visits
-  //   - Compute dwell time per visit
+  // Strategy: Use geohash-bucket JOIN instead of CROSS JOIN.
+  //   - Truncate lat/lng to a grid (~0.01° ≈ 1.1km cells)
+  //   - JOIN pings to POIs by bucket (equi-join on grid cell + neighbors)
+  //   - This reduces O(N×M) to O(N×k) where k ≈ POIs per bucket (~1-5)
   //
-  // Haversine approximation in Athena:
+  // Haversine approximation:
   //   distance_m ≈ 111320 * SQRT(POW(lat1-lat2,2) + POW((lng1-lng2)*COS(RADIANS((lat1+lat2)/2)),2))
 
-  report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m` });
+  report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m (geohash-bucket strategy)` });
+
+  // Grid cell size in degrees. For 200m radius, we need cells ~0.003°.
+  // We use 0.01° (~1.1km) so each ping only needs to check its own cell + 8 neighbors.
+  // This is generous enough to catch all POIs within any reasonable radius.
+  const GRID_STEP = 0.01;
 
   const spatialQuery = `
     WITH
-    -- Step 1: All pings from devices in the movement dataset
+    -- Step 1: All pings with grid bucket assignment
     pings AS (
       SELECT
         ad_id,
         date,
         utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
-        TRY_CAST(longitude AS DOUBLE) as lng
+        TRY_CAST(longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(TRY_CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_bucket
       FROM ${tableName}
       WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
@@ -137,16 +144,28 @@ export async function analyzeLaboratory(
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${dateWhere}
     ),
-    -- Step 2: Real POIs filtered by categories and country
-    real_pois AS (
-      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng
+    -- Step 2: Real POIs with grid buckets + neighbor expansion
+    -- Each POI maps to its own cell + 8 neighbors (3×3 grid) to catch edge cases
+    poi_base AS (
+      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
+        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
       FROM ${poiTableName} p
       WHERE p.category IS NOT NULL
         ${catFilter}
         ${countryFilter}
     ),
-    -- Step 3: Spatial join — match each ping to nearest real POI within radius
-    -- Using Haversine approximation for speed
+    -- Expand each POI into 9 bucket entries (3×3 neighborhood)
+    poi_buckets AS (
+      SELECT poi_id, category, poi_lat, poi_lng,
+        base_lat_bucket + dlat as lat_bucket,
+        base_lng_bucket + dlng as lng_bucket
+      FROM poi_base
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
+    ),
+    -- Step 3: Bucket-based equi-join (replaces expensive CROSS JOIN)
+    -- Only pings in the same bucket as a POI are compared
     matched AS (
       SELECT
         k.ad_id,
@@ -161,9 +180,9 @@ export async function analyzeLaboratory(
           POW((k.lng - p.poi_lng) * COS(RADIANS((k.lat + p.poi_lat) / 2)), 2)
         ) as distance_m
       FROM pings k
-      CROSS JOIN real_pois p
-      WHERE ABS(k.lat - p.poi_lat) < ${(spatialRadius / 111320 * 1.5).toFixed(6)}
-        AND ABS(k.lng - p.poi_lng) < ${(spatialRadius / (111320 * 0.6) * 1.5).toFixed(6)}
+      INNER JOIN poi_buckets p
+        ON k.lat_bucket = p.lat_bucket
+        AND k.lng_bucket = p.lng_bucket
     ),
     -- Step 4: Keep only closest POI per ping (within radius)
     closest AS (
@@ -177,8 +196,7 @@ export async function analyzeLaboratory(
       SELECT ad_id, date, utc_timestamp, lat, lng, poi_id, category
       FROM closest WHERE rn = 1
     ),
-    -- Step 5: Group into visits — consecutive pings at same POI
-    -- A visit = all consecutive pings by same device at same POI on same day
+    -- Step 5: Group into visits (same device × same POI × same day)
     visits AS (
       SELECT
         ad_id,
@@ -192,27 +210,7 @@ export async function analyzeLaboratory(
         HOUR(MIN(utc_timestamp)) as visit_hour
       FROM poi_pings
       GROUP BY ad_id, date, poi_id, category
-    ),
-    -- Step 6: Get origin (first ping of day) for each device-day
-    origins AS (
-      SELECT
-        ad_id,
-        date,
-        MIN_BY(lat, utc_timestamp) as origin_lat,
-        MIN_BY(lng, utc_timestamp) as origin_lng
-      FROM (
-        SELECT ad_id, date, utc_timestamp,
-          TRY_CAST(latitude AS DOUBLE) as lat,
-          TRY_CAST(longitude AS DOUBLE) as lng
-        FROM ${tableName}
-        WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
-          AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-          AND TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
-          ${dateWhere}
-      )
-      GROUP BY ad_id, date
     )
-    -- Final: join visits with origins
     SELECT
       v.ad_id,
       v.date,
@@ -221,15 +219,14 @@ export async function analyzeLaboratory(
       v.dwell_minutes,
       v.visit_hour,
       v.ping_count,
-      ROUND(o.origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
-      ROUND(o.origin_lng, ${COORDINATE_PRECISION}) as origin_lng
+      CAST(NULL AS DOUBLE) as origin_lat,
+      CAST(NULL AS DOUBLE) as origin_lng
     FROM visits v
-    INNER JOIN origins o ON v.ad_id = o.ad_id AND v.date = o.date
     WHERE v.dwell_minutes >= 0
     ORDER BY v.ad_id, v.date, v.visit_start
   `;
 
-  // Total devices in dataset
+  // Total devices in dataset (lightweight query)
   const totalDevicesQuery = `
     SELECT COUNT(DISTINCT ad_id) as total
     FROM ${tableName}
@@ -237,7 +234,8 @@ export async function analyzeLaboratory(
     ${dateWhere}
   `;
 
-  console.log(`[LAB] Running spatial join + origins query...`);
+  console.log(`[LAB] Running spatial join (geohash-bucket strategy)...`);
+  console.log(`[LAB] Grid cell size: ${GRID_STEP}° (~${Math.round(GRID_STEP * 111320)}m)`);
   console.log(`[LAB] Categories requested: ${categoryList.join(', ')}`);
   console.log(`[LAB] Country filter: ${country || 'none'}`);
   console.log(`[LAB] Date filters: ${dateWhere || 'none'}`);
@@ -279,6 +277,7 @@ export async function analyzeLaboratory(
     originLng: number;
   }
 
+  // Parse visits (origins are resolved later in a separate query)
   const allVisits: ParsedVisit[] = spatialRes.rows.map(row => ({
     adId: String(row.ad_id),
     date: String(row.date),
@@ -286,9 +285,9 @@ export async function analyzeLaboratory(
     category: String(row.category) as PoiCategory,
     dwellMinutes: parseFloat(String(row.dwell_minutes)) || 0,
     visitHour: parseInt(String(row.visit_hour)) || 0,
-    originLat: parseFloat(String(row.origin_lat)),
-    originLng: parseFloat(String(row.origin_lng)),
-  })).filter(v => !isNaN(v.originLat) && !isNaN(v.originLng));
+    originLat: 0, // resolved later
+    originLng: 0, // resolved later
+  }));
 
   // Group visits by device
   const deviceVisits = new Map<string, ParsedVisit[]>();
@@ -300,7 +299,7 @@ export async function analyzeLaboratory(
 
   // Apply recipe to each device
   const segmentDevices: SegmentDevice[] = [];
-  const matchedVisits: ParsedVisit[] = []; // visits from devices in segment
+  const matchedAdIds = new Set<string>();
 
   for (const [adId, visits] of deviceVisits.entries()) {
     const stepMatches = recipe.steps.map(step => matchStep(step, visits));
@@ -309,7 +308,6 @@ export async function analyzeLaboratory(
     if (recipe.logic === 'AND') {
       matches = stepMatches.every(m => m);
       if (matches && recipe.ordered) {
-        // Check order: first matching visit of step[i] must be before step[i+1]
         matches = checkOrder(recipe.steps, visits);
       }
     } else {
@@ -333,7 +331,7 @@ export async function analyzeLaboratory(
         categories: Array.from(cats),
       });
 
-      matchedVisits.push(...visits);
+      matchedAdIds.add(adId);
     }
   }
 
@@ -350,12 +348,87 @@ export async function analyzeLaboratory(
     return buildEmptyResult(config, totalDevicesInDataset);
   }
 
-  // ── 6. Geocode origins → postal codes ────────────────────────────────
-  report({ step: 'geocoding', percent: 68, message: 'Geocoding device origins...', detail: 'Resolving to postal codes' });
+  // ── 5b. Fetch origins for matched devices only ──────────────────────
+  // This is a SEPARATE query that only scans rows for matched ad_ids,
+  // instead of duplicating the full 6B+ row table scan inside the spatial join.
+  report({ step: 'geocoding', percent: 66, message: 'Fetching device origins...', detail: `${matchedAdIds.size} devices` });
 
-  // Aggregate unique origin coordinates from matched visits
-  const coordMap = new Map<string, { lat: number; lng: number; devices: number }>();
+  // Collect unique (ad_id, date) pairs from matched visits
+  const matchedPairs = new Set<string>();
+  const matchedVisits: ParsedVisit[] = [];
+  for (const v of allVisits) {
+    if (matchedAdIds.has(v.adId)) {
+      matchedVisits.push(v);
+      matchedPairs.add(`${v.adId}|${v.date}`);
+    }
+  }
+
+  // Query origins: first ping of day for each matched device
+  // We pass the ad_ids as a filter to avoid full table scan
+  const uniqueAdIds = Array.from(matchedAdIds);
+  // Split into batches of 500 to avoid SQL IN clause limits
+  const BATCH_SIZE = 500;
+  const originMap = new Map<string, { lat: number; lng: number }>();
+
+  for (let batchStart = 0; batchStart < uniqueAdIds.length; batchStart += BATCH_SIZE) {
+    const batch = uniqueAdIds.slice(batchStart, batchStart + BATCH_SIZE);
+    const adIdFilter = batch.map(id => `'${id.replace(/'/g, "''")}'`).join(',');
+
+    const originQuery = `
+      SELECT
+        ad_id,
+        date,
+        ROUND(MIN_BY(TRY_CAST(latitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lat,
+        ROUND(MIN_BY(TRY_CAST(longitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lng
+      FROM ${tableName}
+      WHERE ad_id IN (${adIdFilter})
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        ${dateWhere}
+      GROUP BY ad_id, date
+    `;
+
+    try {
+      const originRes = await runQuery(originQuery);
+      for (const row of originRes.rows) {
+        const key = `${row.ad_id}|${row.date}`;
+        const lat = parseFloat(String(row.origin_lat));
+        const lng = parseFloat(String(row.origin_lng));
+        if (!isNaN(lat) && !isNaN(lng)) {
+          originMap.set(key, { lat, lng });
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[LAB] Origin batch query failed:`, err.message);
+    }
+
+    if (batchStart + BATCH_SIZE < uniqueAdIds.length) {
+      report({ step: 'geocoding', percent: 66 + Math.round((batchStart / uniqueAdIds.length) * 4), message: 'Fetching device origins...', detail: `${Math.min(batchStart + BATCH_SIZE, uniqueAdIds.length)}/${uniqueAdIds.length} devices` });
+    }
+  }
+
+  console.log(`[LAB] Origins resolved: ${originMap.size} device-day pairs`);
+
+  // Assign origins to matched visits
   for (const v of matchedVisits) {
+    const origin = originMap.get(`${v.adId}|${v.date}`);
+    if (origin) {
+      v.originLat = origin.lat;
+      v.originLng = origin.lng;
+    }
+  }
+
+  // Filter out visits without valid origins
+  const geoVisits = matchedVisits.filter(v => v.originLat !== 0 || v.originLng !== 0);
+  console.log(`[LAB] Visits with valid origins: ${geoVisits.length}/${matchedVisits.length}`);
+
+  // ── 6. Geocode origins → postal codes ────────────────────────────────
+  report({ step: 'geocoding', percent: 72, message: 'Geocoding device origins...', detail: 'Resolving to postal codes' });
+
+  // Aggregate unique origin coordinates
+  const coordMap = new Map<string, { lat: number; lng: number; devices: number }>();
+  for (const v of geoVisits) {
     const key = `${v.originLat},${v.originLng}`;
     const existing = coordMap.get(key);
     if (existing) {
@@ -398,7 +471,7 @@ export async function analyzeLaboratory(
     visits: number; devices: Set<string>; totalDwell: number;
   }>();
 
-  for (const v of matchedVisits) {
+  for (const v of geoVisits) {
     const coordKey = `${v.originLat},${v.originLng}`;
     const geo = coordToZip.get(coordKey);
     if (!geo) continue;
@@ -556,7 +629,7 @@ export async function analyzeLaboratory(
   report({ step: 'computing_affinity', percent: 92, message: 'Affinity computation complete', detail: `${profiles.length} postal codes profiled` });
 
   // ── 8. Build stats ───────────────────────────────────────────────────
-  const stats = computeStats(records, profiles, segmentDevices, matchedVisits, totalDevicesInDataset);
+  const stats = computeStats(records, profiles, segmentDevices, geoVisits, totalDevicesInDataset);
 
   // Sort segment by totalVisits desc, limit to top 1000 for response
   segmentDevices.sort((a, b) => b.totalVisits - a.totalVisits);

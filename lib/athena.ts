@@ -99,7 +99,7 @@ export async function runQuery(sql: string): Promise<QueryResult> {
     // Poll for completion
     let state: QueryExecutionState = 'QUEUED';
     let attempts = 0;
-    const maxAttempts = 600; // 5 minutes max (500ms * 600) - Athena queries can take time
+    const maxAttempts = 1800; // 15 minutes max (500ms * 1800) - lab queries scan billions of rows
     const logInterval = 20; // Log every 10 seconds
 
     while ((state === 'QUEUED' || state === 'RUNNING') && attempts < maxAttempts) {
