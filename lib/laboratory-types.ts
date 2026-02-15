@@ -28,7 +28,7 @@
 export const POI_CATEGORIES = [
   // ── TIER 1: High affinity signal ──────────────────────────────────
   // Retail / Commerce
-  'clothing_store', 'department_store', 'discount_store', 'shopping_mall',
+  'clothing_store', 'department_store', 'discount_store', 'shopping_center',
   'outlet_store', 'thrift_store', 'gift_shop', 'convenience_store',
   'general_merchandise_store',
   // Food & Beverage
@@ -121,7 +121,7 @@ export const CATEGORY_LABELS: Record<PoiCategory, string> = {
   clothing_store: 'Clothing Stores',
   department_store: 'Department Stores',
   discount_store: 'Discount Stores',
-  shopping_mall: 'Shopping Malls',
+  shopping_center: 'Shopping Centers',
   outlet_store: 'Outlet Stores',
   thrift_store: 'Thrift Stores',
   gift_shop: 'Gift Shops',
@@ -356,7 +356,7 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'ShoppingBag',
     color: 'text-pink-400',
     categories: [
-      'clothing_store', 'department_store', 'discount_store', 'shopping_mall',
+      'clothing_store', 'department_store', 'discount_store', 'shopping_center',
       'outlet_store', 'thrift_store', 'gift_shop', 'convenience_store',
       'general_merchandise_store', 'supermarket',
     ],

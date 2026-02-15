@@ -238,6 +238,10 @@ export async function analyzeLaboratory(
   `;
 
   console.log(`[LAB] Running spatial join + origins query...`);
+  console.log(`[LAB] Categories requested: ${categoryList.join(', ')}`);
+  console.log(`[LAB] Country filter: ${country || 'none'}`);
+  console.log(`[LAB] Date filters: ${dateWhere || 'none'}`);
+  console.log(`[LAB] Spatial radius: ${spatialRadius}m`);
   let spatialRes, totalRes;
   try {
     [spatialRes, totalRes] = await Promise.all([
@@ -245,16 +249,20 @@ export async function analyzeLaboratory(
       runQuery(totalDevicesQuery),
     ]);
   } catch (error: any) {
+    console.error(`[LAB] Query failed:`, error.message);
     report({ step: 'error', percent: 0, message: error.message });
     throw new Error(`Laboratory query failed: ${error.message}`);
   }
 
   const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total)) || 0;
+  console.log(`[LAB] Total devices in dataset: ${totalDevicesInDataset}`);
+  console.log(`[LAB] Spatial join returned ${spatialRes.rows.length} visit rows`);
   report({ step: 'spatial_join', percent: 50, message: 'Spatial join complete', detail: `${spatialRes.rows.length} visits found` });
 
   if (spatialRes.rows.length === 0) {
-    report({ step: 'completed', percent: 100, message: 'No visits found matching criteria' });
-    return buildEmptyResult(config);
+    console.log(`[LAB] No visits found — returning empty result`);
+    report({ step: 'completed', percent: 100, message: 'No visits found matching criteria', detail: `Checked ${categoryList.length} categories in ${country || 'all countries'} with ${spatialRadius}m radius` });
+    return buildEmptyResult(config, totalDevicesInDataset);
   }
 
   // ── 5. Parse visits and apply recipe ─────────────────────────────────
@@ -329,9 +337,15 @@ export async function analyzeLaboratory(
     }
   }
 
+  console.log(`[LAB] Recipe matching: ${segmentDevices.length} devices matched out of ${deviceVisits.size} total`);
+  console.log(`[LAB] Recipe: ${recipe.steps.length} steps, logic=${recipe.logic}, ordered=${recipe.ordered}`);
+  for (const step of recipe.steps) {
+    console.log(`[LAB]   Step ${step.id}: categories=[${step.categories.join(',')}] timeWindow=${step.timeWindow ? `${step.timeWindow.hourFrom}-${step.timeWindow.hourTo}` : 'none'} minDwell=${step.minDwellMinutes ?? 'none'} maxDwell=${step.maxDwellMinutes ?? 'none'} minFreq=${step.minFrequency ?? 1}`);
+  }
   report({ step: 'building_segments', percent: 65, message: 'Segment built', detail: `${segmentDevices.length} devices matched out of ${deviceVisits.size}` });
 
   if (segmentDevices.length === 0) {
+    console.log(`[LAB] No devices matched the recipe — returning empty result`);
     report({ step: 'completed', percent: 100, message: 'No devices matched the recipe' });
     return buildEmptyResult(config, totalDevicesInDataset);
   }
@@ -548,6 +562,7 @@ export async function analyzeLaboratory(
   segmentDevices.sort((a, b) => b.totalVisits - a.totalVisits);
   const segmentForResponse = segmentDevices.slice(0, 1000);
 
+  console.log(`[LAB] Analysis complete: ${segmentDevices.length} devices, ${profiles.length} postal codes, ${records.length} affinity records`);
   report({ step: 'completed', percent: 100, message: 'Analysis complete', detail: `${segmentDevices.length} devices in segment, ${profiles.length} postal codes` });
 
   return {

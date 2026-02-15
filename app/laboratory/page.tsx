@@ -70,6 +70,7 @@ import {
   FileDown,
   ListFilter,
   RotateCcw,
+  AlertTriangle,
 } from 'lucide-react';
 import type {
   LabConfig,
@@ -342,6 +343,33 @@ export default function LaboratoryPage() {
               } else {
                 setProgress(data);
               }
+            } else if (eventType === 'result') {
+              gotResult = true;
+              setResult(data);
+              setPhase('results');
+              setProgress(null);
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      }
+
+      // Process any remaining data in the buffer (last SSE message may not end with \n\n)
+      if (buffer.trim()) {
+        const lines = buffer.trim().split('\n');
+        let eventType = '';
+        let dataStr = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            dataStr += line.slice(6);
+          }
+        }
+        if (eventType && dataStr) {
+          try {
+            const data = JSON.parse(dataStr);
+            if (eventType === 'progress' && data.step === 'error') {
+              backendError = data.message || 'Analysis failed';
             } else if (eventType === 'result') {
               gotResult = true;
               setResult(data);
@@ -863,8 +891,32 @@ export default function LaboratoryPage() {
           </Card>
         )}
 
+        {/* ── Phase: Results (empty segment) ─────────────────────── */}
+        {phase === 'results' && result && result.segment.totalDevices === 0 && (
+          <Card className="border-border">
+            <CardContent className="py-12 text-center space-y-4">
+              <AlertTriangle className="w-8 h-8 text-yellow-500 mx-auto" />
+              <div>
+                <p className="text-sm font-medium mb-1">No devices matched this recipe</p>
+                <p className="text-xs text-muted-foreground max-w-md mx-auto">
+                  The spatial join found {result.stats.totalPingsAnalyzed > 0 ? `${result.stats.totalPingsAnalyzed.toLocaleString()} visits` : 'no visits'} near the selected POIs,
+                  but no devices satisfied all recipe filters (categories, time window, dwell, frequency).
+                  {result.stats.totalDevicesInDataset > 0 && ` Dataset has ${result.stats.totalDevicesInDataset.toLocaleString()} total devices.`}
+                </p>
+                <p className="text-xs text-muted-foreground mt-2">
+                  Try: broader categories, relaxed time windows, lower dwell/frequency thresholds, or a larger spatial radius.
+                </p>
+              </div>
+              <Button variant="outline" size="sm" onClick={() => { setPhase('recipe'); setResult(null); }} className="rounded-xl">
+                <RotateCcw className="w-3.5 h-3.5 mr-1" />
+                Adjust Recipe
+              </Button>
+            </CardContent>
+          </Card>
+        )}
+
         {/* ── Phase: Results ────────────────────────────────────────── */}
-        {phase === 'results' && result && (
+        {phase === 'results' && result && result.segment.totalDevices > 0 && (
           <>
             {/* Summary bar */}
             <div className="flex items-center gap-3 p-4 rounded-xl bg-secondary/50 border border-border">

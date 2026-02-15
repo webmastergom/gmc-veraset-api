@@ -71,6 +71,8 @@ export async function POST(request: NextRequest): Promise<Response> {
           });
         }
       } finally {
+        // Small delay to ensure the last SSE message is flushed before closing
+        await new Promise(resolve => setTimeout(resolve, 100));
         try { controller.close(); } catch { /* already closed */ }
       }
     },
