@@ -140,10 +140,12 @@ function newStepId(): string {
 }
 
 const COUNTRY_FLAGS: Record<string, string> = {
-  FR: '🇫🇷', DE: '🇩🇪', ES: '🇪🇸', IT: '🇮🇹', GB: '🇬🇧', US: '🇺🇸',
-  PT: '🇵🇹', NL: '🇳🇱', BE: '🇧🇪', AT: '🇦🇹', CH: '🇨🇭', PL: '🇵🇱',
-  SE: '🇸🇪', NO: '🇳🇴', DK: '🇩🇰', FI: '🇫🇮', IE: '🇮🇪', CZ: '🇨🇿',
-  GR: '🇬🇷', RO: '🇷🇴', HU: '🇭🇺', BG: '🇧🇬', HR: '🇭🇷', MX: '🇲🇽',
+  // LATAM
+  MX: '🇲🇽', GT: '🇬🇹', DO: '🇩🇴', SV: '🇸🇻', NI: '🇳🇮', CR: '🇨🇷',
+  PA: '🇵🇦', CO: '🇨🇴', CL: '🇨🇱', EC: '🇪🇨', HN: '🇭🇳', AR: '🇦🇷',
+  // Europe
+  FR: '🇫🇷', GB: '🇬🇧', ES: '🇪🇸', SE: '🇸🇪', NL: '🇳🇱', BE: '🇧🇪',
+  DE: '🇩🇪', PT: '🇵🇹', IE: '🇮🇪', IT: '🇮🇹',
 };
 
 // ── Progress step config ──────────────────────────────────────────────
