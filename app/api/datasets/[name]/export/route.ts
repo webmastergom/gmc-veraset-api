@@ -8,15 +8,13 @@ export const maxDuration = 180; // 3 minutes — Athena can take 30-90s per quer
 
 export async function POST(
   req: NextRequest,
-  context: { params: Promise<{ name: string }> | { name: string } }
+  context: { params: Promise<{ name: string }> }
 ) {
   if (!isAuthenticated(req)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const params = await (typeof context.params === 'object' && context.params instanceof Promise
-    ? context.params
-    : Promise.resolve(context.params as { name: string }));
+  const params = await context.params;
   const datasetName = params.name;
 
   try {

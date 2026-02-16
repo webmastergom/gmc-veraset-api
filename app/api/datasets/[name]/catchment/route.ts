@@ -14,12 +14,10 @@ export const maxDuration = 300;
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ name: string }> | { name: string } }
+  context: { params: Promise<{ name: string }> }
 ): Promise<NextResponse> {
   try {
-    const params = await (typeof context.params === 'object' && context.params instanceof Promise
-      ? context.params
-      : Promise.resolve(context.params as { name: string }));
+    const params = await context.params;
     const datasetName = params.name;
 
     if (!datasetName) {

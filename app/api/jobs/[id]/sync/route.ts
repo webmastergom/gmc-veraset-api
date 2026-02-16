@@ -9,13 +9,10 @@ export const maxDuration = 600; // 10 min for large syncs
 
 export async function POST(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params =
-      typeof context.params === 'object' && context.params instanceof Promise
-        ? await context.params
-        : context.params;
+    const params = await context.params;
     const jobId = params.id;
 
     const body = await request.json().catch(() => ({}));

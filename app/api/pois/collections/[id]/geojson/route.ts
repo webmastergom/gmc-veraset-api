@@ -11,18 +11,12 @@ export const revalidate = 0;
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ): Promise<NextResponse> {
   let collectionId: string | undefined;
-  
+
   try {
-    // Handle params - Next.js 14+ may pass params as Promise
-    let params: { id: string };
-    if (context.params instanceof Promise) {
-      params = await context.params;
-    } else {
-      params = context.params;
-    }
+    const params = await context.params;
     collectionId = params.id;
 
     if (!collectionId || typeof collectionId !== 'string') {
@@ -91,18 +85,12 @@ export async function GET(
  */
 export async function PUT(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ): Promise<NextResponse> {
   let collectionId: string | undefined;
-  
+
   try {
-    // Handle params
-    let params: { id: string };
-    if (context.params instanceof Promise) {
-      params = await context.params;
-    } else {
-      params = context.params;
-    }
+    const params = await context.params;
     collectionId = params.id;
 
     if (!collectionId || typeof collectionId !== 'string') {

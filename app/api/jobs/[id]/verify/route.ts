@@ -9,10 +9,10 @@ import { logger } from "@/lib/logger";
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params = await Promise.resolve(context.params);
+    const params = await context.params;
     const jobId = params.id;
 
     const job = await getJob(jobId);

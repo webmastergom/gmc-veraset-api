@@ -22,18 +22,12 @@ export const maxDuration = 300; // 5 minutes for Athena queries + reverse geocod
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ datasetName: string }> | { datasetName: string } }
+  context: { params: Promise<{ datasetName: string }> }
 ): Promise<NextResponse> {
   let jobId: string | undefined;
 
   try {
-    // Handle params - Next.js 14+ may pass params as Promise
-    let params: { datasetName: string };
-    if (context.params instanceof Promise) {
-      params = await context.params;
-    } else {
-      params = context.params;
-    }
+    const params = await context.params;
     jobId = params.datasetName;
 
     console.log(`[OD] GET /api/external/jobs/${jobId}/od`);

@@ -10,13 +10,10 @@ export const revalidate = 0;
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params =
-      typeof context.params === 'object' && context.params instanceof Promise
-        ? await context.params
-        : context.params;
+    const params = await context.params;
     const jobId = params.id;
 
     const job = await getJob(jobId);

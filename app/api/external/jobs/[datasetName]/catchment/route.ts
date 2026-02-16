@@ -18,17 +18,12 @@ export const maxDuration = 300;
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ datasetName: string }> | { datasetName: string } }
+  context: { params: Promise<{ datasetName: string }> }
 ): Promise<NextResponse> {
   let jobId: string | undefined;
 
   try {
-    let params: { datasetName: string };
-    if (context.params instanceof Promise) {
-      params = await context.params;
-    } else {
-      params = context.params;
-    }
+    const params = await context.params;
     jobId = params.datasetName;
 
     console.log(`[CATCHMENT-OD] GET /api/external/jobs/${jobId}/catchment`);

@@ -14,13 +14,10 @@ const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
  */
 export async function POST(
   request: NextRequest,
-  context: { params: Promise<{ name: string }> | { name: string } }
+  context: { params: Promise<{ name: string }> }
 ) {
   try {
-    const params =
-      typeof context.params === 'object' && context.params instanceof Promise
-        ? await context.params
-        : context.params;
+    const params = await context.params;
     const datasetName = params.name;
 
     if (!datasetName) {

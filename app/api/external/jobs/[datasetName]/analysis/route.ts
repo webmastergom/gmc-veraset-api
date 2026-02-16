@@ -16,11 +16,9 @@ export const maxDuration = 300; // Allow up to 5 minutes for Athena queries
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ datasetName: string }> | { datasetName: string } }
+  context: { params: Promise<{ datasetName: string }> }
 ) {
-  const params = await (typeof context.params === 'object' && context.params instanceof Promise
-    ? context.params
-    : Promise.resolve(context.params as { datasetName: string }));
+  const params = await context.params;
   const datasetName = params.datasetName;
 
   try {

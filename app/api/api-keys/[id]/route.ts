@@ -10,24 +10,16 @@ import {
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-async function resolveParams(
-  context: { params: Promise<{ id: string }> | { id: string } }
-) {
-  return typeof context.params === 'object' && context.params instanceof Promise
-    ? await context.params
-    : context.params;
-}
-
 /**
  * GET /api/api-keys/[id]
  * Get specific API key metadata
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params = await resolveParams(context);
+    const params = await context.params;
     const key = await getApiKeyById(params.id);
 
     if (!key) {
@@ -62,10 +54,10 @@ export async function GET(
  */
 export async function PATCH(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params = await resolveParams(context);
+    const params = await context.params;
     const body = await request.json().catch(() => ({}));
     const { name, description, active } = body;
 
@@ -135,10 +127,10 @@ export async function PATCH(
  */
 export async function DELETE(
   request: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params = await resolveParams(context);
+    const params = await context.params;
     const deleted = await deleteApiKey(params.id);
 
     if (!deleted) {

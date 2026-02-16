@@ -12,14 +12,12 @@ export const maxDuration = 600; // 10 minutes - allows time to wait for all part
  */
 export async function POST(
   request: NextRequest,
-  context: { params: Promise<{ name: string }> | { name: string } }
+  context: { params: Promise<{ name: string }> }
 ): Promise<NextResponse> {
   let datasetName: string | undefined;
 
   try {
-    const params = await (typeof context.params === 'object' && context.params instanceof Promise
-      ? context.params
-      : Promise.resolve(context.params as { name: string }));
+    const params = await context.params;
     datasetName = params.name;
 
     if (!datasetName || typeof datasetName !== 'string') {
