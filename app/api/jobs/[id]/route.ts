@@ -6,9 +6,13 @@ export const revalidate = 0;
 
 export async function GET(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> | { id: string } }
 ) {
   try {
+    const params =
+      typeof context.params === 'object' && context.params instanceof Promise
+        ? await context.params
+        : context.params;
     const job = await getJob(params.id);
     
     if (!job) {
@@ -73,7 +77,7 @@ export async function GET(
     return NextResponse.json(job);
     
   } catch (error: any) {
-    console.error(`GET /api/jobs/${params.id} error:`, error);
+    console.error(`GET /api/jobs/[id] error:`, error);
     return NextResponse.json(
       { error: 'Failed to fetch job', details: error.message },
       { status: 500 }

@@ -10,9 +10,13 @@ export const revalidate = 0;
  */
 export async function POST(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> | { id: string } }
 ) {
   try {
+    const params =
+      typeof context.params === 'object' && context.params instanceof Promise
+        ? await context.params
+        : context.params;
     const job = await getJob(params.id);
     
     if (!job) {
@@ -99,7 +103,7 @@ export async function POST(
     }
     
   } catch (error: any) {
-    console.error(`POST /api/jobs/${params.id}/refresh error:`, error);
+    console.error(`POST /api/jobs/[id]/refresh error:`, error);
     return NextResponse.json(
       { error: 'Failed to refresh job status', details: error.message },
       { status: 500 }

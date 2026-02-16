@@ -10,24 +10,33 @@ import {
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+async function resolveParams(
+  context: { params: Promise<{ id: string }> | { id: string } }
+) {
+  return typeof context.params === 'object' && context.params instanceof Promise
+    ? await context.params
+    : context.params;
+}
+
 /**
  * GET /api/api-keys/[id]
  * Get specific API key metadata
  */
 export async function GET(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> | { id: string } }
 ) {
   try {
+    const params = await resolveParams(context);
     const key = await getApiKeyById(params.id);
-    
+
     if (!key) {
       return NextResponse.json(
         { error: 'API key not found' },
         { status: 404 }
       );
     }
-    
+
     // Return key without the hash for security
     return NextResponse.json({
       id: key.id,
@@ -39,7 +48,7 @@ export async function GET(
       usageCount: key.usageCount,
     });
   } catch (error: any) {
-    console.error(`GET /api/api-keys/${params.id} error:`, error);
+    console.error(`GET /api/api-keys/[id] error:`, error);
     return NextResponse.json(
       { error: 'Failed to fetch API key', details: error.message },
       { status: 500 }
@@ -53,12 +62,13 @@ export async function GET(
  */
 export async function PATCH(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> | { id: string } }
 ) {
   try {
+    const params = await resolveParams(context);
     const body = await request.json().catch(() => ({}));
     const { name, description, active } = body;
-    
+
     const updates: any = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -69,11 +79,11 @@ export async function PATCH(
       }
       updates.name = name.trim();
     }
-    
+
     if (description !== undefined) {
       updates.description = typeof description === 'string' ? description.trim() : null;
     }
-    
+
     if (active !== undefined) {
       if (typeof active !== 'boolean') {
         return NextResponse.json(
@@ -83,23 +93,23 @@ export async function PATCH(
       }
       updates.active = active;
     }
-    
+
     if (Object.keys(updates).length === 0) {
       return NextResponse.json(
         { error: 'No valid updates provided' },
         { status: 400 }
       );
     }
-    
+
     const updated = await updateApiKey(params.id, updates);
-    
+
     if (!updated) {
       return NextResponse.json(
         { error: 'API key not found' },
         { status: 404 }
       );
     }
-    
+
     // Return updated key without the hash
     return NextResponse.json({
       id: updated.id,
@@ -111,7 +121,7 @@ export async function PATCH(
       usageCount: updated.usageCount,
     });
   } catch (error: any) {
-    console.error(`PATCH /api/api-keys/${params.id} error:`, error);
+    console.error(`PATCH /api/api-keys/[id] error:`, error);
     return NextResponse.json(
       { error: 'Failed to update API key', details: error.message },
       { status: 500 }
@@ -125,21 +135,22 @@ export async function PATCH(
  */
 export async function DELETE(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> | { id: string } }
 ) {
   try {
+    const params = await resolveParams(context);
     const deleted = await deleteApiKey(params.id);
-    
+
     if (!deleted) {
       return NextResponse.json(
         { error: 'API key not found' },
         { status: 404 }
       );
     }
-    
+
     return NextResponse.json({ success: true, message: 'API key deleted' });
   } catch (error: any) {
-    console.error(`DELETE /api/api-keys/${params.id} error:`, error);
+    console.error(`DELETE /api/api-keys/[id] error:`, error);
     return NextResponse.json(
       { error: 'Failed to delete API key', details: error.message },
       { status: 500 }
