@@ -30,10 +30,28 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
     };
   }
 
-  const copied = job.objectCount ?? 0;
-  const copiedBytes = job.totalBytes ?? 0;
+  let copied = job.objectCount ?? 0;
+  let copiedBytes = job.totalBytes ?? 0;
   let totalObjects = job.expectedObjectCount ?? 0;
   let totalBytes = job.expectedTotalBytes ?? 0;
+
+  // Derive overall progress from dayProgress when available.
+  // The dayProgress is always at least as fresh as objectCount (they are
+  // written in the same flush), and is often more granular because the SSE
+  // stream may read the job between flushes — dayProgress is updated in-memory
+  // per file while objectCount only updates every 5 s via flushProgress.
+  if (job.syncProgress?.dayProgress) {
+    const days = Object.values(job.syncProgress.dayProgress);
+    const sumCopied = days.reduce((s, d) => s + (d.copiedFiles ?? 0), 0);
+    const sumCopiedBytes = days.reduce((s, d) => s + (d.copiedBytes ?? 0), 0);
+    const sumTotal = days.reduce((s, d) => s + (d.totalFiles ?? 0), 0);
+    const sumTotalBytes = days.reduce((s, d) => s + (d.totalBytes ?? 0), 0);
+    // Use dayProgress-derived values when they show more progress
+    if (sumCopied > copied) copied = sumCopied;
+    if (sumCopiedBytes > copiedBytes) copiedBytes = sumCopiedBytes;
+    if (sumTotal > 0 && totalObjects === 0) totalObjects = sumTotal;
+    if (sumTotalBytes > 0 && totalBytes === 0) totalBytes = sumTotalBytes;
+  }
 
   if (totalObjects === 0 && copied > 0) {
     totalObjects = copied;
