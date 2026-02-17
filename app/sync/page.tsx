@@ -245,7 +245,10 @@ function SyncPageContent() {
   // ---------- Auto-retry: detect stalled syncs and re-trigger ----------
   // When a Vercel function times out (10 min), the sync stalls. Since we now
   // have incremental sync, we can safely re-trigger to continue where we left off.
+  const autoRetryInProgressRef = useRef(false)
   const handleAutoRetry = useCallback(async () => {
+    // Guard: prevent concurrent retries
+    if (autoRetryInProgressRef.current) return
     if (!jobId || !destPath) return
     if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) {
       console.warn('[AUTO-RETRY] Max retries reached, stopping auto-retry')
@@ -256,18 +259,26 @@ function SyncPageContent() {
       })
       return
     }
+    autoRetryInProgressRef.current = true
     autoRetryCountRef.current++
     console.log(`[AUTO-RETRY] Triggering auto-retry #${autoRetryCountRef.current}`)
     setAutoRetrying(true)
-    // Small delay to let the lock expire
-    await new Promise(r => setTimeout(r, 3000))
-    setAutoRetrying(false)
-    await handleSync(true)
+    try {
+      // Small delay to let the lock expire
+      await new Promise(r => setTimeout(r, 3000))
+      setAutoRetrying(false)
+      await handleSync(true)
+    } finally {
+      autoRetryInProgressRef.current = false
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, destPath, toast])
 
   useEffect(() => {
     if (!syncStatus || !isPolling) return
+    // Don't trigger while an auto-retry is already in progress
+    if (autoRetryInProgressRef.current) return
+
     if (syncStatus.status !== 'syncing') {
       // If the status switched to 'error' with a stall message, auto-retry
       if (syncStatus.status === 'error' && syncStatus.message?.includes('stalled')) {
