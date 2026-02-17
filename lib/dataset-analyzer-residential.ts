@@ -154,7 +154,7 @@ export async function analyzeResidentialZipcodes(
         AND CARDINALITY(t.poi_ids) = 0
         AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         ${dateWhere}
     ),
     device_home AS (

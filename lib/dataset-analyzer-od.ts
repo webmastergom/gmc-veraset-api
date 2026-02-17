@@ -142,7 +142,7 @@ export async function analyzeOriginDestination(
       INNER JOIN (SELECT DISTINCT ad_id FROM poi_visits) v ON t.ad_id = v.ad_id
       WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         ${dateWhere}
     ),
     device_day_trips AS (
@@ -465,7 +465,7 @@ export async function analyzeOrigins(
       INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
       WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         ${dateWhere}
     ),
     first_pings AS (

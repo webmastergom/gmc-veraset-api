@@ -140,7 +140,7 @@ export async function analyzeLaboratory(
       FROM ${tableName}
       WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${dateWhere}
     ),
@@ -384,7 +384,7 @@ export async function analyzeLaboratory(
       WHERE ad_id IN (${adIdFilter})
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS}
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         ${dateWhere}
       GROUP BY ad_id, date
     `;
