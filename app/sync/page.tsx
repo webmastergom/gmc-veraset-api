@@ -51,6 +51,13 @@ function SyncPageContent() {
   const [syncConflict, setSyncConflict] = useState(false) // 409: lock held, need to cancel first
   const consecutiveErrorsRef = useRef(0)
   const MAX_CONSECUTIVE_ERRORS = 5
+  // Auto-retry: track progress changes to detect stalled syncs
+  const lastProgressRef = useRef<{ copied: number; time: number }>({ copied: 0, time: Date.now() })
+  const autoRetryCountRef = useRef(0)
+  const MAX_AUTO_RETRIES = 30 // Enough for ~50 GB at ~2 GB per 10-min run
+  const STALL_THRESHOLD_MS = 90_000 // 90s without progress = stalled
+  const [autoRetrying, setAutoRetrying] = useState(false)
+  const autoRetryTimerRef = useRef<NodeJS.Timeout | null>(null)
   const { toast } = useToast()
   const router = useRouter()
 
@@ -75,6 +82,10 @@ function SyncPageContent() {
         clearInterval(intervalRef.current)
         intervalRef.current = null
       }
+      if (autoRetryTimerRef.current) {
+        clearTimeout(autoRetryTimerRef.current)
+        autoRetryTimerRef.current = null
+      }
       // Don't abort the sync stream on unmount — let the backend finish
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -86,24 +97,29 @@ function SyncPageContent() {
       setIsPolling(false)
       setLoading(false)
       setSyncConflict(false)
+      autoRetryCountRef.current = 0
       toast({
         title: "Sync Complete",
         description: `Synced ${status.copied} objects (${(status.totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB)`,
       })
       setTimeout(() => router.push(`/jobs/${jobId}`), 2000)
     } else if (status.status === 'error') {
-      setIsPolling(false)
-      setLoading(false)
-      setSyncConflict(false)
-      toast({
-        title: "Sync Error",
-        description: status.message || "Sync failed",
-        variant: "destructive",
-      })
+      // Don't stop polling if it's a stall — auto-retry will handle it
+      if (!status.message?.includes('stalled')) {
+        setIsPolling(false)
+        setLoading(false)
+        setSyncConflict(false)
+        toast({
+          title: "Sync Error",
+          description: status.message || "Sync failed",
+          variant: "destructive",
+        })
+      }
     } else if (status.status === 'cancelled') {
       setIsPolling(false)
       setLoading(false)
       setSyncConflict(false)
+      autoRetryCountRef.current = 0
       toast({
         title: "Sync Stopped",
         description: status.message || "Sync was stopped by user",
@@ -125,7 +141,11 @@ function SyncPageContent() {
         const status = await response.json() as SyncStatus
         setSyncStatus(status)
         if (status.status === 'syncing' && !isPolling) setIsPolling(true)
-        if (status.status === 'completed' || status.status === 'error' || status.status === 'cancelled') {
+        // For stalled errors, keep polling so auto-retry can detect and handle
+        if (status.status === 'error' && status.message?.includes('stalled')) {
+          if (!isPolling) setIsPolling(true)
+          applyStatus(status)
+        } else if (status.status === 'completed' || status.status === 'error' || status.status === 'cancelled') {
           applyStatus(status)
         }
       } else {
@@ -182,10 +202,24 @@ function SyncPageContent() {
       try {
         const status = JSON.parse(e.data) as SyncStatus
         setSyncStatus(status)
-        if (status.status === 'completed' || status.status === 'error' || status.status === 'cancelled') {
+        if (status.status === 'completed' || status.status === 'cancelled') {
           es.close()
           eventSourceRef.current = null
           setIsPolling(false)
+          applyStatus(status)
+        } else if (status.status === 'error') {
+          // For stalled syncs, don't stop polling — auto-retry will handle it
+          // For other errors, stop polling
+          if (status.message?.includes('stalled')) {
+            // Keep polling, switch to fallback since SSE stream died
+            es.close()
+            eventSourceRef.current = null
+            setSseFailed(true)
+          } else {
+            es.close()
+            eventSourceRef.current = null
+            setIsPolling(false)
+          }
           applyStatus(status)
         }
       } catch {
@@ -207,6 +241,59 @@ function SyncPageContent() {
       }
     }
   }, [isPolling, jobId, retryDelay, sseFailed, checkSyncStatus, applyStatus])
+
+  // ---------- Auto-retry: detect stalled syncs and re-trigger ----------
+  // When a Vercel function times out (10 min), the sync stalls. Since we now
+  // have incremental sync, we can safely re-trigger to continue where we left off.
+  const handleAutoRetry = useCallback(async () => {
+    if (!jobId || !destPath) return
+    if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) {
+      console.warn('[AUTO-RETRY] Max retries reached, stopping auto-retry')
+      toast({
+        title: "Auto-retry limit reached",
+        description: `Sync has been auto-retried ${MAX_AUTO_RETRIES} times. Please check the sync manually.`,
+        variant: "destructive",
+      })
+      return
+    }
+    autoRetryCountRef.current++
+    console.log(`[AUTO-RETRY] Triggering auto-retry #${autoRetryCountRef.current}`)
+    setAutoRetrying(true)
+    // Small delay to let the lock expire
+    await new Promise(r => setTimeout(r, 3000))
+    setAutoRetrying(false)
+    await handleSync(true)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, destPath, toast])
+
+  useEffect(() => {
+    if (!syncStatus || !isPolling) return
+    if (syncStatus.status !== 'syncing') {
+      // If the status switched to 'error' with a stall message, auto-retry
+      if (syncStatus.status === 'error' && syncStatus.message?.includes('stalled')) {
+        console.log('[AUTO-RETRY] Detected stalled sync from status, triggering retry...')
+        handleAutoRetry()
+      }
+      return
+    }
+
+    const currentCopied = syncStatus.copied ?? 0
+    const now = Date.now()
+
+    // Update last progress timestamp when copied count increases
+    if (currentCopied > lastProgressRef.current.copied) {
+      lastProgressRef.current = { copied: currentCopied, time: now }
+      return
+    }
+
+    // Check if progress has stalled
+    const elapsed = now - lastProgressRef.current.time
+    if (elapsed >= STALL_THRESHOLD_MS && currentCopied > 0 && currentCopied < (syncStatus.total ?? 0)) {
+      console.log(`[AUTO-RETRY] Progress stalled for ${Math.round(elapsed / 1000)}s at ${currentCopied}/${syncStatus.total}, triggering retry...`)
+      lastProgressRef.current = { copied: currentCopied, time: now } // Reset to avoid re-triggering immediately
+      handleAutoRetry()
+    }
+  }, [syncStatus, isPolling, handleAutoRetry])
 
   // Ref to keep the sync stream connection alive (AbortController)
   const syncAbortRef = useRef<AbortController | null>(null)
@@ -421,7 +508,15 @@ function SyncPageContent() {
                   )}
                   <p className="text-sm font-medium">{syncStatus.message}</p>
                 </div>
-                
+
+                {/* Auto-retry indicator */}
+                {autoRetrying && (
+                  <div className="flex items-center space-x-2 text-sm text-amber-400 bg-amber-950/30 rounded-md p-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Auto-retrying sync (attempt #{autoRetryCountRef.current})... The sync continues from where it left off.</span>
+                  </div>
+                )}
+
                 {/* Professional Loader - Shows detailed day-by-day progress */}
                 {syncStatus.status === 'syncing' && syncStatus.syncProgress && (
                   <ProfessionalLoader

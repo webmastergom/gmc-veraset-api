@@ -72,9 +72,10 @@ export async function POST(
     const sourcePath = parseS3Path(job.s3SourcePath);
     const destPathParsed = parseS3Path(destPath);
 
+    // Clear completion/error flags but preserve progress counters.
+    // The orchestrator will re-calculate accurate progress after listing
+    // source & dest — resetting to 0 here would briefly show wrong progress.
     await updateJob(jobId, {
-      objectCount: 0,
-      totalBytes: 0,
       syncedAt: null,
       syncCancelledAt: null,
       errorMessage: '',
