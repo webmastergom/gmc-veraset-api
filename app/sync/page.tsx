@@ -57,7 +57,7 @@ function SyncPageContent() {
   const MAX_AUTO_RETRIES = 30 // Enough for ~50 GB at ~2 GB per 10-min run
   const STALL_THRESHOLD_MS = 90_000 // 90s without progress = stalled
   const [autoRetrying, setAutoRetrying] = useState(false)
-  const autoRetryTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const autoRetryIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const { toast } = useToast()
   const router = useRouter()
 
@@ -82,9 +82,9 @@ function SyncPageContent() {
         clearInterval(intervalRef.current)
         intervalRef.current = null
       }
-      if (autoRetryTimerRef.current) {
-        clearTimeout(autoRetryTimerRef.current)
-        autoRetryTimerRef.current = null
+      if (autoRetryIntervalRef.current) {
+        clearInterval(autoRetryIntervalRef.current)
+        autoRetryIntervalRef.current = null
       }
       // Don't abort the sync stream on unmount — let the backend finish
     }
@@ -243,68 +243,91 @@ function SyncPageContent() {
   }, [isPolling, jobId, retryDelay, sseFailed, checkSyncStatus, applyStatus])
 
   // ---------- Auto-retry: detect stalled syncs and re-trigger ----------
-  // When a Vercel function times out (10 min), the sync stalls. Since we now
-  // have incremental sync, we can safely re-trigger to continue where we left off.
-  const autoRetryInProgressRef = useRef(false)
-  const handleAutoRetry = useCallback(async () => {
-    // Guard: prevent concurrent retries
-    if (autoRetryInProgressRef.current) return
-    if (!jobId || !destPath) return
-    if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) {
-      console.warn('[AUTO-RETRY] Max retries reached, stopping auto-retry')
-      toast({
-        title: "Auto-retry limit reached",
-        description: `Sync has been auto-retried ${MAX_AUTO_RETRIES} times. Please check the sync manually.`,
-        variant: "destructive",
-      })
-      return
-    }
-    autoRetryInProgressRef.current = true
-    autoRetryCountRef.current++
-    console.log(`[AUTO-RETRY] Triggering auto-retry #${autoRetryCountRef.current}`)
-    setAutoRetrying(true)
-    try {
-      // Small delay to let the lock expire
-      await new Promise(r => setTimeout(r, 3000))
-      setAutoRetrying(false)
-      await handleSync(true)
-    } finally {
-      autoRetryInProgressRef.current = false
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, destPath, toast])
+  // Architecture: a single setInterval checks every 30s if progress has stalled.
+  // This avoids React re-render storms from useEffect + syncStatus dependencies.
+  // The interval only runs while isPolling is true.
+  const autoRetryActiveRef = useRef(false) // true while a retry POST is in flight
+
+  // Stable refs for values the interval callback needs (avoids stale closures)
+  const syncStatusRef = useRef(syncStatus)
+  syncStatusRef.current = syncStatus
+  const isPollingRef = useRef(isPolling)
+  isPollingRef.current = isPolling
+  const destPathRef = useRef(destPath)
+  destPathRef.current = destPath
 
   useEffect(() => {
-    if (!syncStatus || !isPolling) return
-    // Don't trigger while an auto-retry is already in progress
-    if (autoRetryInProgressRef.current) return
+    // Clear previous interval
+    if (autoRetryIntervalRef.current) {
+      clearInterval(autoRetryIntervalRef.current)
+      autoRetryIntervalRef.current = null
+    }
 
-    if (syncStatus.status !== 'syncing') {
-      // If the status switched to 'error' with a stall message, auto-retry
-      if (syncStatus.status === 'error' && syncStatus.message?.includes('stalled')) {
-        console.log('[AUTO-RETRY] Detected stalled sync from status, triggering retry...')
-        handleAutoRetry()
+    if (!isPolling || !jobId) return
+
+    autoRetryIntervalRef.current = setInterval(async () => {
+      // Guard: only one retry at a time
+      if (autoRetryActiveRef.current) return
+      if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) return
+
+      const status = syncStatusRef.current
+      if (!status) return
+      if (!destPathRef.current) return
+
+      let shouldRetry = false
+
+      // Case 1: Server reports stalled (error with "stalled" in message)
+      if (status.status === 'error' && status.message?.includes('stalled')) {
+        console.log('[AUTO-RETRY] Server reports stalled sync, triggering retry...')
+        shouldRetry = true
       }
-      return
-    }
 
-    const currentCopied = syncStatus.copied ?? 0
-    const now = Date.now()
+      // Case 2: Client-side stall detection — status is "syncing" but no progress
+      if (status.status === 'syncing') {
+        const currentCopied = status.copied ?? 0
+        const now = Date.now()
+        if (currentCopied > lastProgressRef.current.copied) {
+          lastProgressRef.current = { copied: currentCopied, time: now }
+        } else {
+          const elapsed = now - lastProgressRef.current.time
+          if (elapsed >= STALL_THRESHOLD_MS && currentCopied > 0 && currentCopied < (status.total ?? 0)) {
+            console.log(`[AUTO-RETRY] Client detected stall: ${Math.round(elapsed / 1000)}s at ${currentCopied}/${status.total}`)
+            shouldRetry = true
+          }
+        }
+      }
 
-    // Update last progress timestamp when copied count increases
-    if (currentCopied > lastProgressRef.current.copied) {
-      lastProgressRef.current = { copied: currentCopied, time: now }
-      return
-    }
+      if (!shouldRetry) return
 
-    // Check if progress has stalled
-    const elapsed = now - lastProgressRef.current.time
-    if (elapsed >= STALL_THRESHOLD_MS && currentCopied > 0 && currentCopied < (syncStatus.total ?? 0)) {
-      console.log(`[AUTO-RETRY] Progress stalled for ${Math.round(elapsed / 1000)}s at ${currentCopied}/${syncStatus.total}, triggering retry...`)
-      lastProgressRef.current = { copied: currentCopied, time: now } // Reset to avoid re-triggering immediately
-      handleAutoRetry()
+      autoRetryActiveRef.current = true
+      autoRetryCountRef.current++
+      const attempt = autoRetryCountRef.current
+      console.log(`[AUTO-RETRY] Triggering auto-retry #${attempt}`)
+      setAutoRetrying(true)
+      try {
+        // Small delay to let the lock expire
+        await new Promise(r => setTimeout(r, 3000))
+        setAutoRetrying(false)
+        // Reset stall timer so we don't immediately re-trigger
+        lastProgressRef.current = { copied: syncStatusRef.current?.copied ?? 0, time: Date.now() }
+        await handleSync(true)
+      } finally {
+        // Keep autoRetryActiveRef true for a cooldown period (2 min)
+        // to let the new sync function start and report progress
+        setTimeout(() => {
+          autoRetryActiveRef.current = false
+        }, 120_000)
+      }
+    }, 30_000) // Check every 30s
+
+    return () => {
+      if (autoRetryIntervalRef.current) {
+        clearInterval(autoRetryIntervalRef.current)
+        autoRetryIntervalRef.current = null
+      }
     }
-  }, [syncStatus, isPolling, handleAutoRetry])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPolling, jobId])
 
   // Ref to keep the sync stream connection alive (AbortController)
   const syncAbortRef = useRef<AbortController | null>(null)
