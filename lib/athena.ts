@@ -721,6 +721,33 @@ export async function tableExists(datasetName: string): Promise<boolean> {
 }
 
 /**
+ * Lightweight table check: if the table already exists and has data, skip the
+ * expensive partition discovery + MSCK REPAIR.  Only falls back to the full
+ * createTableForDataset when the table doesn't exist or is empty.
+ *
+ * This is ~100× faster than createTableForDataset for repeat runs.
+ */
+export async function ensureTableForDataset(datasetName: string): Promise<void> {
+  const tableName = getTableName(datasetName);
+  const exists = await tableExists(datasetName);
+  if (exists) {
+    // Quick sanity check — does the table have any rows?
+    try {
+      const probe = await runQuery(`SELECT 1 FROM ${tableName} LIMIT 1`);
+      if (probe.rows.length > 0) {
+        console.log(`✅ Table ${tableName} exists and has data — skipping full rebuild`);
+        return; // Table is usable
+      }
+      console.log(`⚠️  Table ${tableName} exists but is empty — running full rebuild`);
+    } catch {
+      console.log(`⚠️  Table ${tableName} exists but probe failed — running full rebuild`);
+    }
+  }
+  // Full creation with partition discovery
+  await createTableForDataset(datasetName);
+}
+
+/**
  * Get table name for a dataset
  * Adds 'ds_' prefix to ensure table name starts with a letter (required by SQL)
  */

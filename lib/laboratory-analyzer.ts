@@ -10,7 +10,7 @@
  *   6. Geocode origins → postal codes → compute affinity indices
  */
 
-import { runQuery, createTableForDataset, getTableName } from './athena';
+import { runQuery, ensureTableForDataset, getTableName } from './athena';
 import { batchReverseGeocode, aggregateByZipcode } from './reverse-geocode';
 import type {
   LabConfig,
@@ -68,7 +68,7 @@ export async function analyzeLaboratory(
   // ── 1. Ensure movement data table ────────────────────────────────────
   report({ step: 'initializing', percent: 3, message: 'Preparing movement data table...', detail: tableName });
   try {
-    await createTableForDataset(datasetId);
+    await ensureTableForDataset(datasetId);
   } catch (error: any) {
     if (!error.message?.includes('already exists')) throw error;
   }
