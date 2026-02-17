@@ -133,6 +133,9 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     let writeInFlight = false;
     let pendingWrite: Record<string, unknown> | null = null;
 
+    /** Timeout for a single progress write — if S3 hangs, don't block forever. */
+    const WRITE_TIMEOUT_MS = 30_000;
+
     const flushProgress = async (payload: Record<string, unknown>) => {
       if (writeInFlight) {
         pendingWrite = payload; // overwrite — only latest matters
@@ -141,7 +144,12 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       writeInFlight = true;
       lastWriteTime = Date.now();
       try {
-        await updateJob(jobId, payload as any);
+        await Promise.race([
+          updateJob(jobId, payload as any),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Progress write timed out after 30s')), WRITE_TIMEOUT_MS)
+          ),
+        ]);
       } catch (e) {
         console.warn('[SYNC] Progress write failed:', e instanceof Error ? e.message : e);
       }

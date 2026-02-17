@@ -18,6 +18,8 @@ export interface Job {
   expectedTotalBytes?: number; // Total bytes expected (set at sync start)
   syncedAt?: string | null;
   syncCancelledAt?: string | null;
+  /** ISO timestamp when current sync was last started (for stall detection). */
+  syncStartedAt?: string | null;
   /** ISO timestamp when current sync started; used as lock to prevent concurrent syncs. */
   syncLock?: string | null;
   errorMessage?: string;
@@ -279,15 +281,19 @@ export async function initializeSync(
   expectedObjectCount: number,
   expectedTotalBytes: number
 ): Promise<Job | null> {
+  // NOTE: Do NOT reset objectCount/totalBytes to 0 here.
+  // The orchestrator will re-list source & dest and set accurate counts.
+  // Resetting to 0 causes a brief flash of "0 progress" and, worse,
+  // if the function dies before the first flushProgress, the job is left
+  // at 0/N with no way to detect that it stalled.
   return updateJob(jobId, {
     s3DestPath: destPath,
-    objectCount: 0,
-    totalBytes: 0,
     expectedObjectCount,
     expectedTotalBytes,
     syncedAt: null,
     syncCancelledAt: null, // Clear cancellation when starting new sync
     errorMessage: '', // Clear previous errors when starting new sync
+    syncStartedAt: new Date().toISOString(), // Track when sync was last started
   });
 }
 

@@ -104,14 +104,37 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
     };
   }
 
-  // Check if sync lock is stale (no progress update in >10 min = function died)
+  // Detect stalled syncs: the Vercel function died without writing final state.
+  // Scenarios:
+  //   1. syncLock is set but very old (function died without releasing lock)
+  //   2. syncLock is null (lock released/expired) AND syncStartedAt is set AND
+  //      no syncedAt/errorMessage — function finished but never wrote completion
+  //   3. syncLock is null, syncStartedAt is set, and it's been >12 min since start
+  //      (maxDuration=10min + 2min buffer)
   const lockAge = job.syncLock ? Date.now() - new Date(job.syncLock).getTime() : 0;
-  const isLockStale = lockAge > 10 * 60 * 1000; // 10 min = maxDuration
+  const isLockStale = job.syncLock ? lockAge > 10 * 60 * 1000 : false; // 10 min = maxDuration
 
-  if (isLockStale && copied > 0 && copied < totalObjects) {
+  // Check if sync was started but function is no longer running
+  const syncStartAge = job.syncStartedAt ? Date.now() - new Date(job.syncStartedAt).getTime() : 0;
+  const isFunctionDead = !job.syncLock && job.syncStartedAt && syncStartAge > 12 * 60 * 1000; // 12 min
+
+  // Check lastUpdated from syncProgress — if no update in >12 min, function is dead
+  const lastProgressUpdate = job.syncProgress?.lastUpdated
+    ? Date.now() - new Date(job.syncProgress.lastUpdated).getTime()
+    : 0;
+  const isProgressStale = job.syncProgress?.lastUpdated && lastProgressUpdate > 12 * 60 * 1000;
+
+  const isStalled = isLockStale || isFunctionDead || isProgressStale;
+
+  if (isStalled && copied < totalObjects && totalObjects > 0) {
+    const stalledMinutes = Math.max(
+      isLockStale ? Math.round(lockAge / 60000) : 0,
+      isFunctionDead ? Math.round(syncStartAge / 60000) : 0,
+      isProgressStale ? Math.round(lastProgressUpdate / 60000) : 0
+    );
     return {
       status: 'error',
-      message: `Sync appears stalled (no progress in ${Math.round(lockAge / 60000)} min). Use "Resync" to retry.`,
+      message: `Sync appears stalled (no activity for ${stalledMinutes} min). Use "Resync" to continue.`,
       progress,
       total: totalObjects,
       totalBytes,
