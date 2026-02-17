@@ -66,11 +66,10 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     const totalObjects = sourceObjects.length;
     console.log(`[SYNC] Total to copy: ${totalObjects} objects, ${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB`);
 
-    await initializeSync(jobId, destPath, totalObjects, totalBytes);
-
+    // ---------- Incremental sync: skip files already in destination ----------
     const sourcePrefix = normalizePrefix(sourcePath.key);
     const destPrefix = normalizePrefix(destPathParsed.key);
-    const copies: CopyItem[] = sourceObjects.map((obj) => {
+    const allCopies: CopyItem[] = sourceObjects.map((obj) => {
       const relative = sourcePrefix ? obj.Key.replace(sourcePrefix, '') : obj.Key;
       const destKey = destPrefix + relative.replace(/^\/+/, '');
       return {
@@ -82,14 +81,43 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       };
     });
 
+    // List existing objects in destination to find what's already copied
+    const destObjects = await listS3Objects(destPathParsed.bucket, destPathParsed.key);
+    const destKeySet = new Set(destObjects.map((o) => o.Key));
+    const alreadyCopied = allCopies.filter((c) => destKeySet.has(c.destKey));
+    const copies = allCopies.filter((c) => !destKeySet.has(c.destKey));
+    const alreadyCopiedBytes = alreadyCopied.reduce((s, c) => s + (c.size ?? 0), 0);
+
+    console.log(
+      `[SYNC] Incremental: ${alreadyCopied.length}/${totalObjects} already in dest (${(alreadyCopiedBytes / 1024 / 1024 / 1024).toFixed(2)} GB), ${copies.length} remaining to copy`
+    );
+
+    await initializeSync(jobId, destPath, totalObjects, totalBytes);
+
     const sourceKeys = sourceObjects.map((o) => o.Key);
-    const keyToSize = buildKeyToSizeMap(copies);
+    const keyToSize = buildKeyToSizeMap(allCopies);
     const keyToDate = buildKeyToDateMap(sourceKeys);
-    const dayProgress = buildInitialDayProgress(sourceKeys, copies);
+    const dayProgress = buildInitialDayProgress(sourceKeys, allCopies);
     const sortedDates = Object.keys(dayProgress).sort();
     console.log(`[SYNC] Grouped ${totalObjects} objects into ${sortedDates.length} date partitions`);
 
+    // Pre-populate dayProgress with already-copied files
+    for (const item of alreadyCopied) {
+      const date = keyToDate.get(item.sourceKey);
+      if (date && dayProgress[date]) {
+        dayProgress[date].copiedFiles++;
+        dayProgress[date].copiedBytes += item.size ?? 0;
+        if (dayProgress[date].copiedFiles >= dayProgress[date].totalFiles) {
+          dayProgress[date].status = 'completed';
+        } else {
+          dayProgress[date].status = 'copying';
+        }
+      }
+    }
+
     await updateJob(jobId, {
+      objectCount: alreadyCopied.length,
+      totalBytes: alreadyCopiedBytes,
       syncProgress: {
         dayProgress,
         lastUpdated: new Date().toISOString(),
@@ -126,33 +154,41 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       }
     };
 
+    // Offset counters: already-copied files count toward total progress
+    const copiedOffset = alreadyCopied.length;
+    const bytesOffset = alreadyCopiedBytes;
+
     const result = await copyS3ObjectsBatch(
       copies,
-      (copied, total, bytes, currentKey) => {
+      (batchCopied, batchTotal, batchBytes, currentKey) => {
+        // Overall progress includes already-copied + newly copied
+        const overallCopied = copiedOffset + batchCopied;
+        const overallBytes = bytesOffset + batchBytes;
+
         const { currentDayIndex: dayIdx, currentFileInDay: fileInDay, sortedDates: dates } = applyProgressUpdate(
           dayProgress,
           keyToDate,
           keyToSize,
-          { copied, total, bytes, currentKey }
+          { copied: batchCopied, total: batchTotal, bytes: batchBytes, currentKey }
         );
         currentDayIndex = dayIdx;
         currentFileInDay = fileInDay;
 
         const now = Date.now();
-        const shouldWrite = now - lastWriteTime >= PROGRESS_WRITE_INTERVAL_MS || copied === total;
+        const shouldWrite = now - lastWriteTime >= PROGRESS_WRITE_INTERVAL_MS || batchCopied === batchTotal;
         if (shouldWrite) {
           const currentDay = dates[currentDayIndex] ?? null;
           const totalInDay = currentDay ? dayProgress[currentDay]?.totalFiles : undefined;
-          const pct = ((copied / total) * 100).toFixed(1);
+          const pct = ((overallCopied / totalObjects) * 100).toFixed(1);
           const elapsed = (Date.now() - syncStartTime) / 1000;
-          const speed = elapsed > 0 ? (bytes / elapsed / 1024 / 1024).toFixed(2) : '0';
+          const speed = elapsed > 0 ? (batchBytes / elapsed / 1024 / 1024).toFixed(2) : '0';
           console.log(
-            `[SYNC] Progress: ${pct}% (${copied}/${total}), ${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB @ ${speed} MB/s`
+            `[SYNC] Progress: ${pct}% (${overallCopied}/${totalObjects}), ${(overallBytes / 1024 / 1024 / 1024).toFixed(2)} GB @ ${speed} MB/s`
           );
           // Fire-and-forget but serialized — won't pile up
           flushProgress({
-            objectCount: copied,
-            totalBytes: bytes,
+            objectCount: overallCopied,
+            totalBytes: overallBytes,
             expectedObjectCount: totalObjects,
             expectedTotalBytes: totalBytes,
             syncProgress: buildSyncProgressPayload(
@@ -172,7 +208,9 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    console.log(`[SYNC] CHECK 2 - Copy done: ${result.copied} ok, ${result.failed} failed`);
+    const totalCopied = copiedOffset + result.copied;
+    const totalCopiedBytes = bytesOffset + result.totalBytes;
+    console.log(`[SYNC] CHECK 2 - Copy done: ${result.copied} new + ${copiedOffset} already existed = ${totalCopied} total, ${result.failed} failed`);
 
     for (const failedKey of result.failedKeys) {
       if (keyToDate.has(failedKey)) {
@@ -195,10 +233,10 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     }
 
     if (controller.signal.aborted) {
-      console.log(`[SYNC] Sync cancelled by user; partial state: ${result.copied}/${totalObjects}`);
+      console.log(`[SYNC] Sync cancelled by user; partial state: ${totalCopied}/${totalObjects}`);
       await updateJob(jobId, {
-        objectCount: result.copied,
-        totalBytes: result.totalBytes,
+        objectCount: totalCopied,
+        totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
@@ -211,8 +249,8 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       const pct = ((result.failed / totalObjects) * 100).toFixed(1);
       console.error(`[SYNC] ❌ Copy failed for ${result.failed}/${totalObjects} files (${pct}%)`);
       await updateJob(jobId, {
-        objectCount: result.copied,
-        totalBytes: result.totalBytes,
+        objectCount: totalCopied,
+        totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
@@ -224,7 +262,7 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     const verification = await verifySync(
       destPathParsed,
       totalObjects,
-      copies,
+      allCopies,
       { etagSampleRatio: 0.08 }
     );
 
@@ -232,8 +270,8 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       const diff = Math.abs(verification.destCount - totalObjects);
       console.error(`[SYNC] CHECK 3 - Verification failed: dest=${verification.destCount}, source=${totalObjects}, diff=${diff}`);
       await updateJob(jobId, {
-        objectCount: result.copied,
-        totalBytes: result.totalBytes,
+        objectCount: totalCopied,
+        totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
@@ -246,8 +284,8 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     if (!verification.integrityPassed) {
       console.error(`[SYNC] CHECK 3b - Integrity failed: ${verification.etagMismatches}/${verification.sampleSize} files have ETag mismatch`);
       await updateJob(jobId, {
-        objectCount: result.copied,
-        totalBytes: result.totalBytes,
+        objectCount: totalCopied,
+        totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
@@ -257,8 +295,9 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     }
 
     const sourcePartitionDates = extractUniqueDatesFromKeys(sourceKeys);
-    const destObjects = await listS3Objects(destPathParsed.bucket, destPathParsed.key);
-    const destKeys = destObjects.map((o) => o.Key);
+    // Re-list destination (may have changed during copy) for partition verification
+    const destObjectsPostCopy = await listS3Objects(destPathParsed.bucket, destPathParsed.key);
+    const destKeys = destObjectsPostCopy.map((o) => o.Key);
     const destPartitionDates = extractUniqueDatesFromKeys(destKeys);
 
     const missingInDest = sourcePartitionDates.filter((d) => !destPartitionDates.includes(d));
@@ -266,8 +305,8 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       const errorMsg = `Date partition verification failed: ${missingInDest.length} date partitions present in source but missing in destination: ${missingInDest.slice(0, 10).join(', ')}${missingInDest.length > 10 ? '...' : ''}`;
       console.error(`[SYNC] CHECK 4 - ❌ ${errorMsg}`);
       await updateJob(jobId, {
-        objectCount: result.copied,
-        totalBytes: result.totalBytes,
+        objectCount: totalCopied,
+        totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
@@ -324,8 +363,8 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
 
     const finalUpdate = {
       s3DestPath: destPath,
-      objectCount: result.copied,
-      totalBytes: result.totalBytes,
+      objectCount: totalCopied,
+      totalBytes: totalCopiedBytes,
       expectedObjectCount: totalObjects,
       expectedTotalBytes: totalBytes,
       verificationResult,
@@ -334,7 +373,7 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     };
     await updateJob(jobId, finalUpdate);
     const totalDuration = ((Date.now() - syncStartTime) / 1000).toFixed(1);
-    console.log(`[SYNC] Completed job ${jobId}: ${result.copied} files in ${totalDuration}s`);
+    console.log(`[SYNC] Completed job ${jobId}: ${totalCopied} files (${result.copied} new + ${copiedOffset} already existed) in ${totalDuration}s`);
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     console.error(`[SYNC] ❌ Error syncing job ${jobId}:`, errorMsg);
