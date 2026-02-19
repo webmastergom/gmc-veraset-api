@@ -1,6 +1,33 @@
 import { S3Client, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
+
+// ── In-memory cache for S3 config reads ─────────────────────────────────
+// Avoids repeated S3 round-trips for data that rarely changes.
+// Each entry has a TTL; writes invalidate the cache for that key.
+
+const CONFIG_CACHE = new Map<string, { data: any; expiresAt: number }>();
+const CONFIG_CACHE_TTL_MS = 60_000; // 60 seconds
+
+function getCached<T>(key: string): T | undefined {
+  const entry = CONFIG_CACHE.get(key);
+  if (entry && Date.now() < entry.expiresAt) {
+    return entry.data as T;
+  }
+  CONFIG_CACHE.delete(key);
+  return undefined;
+}
+
+function setCache<T>(key: string, data: T): void {
+  CONFIG_CACHE.set(key, { data, expiresAt: Date.now() + CONFIG_CACHE_TTL_MS });
+}
+
+function invalidateCache(key: string): void {
+  CONFIG_CACHE.delete(key);
+}
+
+// ── S3 client ───────────────────────────────────────────────────────────
 
 export const s3Client = new S3Client({
   region: process.env.AWS_REGION || 'us-west-2',
@@ -32,11 +59,14 @@ export async function getS3Config(): Promise<{ bucket: string; region: string } 
  * Check if config file exists in S3
  */
 export async function configExists(key: string): Promise<boolean> {
+  // If we have it cached, it exists
+  if (getCached(key) !== undefined) return true;
+
   try {
     if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
       return false;
     }
-    
+
     await s3Client.send(new HeadObjectCommand({
       Bucket: BUCKET,
       Key: `config/${key}.json`,
@@ -52,9 +82,14 @@ export async function configExists(key: string): Promise<boolean> {
 }
 
 /**
- * Read a JSON config file from S3 with proper error handling
+ * Read a JSON config file from S3 with proper error handling.
+ * Results are cached in memory for 60s to avoid repeated S3 round-trips.
  */
 export async function getConfig<T>(key: string): Promise<T | null> {
+  // Check in-memory cache first
+  const cached = getCached<T>(key);
+  if (cached !== undefined) return cached;
+
   try {
     // Check if AWS credentials are configured
     if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
@@ -66,35 +101,38 @@ export async function getConfig<T>(key: string): Promise<T | null> {
       Bucket: BUCKET,
       Key: `config/${key}.json`,
     });
-    
+
     const response = await s3Client.send(command);
     const body = await response.Body?.transformToString();
-    
+
     if (!body) {
       return null;
     }
-    
-    return JSON.parse(body) as T;
+
+    const parsed = JSON.parse(body) as T;
+    setCache(key, parsed);
+    return parsed;
   } catch (error: any) {
     // File doesn't exist
     if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
       console.warn(`Config file not found: config/${key}.json`);
       return null;
     }
-    
+
     // Don't throw errors in development - just log and return null
     if (process.env.NODE_ENV === 'development') {
       console.warn(`Error reading config/${key}.json:`, error.message || error);
       return null;
     }
-    
+
     console.error(`Error reading config/${key}.json:`, error);
     throw error;
   }
 }
 
 /**
- * Write a JSON config file to S3 with validation
+ * Write a JSON config file to S3 with validation.
+ * Invalidates the in-memory cache for this key.
  */
 export async function putConfig<T>(key: string, data: T): Promise<void> {
   try {
@@ -103,18 +141,23 @@ export async function putConfig<T>(key: string, data: T): Promise<void> {
     }
 
     const json = JSON.stringify(data, null, 2);
-    
+
     // Validate JSON before saving
     JSON.parse(json);
-    
+
     const command = new PutObjectCommand({
       Bucket: BUCKET,
       Key: `config/${key}.json`,
       Body: json,
       ContentType: 'application/json',
     });
-    
+
     await s3Client.send(command);
+
+    // Invalidate cache and store fresh data
+    invalidateCache(key);
+    setCache(key, data);
+
     console.log(`✅ Saved config/${key}.json`);
   } catch (error: any) {
     console.error(`❌ Error saving config/${key}.json:`, error.message || error);
@@ -123,11 +166,16 @@ export async function putConfig<T>(key: string, data: T): Promise<void> {
 }
 
 /**
- * Initialize config file if it doesn't exist
+ * Initialize config file if it doesn't exist.
+ * Uses cache to avoid the HeadObject + GetObject double round-trip.
  */
 export async function initConfigIfNeeded<T>(key: string, defaultData: T): Promise<T> {
+  // Fast path: cached data available
+  const cached = getCached<T>(key);
+  if (cached !== undefined) return cached;
+
   const exists = await configExists(key);
-  
+
   if (!exists) {
     console.log(`📝 Initializing config/${key}.json with defaults`);
     try {
@@ -138,7 +186,7 @@ export async function initConfigIfNeeded<T>(key: string, defaultData: T): Promis
       return defaultData;
     }
   }
-  
+
   const existing = await getConfig<T>(key);
   return existing || defaultData;
 }
@@ -170,7 +218,7 @@ export async function listObjects(prefix: string): Promise<string[]> {
       Bucket: BUCKET,
       Prefix: prefix,
     });
-    
+
     const response = await s3Client.send(command);
     return (response.Contents || []).map(obj => obj.Key || '').filter(Boolean);
   } catch (error) {
@@ -180,14 +228,15 @@ export async function listObjects(prefix: string): Promise<string[]> {
 }
 
 /**
- * Get POI collection GeoJSON from S3, with fallback to local files
+ * Get POI collection GeoJSON from S3, with fallback to local files.
+ * Local fallback now uses async fs.readFile instead of blocking readFileSync.
  */
 export async function getPOICollection(collectionId: string): Promise<any | null> {
   try {
     // Get collection metadata to find the correct GeoJSON path
     const collections = await getConfig<Record<string, any>>('poi-collections') || {};
     const collection = collections[collectionId];
-    
+
     // Use geojsonPath from collection metadata if available, otherwise construct from ID
     const geojsonKey = collection?.geojsonPath || `pois/${collectionId}.geojson`;
 
@@ -230,7 +279,7 @@ export async function getPOICollection(collectionId: string): Promise<any | null
 
     if (fs.existsSync(localPath)) {
       console.log(`📁 Using local GeoJSON file: ${localPath}`);
-      const fileContent = fs.readFileSync(localPath, 'utf-8');
+      const fileContent = await fsp.readFile(localPath, 'utf-8');
       return JSON.parse(fileContent);
     }
 
@@ -260,6 +309,6 @@ export async function putPOICollection(collectionId: string, geojson: any): Prom
     Body: JSON.stringify(geojson, null, 2),
     ContentType: 'application/json',
   });
-  
+
   await s3Client.send(command);
 }

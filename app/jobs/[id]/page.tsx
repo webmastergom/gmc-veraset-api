@@ -249,16 +249,16 @@ export default async function JobDetailPage({
         </CardContent>
       </Card>
 
-      {/* Audience Agent Toggle */}
+      {/* Roamy Toggle */}
       {job.status === 'SUCCESS' && (
         <Card className="mt-6">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Users className="h-5 w-5" />
-              Audience Agent
+              Roamy
             </CardTitle>
             <CardDescription>
-              Enable this dataset for automated audience segment analysis
+              Roaming Observation Agent for Mobility Yield
             </CardDescription>
           </CardHeader>
           <CardContent>

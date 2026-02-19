@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import Link from "next/link"
-import { Plus, LayoutGrid, List, Search, Calendar, MapPin, Database, ExternalLink, Clock } from "lucide-react"
+import { Plus, LayoutGrid, List, Search, Calendar, MapPin, Database, ExternalLink, Clock, Users } from "lucide-react"
 
 type ViewMode = 'modern' | 'classic';
 
@@ -24,6 +24,7 @@ interface Job {
   summaryMetrics?: string;
   objectCount?: number;
   external?: boolean;
+  audienceAgentEnabled?: boolean;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -64,6 +65,7 @@ export default function JobsPage() {
           summaryMetrics: job.summaryMetrics || job.summary_metrics,
           objectCount: job.objectCount || job.object_count,
           external: job.external || false,
+          audienceAgentEnabled: job.audienceAgentEnabled || false,
         }));
         setJobs(normalizedJobs);
       })
@@ -177,13 +179,19 @@ export default function JobsPage() {
                   </div>
                   <StatusBadge status={job.status} />
                 </div>
-                {job.external && (
-                  <div className="mt-2">
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {job.external && (
                     <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
                       External
                     </span>
-                  </div>
-                )}
+                  )}
+                  {job.audienceAgentEnabled && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">
+                      <Users className="h-3 w-3" />
+                      Roamy
+                    </span>
+                  )}
+                </div>
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center gap-2 text-sm">
@@ -265,6 +273,12 @@ export default function JobsPage() {
                           {job.external && (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
                               External
+                            </span>
+                          )}
+                          {job.audienceAgentEnabled && (
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">
+                              <Users className="h-3 w-3" />
+                              Audience
                             </span>
                           )}
                         </div>

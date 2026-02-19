@@ -533,9 +533,9 @@ export default function AudiencesPage() {
               <Users className="h-6 w-6 text-theme-accent" />
             </div>
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">Audience Agent</h1>
+              <h1 className="text-3xl font-bold tracking-tight">Roamy</h1>
               <p className="text-muted-foreground mt-1">
-                Pre-built audience segments from mobility data
+                Roaming Observation Agent for Mobility Yield
               </p>
             </div>
           </div>
@@ -553,7 +553,7 @@ export default function AudiencesPage() {
               </label>
               {enabledDatasets.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  No datasets enabled. Enable &quot;Audience Agent&quot; on a job to get started.
+                  No datasets enabled. Enable &quot;Roamy&quot; on a job to get started.
                 </p>
               ) : (
                 <Select value={selectedDatasetId} onValueChange={setSelectedDatasetId}>
@@ -749,7 +749,7 @@ export default function AudiencesPage() {
             <Users className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
             <h3 className="text-lg font-medium mb-2">No datasets enabled</h3>
             <p className="text-muted-foreground text-sm max-w-md mx-auto">
-              Go to a job&apos;s detail page and enable &quot;Audience Agent&quot; to start building audience segments from that dataset.
+              Go to a job&apos;s detail page and enable &quot;Roamy&quot; to start building audience segments from that dataset.
             </p>
           </CardContent>
         </Card>

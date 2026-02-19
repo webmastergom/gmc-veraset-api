@@ -2,12 +2,18 @@ import { NextResponse } from 'next/server';
 import { getUsage } from '@/lib/usage';
 
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
 
 export async function GET() {
   try {
     const usage = await getUsage();
-    return NextResponse.json(usage);
+    // Cache usage for 5 minutes — monthly quota doesn't change frequently.
+    // stale-while-revalidate lets the browser use the cached value while
+    // fetching a fresh copy in the background.
+    return NextResponse.json(usage, {
+      headers: {
+        'Cache-Control': 'private, max-age=300, stale-while-revalidate=600',
+      },
+    });
   } catch (error: any) {
     console.error('GET /api/usage error:', error);
     return NextResponse.json(

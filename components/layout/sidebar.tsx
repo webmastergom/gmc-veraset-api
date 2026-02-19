@@ -24,7 +24,7 @@ const navigation = [
   { name: 'Jobs', href: '/jobs', icon: Briefcase },
   { name: 'Datasets', href: '/datasets', icon: Database },
   { name: 'Laboratory', href: '/laboratory', icon: FlaskConical },
-  { name: 'Audiences', href: '/laboratory/audiences', icon: Users },
+  { name: 'Roamy', href: '/laboratory/audiences', icon: Users },
   { name: 'Audit', href: '/audit', icon: ShieldCheck },
   { name: 'API Keys', href: '/api-keys', icon: Key },
 ]
