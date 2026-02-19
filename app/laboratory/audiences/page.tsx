@@ -236,11 +236,19 @@ export default function AudiencesPage() {
 
   // ── Load catalog ──────────────────────────────────────────────────────
 
-  const loadCatalog = useCallback(async (datasetId?: string) => {
+  // Keep a ref for enabledDatasets so loadCatalog always sees the latest value
+  const enabledDatasetsRef = useRef(enabledDatasets);
+  enabledDatasetsRef.current = enabledDatasets;
+
+  const loadCatalog = useCallback(async (datasetId?: string, forceRefreshDatasets = false) => {
     try {
       const params = new URLSearchParams();
       const dsId = datasetId || selectedDatasetId;
-      const ds = enabledDatasets.find(d => d.datasetId === dsId);
+
+      // Use ref to avoid stale closure
+      const currentDatasets = enabledDatasetsRef.current;
+      const ds = currentDatasets.find(d => d.datasetId === dsId);
+
       if (dsId) params.set('datasetId', dsId);
       if (ds?.country) params.set('country', ds.country);
 
@@ -252,10 +260,32 @@ export default function AudiencesPage() {
       setCatalog(data.catalog);
       setGroupLabels(data.groupLabels);
       setResults(data.results);
-      if (!enabledDatasets.length && data.enabledDatasets.length) {
+
+      // ALWAYS update enabledDatasets from the API so country changes are reflected
+      if (data.enabledDatasets.length > 0) {
+        // Update both the React state AND the ref immediately
+        // (the ref ensures the next loadCatalog call sees fresh data
+        //  even before the React re-render completes)
         setEnabledDatasets(data.enabledDatasets);
+        enabledDatasetsRef.current = data.enabledDatasets;
+
+        // Auto-select first dataset if none selected
         if (!selectedDatasetId && data.enabledDatasets.length > 0) {
-          setSelectedDatasetId(data.enabledDatasets[0].datasetId);
+          const firstDs = data.enabledDatasets[0];
+          setSelectedDatasetId(firstDs.datasetId);
+
+          // If the first load had no country (because no dataset was selected yet),
+          // re-fetch with the country now that we know it
+          if (!ds?.country && firstDs.country) {
+            const params2 = new URLSearchParams();
+            params2.set('datasetId', firstDs.datasetId);
+            params2.set('country', firstDs.country);
+            const res2 = await fetch(`/api/laboratory/audiences/catalog?${params2}`, {
+              credentials: 'include',
+            });
+            const data2: CatalogResponse = await res2.json();
+            setResults(data2.results);
+          }
         }
       }
     } catch (err) {
@@ -263,7 +293,7 @@ export default function AudiencesPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedDatasetId, enabledDatasets]);
+  }, [selectedDatasetId]);
 
   useEffect(() => {
     loadCatalog();

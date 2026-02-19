@@ -278,7 +278,7 @@ export default function JobsPage() {
                           {job.audienceAgentEnabled && (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">
                               <Users className="h-3 w-3" />
-                              Audience
+                              Roamy
                             </span>
                           )}
                         </div>
