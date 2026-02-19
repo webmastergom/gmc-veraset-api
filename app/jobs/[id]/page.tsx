@@ -2,11 +2,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
-import { ArrowLeft, RefreshCw, Database, ExternalLink, Info, AlertTriangle, ShieldCheck } from "lucide-react"
+import { ArrowLeft, RefreshCw, Database, ExternalLink, Info, AlertTriangle, ShieldCheck, Users } from "lucide-react"
 import { JobStatusPolling } from "@/components/jobs/job-status-polling"
 import { S3StorageSection } from "@/components/jobs/s3-storage-section"
 import { JobAuditDialog } from "@/components/jobs/job-audit-dialog"
 import { MainLayout } from "@/components/layout/main-layout"
+import { AudienceAgentToggle } from "@/components/jobs/audience-agent-toggle"
 import dynamic from "next/dynamic"
 
 // Dynamic import to avoid bundling server-side code in client
@@ -45,6 +46,7 @@ async function getJob(id: string) {
       actual_date_range: job.actualDateRange,
       date_range_discrepancy: job.dateRangeDiscrepancy,
       has_audit_trail: !!job.auditTrail,
+      audience_agent_enabled: job.audienceAgentEnabled || false,
     };
   } catch (error) {
     console.error("Error fetching job:", error);
@@ -246,6 +248,27 @@ export default async function JobDetailPage({
           <RefreshStatusButton jobId={job.job_id} />
         </CardContent>
       </Card>
+
+      {/* Audience Agent Toggle */}
+      {job.status === 'SUCCESS' && (
+        <Card className="mt-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Users className="h-5 w-5" />
+              Audience Agent
+            </CardTitle>
+            <CardDescription>
+              Enable this dataset for automated audience segment analysis
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <AudienceAgentToggle
+              jobId={job.job_id}
+              initialEnabled={job.audience_agent_enabled}
+            />
+          </CardContent>
+        </Card>
+      )}
 
       {/* Payload Verification Audit */}
       <Card className="mt-6">

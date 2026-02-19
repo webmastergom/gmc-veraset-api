@@ -8,10 +8,16 @@
  *   4. Apply recipe filters (category × time window × dwell × frequency)
  *   5. Build segment of matching ad_ids
  *   6. Geocode origins → postal codes → compute affinity indices
+ *
+ * Extracted functions for Audience Agent batch processing:
+ *   - runSpatialJoin(): Execute geohash-bucket spatial join (Athena)
+ *   - resolveOrigins(): Fetch first-ping-of-day origins for ad_ids
+ *   - geocodeOrigins(): Reverse geocode coordinates → postal codes
+ *   - processVisitsForRecipe(): Apply recipe + compute affinity (in-memory)
  */
 
 import { runQuery, ensureTableForDataset, getTableName } from './athena';
-import { batchReverseGeocode, aggregateByZipcode } from './reverse-geocode';
+import { batchReverseGeocode } from './reverse-geocode';
 import type {
   LabConfig,
   LabAnalysisResult,
@@ -24,11 +30,10 @@ import type {
   SegmentDevice,
   PoiCategory,
   RecipeStep,
+  Recipe,
 } from './laboratory-types';
 import {
-  POI_CATEGORIES,
   CATEGORY_LABELS,
-  CATEGORY_GROUPS,
   AFFINITY_WEIGHTS,
   CONCENTRATION_CAP,
   FREQUENCY_CAP,
@@ -40,32 +45,58 @@ const ACCURACY_THRESHOLD_METERS = 500;
 const COORDINATE_PRECISION = 4;
 const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 
-// ── Main entry point ───────────────────────────────────────────────────
+// ── Shared types ─────────────────────────────────────────────────────────
 
-export async function analyzeLaboratory(
-  config: LabConfig,
-  onProgress?: LabProgressCallback
-): Promise<LabAnalysisResult> {
+export interface ParsedVisit {
+  adId: string;
+  date: string;
+  poiId: string;
+  category: PoiCategory;
+  dwellMinutes: number;
+  visitHour: number;
+  originLat: number;
+  originLng: number;
+}
+
+export interface SpatialJoinResult {
+  visits: ParsedVisit[];
+  totalDevicesInDataset: number;
+}
+
+export interface GeoInfo {
+  zipcode: string;
+  city: string;
+  province: string;
+  region: string;
+}
+
+// ── 1. Spatial Join (Athena) ─────────────────────────────────────────────
+
+/**
+ * Run the geohash-bucket spatial join against Athena.
+ * Returns raw visits (without origins) and total device count.
+ *
+ * This is the most expensive operation — reuse across multiple audiences
+ * by passing ALL categories needed across all recipes.
+ */
+export async function runSpatialJoin(
+  datasetId: string,
+  categories: PoiCategory[],
+  country: string,
+  dateFrom?: string,
+  dateTo?: string,
+  spatialRadius = 200,
+  onProgress?: LabProgressCallback,
+): Promise<SpatialJoinResult> {
   const report = onProgress || (() => {});
-  const { datasetId, recipe, country } = config;
-  const tableName = getTableName(datasetId);
-  const spatialRadius = config.spatialJoinRadiusMeters || 200;
-  const minVisits = config.minVisitsPerZipcode || 5;
-
-  // Collect all categories needed across recipe steps
-  const allCategories = new Set<PoiCategory>();
-  for (const step of recipe.steps) {
-    for (const cat of step.categories) allCategories.add(cat);
-  }
-  const categoryList = Array.from(allCategories);
-
-  report({ step: 'initializing', percent: 0, message: 'Validating configuration...', detail: `Dataset: ${config.datasetName}` });
 
   if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
     throw new Error('AWS credentials not configured.');
   }
 
-  // ── 1. Ensure movement data table ────────────────────────────────────
+  const tableName = getTableName(datasetId);
+
+  // 1. Ensure movement data table
   report({ step: 'initializing', percent: 3, message: 'Preparing movement data table...', detail: tableName });
   try {
     await ensureTableForDataset(datasetId);
@@ -73,7 +104,7 @@ export async function analyzeLaboratory(
     if (!error.message?.includes('already exists')) throw error;
   }
 
-  // ── 2. Ensure POI parquet table ──────────────────────────────────────
+  // 2. Ensure POI parquet table
   report({ step: 'loading_pois', percent: 8, message: 'Preparing POI catalog table...', detail: `Real POIs from pois_gmc` });
   const poiTableName = 'lab_pois_gmc';
   try {
@@ -98,36 +129,22 @@ export async function analyzeLaboratory(
   }
   report({ step: 'loading_pois', percent: 12, message: 'POI catalog ready' });
 
-  // ── 3. Build date filters ────────────────────────────────────────────
+  // 3. Build filters
   const dateConditions: string[] = [];
-  if (config.dateFrom) dateConditions.push(`date >= '${config.dateFrom}'`);
-  if (config.dateTo) dateConditions.push(`date <= '${config.dateTo}'`);
+  if (dateFrom) dateConditions.push(`date >= '${dateFrom}'`);
+  if (dateTo) dateConditions.push(`date <= '${dateTo}'`);
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
-  // Category filter for POI table
-  const catFilter = `AND p.category IN (${categoryList.map(c => `'${c}'`).join(',')})`;
-  // Country filter for POI table
+  const catFilter = `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`;
   const countryFilter = country ? `AND p.country = '${country.toUpperCase()}'` : '';
 
-  // ── 4. Spatial join + dwell time query ───────────────────────────────
-  // Strategy: Use geohash-bucket JOIN instead of CROSS JOIN.
-  //   - Truncate lat/lng to a grid (~0.01° ≈ 1.1km cells)
-  //   - JOIN pings to POIs by bucket (equi-join on grid cell + neighbors)
-  //   - This reduces O(N×M) to O(N×k) where k ≈ POIs per bucket (~1-5)
-  //
-  // Haversine approximation:
-  //   distance_m ≈ 111320 * SQRT(POW(lat1-lat2,2) + POW((lng1-lng2)*COS(RADIANS((lat1+lat2)/2)),2))
-
+  // 4. Spatial join query
   report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m (geohash-bucket strategy)` });
 
-  // Grid cell size in degrees. For 200m radius, we need cells ~0.003°.
-  // We use 0.01° (~1.1km) so each ping only needs to check its own cell + 8 neighbors.
-  // This is generous enough to catch all POIs within any reasonable radius.
   const GRID_STEP = 0.01;
 
   const spatialQuery = `
     WITH
-    -- Step 1: All pings with grid bucket assignment
     pings AS (
       SELECT
         ad_id,
@@ -144,8 +161,6 @@ export async function analyzeLaboratory(
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${dateWhere}
     ),
-    -- Step 2: Real POIs with grid buckets + neighbor expansion
-    -- Each POI maps to its own cell + 8 neighbors (3×3 grid) to catch edge cases
     poi_base AS (
       SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
         CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
@@ -155,7 +170,6 @@ export async function analyzeLaboratory(
         ${catFilter}
         ${countryFilter}
     ),
-    -- Expand each POI into 9 bucket entries (3×3 neighborhood)
     poi_buckets AS (
       SELECT poi_id, category, poi_lat, poi_lng,
         base_lat_bucket + dlat as lat_bucket,
@@ -164,8 +178,6 @@ export async function analyzeLaboratory(
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
     ),
-    -- Step 3: Bucket-based equi-join (replaces expensive CROSS JOIN)
-    -- Only pings in the same bucket as a POI are compared
     matched AS (
       SELECT
         k.ad_id,
@@ -184,7 +196,6 @@ export async function analyzeLaboratory(
         ON k.lat_bucket = p.lat_bucket
         AND k.lng_bucket = p.lng_bucket
     ),
-    -- Step 4: Keep only closest POI per ping (within radius)
     closest AS (
       SELECT
         ad_id, date, utc_timestamp, lat, lng, poi_id, category, distance_m,
@@ -196,7 +207,6 @@ export async function analyzeLaboratory(
       SELECT ad_id, date, utc_timestamp, lat, lng, poi_id, category
       FROM closest WHERE rn = 1
     ),
-    -- Step 5: Group into visits (same device × same POI × same day)
     visits AS (
       SELECT
         ad_id,
@@ -226,7 +236,6 @@ export async function analyzeLaboratory(
     ORDER BY v.ad_id, v.date, v.visit_start
   `;
 
-  // Total devices in dataset (lightweight query)
   const totalDevicesQuery = `
     SELECT COUNT(DISTINCT ad_id) as total
     FROM ${tableName}
@@ -236,10 +245,11 @@ export async function analyzeLaboratory(
 
   console.log(`[LAB] Running spatial join (geohash-bucket strategy)...`);
   console.log(`[LAB] Grid cell size: ${GRID_STEP}° (~${Math.round(GRID_STEP * 111320)}m)`);
-  console.log(`[LAB] Categories requested: ${categoryList.join(', ')}`);
+  console.log(`[LAB] Categories requested: ${categories.join(', ')}`);
   console.log(`[LAB] Country filter: ${country || 'none'}`);
   console.log(`[LAB] Date filters: ${dateWhere || 'none'}`);
   console.log(`[LAB] Spatial radius: ${spatialRadius}m`);
+
   let spatialRes, totalRes;
   try {
     [spatialRes, totalRes] = await Promise.all([
@@ -257,41 +267,167 @@ export async function analyzeLaboratory(
   console.log(`[LAB] Spatial join returned ${spatialRes.rows.length} visit rows`);
   report({ step: 'spatial_join', percent: 50, message: 'Spatial join complete', detail: `${spatialRes.rows.length} visits found` });
 
-  if (spatialRes.rows.length === 0) {
-    console.log(`[LAB] No visits found — returning empty result`);
-    report({ step: 'completed', percent: 100, message: 'No visits found matching criteria', detail: `Checked ${categoryList.length} categories in ${country || 'all countries'} with ${spatialRadius}m radius` });
-    return buildEmptyResult(config, totalDevicesInDataset);
-  }
-
-  // ── 5. Parse visits and apply recipe ─────────────────────────────────
-  report({ step: 'computing_dwell', percent: 55, message: 'Applying recipe filters...', detail: `${recipe.steps.length} steps, logic: ${recipe.logic}` });
-
-  interface ParsedVisit {
-    adId: string;
-    date: string;
-    poiId: string;
-    category: PoiCategory;
-    dwellMinutes: number;
-    visitHour: number;
-    originLat: number;
-    originLng: number;
-  }
-
-  // Parse visits (origins are resolved later in a separate query)
-  const allVisits: ParsedVisit[] = spatialRes.rows.map(row => ({
+  // Parse visits
+  const visits: ParsedVisit[] = spatialRes.rows.map(row => ({
     adId: String(row.ad_id),
     date: String(row.date),
     poiId: String(row.poi_id),
     category: String(row.category) as PoiCategory,
     dwellMinutes: parseFloat(String(row.dwell_minutes)) || 0,
     visitHour: parseInt(String(row.visit_hour)) || 0,
-    originLat: 0, // resolved later
-    originLng: 0, // resolved later
+    originLat: 0,
+    originLng: 0,
   }));
 
-  // Group visits by device
+  return { visits, totalDevicesInDataset };
+}
+
+// ── 2. Resolve Origins (Athena) ──────────────────────────────────────────
+
+/**
+ * Fetch first-ping-of-day origin coordinates for a set of ad_ids.
+ * Batches in groups of 500 to avoid SQL IN clause limits.
+ */
+export async function resolveOrigins(
+  adIds: string[],
+  datasetId: string,
+  dateFrom?: string,
+  dateTo?: string,
+  onProgress?: LabProgressCallback,
+): Promise<Map<string, { lat: number; lng: number }>> {
+  const report = onProgress || (() => {});
+  const tableName = getTableName(datasetId);
+
+  const dateConditions: string[] = [];
+  if (dateFrom) dateConditions.push(`date >= '${dateFrom}'`);
+  if (dateTo) dateConditions.push(`date <= '${dateTo}'`);
+  const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+  const BATCH_SIZE = 500;
+  const originMap = new Map<string, { lat: number; lng: number }>();
+
+  for (let batchStart = 0; batchStart < adIds.length; batchStart += BATCH_SIZE) {
+    const batch = adIds.slice(batchStart, batchStart + BATCH_SIZE);
+    const adIdFilter = batch.map(id => `'${id.replace(/'/g, "''")}'`).join(',');
+
+    const originQuery = `
+      SELECT
+        ad_id,
+        date,
+        ROUND(MIN_BY(TRY_CAST(latitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lat,
+        ROUND(MIN_BY(TRY_CAST(longitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lng
+      FROM ${tableName}
+      WHERE ad_id IN (${adIdFilter})
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+        ${dateWhere}
+      GROUP BY ad_id, date
+    `;
+
+    try {
+      const originRes = await runQuery(originQuery);
+      for (const row of originRes.rows) {
+        const key = `${row.ad_id}|${row.date}`;
+        const lat = parseFloat(String(row.origin_lat));
+        const lng = parseFloat(String(row.origin_lng));
+        if (!isNaN(lat) && !isNaN(lng)) {
+          originMap.set(key, { lat, lng });
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[LAB] Origin batch query failed:`, err.message);
+    }
+
+    if (batchStart + BATCH_SIZE < adIds.length) {
+      report({ step: 'geocoding', percent: 66 + Math.round((batchStart / adIds.length) * 4), message: 'Fetching device origins...', detail: `${Math.min(batchStart + BATCH_SIZE, adIds.length)}/${adIds.length} devices` });
+    }
+  }
+
+  console.log(`[LAB] Origins resolved: ${originMap.size} device-day pairs`);
+  return originMap;
+}
+
+// ── 3. Geocode Origins ───────────────────────────────────────────────────
+
+/**
+ * Reverse geocode origin coordinates to postal codes.
+ * Returns a map from "lat,lng" → geo info.
+ */
+export async function geocodeOrigins(
+  visits: ParsedVisit[],
+): Promise<Map<string, GeoInfo>> {
+  const coordMap = new Map<string, { lat: number; lng: number; devices: number }>();
+  for (const v of visits) {
+    if (v.originLat === 0 && v.originLng === 0) continue;
+    const key = `${v.originLat},${v.originLng}`;
+    const existing = coordMap.get(key);
+    if (existing) {
+      existing.devices++;
+    } else {
+      coordMap.set(key, { lat: v.originLat, lng: v.originLng, devices: 1 });
+    }
+  }
+
+  const geocodePoints = Array.from(coordMap.values()).map(p => ({
+    lat: p.lat, lng: p.lng, deviceCount: p.devices,
+  }));
+
+  const geocoded = await batchReverseGeocode(geocodePoints);
+
+  const coordToZip = new Map<string, GeoInfo>();
+  for (let i = 0; i < geocodePoints.length; i++) {
+    const result = geocoded[i];
+    const point = geocodePoints[i];
+    const key = `${point.lat},${point.lng}`;
+    if (result.type === 'geojson_local') {
+      coordToZip.set(key, {
+        zipcode: result.postcode,
+        city: result.city,
+        province: result.province,
+        region: result.region,
+      });
+    }
+  }
+
+  return coordToZip;
+}
+
+// ── 4. Process Visits for Recipe (in-memory) ─────────────────────────────
+
+/**
+ * Apply recipe filters to visits and compute affinity indices.
+ * Returns a full LabAnalysisResult.
+ *
+ * This is the in-memory portion — no Athena queries.
+ * For batch processing, call runSpatialJoin once, then call this
+ * per audience with different recipes and pre-resolved origins/geocoding.
+ */
+export function processVisitsForRecipe(opts: {
+  config: LabConfig;
+  allVisits: ParsedVisit[];
+  totalDevicesInDataset: number;
+  originMap: Map<string, { lat: number; lng: number }>;
+  coordToZip: Map<string, GeoInfo>;
+  onProgress?: LabProgressCallback;
+}): LabAnalysisResult {
+  const { config, allVisits, totalDevicesInDataset, originMap, coordToZip, onProgress } = opts;
+  const report = onProgress || (() => {});
+  const { recipe } = config;
+  const minVisits = config.minVisitsPerZipcode || 5;
+
+  // Filter visits to only those with categories relevant to this recipe
+  const recipeCategories = new Set<PoiCategory>();
+  for (const step of recipe.steps) {
+    for (const cat of step.categories) recipeCategories.add(cat);
+  }
+
+  report({ step: 'computing_dwell', percent: 55, message: 'Applying recipe filters...', detail: `${recipe.steps.length} steps, logic: ${recipe.logic}` });
+
+  // Group visits by device (only visits with relevant categories)
   const deviceVisits = new Map<string, ParsedVisit[]>();
   for (const v of allVisits) {
+    if (!recipeCategories.has(v.category)) continue;
     const list = deviceVisits.get(v.adId) || [];
     list.push(v);
     deviceVisits.set(v.adId, list);
@@ -336,135 +472,29 @@ export async function analyzeLaboratory(
   }
 
   console.log(`[LAB] Recipe matching: ${segmentDevices.length} devices matched out of ${deviceVisits.size} total`);
-  console.log(`[LAB] Recipe: ${recipe.steps.length} steps, logic=${recipe.logic}, ordered=${recipe.ordered}`);
-  for (const step of recipe.steps) {
-    console.log(`[LAB]   Step ${step.id}: categories=[${step.categories.join(',')}] timeWindow=${step.timeWindow ? `${step.timeWindow.hourFrom}-${step.timeWindow.hourTo}` : 'none'} minDwell=${step.minDwellMinutes ?? 'none'} maxDwell=${step.maxDwellMinutes ?? 'none'} minFreq=${step.minFrequency ?? 1}`);
-  }
   report({ step: 'building_segments', percent: 65, message: 'Segment built', detail: `${segmentDevices.length} devices matched out of ${deviceVisits.size}` });
 
   if (segmentDevices.length === 0) {
-    console.log(`[LAB] No devices matched the recipe — returning empty result`);
     report({ step: 'completed', percent: 100, message: 'No devices matched the recipe' });
     return buildEmptyResult(config, totalDevicesInDataset);
   }
 
-  // ── 5b. Fetch origins for matched devices only ──────────────────────
-  // This is a SEPARATE query that only scans rows for matched ad_ids,
-  // instead of duplicating the full 6B+ row table scan inside the spatial join.
-  report({ step: 'geocoding', percent: 66, message: 'Fetching device origins...', detail: `${matchedAdIds.size} devices` });
-
-  // Collect unique (ad_id, date) pairs from matched visits
-  const matchedPairs = new Set<string>();
+  // Assign origins and filter
   const matchedVisits: ParsedVisit[] = [];
   for (const v of allVisits) {
-    if (matchedAdIds.has(v.adId)) {
-      matchedVisits.push(v);
-      matchedPairs.add(`${v.adId}|${v.date}`);
-    }
-  }
-
-  // Query origins: first ping of day for each matched device
-  // We pass the ad_ids as a filter to avoid full table scan
-  const uniqueAdIds = Array.from(matchedAdIds);
-  // Split into batches of 500 to avoid SQL IN clause limits
-  const BATCH_SIZE = 500;
-  const originMap = new Map<string, { lat: number; lng: number }>();
-
-  for (let batchStart = 0; batchStart < uniqueAdIds.length; batchStart += BATCH_SIZE) {
-    const batch = uniqueAdIds.slice(batchStart, batchStart + BATCH_SIZE);
-    const adIdFilter = batch.map(id => `'${id.replace(/'/g, "''")}'`).join(',');
-
-    const originQuery = `
-      SELECT
-        ad_id,
-        date,
-        ROUND(MIN_BY(TRY_CAST(latitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lat,
-        ROUND(MIN_BY(TRY_CAST(longitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lng
-      FROM ${tableName}
-      WHERE ad_id IN (${adIdFilter})
-        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
-        ${dateWhere}
-      GROUP BY ad_id, date
-    `;
-
-    try {
-      const originRes = await runQuery(originQuery);
-      for (const row of originRes.rows) {
-        const key = `${row.ad_id}|${row.date}`;
-        const lat = parseFloat(String(row.origin_lat));
-        const lng = parseFloat(String(row.origin_lng));
-        if (!isNaN(lat) && !isNaN(lng)) {
-          originMap.set(key, { lat, lng });
-        }
-      }
-    } catch (err: any) {
-      console.warn(`[LAB] Origin batch query failed:`, err.message);
-    }
-
-    if (batchStart + BATCH_SIZE < uniqueAdIds.length) {
-      report({ step: 'geocoding', percent: 66 + Math.round((batchStart / uniqueAdIds.length) * 4), message: 'Fetching device origins...', detail: `${Math.min(batchStart + BATCH_SIZE, uniqueAdIds.length)}/${uniqueAdIds.length} devices` });
-    }
-  }
-
-  console.log(`[LAB] Origins resolved: ${originMap.size} device-day pairs`);
-
-  // Assign origins to matched visits
-  for (const v of matchedVisits) {
+    if (!matchedAdIds.has(v.adId)) continue;
+    if (!recipeCategories.has(v.category)) continue;
     const origin = originMap.get(`${v.adId}|${v.date}`);
     if (origin) {
-      v.originLat = origin.lat;
-      v.originLng = origin.lng;
+      matchedVisits.push({ ...v, originLat: origin.lat, originLng: origin.lng });
     }
   }
 
-  // Filter out visits without valid origins
   const geoVisits = matchedVisits.filter(v => v.originLat !== 0 || v.originLng !== 0);
-  console.log(`[LAB] Visits with valid origins: ${geoVisits.length}/${matchedVisits.length}`);
 
-  // ── 6. Geocode origins → postal codes ────────────────────────────────
-  report({ step: 'geocoding', percent: 72, message: 'Geocoding device origins...', detail: 'Resolving to postal codes' });
-
-  // Aggregate unique origin coordinates
-  const coordMap = new Map<string, { lat: number; lng: number; devices: number }>();
-  for (const v of geoVisits) {
-    const key = `${v.originLat},${v.originLng}`;
-    const existing = coordMap.get(key);
-    if (existing) {
-      existing.devices++;
-    } else {
-      coordMap.set(key, { lat: v.originLat, lng: v.originLng, devices: 1 });
-    }
-  }
-
-  const geocodePoints = Array.from(coordMap.values()).map(p => ({
-    lat: p.lat, lng: p.lng, deviceCount: p.devices,
-  }));
-
-  const geocoded = await batchReverseGeocode(geocodePoints);
-
-  const coordToZip = new Map<string, { zipcode: string; city: string; province: string; region: string }>();
-  for (let i = 0; i < geocodePoints.length; i++) {
-    const result = geocoded[i];
-    const point = geocodePoints[i];
-    const key = `${point.lat},${point.lng}`;
-    if (result.type === 'geojson_local') {
-      coordToZip.set(key, {
-        zipcode: result.postcode,
-        city: result.city,
-        province: result.province,
-        region: result.region,
-      });
-    }
-  }
-
-  report({ step: 'geocoding', percent: 78, message: 'Geocoding complete', detail: `${coordToZip.size}/${geocodePoints.length} points matched` });
-
-  // ── 7. Compute affinity indices ──────────────────────────────────────
+  // Compute affinity indices
   report({ step: 'computing_affinity', percent: 82, message: 'Computing affinity indices...' });
 
-  // Build: zipcode × category → { visits, devices, totalDwell }
   const zipCatMap = new Map<string, {
     zipcode: string; city: string; province: string; region: string;
     category: PoiCategory;
@@ -490,20 +520,18 @@ export async function analyzeLaboratory(
     }
   }
 
-  // Totals for affinity calculation
+  // Totals
   const zipTotals = new Map<string, { total: number; devices: Set<string>; city: string; province: string; region: string; totalDwell: number }>();
   const catTotals = new Map<PoiCategory, { total: number; totalDwell: number }>();
   let grandTotal = 0;
 
   for (const entry of zipCatMap.values()) {
-    // Zipcode totals
     const zt = zipTotals.get(entry.zipcode) || { total: 0, devices: new Set<string>(), city: entry.city, province: entry.province, region: entry.region, totalDwell: 0 };
     zt.total += entry.visits;
     for (const d of entry.devices) zt.devices.add(d);
     zt.totalDwell += entry.totalDwell;
     zipTotals.set(entry.zipcode, zt);
 
-    // Category totals
     const ct = catTotals.get(entry.category) || { total: 0, totalDwell: 0 };
     ct.total += entry.visits;
     ct.totalDwell += entry.totalDwell;
@@ -512,13 +540,11 @@ export async function analyzeLaboratory(
     grandTotal += entry.visits;
   }
 
-  // National shares
   const nationalShares = new Map<PoiCategory, number>();
   for (const [cat, t] of catTotals.entries()) {
     nationalShares.set(cat, grandTotal > 0 ? t.total / grandTotal : 0);
   }
 
-  // Category median dwell times (for dwell score)
   const catMedianDwell = new Map<PoiCategory, number>();
   for (const [cat, t] of catTotals.entries()) {
     catMedianDwell.set(cat, t.total > 0 ? t.totalDwell / t.total : 0);
@@ -538,15 +564,12 @@ export async function analyzeLaboratory(
     const localShare = zt.total > 0 ? entry.visits / zt.total : 0;
     const natShare = nationalShares.get(entry.category) || 0;
 
-    // Concentration score (0-100)
     const rawRatio = natShare > 0 ? localShare / natShare : 0;
     const concentrationScore = Math.round(Math.min(rawRatio / CONCENTRATION_CAP, 1) * 100);
 
-    // Frequency score (0-100)
     const freqNorm = freq > 0 ? Math.log2(freq) / Math.log2(FREQUENCY_CAP) : 0;
     const frequencyScore = Math.round(Math.min(Math.max(freqNorm, 0), 1) * 100);
 
-    // Dwell score (0-100): how does avg dwell compare to category median
     const medianDwell = catMedianDwell.get(entry.category) || 1;
     const dwellRatio = medianDwell > 0 ? avgDwell / medianDwell : 0;
     const dwellScore = Math.round(Math.min(dwellRatio / (DWELL_CAP_MINUTES / medianDwell), 1) * 100);
@@ -628,12 +651,11 @@ export async function analyzeLaboratory(
 
   report({ step: 'computing_affinity', percent: 92, message: 'Affinity computation complete', detail: `${profiles.length} postal codes profiled` });
 
-  // ── 8. Build stats ───────────────────────────────────────────────────
+  // Build stats
   const stats = computeStats(records, profiles, segmentDevices, geoVisits, totalDevicesInDataset);
 
-  // Sort segment by totalVisits desc, limit to top 1000 for response
+  // Sort segment, keep ALL devices (not truncated)
   segmentDevices.sort((a, b) => b.totalVisits - a.totalVisits);
-  const segmentForResponse = segmentDevices.slice(0, 1000);
 
   console.log(`[LAB] Analysis complete: ${segmentDevices.length} devices, ${profiles.length} postal codes, ${records.length} affinity records`);
   report({ step: 'completed', percent: 100, message: 'Analysis complete', detail: `${segmentDevices.length} devices in segment, ${profiles.length} postal codes` });
@@ -643,7 +665,9 @@ export async function analyzeLaboratory(
     analyzedAt: new Date().toISOString(),
     segment: {
       totalDevices: segmentDevices.length,
-      devices: segmentForResponse,
+      // Return top 1000 for UI display; full list available via allSegmentDevices
+      devices: segmentDevices.slice(0, 1000),
+      allSegmentDevices: segmentDevices,
     },
     records,
     profiles,
@@ -651,40 +675,125 @@ export async function analyzeLaboratory(
   };
 }
 
+// ── Main entry point (unchanged behavior) ────────────────────────────────
+
+/**
+ * Original entry point for the Laboratory UI.
+ * Orchestrates spatial join → origins → geocoding → recipe processing.
+ */
+export async function analyzeLaboratory(
+  config: LabConfig,
+  onProgress?: LabProgressCallback
+): Promise<LabAnalysisResult> {
+  const report = onProgress || (() => {});
+  const { datasetId, recipe, country } = config;
+  const spatialRadius = config.spatialJoinRadiusMeters || 200;
+
+  report({ step: 'initializing', percent: 0, message: 'Validating configuration...', detail: `Dataset: ${config.datasetName}` });
+
+  // Collect all categories needed
+  const allCategories = new Set<PoiCategory>();
+  for (const step of recipe.steps) {
+    for (const cat of step.categories) allCategories.add(cat);
+  }
+  const categoryList = Array.from(allCategories);
+
+  // 1. Spatial join
+  const { visits, totalDevicesInDataset } = await runSpatialJoin(
+    datasetId, categoryList, country,
+    config.dateFrom, config.dateTo, spatialRadius, onProgress,
+  );
+
+  if (visits.length === 0) {
+    console.log(`[LAB] No visits found — returning empty result`);
+    report({ step: 'completed', percent: 100, message: 'No visits found matching criteria', detail: `Checked ${categoryList.length} categories in ${country || 'all countries'} with ${spatialRadius}m radius` });
+    return buildEmptyResult(config, totalDevicesInDataset);
+  }
+
+  // 2. Quick recipe match to find which ad_ids need origins
+  const deviceVisits = new Map<string, ParsedVisit[]>();
+  for (const v of visits) {
+    const list = deviceVisits.get(v.adId) || [];
+    list.push(v);
+    deviceVisits.set(v.adId, list);
+  }
+
+  const matchedAdIds = new Set<string>();
+  for (const [adId, devVisits] of deviceVisits.entries()) {
+    const stepMatches = recipe.steps.map(step => matchStep(step, devVisits));
+    let matches: boolean;
+    if (recipe.logic === 'AND') {
+      matches = stepMatches.every(m => m);
+      if (matches && recipe.ordered) {
+        matches = checkOrder(recipe.steps, devVisits);
+      }
+    } else {
+      matches = stepMatches.some(m => m);
+    }
+    if (matches) matchedAdIds.add(adId);
+  }
+
+  if (matchedAdIds.size === 0) {
+    console.log(`[LAB] No devices matched the recipe — returning empty result`);
+    report({ step: 'completed', percent: 100, message: 'No devices matched the recipe' });
+    return buildEmptyResult(config, totalDevicesInDataset);
+  }
+
+  // 3. Resolve origins
+  report({ step: 'geocoding', percent: 66, message: 'Fetching device origins...', detail: `${matchedAdIds.size} devices` });
+  const originMap = await resolveOrigins(
+    Array.from(matchedAdIds), datasetId,
+    config.dateFrom, config.dateTo, onProgress,
+  );
+
+  // 4. Assign origins to visits
+  for (const v of visits) {
+    const origin = originMap.get(`${v.adId}|${v.date}`);
+    if (origin) {
+      v.originLat = origin.lat;
+      v.originLng = origin.lng;
+    }
+  }
+
+  // 5. Geocode
+  report({ step: 'geocoding', percent: 72, message: 'Geocoding device origins...', detail: 'Resolving to postal codes' });
+  const coordToZip = await geocodeOrigins(visits);
+  report({ step: 'geocoding', percent: 78, message: 'Geocoding complete', detail: `${coordToZip.size} points matched` });
+
+  // 6. Process visits for recipe
+  return processVisitsForRecipe({
+    config, allVisits: visits, totalDevicesInDataset,
+    originMap, coordToZip, onProgress,
+  });
+}
+
 
 // ── Recipe matching helpers ────────────────────────────────────────────
 
 function matchStep(step: RecipeStep, visits: { category: PoiCategory; dwellMinutes: number; visitHour: number }[]): boolean {
   const matching = visits.filter(v => {
-    // Category match (OR within step)
     if (!step.categories.includes(v.category)) return false;
 
-    // Time window
     if (step.timeWindow) {
       const { hourFrom, hourTo } = step.timeWindow;
       if (hourFrom <= hourTo) {
         if (v.visitHour < hourFrom || v.visitHour >= hourTo) return false;
       } else {
-        // Wrapping (e.g. 22-6)
         if (v.visitHour < hourFrom && v.visitHour >= hourTo) return false;
       }
     }
 
-    // Dwell time
     if (step.minDwellMinutes != null && v.dwellMinutes < step.minDwellMinutes) return false;
     if (step.maxDwellMinutes != null && v.dwellMinutes > step.maxDwellMinutes) return false;
 
     return true;
   });
 
-  // Frequency check
   const minFreq = step.minFrequency || 1;
   return matching.length >= minFreq;
 }
 
 function checkOrder(steps: RecipeStep[], visits: { category: PoiCategory; date: string; visitHour: number; dwellMinutes: number }[]): boolean {
-  // For ordered AND: the first qualifying visit of step[i] must be on a date
-  // <= the first qualifying visit of step[i+1]
   let lastDate = '';
   for (const step of steps) {
     const qualifying = visits

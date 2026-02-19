@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   Key,
   FlaskConical,
+  Users,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -23,6 +24,7 @@ const navigation = [
   { name: 'Jobs', href: '/jobs', icon: Briefcase },
   { name: 'Datasets', href: '/datasets', icon: Database },
   { name: 'Laboratory', href: '/laboratory', icon: FlaskConical },
+  { name: 'Audiences', href: '/laboratory/audiences', icon: Users },
   { name: 'Audit', href: '/audit', icon: ShieldCheck },
   { name: 'API Keys', href: '/api-keys', icon: Key },
 ]
@@ -87,7 +89,7 @@ export function Sidebar() {
       {/* Navigation */}
       <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
         {navigation.map((item) => {
-          const isActive = pathname.startsWith(item.href)
+          const isActive = pathname === item.href || (pathname.startsWith(item.href + '/') && !navigation.some(n => n !== item && pathname.startsWith(n.href) && n.href.length > item.href.length))
           return (
             <Link
               key={item.name}

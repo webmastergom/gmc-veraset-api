@@ -87,6 +87,8 @@ export interface Job {
     verasetMissingDays: number;
     timestamp: string;
   };
+  /** Whether this dataset is enabled for the Audience Agent */
+  audienceAgentEnabled?: boolean;
   /** Detailed sync progress by day (for professional loader) */
   syncProgress?: {
     currentDay?: string; // Date being copied (YYYY-MM-DD)
@@ -118,6 +120,14 @@ export async function getAllJobs(): Promise<Job[]> {
   return Object.values(data).sort((a, b) => 
     new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   );
+}
+
+/**
+ * Get jobs enabled for the Audience Agent (SUCCESS status + audienceAgentEnabled)
+ */
+export async function getAudienceEnabledJobs(): Promise<Job[]> {
+  const all = await getAllJobs();
+  return all.filter(j => j.status === 'SUCCESS' && j.audienceAgentEnabled === true);
 }
 
 /**

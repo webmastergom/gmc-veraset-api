@@ -663,7 +663,8 @@ export interface LabAnalysisResult {
   // Segment
   segment: {
     totalDevices: number;
-    devices: SegmentDevice[];           // top N for display (full list exported via CSV)
+    devices: SegmentDevice[];           // top 1000 for UI display
+    allSegmentDevices?: SegmentDevice[]; // full list for batch export (audience agent)
   };
   // Affinity
   records: AffinityRecord[];
