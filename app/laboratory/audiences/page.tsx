@@ -189,6 +189,8 @@ export default function AudiencesPage() {
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   // Detail dialog
   const [detailAudience, setDetailAudience] = useState<AudienceDefinition | null>(null);
@@ -299,13 +301,134 @@ export default function AudiencesPage() {
     loadCatalog();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Re-load results when dataset changes
+  // Re-load results when dataset changes + check for active run
   useEffect(() => {
-    if (selectedDatasetId) {
-      setLoading(true);
-      loadCatalog(selectedDatasetId);
-    }
+    if (!selectedDatasetId) return;
+
+    setLoading(true);
+    loadCatalog(selectedDatasetId);
+
+    // Check for an active run (e.g., user navigated away and came back)
+    const ds = enabledDatasetsRef.current.find(d => d.datasetId === selectedDatasetId);
+    if (!ds?.country) return;
+
+    const checkActiveRun = async () => {
+      try {
+        const res = await fetch(
+          `/api/laboratory/audiences/status?datasetId=${encodeURIComponent(ds.datasetId)}&country=${encodeURIComponent(ds.country)}`,
+          { credentials: 'include' },
+        );
+        const data = await res.json();
+
+        if (data.active) {
+          // There's a run in progress — resume the UI
+          setBatchRunning(true);
+          setBatchProgress({
+            phase: data.phase,
+            audienceId: undefined,
+            audienceName: data.currentAudienceName,
+            current: data.current,
+            total: data.total,
+            percent: data.percent,
+            message: data.message,
+          });
+          setActiveRunId(data.runId);
+
+          // Start polling
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = setInterval(() => {
+            // Inline poll to avoid stale closure
+            fetch(
+              `/api/laboratory/audiences/status?datasetId=${encodeURIComponent(ds.datasetId)}&country=${encodeURIComponent(ds.country)}`,
+              { credentials: 'include' },
+            )
+              .then(r => r.json())
+              .then(status => {
+                if (!status.active) {
+                  if (pollIntervalRef.current) {
+                    clearInterval(pollIntervalRef.current);
+                    pollIntervalRef.current = null;
+                  }
+                  setBatchRunning(false);
+                  setBatchProgress(null);
+                  setActiveRunId(null);
+                  // Reload results
+                  loadCatalog(ds.datasetId);
+                  return;
+                }
+                setBatchProgress({
+                  phase: status.phase,
+                  audienceId: undefined,
+                  audienceName: status.currentAudienceName,
+                  current: status.current,
+                  total: status.total,
+                  percent: status.percent,
+                  message: status.message,
+                });
+              })
+              .catch(() => {});
+          }, 4000);
+        }
+      } catch {
+        // No active run — ignore
+      }
+    };
+    checkActiveRun();
   }, [selectedDatasetId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Poll run status (fallback for when client disconnects) ──────────
+
+  const pollRunStatus = useCallback(async () => {
+    if (!selectedDataset) return;
+
+    try {
+      const res = await fetch(
+        `/api/laboratory/audiences/status?datasetId=${encodeURIComponent(selectedDataset.datasetId)}&country=${encodeURIComponent(selectedDataset.country)}`,
+        { credentials: 'include' },
+      );
+      const data = await res.json();
+
+      if (!data.active) {
+        // Run is done — stop polling
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
+        }
+
+        if (data.status === 'completed' || data.status === 'cancelled' || data.status === 'failed') {
+          // Reload results from S3
+          await loadCatalog(selectedDataset.datasetId);
+        }
+
+        setBatchRunning(false);
+        setBatchProgress(null);
+        setActiveRunId(null);
+        return;
+      }
+
+      // Update progress from polled status
+      setBatchProgress({
+        phase: data.phase,
+        audienceId: undefined,
+        audienceName: data.currentAudienceName,
+        current: data.current,
+        total: data.total,
+        percent: data.percent,
+        message: data.message,
+      });
+    } catch (err) {
+      console.error('Poll error:', err);
+    }
+  }, [selectedDataset, loadCatalog]);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, []);
 
   // ── Run single audience ───────────────────────────────────────────────
 
@@ -447,6 +570,10 @@ export default function AudiencesPage() {
     const controller = new AbortController();
     abortRef.current = controller;
 
+    // Start polling as backup — if SSE disconnects, polling takes over
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    pollIntervalRef.current = setInterval(pollRunStatus, 4000);
+
     try {
       const res = await fetch('/api/laboratory/audiences/run-batch', {
         method: 'POST',
@@ -463,6 +590,10 @@ export default function AudiencesPage() {
           dateTo: selectedDataset.actualDateRange?.to || selectedDataset.dateRange.to,
         }),
       });
+
+      // Get runId from header
+      const runId = res.headers.get('X-Run-Id');
+      if (runId) setActiveRunId(runId);
 
       const reader = res.body?.getReader();
       if (!reader) throw new Error('No stream');
@@ -499,22 +630,49 @@ export default function AudiencesPage() {
           }
         }
       }
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        console.error('Batch run error:', err);
+
+      // SSE stream completed cleanly — stop polling
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
       }
-    } finally {
       setBatchRunning(false);
       setBatchProgress(null);
-      abortRef.current = null;
+      setActiveRunId(null);
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // User clicked Stop — polling will detect cancellation
+        return;
+      }
+      // SSE disconnected (user navigated away) but run continues on server.
+      // Polling is already running and will track progress.
+      console.log('SSE disconnected, polling will continue tracking progress');
     }
-  }, [selectedDataset, catalog, results, runningAudienceId, batchRunning]);
+  }, [selectedDataset, catalog, results, runningAudienceId, batchRunning, pollRunStatus]);
 
   // ── Cancel ────────────────────────────────────────────────────────────
 
-  const cancel = useCallback(() => {
+  const cancel = useCallback(async () => {
+    // Abort the SSE connection (cleanup)
     abortRef.current?.abort();
-  }, []);
+
+    // Send cancel request to the server
+    if (selectedDataset) {
+      try {
+        await fetch('/api/laboratory/audiences/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            datasetId: selectedDataset.datasetId,
+            country: selectedDataset.country,
+          }),
+        });
+      } catch (err) {
+        console.error('Cancel request failed:', err);
+      }
+    }
+  }, [selectedDataset]);
 
   // ── Download CSV ──────────────────────────────────────────────────────
 

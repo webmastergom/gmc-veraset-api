@@ -19,6 +19,16 @@ import {
   type AudienceDefinition,
   type AudienceRunResult,
 } from './audience-catalog';
+import type { AudienceRunStatus } from './audience-run-status';
+
+// ── Background mode hooks ────────────────────────────────────────────────
+
+export interface BatchRunOptions {
+  /** Called between audience iterations to check if user requested stop. */
+  checkCancelled?: () => Promise<boolean>;
+  /** Called after each phase/audience to persist progress to S3. */
+  saveStatus?: (update: Partial<AudienceRunStatus>) => Promise<void>;
+}
 
 // ── Single audience run ──────────────────────────────────────────────────
 
@@ -83,6 +93,7 @@ export async function runBatchAudienceAnalysis(
     percent: number;
     message: string;
   }) => void,
+  options?: BatchRunOptions,
 ): Promise<Record<string, AudienceRunResult>> {
   const report = onProgress || (() => {});
   const startedAt = new Date().toISOString();
@@ -128,6 +139,11 @@ export async function runBatchAudienceAnalysis(
 
   const { visits, totalDevicesInDataset } = spatialResult;
   console.log(`[AUDIENCE-BATCH] Spatial join: ${visits.length} visits, ${totalDevicesInDataset} total devices`);
+
+  // Save status: spatial join complete
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'origins', percent: 40, message: `Spatial join done: ${visits.length} visits` });
+  }
 
   if (visits.length === 0) {
     for (const a of audiences) {
@@ -192,16 +208,46 @@ export async function runBatchAudienceAnalysis(
     }
   }
 
+  // Save status: origins complete
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'geocoding', percent: 60, message: `Origins resolved for ${allMatchedAdIds.size} devices` });
+  }
+
   // 5. Run ONE geocoding pass
   report({ phase: 'geocoding', current: 0, total: audiences.length, percent: 60, message: 'Geocoding device origins...' });
 
   const coordToZip = await geocodeOrigins(visits);
   console.log(`[AUDIENCE-BATCH] Geocoded ${coordToZip.size} unique coordinates`);
 
+  // Save status: geocoding complete
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'processing', percent: 65, message: `Geocoded ${coordToZip.size} coordinates` });
+  }
+
   // 6. Process each audience in-memory
   for (let i = 0; i < audiences.length; i++) {
+    // Check cancellation before each audience
+    if (options?.checkCancelled) {
+      const cancelled = await options.checkCancelled();
+      if (cancelled) {
+        console.log(`[AUDIENCE-BATCH] Cancellation requested after ${i} audiences`);
+        for (let j = i; j < audiences.length; j++) {
+          results[audiences[j].id] = {
+            audienceId: audiences[j].id,
+            datasetId: dataset.id,
+            country,
+            status: 'failed',
+            startedAt,
+            completedAt: new Date().toISOString(),
+            error: 'Cancelled by user',
+          };
+        }
+        break;
+      }
+    }
+
     const audience = audiences[i];
-    const pct = 65 + Math.round((i / audiences.length) * 30);
+    const pct = 65 + Math.round(((i + 1) / audiences.length) * 30);
 
     report({
       phase: 'processing',
@@ -236,6 +282,17 @@ export async function runBatchAudienceAnalysis(
         completedAt: new Date().toISOString(),
         error: error.message,
       };
+    }
+
+    // Save status after each audience
+    if (options?.saveStatus) {
+      await options.saveStatus({
+        current: i + 1,
+        currentAudienceName: audience.name,
+        percent: pct,
+        message: `Completed ${audience.name} (${i + 1}/${audiences.length})`,
+        completedAudiences: Object.keys(results).filter(id => results[id].status === 'completed'),
+      });
     }
   }
 
