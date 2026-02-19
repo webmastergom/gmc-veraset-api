@@ -1,4 +1,4 @@
-import { getConfig, putConfig, initConfigIfNeeded } from './s3-config';
+import { getConfig, putConfig, initConfigIfNeeded, invalidateCache } from './s3-config';
 
 export interface Job {
   jobId: string;
@@ -169,7 +169,12 @@ export async function createJob(job: Omit<Job, 'createdAt' | 'updatedAt'>): Prom
  * Multiple concurrent calls may still race, but each call sees the latest state before updating.
  */
 export async function updateJob(jobId: string, updates: Partial<Job>): Promise<Job | null> {
-  // Read current state
+  // Invalidate cache to ensure we read the latest state from S3 before writing.
+  // Without this, the 60s in-memory cache could cause stale reads that overwrite
+  // concurrent changes or fail to find newly-created jobs.
+  invalidateCache('jobs');
+
+  // Read current state (now guaranteed fresh from S3)
   const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
   
   if (!data[jobId]) {

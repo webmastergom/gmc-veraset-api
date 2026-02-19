@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { Switch } from '@/components/ui/switch';
 import { Users, CheckCircle, Loader2 } from 'lucide-react';
 
@@ -10,13 +10,51 @@ interface AudienceAgentToggleProps {
   disabled?: boolean;
 }
 
+const MAX_RETRIES = 3;
+
+async function patchWithRetry(
+  url: string,
+  body: Record<string, unknown>,
+  retries = MAX_RETRIES,
+): Promise<Response> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(body),
+      });
+
+      if (res.ok) return res;
+
+      // Server error — retry with backoff
+      if (res.status >= 500 && attempt < retries) {
+        console.warn(`PATCH attempt ${attempt} failed (${res.status}), retrying...`);
+        await new Promise(r => setTimeout(r, 500 * attempt));
+        continue;
+      }
+
+      return res; // 4xx or last attempt — return as-is
+    } catch (err) {
+      if (attempt < retries) {
+        console.warn(`PATCH attempt ${attempt} network error, retrying...`);
+        await new Promise(r => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Unreachable');
+}
+
 export function AudienceAgentToggle({ jobId, initialEnabled, disabled }: AudienceAgentToggleProps) {
   const [enabled, setEnabled] = useState(initialEnabled);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const toggle = async (checked: boolean) => {
+  const toggle = useCallback(async (checked: boolean) => {
     // Optimistic update — flip immediately so the UI feels instant
     setEnabled(checked);
     setSaving(true);
@@ -24,32 +62,28 @@ export function AudienceAgentToggle({ jobId, initialEnabled, disabled }: Audienc
     setError(null);
 
     try {
-      const res = await fetch(`/api/jobs/${jobId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ audienceAgentEnabled: checked }),
-      });
+      const res = await patchWithRetry(
+        `/api/jobs/${jobId}`,
+        { audienceAgentEnabled: checked },
+      );
 
       if (!res.ok) {
-        // Revert on failure
+        const data = await res.json().catch(() => ({}));
         setEnabled(!checked);
-        setError('Failed to save');
+        setError(data.error || `Error ${res.status}`);
         return;
       }
 
-      // Show brief success indicator
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch (err) {
-      console.error('Failed to update audience agent toggle:', err);
-      // Revert on failure
+    } catch (err: any) {
+      console.error('Failed to update toggle:', err);
       setEnabled(!checked);
-      setError('Network error');
+      setError('Network error — please retry');
     } finally {
       setSaving(false);
     }
-  };
+  }, [jobId]);
 
   return (
     <div className="flex items-center justify-between">

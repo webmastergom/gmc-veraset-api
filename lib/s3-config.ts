@@ -23,7 +23,7 @@ function setCache<T>(key: string, data: T): void {
   CONFIG_CACHE.set(key, { data, expiresAt: Date.now() + CONFIG_CACHE_TTL_MS });
 }
 
-function invalidateCache(key: string): void {
+export function invalidateCache(key: string): void {
   CONFIG_CACHE.delete(key);
 }
 
