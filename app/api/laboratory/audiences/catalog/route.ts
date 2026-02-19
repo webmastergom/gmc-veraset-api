@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { AUDIENCE_CATALOG, AUDIENCE_GROUP_LABELS } from '@/lib/audience-catalog';
 import { loadAudienceResults } from '@/lib/audience-runner';
 import { getAudienceEnabledJobs } from '@/lib/jobs';
+import { inferCountryFromName } from '@/lib/country-inference';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -39,7 +40,7 @@ export async function GET(request: NextRequest): Promise<Response> {
       jobId: j.jobId,
       name: j.name,
       datasetId: j.s3DestPath?.replace(/^s3:\/\/[^/]+\//, '').replace(/\/$/, '') || j.jobId,
-      country: j.country || '',
+      country: j.country || inferCountryFromName(j.name),
       dateRange: j.dateRange,
       actualDateRange: j.actualDateRange,
       poiCount: j.poiCount,

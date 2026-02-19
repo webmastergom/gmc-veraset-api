@@ -8,6 +8,7 @@ import { S3StorageSection } from "@/components/jobs/s3-storage-section"
 import { JobAuditDialog } from "@/components/jobs/job-audit-dialog"
 import { MainLayout } from "@/components/layout/main-layout"
 import { AudienceAgentToggle } from "@/components/jobs/audience-agent-toggle"
+import { inferCountryFromName } from "@/lib/country-inference"
 import dynamic from "next/dynamic"
 
 // Dynamic import to avoid bundling server-side code in client
@@ -47,7 +48,7 @@ async function getJob(id: string) {
       date_range_discrepancy: job.dateRangeDiscrepancy,
       has_audit_trail: !!job.auditTrail,
       audience_agent_enabled: job.audienceAgentEnabled || false,
-      country: job.country || '',
+      country: job.country || inferCountryFromName(job.name),
     };
   } catch (error) {
     console.error("Error fetching job:", error);
