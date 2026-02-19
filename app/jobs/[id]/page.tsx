@@ -47,6 +47,7 @@ async function getJob(id: string) {
       date_range_discrepancy: job.dateRangeDiscrepancy,
       has_audit_trail: !!job.auditTrail,
       audience_agent_enabled: job.audienceAgentEnabled || false,
+      country: job.country || '',
     };
   } catch (error) {
     console.error("Error fetching job:", error);
@@ -265,6 +266,7 @@ export default async function JobDetailPage({
             <AudienceAgentToggle
               jobId={job.job_id}
               initialEnabled={job.audience_agent_enabled}
+              initialCountry={job.country}
             />
           </CardContent>
         </Card>
