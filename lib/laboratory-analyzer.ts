@@ -18,6 +18,7 @@
 
 import { runQuery, ensureTableForDataset, getTableName } from './athena';
 import { batchReverseGeocode } from './reverse-geocode';
+import { toIsoCountry } from './country-inference';
 import type {
   LabConfig,
   LabAnalysisResult,
@@ -136,7 +137,7 @@ export async function runSpatialJoin(
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
   const catFilter = `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`;
-  const countryFilter = country ? `AND p.country = '${country.toUpperCase()}'` : '';
+  const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
 
   // 4. Spatial join query
   report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m (geohash-bucket strategy)` });

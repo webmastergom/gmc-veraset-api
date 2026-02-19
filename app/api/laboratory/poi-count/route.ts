@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { runQuery } from '@/lib/athena';
 import type { PoiCategory } from '@/lib/laboratory-types';
 import { POI_CATEGORIES } from '@/lib/laboratory-types';
+import { toIsoCountry } from '@/lib/country-inference';
 
 export const dynamic = 'force-dynamic';
 
@@ -60,7 +61,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     SELECT category, COUNT(*) as cnt
     FROM ${poiTableName}
     WHERE category IN (${catFilter})
-      AND country = '${country.toUpperCase()}'
+      AND country = '${toIsoCountry(country)}'
     GROUP BY category
   `;
 

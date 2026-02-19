@@ -1,5 +1,25 @@
 /**
- * Infers country ISO code from a job name string.
+ * Country code utilities for GMC.
+ *
+ * GMC uses 'UK' for United Kingdom, but the POI parquet table (pois_gmc)
+ * uses ISO 3166-1 alpha-2 where United Kingdom = 'GB'.
+ * toIsoCountry() normalizes before SQL queries against POI data.
+ */
+
+// GMC display codes → ISO 3166-1 alpha-2 (for POI table queries)
+const GMC_TO_ISO: Record<string, string> = { UK: 'GB' };
+
+/**
+ * Normalize a GMC country code to ISO 3166-1 alpha-2 for POI queries.
+ * E.g., 'UK' → 'GB'. All other codes pass through unchanged.
+ */
+export function toIsoCountry(code: string): string {
+  const upper = code.toUpperCase();
+  return GMC_TO_ISO[upper] || upper;
+}
+
+/**
+ * Infers country code from a job name string.
  * Used as fallback when the country field is not explicitly set on a job.
  */
 
