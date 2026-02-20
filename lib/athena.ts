@@ -234,6 +234,190 @@ export async function runQuery(sql: string): Promise<QueryResult> {
   }
 }
 
+// ── Async Query Functions (fire-and-forget + status check) ───────────────
+
+/**
+ * Start an Athena query and return the QueryExecutionId immediately.
+ * Does NOT wait for the query to finish — use checkQueryStatus() to poll.
+ */
+export async function startQueryAsync(sql: string): Promise<string> {
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    throw new Error('AWS credentials not configured.');
+  }
+
+  const startRes = await athena.send(new StartQueryExecutionCommand({
+    QueryString: sql,
+    QueryExecutionContext: { Database: DATABASE },
+    ResultConfiguration: { OutputLocation: OUTPUT_LOCATION },
+  }));
+
+  const queryId = startRes.QueryExecutionId;
+  if (!queryId) throw new Error('No query execution ID returned from Athena');
+
+  console.log(`[ATHENA-ASYNC] Started query: ${queryId}`);
+  console.log(`   Query preview: ${sql.substring(0, 200)}${sql.length > 200 ? '...' : ''}`);
+  return queryId;
+}
+
+/**
+ * Check the status of an Athena query without blocking.
+ * Returns the current state, output location, and any error.
+ */
+export async function checkQueryStatus(queryId: string): Promise<{
+  state: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
+  outputLocation?: string;
+  error?: string;
+  statistics?: { dataScannedBytes?: number; engineExecutionTimeMs?: number };
+}> {
+  const statusRes = await athena.send(new GetQueryExecutionCommand({
+    QueryExecutionId: queryId,
+  }));
+
+  const execution = statusRes.QueryExecution;
+  const state = (execution?.Status?.State || 'QUEUED') as any;
+  const stats = execution?.Statistics;
+
+  return {
+    state,
+    outputLocation: execution?.ResultConfiguration?.OutputLocation,
+    error: state === 'FAILED'
+      ? execution?.Status?.StateChangeReason || 'Query failed'
+      : undefined,
+    statistics: stats ? {
+      dataScannedBytes: Number(stats.DataScannedInBytes) || undefined,
+      engineExecutionTimeMs: Number(stats.EngineExecutionTimeInMillis) || undefined,
+    } : undefined,
+  };
+}
+
+/**
+ * Fetch paginated results from a completed Athena query.
+ * The query must be in SUCCEEDED state — call checkQueryStatus() first.
+ */
+export async function fetchQueryResults(queryId: string): Promise<QueryResult> {
+  const allDataRows: Record<string, any>[] = [];
+  let nextToken: string | undefined;
+  let columns: string[] = [];
+  let isFirstPage = true;
+
+  do {
+    const resultsRes = await athena.send(new GetQueryResultsCommand({
+      QueryExecutionId: queryId,
+      NextToken: nextToken,
+      MaxResults: 1000,
+    }));
+
+    const rows = resultsRes.ResultSet?.Rows || [];
+
+    if (isFirstPage) {
+      if (rows.length === 0) return { columns: [], rows: [] };
+      columns = rows[0].Data?.map((d: any) => d.VarCharValue || '') || [];
+      for (let i = 1; i < rows.length; i++) {
+        allDataRows.push(parseRow(rows[i], columns));
+      }
+      isFirstPage = false;
+    } else {
+      for (const row of rows) {
+        allDataRows.push(parseRow(row, columns));
+      }
+    }
+
+    nextToken = resultsRes.NextToken;
+  } while (nextToken);
+
+  console.log(`[ATHENA-ASYNC] Fetched ${allDataRows.length} rows for query ${queryId}`);
+  return { columns, rows: allDataRows };
+}
+
+// ── CTAS (Create Table As Select) Functions ──────────────────────────────
+
+/**
+ * Generate a sanitized temp table name from a base + runId.
+ * Athena table names must start with a letter and use only [a-z0-9_].
+ */
+export function tempTableName(base: string, runId: string): string {
+  const safe = runId.replace(/-/g, '_');
+  return `temp_${base}_${safe}`;
+}
+
+/**
+ * Start a CTAS query that materializes a SELECT result as Parquet in S3.
+ * Returns QueryExecutionId immediately — poll with checkQueryStatus().
+ *
+ * The result is a new Athena table backed by Parquet files at:
+ *   s3://{BUCKET}/athena-temp/{tableName}/
+ */
+export async function startCTASAsync(
+  selectSql: string,
+  tableName: string,
+): Promise<string> {
+  const s3Location = `s3://${BUCKET}/athena-temp/${tableName}/`;
+
+  const ctasSql = `
+    CREATE TABLE ${tableName}
+    WITH (
+      format = 'PARQUET',
+      parquet_compression = 'SNAPPY',
+      external_location = '${s3Location}'
+    )
+    AS ${selectSql}
+  `;
+
+  return startQueryAsync(ctasSql);
+}
+
+/**
+ * Drop a temporary Athena table (Glue catalog entry only — data stays in S3).
+ * Fire-and-forget safe.
+ */
+export async function dropTempTable(tableName: string): Promise<void> {
+  try {
+    await runQuery(`DROP TABLE IF EXISTS ${tableName}`);
+    console.log(`[ATHENA] Dropped temp table: ${tableName}`);
+  } catch (e: any) {
+    console.warn(`[ATHENA] Failed to drop temp table ${tableName}:`, e.message);
+  }
+}
+
+/**
+ * Clean up S3 objects created by a CTAS query under athena-temp/{prefix}/.
+ * Uses batched DeleteObjects for efficiency.
+ */
+export async function cleanupTempS3(prefix: string): Promise<void> {
+  const { ListObjectsV2Command, DeleteObjectsCommand } = await import('@aws-sdk/client-s3');
+  const fullPrefix = `athena-temp/${prefix}/`;
+
+  try {
+    let continuationToken: string | undefined;
+    do {
+      const listRes = await s3Client.send(new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: fullPrefix,
+        ContinuationToken: continuationToken,
+      }));
+
+      const objects = listRes.Contents || [];
+      if (objects.length > 0) {
+        await s3Client.send(new DeleteObjectsCommand({
+          Bucket: BUCKET,
+          Delete: {
+            Objects: objects.map(o => ({ Key: o.Key! })),
+            Quiet: true,
+          },
+        }));
+      }
+
+      continuationToken = listRes.IsTruncated ? listRes.NextContinuationToken : undefined;
+    } while (continuationToken);
+
+    console.log(`[ATHENA] Cleaned up S3: ${fullPrefix}`);
+  } catch (e: any) {
+    console.warn(`[ATHENA] Failed to cleanup S3 ${fullPrefix}:`, e.message);
+  }
+}
+
+// ── Partition Discovery ─────────────────────────────────────────────────
+
 /**
  * Discover partitions from S3 by listing objects
  * This function ensures ALL partitions are discovered using a dual-pass strategy:

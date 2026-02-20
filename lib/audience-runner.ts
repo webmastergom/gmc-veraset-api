@@ -9,9 +9,10 @@
 
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET, listObjects } from './s3-config';
-import { analyzeLaboratory, runSpatialJoin, resolveOrigins, geocodeOrigins, processVisitsForRecipe } from './laboratory-analyzer';
+import { analyzeLaboratory, runSpatialJoin, buildSpatialJoinQueries, buildOriginsCTASQuery, resolveOrigins, geocodeOrigins, processVisitsForRecipe } from './laboratory-analyzer';
 import type { ParsedVisit, GeoInfo } from './laboratory-analyzer';
 import type { LabAnalysisResult, LabProgressCallback, PoiCategory } from './laboratory-types';
+import { startQueryAsync, fetchQueryResults, ensureTableForDataset, runQuery, startCTASAsync, tempTableName, dropTempTable, cleanupTempS3 } from './athena';
 import {
   AUDIENCE_CATALOG,
   audienceToLabConfig,
@@ -299,6 +300,291 @@ export async function runBatchAudienceAnalysis(
   report({ phase: 'processing', current: audiences.length, total: audiences.length, percent: 100, message: `Batch complete: ${audiences.length} audiences processed` });
 
   return results;
+}
+
+// ── Async batch start (fire-and-forget Athena CTAS) ─────────────────────
+
+/**
+ * Phase 1 of the async CTAS pipeline.
+ * Ensures tables exist, builds SQL, fires Athena queries, returns immediately.
+ *
+ * Q1: CTAS spatial join → temp_visits_{runId}  (materializes ~200MB Parquet)
+ * Q2: COUNT DISTINCT total devices             (lightweight, returns 1 number)
+ *
+ * The queries continue running in Athena — poll with checkQueryStatus().
+ */
+export async function startBatchAsync(
+  audienceIds: string[],
+  dataset: { id: string; name: string; jobId: string },
+  country: string,
+  runId: string,
+  dateFrom?: string,
+  dateTo?: string,
+): Promise<{ spatialQueryId: string; totalDevicesQueryId: string; visitsTableName: string }> {
+  // Resolve audience definitions, collect all categories
+  const audiences: AudienceDefinition[] = [];
+  for (const id of audienceIds) {
+    const a = AUDIENCE_CATALOG.find(x => x.id === id);
+    if (a) audiences.push(a);
+  }
+  if (audiences.length === 0) throw new Error('No valid audiences');
+
+  const allCategories = collectAllCategories(audiences);
+  console.log(`[AUDIENCE-BATCH-ASYNC] ${audiences.length} audiences, ${allCategories.length} unique categories`);
+
+  // Ensure tables exist (fast — skips if already set up)
+  await ensureTableForDataset(dataset.id);
+  try {
+    await runQuery(`
+      CREATE EXTERNAL TABLE IF NOT EXISTS lab_pois_gmc (
+        id STRING, name STRING, category STRING, city STRING,
+        postal_code STRING, country STRING, latitude DOUBLE, longitude DOUBLE
+      )
+      STORED AS PARQUET
+      LOCATION 's3://${BUCKET}/pois_gmc/'
+    `);
+  } catch (error: any) {
+    if (!error.message?.includes('already exists')) {
+      console.warn(`[AUDIENCE-BATCH-ASYNC] Warning creating POI table:`, error.message);
+    }
+  }
+
+  // Build SQL queries
+  const { spatialSelectForCTAS, totalDevicesQuery } = buildSpatialJoinQueries(
+    dataset.id, allCategories, country, dateFrom, dateTo, 200,
+  );
+
+  // Generate temp table name for CTAS spatial join
+  const visitsTable = tempTableName('visits', runId);
+
+  // Fire both queries asynchronously:
+  // - Q1 as CTAS → creates temp_visits_{runId} table backed by Parquet in S3
+  // - Q2 as regular query → just returns a count
+  const [spatialQueryId, totalDevicesQueryId] = await Promise.all([
+    startCTASAsync(spatialSelectForCTAS, visitsTable),
+    startQueryAsync(totalDevicesQuery),
+  ]);
+
+  console.log(`[AUDIENCE-BATCH-ASYNC] Fired CTAS queries: spatial=${spatialQueryId} (→ ${visitsTable}), totalDevices=${totalDevicesQueryId}`);
+  return { spatialQueryId, totalDevicesQueryId, visitsTableName: visitsTable };
+}
+
+// ── Async origins start (Phase 2 — triggered by /status when Q1 succeeds) ──
+
+/**
+ * Fire Q3: CTAS origins query.
+ * Called from the /status endpoint once the spatial CTAS (Q1) has SUCCEEDED.
+ * Joins the full dataset against the small materialized visits table to resolve
+ * first-ping-of-day origins for ALL devices — ONE query instead of N/500.
+ */
+export async function startOriginsAsync(
+  datasetId: string,
+  runId: string,
+  visitsTableName: string,
+  dateFrom?: string,
+  dateTo?: string,
+): Promise<{ originsQueryId: string; originsTableName: string }> {
+  const originsTable = tempTableName('origins', runId);
+  const selectSql = buildOriginsCTASQuery(datasetId, visitsTableName, dateFrom, dateTo);
+
+  const originsQueryId = await startCTASAsync(selectSql, originsTable);
+  console.log(`[AUDIENCE-BATCH-ASYNC] Fired CTAS origins: ${originsQueryId} (→ ${originsTable})`);
+
+  return { originsQueryId, originsTableName: originsTable };
+}
+
+// ── Async batch continue (Phase 3: read temp tables + process) ───────────
+
+/**
+ * Phase 3 of the async CTAS pipeline.
+ * Called after ALL Athena queries (Q1 spatial CTAS, Q2 total devices, Q3 origins CTAS)
+ * are SUCCEEDED. Reads from the small materialized temp tables — no more N/500 queries.
+ *
+ * Data flow:
+ *   SELECT * FROM temp_visits_{runId}   (~200MB, fast)
+ *   SELECT * FROM temp_origins_{runId}  (~50MB, fast)
+ *   + fetchQueryResults(totalDevicesQueryId) for the count
+ *   → geocode origins (local, ~30s)
+ *   → process each audience (in-memory, ~5s/audience)
+ *   → persist results to S3
+ *   → cleanup temp tables + S3 (fire-and-forget)
+ */
+export async function continueBatchProcessing(
+  audienceIds: string[],
+  dataset: { id: string; name: string; jobId: string },
+  country: string,
+  totalDevicesQueryId: string,
+  visitsTableName: string,
+  originsTableName: string,
+  dateFrom?: string,
+  dateTo?: string,
+  options?: BatchRunOptions,
+): Promise<Record<string, AudienceRunResult>> {
+  const startedAt = new Date().toISOString();
+  const results: Record<string, AudienceRunResult> = {};
+
+  // Resolve audiences
+  const audiences = audienceIds
+    .map(id => AUDIENCE_CATALOG.find(x => x.id === id))
+    .filter(Boolean) as AudienceDefinition[];
+
+  if (audiences.length === 0) return results;
+
+  // 1. Read from temp tables + fetch total devices count
+  console.log(`[AUDIENCE-BATCH-CONTINUE] Reading from temp tables: ${visitsTableName}, ${originsTableName}`);
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'processing', percent: 70, message: 'Reading materialized results from temp tables...' });
+  }
+
+  const [visitsRes, originsRes, totalRes] = await Promise.all([
+    runQuery(`SELECT ad_id, date, poi_id, category, dwell_minutes, visit_hour, ping_count FROM ${visitsTableName}`),
+    runQuery(`SELECT ad_id, date, origin_lat, origin_lng FROM ${originsTableName}`),
+    fetchQueryResults(totalDevicesQueryId),
+  ]);
+
+  const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total)) || 0;
+
+  // 2. Parse visits
+  const visits: ParsedVisit[] = visitsRes.rows.map(row => ({
+    adId: String(row.ad_id),
+    date: String(row.date),
+    poiId: String(row.poi_id),
+    category: String(row.category) as PoiCategory,
+    dwellMinutes: parseFloat(String(row.dwell_minutes)) || 0,
+    visitHour: parseInt(String(row.visit_hour)) || 0,
+    originLat: 0,
+    originLng: 0,
+  }));
+
+  console.log(`[AUDIENCE-BATCH-CONTINUE] Visits: ${visits.length}, Origins: ${originsRes.rows.length}, Total devices: ${totalDevicesInDataset}`);
+
+  // 3. Build origin map from temp_origins table (replaces resolveOrigins N/500 queries)
+  const originMap = new Map<string, { lat: number; lng: number }>();
+  for (const row of originsRes.rows) {
+    const lat = parseFloat(String(row.origin_lat));
+    const lng = parseFloat(String(row.origin_lng));
+    if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
+      originMap.set(`${row.ad_id}|${row.date}`, { lat, lng });
+    }
+  }
+
+  // Assign origins to visits
+  for (const v of visits) {
+    const origin = originMap.get(`${v.adId}|${v.date}`);
+    if (origin) { v.originLat = origin.lat; v.originLng = origin.lng; }
+  }
+
+  console.log(`[AUDIENCE-BATCH-CONTINUE] Origin map: ${originMap.size} device-day pairs`);
+
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'processing', percent: 75, message: `Loaded ${visits.length} visits, ${originMap.size} origins` });
+  }
+
+  if (visits.length === 0) {
+    for (const a of audiences) {
+      results[a.id] = {
+        audienceId: a.id, datasetId: dataset.id, country,
+        status: 'completed', startedAt, completedAt: new Date().toISOString(),
+        segmentSize: 0, segmentPercent: 0, totalDevicesInDataset,
+        totalPostalCodes: 0, avgAffinityIndex: 0, avgDwellMinutes: 0, topHotspots: [],
+      };
+    }
+    // Cleanup temp tables even on empty results
+    cleanupTempTables(visitsTableName, originsTableName);
+    return results;
+  }
+
+  // 4. Geocode origins (local GeoJSON — very fast, ~30s)
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'processing', percent: 78, message: 'Geocoding device origins...' });
+  }
+
+  const coordToZip = await geocodeOrigins(visits);
+  console.log(`[AUDIENCE-BATCH-CONTINUE] Geocoded ${coordToZip.size} unique coordinates`);
+
+  if (options?.saveStatus) {
+    await options.saveStatus({ phase: 'processing', percent: 80, message: `Geocoded ${coordToZip.size} coordinates` });
+  }
+
+  // 5. Process each audience in-memory
+  for (let i = 0; i < audiences.length; i++) {
+    // Check cancellation
+    if (options?.checkCancelled) {
+      const cancelled = await options.checkCancelled();
+      if (cancelled) {
+        console.log(`[AUDIENCE-BATCH-CONTINUE] Cancellation requested after ${i} audiences`);
+        for (let j = i; j < audiences.length; j++) {
+          results[audiences[j].id] = {
+            audienceId: audiences[j].id, datasetId: dataset.id, country,
+            status: 'failed', startedAt, completedAt: new Date().toISOString(),
+            error: 'Cancelled by user',
+          };
+        }
+        break;
+      }
+    }
+
+    const audience = audiences[i];
+    const pct = 80 + Math.round(((i + 1) / audiences.length) * 18); // 80-98%
+
+    if (options?.saveStatus) {
+      await options.saveStatus({
+        current: i + 1,
+        currentAudienceName: audience.name,
+        percent: pct,
+        message: `Processing ${audience.name} (${i + 1}/${audiences.length})...`,
+      });
+    }
+
+    try {
+      const config = audienceToLabConfig(audience, dataset, country, dateFrom, dateTo);
+      const labResult = processVisitsForRecipe({
+        config, allVisits: visits, totalDevicesInDataset, originMap, coordToZip,
+      });
+
+      results[audience.id] = await persistAudienceResult(audience, dataset.id, country, labResult, startedAt);
+      console.log(`[AUDIENCE-BATCH-CONTINUE] ${audience.name}: ${labResult.stats.segmentSize} devices, AI=${labResult.stats.avgAffinityIndex}`);
+    } catch (error: any) {
+      console.error(`[AUDIENCE-BATCH-CONTINUE] ${audience.name} failed:`, error.message);
+      results[audience.id] = {
+        audienceId: audience.id, datasetId: dataset.id, country,
+        status: 'failed', startedAt, completedAt: new Date().toISOString(),
+        error: error.message,
+      };
+    }
+
+    if (options?.saveStatus) {
+      await options.saveStatus({
+        current: i + 1,
+        currentAudienceName: audience.name,
+        percent: pct,
+        message: `Completed ${audience.name} (${i + 1}/${audiences.length})`,
+        completedAudiences: Object.keys(results).filter(id => results[id].status === 'completed'),
+      });
+    }
+  }
+
+  // 6. Cleanup temp tables + S3 (fire-and-forget — don't block the response)
+  cleanupTempTables(visitsTableName, originsTableName);
+
+  return results;
+}
+
+/**
+ * Fire-and-forget cleanup of CTAS temp tables and their S3 data.
+ * Drops Glue catalog entries and deletes Parquet files from athena-temp/.
+ */
+function cleanupTempTables(visitsTableName: string, originsTableName: string): void {
+  Promise.all([
+    dropTempTable(visitsTableName),
+    dropTempTable(originsTableName),
+    cleanupTempS3(visitsTableName),
+    cleanupTempS3(originsTableName),
+  ]).then(() => {
+    console.log(`[CLEANUP] Temp tables cleaned: ${visitsTableName}, ${originsTableName}`);
+  }).catch(err => {
+    console.warn(`[CLEANUP] Some cleanup failed (non-fatal):`, err.message);
+  });
 }
 
 // ── Persist results to S3 ────────────────────────────────────────────────

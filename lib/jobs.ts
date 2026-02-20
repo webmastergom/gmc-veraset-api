@@ -256,6 +256,11 @@ const SYNC_LOCK_TTL_MS = 600_000; // 10 min
  * Try to acquire sync lock. Returns true if acquired, false if another sync is in progress or lock not expired.
  */
 export async function tryAcquireSyncLock(jobId: string): Promise<boolean> {
+  // Invalidate cache to ensure we read the latest lock state from S3.
+  // Without this, the 60s in-memory cache could show a stale lock that
+  // was already released, or miss a lock acquired by another request.
+  invalidateCache('jobs');
+
   const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
   const job = data[jobId];
   if (!job) return false;
@@ -277,6 +282,11 @@ export async function tryAcquireSyncLock(jobId: string): Promise<boolean> {
  * Release sync lock (call when sync finishes or fails).
  */
 export async function releaseSyncLock(jobId: string): Promise<void> {
+  // Invalidate cache to ensure we read the latest state from S3.
+  // Without this, the 60s cache could cause us to read stale job data
+  // and write it back, "resurrecting" a lock that was already cleared.
+  invalidateCache('jobs');
+
   const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
   if (!data[jobId]) return;
   data[jobId] = {

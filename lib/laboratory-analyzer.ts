@@ -74,63 +74,21 @@ export interface GeoInfo {
 // ── 1. Spatial Join (Athena) ─────────────────────────────────────────────
 
 /**
- * Run the geohash-bucket spatial join against Athena.
- * Returns raw visits (without origins) and total device count.
- *
- * This is the most expensive operation — reuse across multiple audiences
- * by passing ALL categories needed across all recipes.
+ * Build the SQL queries for spatial join and total device count.
+ * Extracted so that the async pipeline can fire these without blocking.
  */
-export async function runSpatialJoin(
+export function buildSpatialJoinQueries(
   datasetId: string,
   categories: PoiCategory[],
   country: string,
   dateFrom?: string,
   dateTo?: string,
   spatialRadius = 200,
-  onProgress?: LabProgressCallback,
-): Promise<SpatialJoinResult> {
-  const report = onProgress || (() => {});
-
-  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-    throw new Error('AWS credentials not configured.');
-  }
-
+): { spatialQuery: string; spatialSelectForCTAS: string; totalDevicesQuery: string } {
   const tableName = getTableName(datasetId);
-
-  // 1. Ensure movement data table
-  report({ step: 'initializing', percent: 3, message: 'Preparing movement data table...', detail: tableName });
-  try {
-    await ensureTableForDataset(datasetId);
-  } catch (error: any) {
-    if (!error.message?.includes('already exists')) throw error;
-  }
-
-  // 2. Ensure POI parquet table
-  report({ step: 'loading_pois', percent: 8, message: 'Preparing POI catalog table...', detail: `Real POIs from pois_gmc` });
   const poiTableName = 'lab_pois_gmc';
-  try {
-    await runQuery(`
-      CREATE EXTERNAL TABLE IF NOT EXISTS ${poiTableName} (
-        id STRING,
-        name STRING,
-        category STRING,
-        city STRING,
-        postal_code STRING,
-        country STRING,
-        latitude DOUBLE,
-        longitude DOUBLE
-      )
-      STORED AS PARQUET
-      LOCATION 's3://${BUCKET}/pois_gmc/'
-    `);
-  } catch (error: any) {
-    if (!error.message?.includes('already exists')) {
-      console.warn(`[LAB] Warning creating POI table:`, error.message);
-    }
-  }
-  report({ step: 'loading_pois', percent: 12, message: 'POI catalog ready' });
 
-  // 3. Build filters
+  // Build filters
   const dateConditions: string[] = [];
   if (dateFrom) dateConditions.push(`date >= '${dateFrom}'`);
   if (dateTo) dateConditions.push(`date <= '${dateTo}'`);
@@ -138,9 +96,6 @@ export async function runSpatialJoin(
 
   const catFilter = `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`;
   const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
-
-  // 4. Spatial join query
-  report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m (geohash-bucket strategy)` });
 
   const GRID_STEP = 0.01;
 
@@ -237,6 +192,97 @@ export async function runSpatialJoin(
     ORDER BY v.ad_id, v.date, v.visit_start
   `;
 
+  // CTAS-compatible version: no ORDER BY (not supported in CTAS), no NULL origin columns
+  const spatialSelectForCTAS = `
+    WITH
+    pings AS (
+      SELECT
+        ad_id,
+        date,
+        utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(TRY_CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_bucket
+      FROM ${tableName}
+      WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${dateWhere}
+    ),
+    poi_base AS (
+      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
+        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
+      FROM ${poiTableName} p
+      WHERE p.category IS NOT NULL
+        ${catFilter}
+        ${countryFilter}
+    ),
+    poi_buckets AS (
+      SELECT poi_id, category, poi_lat, poi_lng,
+        base_lat_bucket + dlat as lat_bucket,
+        base_lng_bucket + dlng as lng_bucket
+      FROM poi_base
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
+    ),
+    matched AS (
+      SELECT
+        k.ad_id,
+        k.date,
+        k.utc_timestamp,
+        k.lat,
+        k.lng,
+        p.poi_id,
+        p.category,
+        111320 * SQRT(
+          POW(k.lat - p.poi_lat, 2) +
+          POW((k.lng - p.poi_lng) * COS(RADIANS((k.lat + p.poi_lat) / 2)), 2)
+        ) as distance_m
+      FROM pings k
+      INNER JOIN poi_buckets p
+        ON k.lat_bucket = p.lat_bucket
+        AND k.lng_bucket = p.lng_bucket
+    ),
+    closest AS (
+      SELECT
+        ad_id, date, utc_timestamp, lat, lng, poi_id, category, distance_m,
+        ROW_NUMBER() OVER (PARTITION BY ad_id, utc_timestamp ORDER BY distance_m) as rn
+      FROM matched
+      WHERE distance_m <= ${spatialRadius}
+    ),
+    poi_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng, poi_id, category
+      FROM closest WHERE rn = 1
+    ),
+    visits AS (
+      SELECT
+        ad_id,
+        date,
+        poi_id,
+        category,
+        MIN(utc_timestamp) as visit_start,
+        MAX(utc_timestamp) as visit_end,
+        COUNT(*) as ping_count,
+        ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes,
+        HOUR(MIN(utc_timestamp)) as visit_hour
+      FROM poi_pings
+      GROUP BY ad_id, date, poi_id, category
+    )
+    SELECT
+      v.ad_id,
+      v.date,
+      v.poi_id,
+      v.category,
+      v.dwell_minutes,
+      v.visit_hour,
+      v.ping_count
+    FROM visits v
+    WHERE v.dwell_minutes >= 0
+  `;
+
   const totalDevicesQuery = `
     SELECT COUNT(DISTINCT ad_id) as total
     FROM ${tableName}
@@ -244,11 +290,111 @@ export async function runSpatialJoin(
     ${dateWhere}
   `;
 
+  return { spatialQuery, spatialSelectForCTAS, totalDevicesQuery };
+}
+
+/**
+ * Build a SELECT query for origin resolution (first-ping-of-day per device).
+ * Designed for CTAS wrapping — joins against a materialized visits temp table
+ * instead of using IN (...) clauses with thousands of ad_ids.
+ *
+ * This replaces the N/500 sequential queries in resolveOrigins() with ONE query.
+ */
+export function buildOriginsCTASQuery(
+  datasetId: string,
+  visitsTableName: string,
+  dateFrom?: string,
+  dateTo?: string,
+): string {
+  const tableName = getTableName(datasetId);
+
+  const dateConditions: string[] = [];
+  if (dateFrom) dateConditions.push(`date >= '${dateFrom}'`);
+  if (dateTo) dateConditions.push(`date <= '${dateTo}'`);
+  const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+  return `
+    SELECT
+      d.ad_id,
+      d.date,
+      ROUND(MIN_BY(TRY_CAST(d.latitude AS DOUBLE), d.utc_timestamp), ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(MIN_BY(TRY_CAST(d.longitude AS DOUBLE), d.utc_timestamp), ${COORDINATE_PRECISION}) as origin_lng
+    FROM ${tableName} d
+    WHERE d.ad_id IN (SELECT DISTINCT ad_id FROM ${visitsTableName})
+      AND TRY_CAST(d.latitude AS DOUBLE) IS NOT NULL
+      AND TRY_CAST(d.longitude AS DOUBLE) IS NOT NULL
+      AND (d.horizontal_accuracy IS NULL OR TRY_CAST(d.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+      ${dateWhere}
+    GROUP BY d.ad_id, d.date
+  `;
+}
+
+/**
+ * Run the geohash-bucket spatial join against Athena.
+ * Returns raw visits (without origins) and total device count.
+ *
+ * This is the most expensive operation — reuse across multiple audiences
+ * by passing ALL categories needed across all recipes.
+ */
+export async function runSpatialJoin(
+  datasetId: string,
+  categories: PoiCategory[],
+  country: string,
+  dateFrom?: string,
+  dateTo?: string,
+  spatialRadius = 200,
+  onProgress?: LabProgressCallback,
+): Promise<SpatialJoinResult> {
+  const report = onProgress || (() => {});
+
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    throw new Error('AWS credentials not configured.');
+  }
+
+  // 1. Ensure movement data table
+  report({ step: 'initializing', percent: 3, message: 'Preparing movement data table...', detail: getTableName(datasetId) });
+  try {
+    await ensureTableForDataset(datasetId);
+  } catch (error: any) {
+    if (!error.message?.includes('already exists')) throw error;
+  }
+
+  // 2. Ensure POI parquet table
+  report({ step: 'loading_pois', percent: 8, message: 'Preparing POI catalog table...', detail: `Real POIs from pois_gmc` });
+  try {
+    await runQuery(`
+      CREATE EXTERNAL TABLE IF NOT EXISTS lab_pois_gmc (
+        id STRING,
+        name STRING,
+        category STRING,
+        city STRING,
+        postal_code STRING,
+        country STRING,
+        latitude DOUBLE,
+        longitude DOUBLE
+      )
+      STORED AS PARQUET
+      LOCATION 's3://${BUCKET}/pois_gmc/'
+    `);
+  } catch (error: any) {
+    if (!error.message?.includes('already exists')) {
+      console.warn(`[LAB] Warning creating POI table:`, error.message);
+    }
+  }
+  report({ step: 'loading_pois', percent: 12, message: 'POI catalog ready' });
+
+  // 3. Build queries using shared function
+  const { spatialQuery, totalDevicesQuery } = buildSpatialJoinQueries(
+    datasetId, categories, country, dateFrom, dateTo, spatialRadius,
+  );
+
+  // 4. Run spatial join
+  report({ step: 'spatial_join', percent: 15, message: 'Running spatial join...', detail: `Matching pings to real POIs within ${spatialRadius}m (geohash-bucket strategy)` });
+
   console.log(`[LAB] Running spatial join (geohash-bucket strategy)...`);
-  console.log(`[LAB] Grid cell size: ${GRID_STEP}° (~${Math.round(GRID_STEP * 111320)}m)`);
+  console.log(`[LAB] Grid cell size: 0.01° (~${Math.round(0.01 * 111320)}m)`);
   console.log(`[LAB] Categories requested: ${categories.join(', ')}`);
   console.log(`[LAB] Country filter: ${country || 'none'}`);
-  console.log(`[LAB] Date filters: ${dateWhere || 'none'}`);
   console.log(`[LAB] Spatial radius: ${spatialRadius}m`);
 
   let spatialRes, totalRes;

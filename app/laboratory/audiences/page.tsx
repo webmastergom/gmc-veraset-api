@@ -550,7 +550,7 @@ export default function AudiencesPage() {
     if (audienceIds.length === 0) return;
 
     setBatchRunning(true);
-    setBatchProgress({ phase: 'spatial_join', current: 0, total: audienceIds.length, percent: 0, message: 'Starting batch...' });
+    setBatchProgress({ phase: 'spatial_join', current: 0, total: audienceIds.length, percent: 5, message: 'Starting batch...' });
 
     // Mark all as running
     setResults(prev => {
@@ -567,19 +567,12 @@ export default function AudiencesPage() {
       return next;
     });
 
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    // Start polling as backup — if SSE disconnects, polling takes over
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    pollIntervalRef.current = setInterval(pollRunStatus, 4000);
-
     try {
+      // POST fires Athena queries and returns immediately with { runId }
       const res = await fetch('/api/laboratory/audiences/run-batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        signal: controller.signal,
         body: JSON.stringify({
           audienceIds,
           datasetId: selectedDataset.datasetId,
@@ -591,62 +584,25 @@ export default function AudiencesPage() {
         }),
       });
 
-      // Get runId from header
-      const runId = res.headers.get('X-Run-Id');
-      if (runId) setActiveRunId(runId);
-
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error('No stream');
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            const eventType = line.slice(7).trim();
-            const nextLine = lines[lines.indexOf(line) + 1];
-            if (nextLine?.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(nextLine.slice(6));
-                if (eventType === 'progress') {
-                  setBatchProgress(data as BatchProgress);
-                } else if (eventType === 'result') {
-                  // Batch complete — data.results is Record<audienceId, AudienceRunResult>
-                  const batchResults = data.results as Record<string, AudienceRunResult>;
-                  setResults(prev => ({ ...prev, ...batchResults }));
-                } else if (eventType === 'error') {
-                  console.error('Batch error:', data.message);
-                }
-              } catch { /* parse error */ }
-            }
-          }
-        }
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || 'Failed to start batch');
       }
 
-      // SSE stream completed cleanly — stop polling
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
+      const data = await res.json();
+      if (data.runId) {
+        setActiveRunId(data.runId);
       }
+
+      // Start polling — this is the only way to track progress now.
+      // The /status endpoint checks Athena progress and triggers /continue when done.
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = setInterval(pollRunStatus, 4000);
+
+    } catch (err: any) {
+      console.error('Failed to start batch:', err.message);
       setBatchRunning(false);
       setBatchProgress(null);
-      setActiveRunId(null);
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        // User clicked Stop — polling will detect cancellation
-        return;
-      }
-      // SSE disconnected (user navigated away) but run continues on server.
-      // Polling is already running and will track progress.
-      console.log('SSE disconnected, polling will continue tracking progress');
     }
   }, [selectedDataset, catalog, results, runningAudienceId, batchRunning, pollRunStatus]);
 

@@ -32,6 +32,23 @@ export interface AudienceRunStatus {
   error: string | null;
   completedAudiences: string[]; // audience IDs that finished successfully
   cancelRequested: boolean;     // cooperative cancellation flag
+
+  // ── Async CTAS pipeline fields ──────────────────────────────────────
+  athenaQueryIds?: {
+    spatialJoin?: string;       // Q1: CTAS spatial join QueryExecutionId
+    totalDevices?: string;      // Q2: COUNT DISTINCT QueryExecutionId
+    origins?: string;           // Q3: CTAS origins QueryExecutionId
+  };
+  pipelinePhase?: 'athena_spatial' | 'athena_origins' | 'processing' | 'done';
+  continueTriggered?: boolean;  // prevents double-trigger of /continue
+  visitsTableName?: string;     // temp_visits_{runId} (Athena CTAS table)
+  originsTableName?: string;    // temp_origins_{runId} (Athena CTAS table)
+
+  // ── Run parameters (needed by /continue endpoint) ───────────────────
+  datasetName?: string;
+  jobId?: string;
+  dateFrom?: string;
+  dateTo?: string;
 }
 
 // ── S3 Key ───────────────────────────────────────────────────────────────
