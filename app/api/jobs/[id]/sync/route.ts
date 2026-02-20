@@ -2,10 +2,36 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getJob, updateJob, tryAcquireSyncLock, releaseSyncLock } from '@/lib/jobs';
 import { parseS3Path } from '@/lib/s3';
 import { runSync } from '@/lib/sync/sync-orchestrator';
+import { determineSyncStatus } from '@/lib/sync/determine-sync-status';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 export const maxDuration = 600; // 10 min for large syncs
+
+/**
+ * GET /api/jobs/[id]/sync
+ * Returns sync status (same as GET /sync/status). Use POST to start sync.
+ */
+export async function GET(
+  _request: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  try {
+    const params = await context.params;
+    const job = await getJob(params.id);
+    if (!job) {
+      return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+    }
+    const response = determineSyncStatus(job);
+    return NextResponse.json(response);
+  } catch (error) {
+    console.error('GET /api/jobs/[id]/sync error:', error);
+    return NextResponse.json(
+      { error: 'Failed to get sync status', details: error instanceof Error ? error.message : 'Unknown error' },
+      { status: 500 }
+    );
+  }
+}
 
 export async function POST(
   request: NextRequest,

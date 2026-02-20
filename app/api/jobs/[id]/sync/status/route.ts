@@ -25,11 +25,17 @@ export async function GET(
   request: NextRequest,
   context: { params: Promise<{ id: string }> }
 ) {
-  const params = await context.params;
-
   try {
+    const params = await context.params;
+    const jobId = params?.id;
+    if (!jobId) {
+      return NextResponse.json(
+        { status: 'error', message: 'Job ID required', progress: 0, total: 0, totalBytes: 0, copied: 0, copiedBytes: 0 } as SyncStatusResponse,
+        { status: 400 }
+      );
+    }
     const clientId = getClientIdentifier(request);
-    const rateLimit = checkRateLimit(`sync-status:${clientId}:${params.id}`, 20, 60000);
+    const rateLimit = checkRateLimit(`sync-status:${clientId}:${jobId}`, 20, 60000);
 
     if (!rateLimit.allowed) {
       return NextResponse.json(
@@ -47,7 +53,7 @@ export async function GET(
       );
     }
 
-    const job = await getJob(params.id);
+    const job = await getJob(jobId);
     if (!job) {
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }

@@ -42,10 +42,10 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
   // per file while objectCount only updates every 5 s via flushProgress.
   if (job.syncProgress?.dayProgress) {
     const days = Object.values(job.syncProgress.dayProgress);
-    const sumCopied = days.reduce((s, d) => s + (d.copiedFiles ?? 0), 0);
-    const sumCopiedBytes = days.reduce((s, d) => s + (d.copiedBytes ?? 0), 0);
-    const sumTotal = days.reduce((s, d) => s + (d.totalFiles ?? 0), 0);
-    const sumTotalBytes = days.reduce((s, d) => s + (d.totalBytes ?? 0), 0);
+    const sumCopied = days.reduce((s, d) => s + (d?.copiedFiles ?? 0), 0);
+    const sumCopiedBytes = days.reduce((s, d) => s + (d?.copiedBytes ?? 0), 0);
+    const sumTotal = days.reduce((s, d) => s + (d?.totalFiles ?? 0), 0);
+    const sumTotalBytes = days.reduce((s, d) => s + (d?.totalBytes ?? 0), 0);
     // Use dayProgress-derived values when they show more progress
     if (sumCopied > copied) copied = sumCopied;
     if (sumCopiedBytes > copiedBytes) copiedBytes = sumCopiedBytes;
