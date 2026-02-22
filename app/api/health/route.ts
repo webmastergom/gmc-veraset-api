@@ -73,6 +73,30 @@ export async function GET() {
     };
   }
 
+  // Check 5: Veraset S3 bucket access (CRITICAL for sync)
+  try {
+    const { s3Client } = await import('@/lib/s3-config');
+    const { ListObjectsV2Command } = await import('@aws-sdk/client-s3');
+    const res = await s3Client.send(new ListObjectsV2Command({
+      Bucket: 'veraset-prd-platform-us-west-2',
+      Prefix: 'output/garritz/',
+      MaxKeys: 1,
+    }));
+    checks.verasetS3Access = {
+      status: 'ok',
+      message: 'Can read Veraset source bucket (sync will work)',
+      details: { accessible: true },
+    };
+  } catch (error: any) {
+    checks.verasetS3Access = {
+      status: 'error',
+      message: `Cannot access Veraset S3 bucket: ${error.message}`,
+      details: {
+        hint: 'AWS credentials need cross-account read access to veraset-prd-platform-us-west-2. Contact Veraset for IAM permissions.',
+      },
+    };
+  }
+
   // Overall status
   const allChecksOk = Object.values(checks).every(c => c.status === 'ok');
   const overallStatus = allChecksOk ? 'healthy' : 'degraded';
