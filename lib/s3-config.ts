@@ -27,34 +27,29 @@ export function invalidateCache(key: string): void {
   CONFIG_CACHE.delete(key);
 }
 
-// ── S3 client (lazy singleton) ──────────────────────────────────────────
-// Created on first use, NOT at module load time. This prevents import-time
-// crashes when env vars are missing/invalid — the Vercel function can still
-// start and return JSON errors instead of an HTML 500 page.
+// ── S3 client ───────────────────────────────────────────────────────────
+// Created eagerly but wrapped in try-catch so a bad env var doesn't crash
+// the module import and cause Vercel to return an HTML 500 page.
 
-let _s3Client: S3Client | null = null;
-
-export function getS3ClientInstance(): S3Client {
-  if (!_s3Client) {
-    _s3Client = new S3Client({
-      region: process.env.AWS_REGION || 'us-west-2',
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-      },
-      requestChecksumCalculation: 'WHEN_REQUIRED',
-      responseChecksumValidation: 'WHEN_REQUIRED',
-    });
-  }
-  return _s3Client;
+let s3ClientInstance: S3Client;
+try {
+  s3ClientInstance = new S3Client({
+    region: process.env.AWS_REGION || 'us-west-2',
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+    },
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
+  });
+} catch (err) {
+  console.error('[S3-CONFIG] Failed to create S3Client:', err);
+  // Create a bare client so imports don't crash — calls will fail at runtime
+  // with a clear error instead of an import-time crash.
+  s3ClientInstance = new S3Client({ region: 'us-west-2' });
 }
 
-/** @deprecated Use getS3ClientInstance() for lazy init. Kept for backward compat. */
-export const s3Client = new Proxy({} as S3Client, {
-  get(_target, prop) {
-    return (getS3ClientInstance() as any)[prop];
-  },
-});
+export const s3Client = s3ClientInstance;
 
 export const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 
