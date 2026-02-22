@@ -251,13 +251,54 @@ export async function updateJob(jobId: string, updates: Partial<Job>): Promise<J
 }
 
 /**
- * Update job status
+ * Valid job status transitions. Terminal states (SUCCESS) have no outgoing transitions.
+ * FAILED allows retry back to QUEUED.
+ */
+const VALID_TRANSITIONS: Record<Job['status'], Job['status'][]> = {
+  QUEUED: ['RUNNING', 'FAILED', 'SCHEDULED'],
+  SCHEDULED: ['QUEUED', 'RUNNING', 'FAILED'],
+  RUNNING: ['SUCCESS', 'FAILED'],
+  SUCCESS: [],  // Terminal
+  FAILED: ['QUEUED'],  // Allow retry
+};
+
+/**
+ * Update job status with state machine validation.
+ * Invalid transitions are logged and silently ignored to prevent
+ * stale Veraset responses from corrupting local state.
  */
 export async function updateJobStatus(
   jobId: string,
   status: Job['status'],
   errorMessage?: string
 ): Promise<Job | null> {
+  const currentJob = await getJob(jobId);
+  if (!currentJob) {
+    console.error(`[updateJobStatus] Job not found: ${jobId}`);
+    return null;
+  }
+
+  const currentStatus = currentJob.status;
+
+  // Same status — no-op, just update errorMessage if changed
+  if (currentStatus === status) {
+    if (errorMessage !== undefined && errorMessage !== currentJob.errorMessage) {
+      return updateJob(jobId, { errorMessage });
+    }
+    return currentJob;
+  }
+
+  // Validate transition
+  const allowedNext = VALID_TRANSITIONS[currentStatus] || [];
+  if (!allowedNext.includes(status)) {
+    console.warn(
+      `[updateJobStatus] Invalid transition for ${jobId}: ${currentStatus} -> ${status}. ` +
+      `Allowed: [${allowedNext.join(', ') || 'terminal'}]`
+    );
+    return currentJob;
+  }
+
+  console.log(`[updateJobStatus] ${jobId}: ${currentStatus} -> ${status}`);
   return updateJob(jobId, { status, errorMessage });
 }
 

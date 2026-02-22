@@ -5,6 +5,10 @@ const nextConfig = {
     serverActions: {
       bodySizeLimit: '10mb',
     },
+    outputFileTracingExcludes: {
+      '/api/*': ['./POIs/**'],
+      '/jobs/*': ['./POIs/**'],
+    },
   },
   // Keep existing API routes in /api directory
   async rewrites() {

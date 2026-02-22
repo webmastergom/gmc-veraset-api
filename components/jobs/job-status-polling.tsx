@@ -31,42 +31,15 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
     }
   }, [])
 
-  const fetchStatus = useCallback(async (forceRefresh = false) => {
+  const fetchStatus = useCallback(async () => {
     if (!isMountedRef.current) return
     
     try {
       setLoading(true)
       setError(null)
-      console.log(`🔄 Fetching status for job ${jobId}${forceRefresh ? ' (force refresh)' : ''}...`)
+      console.log(`🔄 Fetching status for job ${jobId}...`)
       
-      // If force refresh, call the refresh endpoint first
-      if (forceRefresh) {
-        try {
-          const refreshResponse = await fetch(`/api/jobs/${jobId}/refresh`, {
-            method: 'POST',
-            cache: 'no-store',
-            credentials: 'include',
-            headers: {
-              'Cache-Control': 'no-cache',
-            },
-          })
-          
-          if (!refreshResponse.ok) {
-            const errorData = await refreshResponse.json().catch(() => ({}))
-            console.warn(`⚠️ Refresh endpoint returned ${refreshResponse.status}:`, errorData)
-            // Continue with normal fetch even if refresh fails
-          } else {
-            const refreshData = await refreshResponse.json()
-            console.log(`✅ Refresh successful:`, refreshData)
-            // Small delay to ensure DB is updated
-            await new Promise(resolve => setTimeout(resolve, 100))
-          }
-        } catch (refreshError) {
-          console.warn(`⚠️ Refresh endpoint error (continuing with normal fetch):`, refreshError)
-          // Continue with normal fetch even if refresh fails
-        }
-      }
-      
+      // GET /api/jobs/[id] always checks Veraset for non-terminal jobs - no need for separate /refresh
       const jobStatus = await getJobStatus(jobId)
       
       if (!isMountedRef.current) return
@@ -154,7 +127,7 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
           )}
         </div>
         <Button 
-          onClick={() => fetchStatus(true)} 
+          onClick={() => fetchStatus()} 
           variant="outline" 
           size="sm" 
           disabled={loading}

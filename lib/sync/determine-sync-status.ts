@@ -1,6 +1,11 @@
 /**
  * Compute canonical sync status from job + optional per-job sync state.
  * The per-job state file is fresher during active syncs (updated every 5s vs jobs.json).
+ *
+ * CONCURRENCY NOTE: During active syncs, progress is tracked in per-job
+ * sync-state files (config/sync-state/{jobId}.json). When syncState is
+ * present, its values are preferred over job fields to avoid stale data
+ * from the large jobs.json (which may lag behind).
  */
 
 import type { Job } from '@/lib/jobs';
@@ -32,10 +37,10 @@ export function determineSyncStatus(job: Job, syncState?: SyncState | null): Syn
     };
   }
 
-  // Use per-job sync state when available (fresher during active syncs).
-  // Falls back to job fields for backward compatibility.
-  let copied = Math.max(job.objectCount ?? 0, syncState?.objectCount ?? 0);
-  let copiedBytes = Math.max(job.totalBytes ?? 0, syncState?.totalBytes ?? 0);
+  // Prefer per-job syncState (updated every 5s) over job fields (stale in jobs.json).
+  // Only fall back to job fields when no syncState exists.
+  let copied = syncState ? (syncState.objectCount ?? 0) : (job.objectCount ?? 0);
+  let copiedBytes = syncState ? (syncState.totalBytes ?? 0) : (job.totalBytes ?? 0);
   let totalObjects = syncState?.expectedObjectCount ?? job.expectedObjectCount ?? 0;
   let totalBytes = syncState?.expectedTotalBytes ?? job.expectedTotalBytes ?? 0;
 
@@ -43,6 +48,7 @@ export function determineSyncStatus(job: Job, syncState?: SyncState | null): Syn
   const syncProgress = syncState?.syncProgress ?? job.syncProgress;
 
   // Derive overall progress from dayProgress when available.
+  // dayProgress is authoritative for total counts when present.
   if (syncProgress?.dayProgress) {
     const days = Object.values(syncProgress.dayProgress);
     const sumCopied = days.reduce((s, d) => s + (d?.copiedFiles ?? 0), 0);
@@ -51,14 +57,14 @@ export function determineSyncStatus(job: Job, syncState?: SyncState | null): Syn
     const sumTotalBytes = days.reduce((s, d) => s + (d?.totalBytes ?? 0), 0);
     if (sumCopied > copied) copied = sumCopied;
     if (sumCopiedBytes > copiedBytes) copiedBytes = sumCopiedBytes;
-    if (sumTotal > 0 && totalObjects === 0) totalObjects = sumTotal;
-    if (sumTotalBytes > 0 && totalBytes === 0) totalBytes = sumTotalBytes;
+    // dayProgress sums are authoritative when available (not just fallback for 0)
+    if (sumTotal > 0) totalObjects = sumTotal;
+    if (sumTotalBytes > 0) totalBytes = sumTotalBytes;
   }
 
-  if (totalObjects === 0 && copied > 0) {
-    totalObjects = copied;
-    totalBytes = copiedBytes;
-  }
+  // REMOVED: The old fallback `totalObjects = copied` when totalObjects === 0
+  // incorrectly marked partial syncs as complete. Without an explicitly set
+  // expectedObjectCount, progress shows 0% — which is better than a false 100%.
 
   const progress = totalObjects > 0 ? Math.round((copied / totalObjects) * 100) : 0;
 
@@ -91,7 +97,11 @@ export function determineSyncStatus(job: Job, syncState?: SyncState | null): Syn
   }
 
   const isComplete = !!job.syncedAt;
-  const looksComplete = totalObjects > 0 && copied >= totalObjects;
+  // Only trust "looks complete" when expectedObjectCount was explicitly set
+  // (by initializeSync at sync start). Prevents partial syncs from being
+  // reported as complete when expectedObjectCount was never initialized.
+  const hasExplicitExpected = !!(syncState?.expectedObjectCount || job.expectedObjectCount);
+  const looksComplete = hasExplicitExpected && totalObjects > 0 && copied >= totalObjects;
 
   if (isComplete || looksComplete) {
     return {

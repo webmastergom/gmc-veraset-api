@@ -10,7 +10,12 @@ export async function GET(
 ) {
   try {
     const params = await context.params;
-    const job = await getJob(params.id);
+    const id = params?.id;
+    if (!id) {
+      return NextResponse.json({ error: 'Job ID required' }, { status: 400 });
+    }
+
+    const job = await getJob(id);
 
     if (!job) {
       return NextResponse.json(
@@ -28,7 +33,7 @@ export async function GET(
         const apiKey = process.env.VERASET_API_KEY?.trim();
 
         if (apiKey) {
-          console.log(`🔄 Checking Veraset status for job ${params.id} (current: ${job.status})`);
+          console.log(`🔄 Checking Veraset status for job ${id} (current: ${job.status})`);
           const verasetResponse = await fetch(
             `https://platform.prd.veraset.tech/v1/job/${params.id}`,
             {
@@ -47,7 +52,7 @@ export async function GET(
             if (newStatus && newStatus !== job.status) {
               console.log(`✅ Status changed: ${job.status} -> ${newStatus}`);
               const updatedJob = await updateJobStatus(
-                params.id,
+                id,
                 newStatus as any,
                 verasetData.error_message || verasetData.data?.error_message
               );
@@ -55,11 +60,11 @@ export async function GET(
             }
           } else {
             const errorText = await verasetResponse.text();
-            console.warn(`⚠️ Veraset API returned ${verasetResponse.status} for ${params.id}:`, errorText);
+            console.warn(`⚠️ Veraset API returned ${verasetResponse.status} for ${id}:`, errorText);
           }
         }
       } catch (verasetError: any) {
-        console.warn(`❌ Failed to check Veraset status for ${params.id}:`, verasetError.message || verasetError);
+        console.warn(`❌ Failed to check Veraset status for ${id}:`, verasetError.message || verasetError);
       }
     }
 
