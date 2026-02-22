@@ -130,7 +130,7 @@ function SyncPageContent() {
   const checkSyncStatus = useCallback(async () => {
     if (!jobId) return
     try {
-      const response = await fetch(`/api/jobs/${jobId}/sync/status`, { cache: 'no-store' })
+      const response = await fetch(`/api/jobs/${jobId}/sync/status`, { cache: 'no-store', credentials: 'include' })
       if (response.status === 429) {
         setRetryDelay(prev => Math.min(prev * 2, 60000))
         return
@@ -354,6 +354,7 @@ function SyncPageContent() {
 
       const response = await fetch(`/api/jobs/${jobId}/sync`, {
         method: "POST",
+        credentials: 'include',
         headers: {
           "Content-Type": "application/json",
         },
@@ -424,6 +425,7 @@ function SyncPageContent() {
     try {
       const response = await fetch(`/api/jobs/${jobId}/sync/cancel`, {
         method: "POST",
+        credentials: 'include',
       })
 
       if (!response.ok) {

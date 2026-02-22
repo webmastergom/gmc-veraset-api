@@ -67,7 +67,8 @@ export async function getJobStatus(jobId: string): Promise<VerasetJobStatus> {
     // Add timestamp to prevent caching
     const cacheBuster = `?t=${Date.now()}`;
     const response = await fetch(url + cacheBuster, {
-      cache: 'no-store', // Always fetch fresh data
+      cache: 'no-store',
+      credentials: 'include', // Send auth cookie for /api/jobs
       headers: {
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',

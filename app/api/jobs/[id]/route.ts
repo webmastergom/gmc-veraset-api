@@ -19,12 +19,11 @@ export async function GET(
       );
     }
 
-    // Veraset status check is now opt-in via ?refresh=true query param.
-    // This prevents the 1-5s blocking call from slowing down every page load.
-    // The client-side JobStatusPolling component handles automatic polling.
-    const shouldRefresh = request.nextUrl.searchParams.get('refresh') === 'true';
+    // Always check Veraset for non-terminal jobs so polling gets fresh status.
+    // Without this, status would never update (polling would return stale S3 data).
+    const isNonTerminal = job.status === 'QUEUED' || job.status === 'RUNNING' || job.status === 'SCHEDULED';
 
-    if (shouldRefresh && (job.status === 'QUEUED' || job.status === 'RUNNING' || job.status === 'SCHEDULED')) {
+    if (isNonTerminal) {
       try {
         const apiKey = process.env.VERASET_API_KEY?.trim();
 

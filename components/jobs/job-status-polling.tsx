@@ -45,6 +45,7 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
           const refreshResponse = await fetch(`/api/jobs/${jobId}/refresh`, {
             method: 'POST',
             cache: 'no-store',
+            credentials: 'include',
             headers: {
               'Cache-Control': 'no-cache',
             },
