@@ -33,12 +33,12 @@ export function normalizePrefix(prefix: string): string {
 
 /**
  * List ALL objects under a prefix with full pagination.
- * TRIPLE CHECK: (1) MaxKeys 1000, (2) paginate while IsTruncated or NextContinuationToken, (3) only stop when no more pages.
- * Does not omit files: every page is requested until AWS returns no continuation.
+ * Supports abort signal for cancellation during long listings (100K+ objects).
  */
 export async function listS3Objects(
   bucket: string,
-  prefix: string
+  prefix: string,
+  signal?: AbortSignal
 ): Promise<S3ObjectInfo[]> {
   const normalizedPrefix = normalizePrefix(prefix);
   const allObjects: S3ObjectInfo[] = [];
@@ -46,6 +46,10 @@ export async function listS3Objects(
   let pageCount = 0;
 
   do {
+    if (signal?.aborted) {
+      throw new Error('Listing aborted');
+    }
+
     const command = new ListObjectsV2Command({
       Bucket: bucket,
       Prefix: normalizedPrefix,
@@ -67,7 +71,6 @@ export async function listS3Objects(
     pageCount++;
     continuationToken = response.NextContinuationToken;
 
-    // Double-check: if we got a full page, there might be more (S3 returns token when truncated)
     const isTruncated = response.IsTruncated === true;
     if (isTruncated && !continuationToken) {
       console.warn(
@@ -77,6 +80,109 @@ export async function listS3Objects(
   } while (continuationToken);
 
   return allObjects;
+}
+
+/**
+ * Count objects and optionally collect date partitions in a single pass.
+ * Memory-efficient: only accumulates a counter + optional Set of dates.
+ * Use this instead of listS3Objects when you don't need the full object list.
+ */
+export async function countS3ObjectsByPrefix(
+  bucket: string,
+  prefix: string,
+  options?: { collectDates?: boolean }
+): Promise<{ count: number; dates?: string[] }> {
+  const normalizedPrefix = normalizePrefix(prefix);
+  let count = 0;
+  let continuationToken: string | undefined;
+  const dateSet = options?.collectDates ? new Set<string>() : undefined;
+  const datePattern = /date=(\d{4}-\d{2}-\d{2})/;
+
+  do {
+    const response = await s3Client.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: normalizedPrefix,
+      MaxKeys: LIST_PAGE_SIZE,
+      ContinuationToken: continuationToken,
+    }));
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        if (!obj.Key || obj.Key.endsWith('/')) continue;
+        count++;
+        if (dateSet) {
+          const m = obj.Key.match(datePattern);
+          if (m?.[1]) dateSet.add(m[1]);
+        }
+      }
+    }
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken);
+
+  return { count, dates: dateSet ? Array.from(dateSet).sort() : undefined };
+}
+
+/**
+ * List destination keys as a Set (memory-efficient for incremental diff).
+ * Returns only keys, not sizes — halves memory vs listS3Objects.
+ */
+export async function listS3KeySet(
+  bucket: string,
+  prefix: string,
+  signal?: AbortSignal
+): Promise<Set<string>> {
+  const normalizedPrefix = normalizePrefix(prefix);
+  const keys = new Set<string>();
+  let continuationToken: string | undefined;
+
+  do {
+    if (signal?.aborted) {
+      throw new Error('Listing aborted');
+    }
+
+    const response = await s3Client.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: normalizedPrefix,
+      MaxKeys: LIST_PAGE_SIZE,
+      ContinuationToken: continuationToken,
+    }));
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        if (obj.Key && !obj.Key.endsWith('/')) keys.add(obj.Key);
+      }
+    }
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken);
+
+  return keys;
+}
+
+/** Hard ceiling on concurrent S3 copy operations to prevent throttling (503 SlowDown). */
+const MAX_CONCURRENT_COPIES = 25;
+
+/**
+ * Run async operations with a concurrency limit (semaphore pattern).
+ * Unlike Promise.allSettled with full batches, this maintains a sliding window
+ * of at most `limit` in-flight operations.
+ */
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>,
+  signal?: AbortSignal
+): Promise<void> {
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      if (signal?.aborted) return;
+      const i = nextIndex++;
+      await fn(items[i], i);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => worker())
+  );
 }
 
 /**
@@ -153,8 +259,10 @@ export interface CopyBatchResult {
 }
 
 /**
- * Copy objects in parallel batches with retries.
- * Second pass: retry all failed items once; errors from both passes are preserved (not cleared).
+ * Copy objects with a hard concurrency limit (25 simultaneous copies).
+ * Uses a sliding-window semaphore instead of fixed batches — ensures S3 is never
+ * overwhelmed while keeping the pipeline full.
+ * Second pass: retry all failed items once; errors from both passes are preserved.
  * If signal is provided and aborted, returns partial result without throwing.
  */
 export async function copyS3ObjectsBatch(
@@ -166,86 +274,54 @@ export async function copyS3ObjectsBatch(
   let totalBytes = 0;
   const errors: string[] = [];
   const failedKeys: string[] = [];
-  const batchSize = calculateBatchSize(copies);
+  const failedItems: CopyItem[] = [];
 
-  const runBatch = async (
-    items: CopyItem[],
-    outErrors: string[],
-    outFailedKeys: string[]
-  ): Promise<{ ok: CopyItem[]; fail: CopyItem[] }> => {
-    const results = await Promise.allSettled(
-      items.map(async (item) => {
-        await copyS3ObjectWithRetry(
-          item.sourceBucket,
-          item.sourceKey,
-          item.destBucket,
-          item.destKey
-        );
-        return item;
-      })
-    );
-    const ok: CopyItem[] = [];
-    const fail: CopyItem[] = [];
-    results.forEach((r, j) => {
-      const item = items[j];
-      if (r.status === 'fulfilled') {
-        ok.push(item);
-      } else {
-        fail.push(item);
-        const msg = r.reason?.message || 'Unknown error';
-        outErrors.push(`${item.sourceKey}: ${msg}`);
-        outFailedKeys.push(item.sourceKey);
-      }
-    });
-    return { ok, fail };
-  };
-
-  // First pass: all items in batches
-  let pending = [...copies];
-  while (pending.length > 0) {
-    if (signal?.aborted) {
-      console.log('[SYNC] Copy aborted by signal');
-      break;
-    }
-    const batch = pending.slice(0, batchSize);
-    pending = pending.slice(batchSize);
-    const { ok, fail } = await runBatch(batch, errors, failedKeys);
-    for (const item of ok) {
+  // First pass: copy all items with concurrency limit
+  await runWithConcurrency(copies, MAX_CONCURRENT_COPIES, async (item) => {
+    if (signal?.aborted) return;
+    try {
+      await copyS3ObjectWithRetry(item.sourceBucket, item.sourceKey, item.destBucket, item.destKey);
       copied++;
       totalBytes += item.size || 0;
-      if (onProgress) {
-        onProgress(copied, copies.length, totalBytes, item.sourceKey);
-      }
+      onProgress?.(copied, copies.length, totalBytes, item.sourceKey);
+    } catch (error: any) {
+      failedItems.push(item);
+      failedKeys.push(item.sourceKey);
+      errors.push(`${item.sourceKey}: ${error?.message || 'Unknown error'}`);
+      onProgress?.(copied, copies.length, totalBytes, item.sourceKey);
     }
-    for (const item of fail) {
-      if (onProgress) {
-        onProgress(copied, copies.length, totalBytes, item.sourceKey);
-      }
-    }
+  }, signal);
+
+  if (signal?.aborted) {
+    console.log('[SYNC] Copy aborted by signal');
   }
 
-  // Second pass: retry failed items once; use separate arrays then consolidate (preserve full error history)
-  const keysToRetry = new Set(failedKeys);
-  if (keysToRetry.size > 0 && !signal?.aborted) {
+  // Second pass: retry failures once with same concurrency limit
+  if (failedItems.length > 0 && !signal?.aborted) {
+    console.log(`[SYNC] Retrying ${failedItems.length} failed items...`);
     const firstPassErrors = [...errors];
     const firstPassFailedKeys = [...failedKeys];
-    const retryErrors: string[] = [];
     const retryFailedKeys: string[] = [];
-    const toRetry = copies.filter((c) => keysToRetry.has(c.sourceKey));
-    const { ok, fail } = await runBatch(toRetry, retryErrors, retryFailedKeys);
-    for (const item of ok) {
-      copied++;
-      totalBytes += item.size || 0;
-      if (onProgress) {
-        onProgress(copied, copies.length, totalBytes, item.sourceKey);
+    const retryErrors: string[] = [];
+
+    await runWithConcurrency(failedItems, MAX_CONCURRENT_COPIES, async (item) => {
+      if (signal?.aborted) return;
+      try {
+        await copyS3ObjectWithRetry(item.sourceBucket, item.sourceKey, item.destBucket, item.destKey);
+        copied++;
+        totalBytes += item.size || 0;
+        onProgress?.(copied, copies.length, totalBytes, item.sourceKey);
+      } catch (error: any) {
+        retryFailedKeys.push(item.sourceKey);
+        retryErrors.push(`${item.sourceKey}: ${error?.message || 'Unknown error'}`);
       }
-    }
-    // Consolidate: final failed = keys that failed on retry; errors = first-pass + retry messages for those keys
-    const finalFailedKeys = fail.map((f) => f.sourceKey);
+    }, signal);
+
+    // Consolidate: final failed = keys that still failed on retry
     failedKeys.length = 0;
-    failedKeys.push(...finalFailedKeys);
+    failedKeys.push(...retryFailedKeys);
     errors.length = 0;
-    finalFailedKeys.forEach((key) => {
+    for (const key of retryFailedKeys) {
       const firstIdx = firstPassFailedKeys.indexOf(key);
       if (firstIdx >= 0 && firstPassErrors[firstIdx]) {
         errors.push(firstPassErrors[firstIdx]);
@@ -254,7 +330,7 @@ export async function copyS3ObjectsBatch(
       if (retryIdx >= 0 && retryErrors[retryIdx]) {
         errors.push(retryErrors[retryIdx]);
       }
-    });
+    }
   }
 
   return {
@@ -268,13 +344,14 @@ export async function copyS3ObjectsBatch(
 
 /**
  * List destination prefix and return count (for verification after sync).
+ * @deprecated Use countS3ObjectsByPrefix for memory-efficient counting.
  */
 export async function countS3Objects(
   bucket: string,
   prefix: string
 ): Promise<number> {
-  const objects = await listS3Objects(bucket, prefix);
-  return objects.length;
+  const result = await countS3ObjectsByPrefix(bucket, prefix);
+  return result.count;
 }
 
 export async function getObjectMetadata(bucket: string, key: string) {

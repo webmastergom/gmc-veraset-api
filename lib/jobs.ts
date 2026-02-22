@@ -117,9 +117,43 @@ const DEFAULT_JOBS: JobsData = {};
  */
 export async function getAllJobs(): Promise<Job[]> {
   const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  return Object.values(data).sort((a, b) => 
+  return Object.values(data).sort((a, b) =>
     new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   );
+}
+
+/** Fields stripped from the list endpoint response to reduce payload size. */
+const HEAVY_FIELDS: (keyof Job)[] = [
+  'verasetPayload',
+  'auditTrail',
+  'verificationResult',
+  'syncProgress',
+  'externalPois',
+  'poiMapping',
+  'poiNames',
+];
+
+/**
+ * Get all jobs for the list view — strips heavy nested fields that are only
+ * needed on the detail page.  Reduces response from ~500KB+ to ~20KB for
+ * a typical 20-job account.  Keeps AWS costs marginal (same single S3 GET).
+ */
+export async function getAllJobsSummary(): Promise<Partial<Job>[]> {
+  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
+  return Object.values(data)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .map((job) => {
+      const summary: Record<string, any> = {};
+      for (const key of Object.keys(job) as (keyof Job)[]) {
+        if (!HEAVY_FIELDS.includes(key)) {
+          summary[key] = job[key];
+        }
+      }
+      // Keep lightweight sync status indicators
+      summary.hasSyncProgress = !!job.syncProgress?.dayProgress;
+      summary.hasVerification = !!job.verificationResult;
+      return summary as Partial<Job>;
+    });
 }
 
 /**

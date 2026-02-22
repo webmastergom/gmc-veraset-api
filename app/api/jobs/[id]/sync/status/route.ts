@@ -3,6 +3,7 @@ import { getJob } from '@/lib/jobs';
 import { listS3Objects, parseS3Path } from '@/lib/s3';
 import { checkRateLimit, getClientIdentifier } from '@/lib/security';
 import { determineSyncStatus } from '@/lib/sync/determine-sync-status';
+import { getSyncState } from '@/lib/sync/sync-state';
 import type { SyncStatusResponse } from '@/lib/sync-types';
 
 export const dynamic = 'force-dynamic';
@@ -58,8 +59,11 @@ export async function GET(
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
 
+    // Load per-job sync state (fresher during active syncs, ~2-5KB file)
+    const syncState = await getSyncState(jobId);
+
     if (!job.s3SourcePath) {
-      const response = determineSyncStatus(job);
+      const response = determineSyncStatus(job, syncState);
       return NextResponse.json(response, {
         status: 200,
         headers: { ...statusHeaders(rateLimit), 'Cache-Control': 'public, max-age=60' },
@@ -67,7 +71,7 @@ export async function GET(
     }
 
     if (!job.s3DestPath) {
-      const response = determineSyncStatus(job);
+      const response = determineSyncStatus(job, syncState);
       return NextResponse.json(response, {
         status: 200,
         headers: { ...statusHeaders(rateLimit), 'Cache-Control': 'public, max-age=30' },
@@ -75,7 +79,7 @@ export async function GET(
     }
 
     // When we have dest path and expected totals, use stored progress only (no S3 listing in GET)
-    let response: SyncStatusResponse = determineSyncStatus(job);
+    let response: SyncStatusResponse = determineSyncStatus(job, syncState);
 
     // Backward compatibility: if no expected totals yet (e.g. very first poll), list source once
     const hasExpected = (job.expectedObjectCount ?? 0) > 0 || (job.expectedTotalBytes ?? 0) > 0;

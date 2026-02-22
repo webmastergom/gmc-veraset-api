@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getJob } from '@/lib/jobs';
 import { determineSyncStatus } from '@/lib/sync/determine-sync-status';
+import { getSyncState } from '@/lib/sync/sync-state';
 import type { SyncStatusResponse } from '@/lib/sync-types';
 
 export const dynamic = 'force-dynamic';
@@ -61,7 +62,8 @@ export async function GET(
               controller.close();
               return;
             }
-            const status = determineSyncStatus(jobSnapshot);
+            const syncState = await getSyncState(jobId);
+            const status = determineSyncStatus(jobSnapshot, syncState);
             send('progress', status);
             if (
               status.status === 'completed' ||

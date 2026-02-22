@@ -1,6 +1,6 @@
 /**
- * Sync orchestrator: list → copy → verify. Uses S3BatchCopier, SyncProgressTracker, SyncVerifier.
- * Checks abort signal (from registry) between batches; records partial state on cancel.
+ * Sync orchestrator: list → copy → verify.
+ * Checks abort signal between batches; records partial state on cancel.
  *
  * Progress writes are serialized: only one updateJob at a time, at most every 5s.
  * This prevents S3 race conditions (concurrent read-modify-write on jobs.json).
@@ -9,8 +9,10 @@
 import { getJob, updateJob, initializeSync, releaseSyncLock } from '@/lib/jobs';
 import {
   listS3Objects,
+  listS3KeySet,
   copyS3ObjectsBatch,
   normalizePrefix,
+  countS3ObjectsByPrefix,
   extractUniqueDatesFromKeys,
   calculateDaysInclusive,
 } from '@/lib/s3';
@@ -24,7 +26,9 @@ import {
   applyProgressUpdate,
   buildSyncProgressPayload,
 } from './sync-progress-tracker';
-import { verifySync } from './sync-verifier';
+import { verifyEtags } from './sync-verifier';
+import { getSyncState, putSyncState } from './sync-state';
+import type { SyncState } from './sync-state';
 
 /** Min interval between progress writes to S3 (avoids race conditions). */
 const PROGRESS_WRITE_INTERVAL_MS = 5_000;
@@ -44,8 +48,9 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
   try {
     console.log(`[SYNC] Starting sync for job ${jobId} (orchestrator)...`);
 
+    // ---------- Phase 1: List source (abort-aware) ----------
     const listStart = Date.now();
-    const sourceObjects = await listS3Objects(sourcePath.bucket, sourcePath.key);
+    const sourceObjects = await listS3Objects(sourcePath.bucket, sourcePath.key, controller.signal);
     const listDuration = ((Date.now() - listStart) / 1000).toFixed(2);
     console.log(`[SYNC] CHECK 1 - Listed ${sourceObjects.length} source objects in ${listDuration}s`);
 
@@ -81,9 +86,8 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       };
     });
 
-    // List existing objects in destination to find what's already copied
-    const destObjects = await listS3Objects(destPathParsed.bucket, destPathParsed.key);
-    const destKeySet = new Set(destObjects.map((o) => o.Key));
+    // Memory-efficient: only load dest keys as a Set (no sizes needed for diff)
+    const destKeySet = await listS3KeySet(destPathParsed.bucket, destPathParsed.key, controller.signal);
     const alreadyCopied = allCopies.filter((c) => destKeySet.has(c.destKey));
     const copies = allCopies.filter((c) => !destKeySet.has(c.destKey));
     const alreadyCopiedBytes = alreadyCopied.reduce((s, c) => s + (c.size ?? 0), 0);
@@ -115,6 +119,21 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       }
     }
 
+    // Write initial state to per-job sync file (fast, small writes)
+    const initialSyncState: SyncState = {
+      objectCount: alreadyCopied.length,
+      totalBytes: alreadyCopiedBytes,
+      expectedObjectCount: totalObjects,
+      expectedTotalBytes: totalBytes,
+      syncStartedAt: new Date().toISOString(),
+      syncProgress: {
+        dayProgress,
+        lastUpdated: new Date().toISOString(),
+      },
+    };
+    await putSyncState(jobId, initialSyncState);
+
+    // Also update jobs.json with initial counts (for backward compat)
     await updateJob(jobId, {
       objectCount: alreadyCopied.length,
       totalBytes: alreadyCopiedBytes,
@@ -125,27 +144,27 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     });
 
     // ---------- Serialized progress writer ----------
-    // Only one S3 write in flight at a time. If a write is pending, the latest
-    // snapshot is queued and written when the current write completes.
+    // Writes to per-job sync-state file (2-5KB) instead of full jobs.json (500KB+).
+    // Only one write in flight at a time; latest snapshot overwrites pending.
     let currentDayIndex = 0;
     let currentFileInDay = 0;
     let lastWriteTime = Date.now();
     let writeInFlight = false;
-    let pendingWrite: Record<string, unknown> | null = null;
+    let pendingWrite: SyncState | null = null;
 
     /** Timeout for a single progress write — if S3 hangs, don't block forever. */
     const WRITE_TIMEOUT_MS = 30_000;
 
-    const flushProgress = async (payload: Record<string, unknown>) => {
+    const flushProgress = async (state: SyncState) => {
       if (writeInFlight) {
-        pendingWrite = payload; // overwrite — only latest matters
+        pendingWrite = state; // overwrite — only latest matters
         return;
       }
       writeInFlight = true;
       lastWriteTime = Date.now();
       try {
         await Promise.race([
-          updateJob(jobId, payload as any),
+          putSyncState(jobId, state),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Progress write timed out after 30s')), WRITE_TIMEOUT_MS)
           ),
@@ -193,12 +212,13 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
           console.log(
             `[SYNC] Progress: ${pct}% (${overallCopied}/${totalObjects}), ${(overallBytes / 1024 / 1024 / 1024).toFixed(2)} GB @ ${speed} MB/s`
           );
-          // Fire-and-forget but serialized — won't pile up
+          // Write to per-job state file (fast, ~2-5KB)
           flushProgress({
             objectCount: overallCopied,
             totalBytes: overallBytes,
             expectedObjectCount: totalObjects,
             expectedTotalBytes: totalBytes,
+            syncStartedAt: initialSyncState.syncStartedAt,
             syncProgress: buildSyncProgressPayload(
               dayProgress,
               currentDay,
@@ -267,46 +287,51 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       return;
     }
 
-    const verification = await verifySync(
-      destPathParsed,
-      totalObjects,
-      allCopies,
-      { etagSampleRatio: 0.08 }
+    // ---------- Phase 3: Verification (single pass for count + dates) ----------
+    // One paginated pass over destination: gets count + date partitions. No full array in memory.
+    const verifyResult = await countS3ObjectsByPrefix(
+      destPathParsed.bucket,
+      destPathParsed.key,
+      { collectDates: true }
     );
 
-    if (!verification.countMatch) {
-      const diff = Math.abs(verification.destCount - totalObjects);
-      console.error(`[SYNC] CHECK 3 - Verification failed: dest=${verification.destCount}, source=${totalObjects}, diff=${diff}`);
+    const destCount = verifyResult.count;
+    const countMatch = destCount === totalObjects;
+    const destPartitionDates = verifyResult.dates!;
+
+    if (!countMatch) {
+      const diff = Math.abs(destCount - totalObjects);
+      console.error(`[SYNC] CHECK 3 - Verification failed: dest=${destCount}, source=${totalObjects}, diff=${diff}`);
       await updateJob(jobId, {
         objectCount: totalCopied,
         totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
-        errorMessage: `Verification failed: destination has ${verification.destCount} objects, expected ${totalObjects} from source.`,
+        errorMessage: `Verification failed: destination has ${destCount} objects, expected ${totalObjects} from source.`,
       });
       return;
     }
-    console.log(`[SYNC] CHECK 3 - ✅ Verified: destination has ${verification.destCount} objects (matches source)`);
+    console.log(`[SYNC] CHECK 3 - ✅ Verified: destination has ${destCount} objects (matches source)`);
 
-    if (!verification.integrityPassed) {
-      console.error(`[SYNC] CHECK 3b - Integrity failed: ${verification.etagMismatches}/${verification.sampleSize} files have ETag mismatch`);
+    // ETag sampling (parallel HEAD requests)
+    const etagResult = await verifyEtags(allCopies, { etagSampleRatio: 0.08 });
+
+    if (!etagResult.integrityPassed) {
+      console.error(`[SYNC] CHECK 3b - Integrity failed: ${etagResult.etagMismatches}/${etagResult.sampleSize} files have ETag mismatch`);
       await updateJob(jobId, {
         objectCount: totalCopied,
         totalBytes: totalCopiedBytes,
         expectedObjectCount: totalObjects,
         expectedTotalBytes: totalBytes,
         syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
-        errorMessage: `Integrity verification failed: ${verification.etagMismatches} of ${verification.sampleSize} sampled files have corrupted data. ${verification.etagErrors.slice(0, 3).join('; ')}${verification.etagErrors.length > 3 ? '...' : ''}`,
+        errorMessage: `Integrity verification failed: ${etagResult.etagMismatches} of ${etagResult.sampleSize} sampled files have corrupted data. ${etagResult.etagErrors.slice(0, 3).join('; ')}${etagResult.etagErrors.length > 3 ? '...' : ''}`,
       });
       return;
     }
 
+    // ---------- Phase 4: Partition verification ----------
     const sourcePartitionDates = extractUniqueDatesFromKeys(sourceKeys);
-    // Re-list destination (may have changed during copy) for partition verification
-    const destObjectsPostCopy = await listS3Objects(destPathParsed.bucket, destPathParsed.key);
-    const destKeys = destObjectsPostCopy.map((o) => o.Key);
-    const destPartitionDates = extractUniqueDatesFromKeys(destKeys);
 
     const missingInDest = sourcePartitionDates.filter((d) => !destPartitionDates.includes(d));
     if (missingInDest.length > 0) {
@@ -355,13 +380,13 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
     }
 
     const verificationResult = {
-      countMatch: verification.countMatch,
+      countMatch,
       sourceCount: totalObjects,
-      destCount: verification.destCount,
-      integrityPassed: verification.integrityPassed,
-      etagSampleSize: verification.sampleSize,
-      etagMismatches: verification.etagMismatches,
-      multipartSkipped: verification.multipartSkipped,
+      destCount,
+      integrityPassed: etagResult.integrityPassed,
+      etagSampleSize: etagResult.sampleSize,
+      etagMismatches: etagResult.etagMismatches,
+      multipartSkipped: etagResult.multipartSkipped,
       sourcePartitionDates,
       destPartitionDates,
       missingPartitionsInDest: missingInDest,
@@ -369,6 +394,7 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       timestamp: new Date().toISOString(),
     };
 
+    // Final merge to jobs.json (single write with all completion data)
     const finalUpdate = {
       s3DestPath: destPath,
       objectCount: totalCopied,
@@ -380,6 +406,17 @@ export async function runSync(params: SyncOrchestratorParams): Promise<void> {
       syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
     };
     await updateJob(jobId, finalUpdate);
+
+    // Also update per-job state to reflect completion
+    await putSyncState(jobId, {
+      objectCount: totalCopied,
+      totalBytes: totalCopiedBytes,
+      expectedObjectCount: totalObjects,
+      expectedTotalBytes: totalBytes,
+      syncedAt: finalUpdate.syncedAt,
+      syncProgress: { dayProgress, lastUpdated: new Date().toISOString() },
+    });
+
     const totalDuration = ((Date.now() - syncStartTime) / 1000).toFixed(1);
     console.log(`[SYNC] Completed job ${jobId}: ${totalCopied} files (${result.copied} new + ${copiedOffset} already existed) in ${totalDuration}s`);
   } catch (err: unknown) {

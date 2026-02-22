@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAllJobs, createJob } from "@/lib/jobs";
+import { getAllJobs, getAllJobsSummary, createJob } from "@/lib/jobs";
 import { canCreateJob, incrementUsage } from "@/lib/usage";
 import { createJobSchema } from "@/lib/validation";
 import { logger } from "@/lib/logger";
@@ -22,8 +22,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     let jobs: any[] = [];
     
     try {
-      jobs = await getAllJobs();
-      console.log(`[JOBS GET] Found ${jobs.length} jobs from getAllJobs`);
+      jobs = await getAllJobsSummary();
+      console.log(`[JOBS GET] Found ${jobs.length} jobs from getAllJobsSummary`);
     } catch (getJobsError: any) {
       console.error('[JOBS GET] Error calling getAllJobs:', getJobsError?.message);
       console.error('[JOBS GET] Error stack:', getJobsError?.stack);

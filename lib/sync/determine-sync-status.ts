@@ -1,11 +1,13 @@
 /**
- * Pure function: compute canonical sync status from job. No side effects (no repair).
+ * Compute canonical sync status from job + optional per-job sync state.
+ * The per-job state file is fresher during active syncs (updated every 5s vs jobs.json).
  */
 
 import type { Job } from '@/lib/jobs';
 import type { SyncStatusResponse } from '@/lib/sync-types';
+import type { SyncState } from './sync-state';
 
-export function determineSyncStatus(job: Job): SyncStatusResponse {
+export function determineSyncStatus(job: Job, syncState?: SyncState | null): SyncStatusResponse {
   if (!job.s3SourcePath) {
     return {
       status: 'not_started',
@@ -30,23 +32,23 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
     };
   }
 
-  let copied = job.objectCount ?? 0;
-  let copiedBytes = job.totalBytes ?? 0;
-  let totalObjects = job.expectedObjectCount ?? 0;
-  let totalBytes = job.expectedTotalBytes ?? 0;
+  // Use per-job sync state when available (fresher during active syncs).
+  // Falls back to job fields for backward compatibility.
+  let copied = Math.max(job.objectCount ?? 0, syncState?.objectCount ?? 0);
+  let copiedBytes = Math.max(job.totalBytes ?? 0, syncState?.totalBytes ?? 0);
+  let totalObjects = syncState?.expectedObjectCount ?? job.expectedObjectCount ?? 0;
+  let totalBytes = syncState?.expectedTotalBytes ?? job.expectedTotalBytes ?? 0;
+
+  // Use the freshest syncProgress (per-job state or job)
+  const syncProgress = syncState?.syncProgress ?? job.syncProgress;
 
   // Derive overall progress from dayProgress when available.
-  // The dayProgress is always at least as fresh as objectCount (they are
-  // written in the same flush), and is often more granular because the SSE
-  // stream may read the job between flushes — dayProgress is updated in-memory
-  // per file while objectCount only updates every 5 s via flushProgress.
-  if (job.syncProgress?.dayProgress) {
-    const days = Object.values(job.syncProgress.dayProgress);
+  if (syncProgress?.dayProgress) {
+    const days = Object.values(syncProgress.dayProgress);
     const sumCopied = days.reduce((s, d) => s + (d?.copiedFiles ?? 0), 0);
     const sumCopiedBytes = days.reduce((s, d) => s + (d?.copiedBytes ?? 0), 0);
     const sumTotal = days.reduce((s, d) => s + (d?.totalFiles ?? 0), 0);
     const sumTotalBytes = days.reduce((s, d) => s + (d?.totalBytes ?? 0), 0);
-    // Use dayProgress-derived values when they show more progress
     if (sumCopied > copied) copied = sumCopied;
     if (sumCopiedBytes > copiedBytes) copiedBytes = sumCopiedBytes;
     if (sumTotal > 0 && totalObjects === 0) totalObjects = sumTotal;
@@ -69,7 +71,7 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
       totalBytes,
       copied,
       copiedBytes,
-      syncProgress: job.syncProgress ?? null,
+      syncProgress: syncProgress ?? null,
     };
   }
 
@@ -84,7 +86,7 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
       totalBytes,
       copied,
       copiedBytes,
-      syncProgress: job.syncProgress ?? null,
+      syncProgress: syncProgress ?? null,
     };
   }
 
@@ -100,7 +102,7 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
       totalBytes: totalBytes || copiedBytes,
       copied: copied || totalObjects || 0,
       copiedBytes: copiedBytes || totalBytes || 0,
-      syncProgress: job.syncProgress ?? null,
+      syncProgress: syncProgress ?? null,
     };
   }
 
@@ -118,11 +120,12 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
   const syncStartAge = job.syncStartedAt ? Date.now() - new Date(job.syncStartedAt).getTime() : 0;
   const isFunctionDead = !job.syncLock && job.syncStartedAt && syncStartAge > 12 * 60 * 1000; // 12 min
 
-  // Check lastUpdated from syncProgress — if no update in >12 min, function is dead
-  const lastProgressUpdate = job.syncProgress?.lastUpdated
-    ? Date.now() - new Date(job.syncProgress.lastUpdated).getTime()
+  // Check lastUpdated from syncProgress (per-job state is fresher) — if no update in >12 min, function is dead
+  const lastUpdated = syncProgress?.lastUpdated ?? job.syncProgress?.lastUpdated;
+  const lastProgressUpdate = lastUpdated
+    ? Date.now() - new Date(lastUpdated).getTime()
     : 0;
-  const isProgressStale = job.syncProgress?.lastUpdated && lastProgressUpdate > 12 * 60 * 1000;
+  const isProgressStale = lastUpdated && lastProgressUpdate > 12 * 60 * 1000;
 
   const isStalled = isLockStale || isFunctionDead || isProgressStale;
 
@@ -140,7 +143,7 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
       totalBytes,
       copied,
       copiedBytes,
-      syncProgress: job.syncProgress ?? null,
+      syncProgress: syncProgress ?? null,
     };
   }
 
@@ -153,7 +156,7 @@ export function determineSyncStatus(job: Job): SyncStatusResponse {
       totalBytes,
       copied,
       copiedBytes,
-      syncProgress: job.syncProgress ?? null,
+      syncProgress: syncProgress ?? null,
     };
   }
 

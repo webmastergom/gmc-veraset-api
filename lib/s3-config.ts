@@ -27,19 +27,33 @@ export function invalidateCache(key: string): void {
   CONFIG_CACHE.delete(key);
 }
 
-// ── S3 client ───────────────────────────────────────────────────────────
+// ── S3 client (lazy singleton) ──────────────────────────────────────────
+// Created on first use, NOT at module load time. This prevents import-time
+// crashes when env vars are missing/invalid — the Vercel function can still
+// start and return JSON errors instead of an HTML 500 page.
 
-export const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'us-west-2',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+let _s3Client: S3Client | null = null;
+
+export function getS3ClientInstance(): S3Client {
+  if (!_s3Client) {
+    _s3Client = new S3Client({
+      region: process.env.AWS_REGION || 'us-west-2',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+      },
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
+    });
+  }
+  return _s3Client;
+}
+
+/** @deprecated Use getS3ClientInstance() for lazy init. Kept for backward compat. */
+export const s3Client = new Proxy({} as S3Client, {
+  get(_target, prop) {
+    return (getS3ClientInstance() as any)[prop];
   },
-  // Disable automatic CRC32 checksum in presigned URLs — AWS SDK v3.654+
-  // adds x-amz-checksum-crc32 params by default, which causes CORS preflight
-  // failures when browsers PUT directly to S3 via presigned URLs.
-  requestChecksumCalculation: 'WHEN_REQUIRED',
-  responseChecksumValidation: 'WHEN_REQUIRED',
 });
 
 export const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
@@ -119,14 +133,11 @@ export async function getConfig<T>(key: string): Promise<T | null> {
       return null;
     }
 
-    // Don't throw errors in development - just log and return null
-    if (process.env.NODE_ENV === 'development') {
-      console.warn(`Error reading config/${key}.json:`, error.message || error);
-      return null;
-    }
-
-    console.error(`Error reading config/${key}.json:`, error);
-    throw error;
+    // Never throw for config reads — a transient S3 error (timeout, throttle,
+    // credential rotation) should not crash the entire route handler.
+    // Return null and let the caller decide how to handle (e.g., show cached/seed data).
+    console.error(`Error reading config/${key}.json:`, error.message || error);
+    return null;
   }
 }
 

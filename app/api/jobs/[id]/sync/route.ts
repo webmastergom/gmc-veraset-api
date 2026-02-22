@@ -3,6 +3,7 @@ import { getJob, updateJob, tryAcquireSyncLock, releaseSyncLock } from '@/lib/jo
 import { parseS3Path } from '@/lib/s3';
 import { runSync } from '@/lib/sync/sync-orchestrator';
 import { determineSyncStatus } from '@/lib/sync/determine-sync-status';
+import { getSyncState } from '@/lib/sync/sync-state';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -22,7 +23,8 @@ export async function GET(
     if (!job) {
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
-    const response = determineSyncStatus(job);
+    const syncState = await getSyncState(params.id);
+    const response = determineSyncStatus(job, syncState);
     return NextResponse.json(response);
   } catch (error) {
     console.error('GET /api/jobs/[id]/sync error:', error);
