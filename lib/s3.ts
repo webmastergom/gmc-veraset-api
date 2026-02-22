@@ -1,18 +1,9 @@
 import {
-  S3Client,
   ListObjectsV2Command,
   CopyObjectCommand,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
-
-const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'us-west-2',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-  },
-  maxAttempts: 3,
-});
+import { s3Client } from './s3-config';
 
 /** Max keys per ListObjectsV2 request (S3 limit). */
 const LIST_PAGE_SIZE = 1000;
