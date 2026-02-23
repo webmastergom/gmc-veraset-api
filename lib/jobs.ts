@@ -255,8 +255,8 @@ export async function updateJob(jobId: string, updates: Partial<Job>): Promise<J
  * FAILED allows retry back to QUEUED.
  */
 const VALID_TRANSITIONS: Record<Job['status'], Job['status'][]> = {
-  QUEUED: ['RUNNING', 'FAILED', 'SCHEDULED'],
-  SCHEDULED: ['QUEUED', 'RUNNING', 'FAILED'],
+  QUEUED: ['RUNNING', 'SUCCESS', 'FAILED', 'SCHEDULED'],
+  SCHEDULED: ['QUEUED', 'RUNNING', 'SUCCESS', 'FAILED'],
   RUNNING: ['SUCCESS', 'FAILED'],
   SUCCESS: [],  // Terminal
   FAILED: ['QUEUED'],  // Allow retry
