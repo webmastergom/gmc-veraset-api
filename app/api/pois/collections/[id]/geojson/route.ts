@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getPOICollection, putPOICollection } from '@/lib/s3-config';
+import { getPOICollection, putPOICollection } from '@/lib/poi-storage';
 import { getConfig, putConfig } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';

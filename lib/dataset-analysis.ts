@@ -519,7 +519,7 @@ export async function runFullAnalysis(datasetName: string): Promise<AnalysisResu
     // Fallback: GeoJSON for POIs missing names
     if (job?.poiCollectionId && job?.poiMapping) {
       try {
-        const { getPOICollection } = await import('./s3-config');
+        const { getPOICollection } = await import('./poi-storage');
         const geojson = await getPOICollection(job.poiCollectionId);
         if (geojson?.features) {
           for (const [verasetPoiId, originalPoiId] of Object.entries(job.poiMapping)) {

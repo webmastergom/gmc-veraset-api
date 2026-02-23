@@ -2,7 +2,7 @@
  * Audit utilities to verify data integrity
  */
 
-import { getPOICollection } from './s3-config';
+import { getPOICollection } from './poi-storage';
 import { getAllJobs } from './jobs';
 import { ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from './s3-config';

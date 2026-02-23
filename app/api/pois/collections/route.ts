@@ -98,7 +98,8 @@ export async function POST(request: NextRequest) {
 
     collectionsData[collectionId] = collection;
     
-    const { putConfig, putPOICollection } = await import("@/lib/s3-config");
+    const { putConfig } = await import("@/lib/s3-config");
+    const { putPOICollection } = await import("@/lib/poi-storage");
     await putConfig("poi-collections", collectionsData);
 
     // If GeoJSON is provided, save it to S3

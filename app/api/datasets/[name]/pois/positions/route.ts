@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllJobs } from '@/lib/jobs';
 import { isAuthenticated } from '@/lib/auth';
-import { getPOICollection } from '@/lib/s3-config';
+import { getPOICollection } from '@/lib/poi-storage';
 
 const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAllJobs } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { runFullAnalysis } from '@/lib/dataset-analysis';
-import { getPOICollection } from '@/lib/s3-config';
+import { getPOICollection } from '@/lib/poi-storage';
 import { BUCKET } from '@/lib/s3-config';
 import { runQuery, createTableForDataset, tableExists, getTableName } from '@/lib/athena';
 
