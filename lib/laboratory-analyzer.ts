@@ -450,30 +450,51 @@ export async function resolveOrigins(
   if (dateTo) dateConditions.push(`date <= '${dateTo}'`);
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
-  const BATCH_SIZE = 500;
+  const BATCH_SIZE = 2000;      // 4× larger batches (safe within Athena 256KB query limit)
+  const MAX_PARALLEL = 5;       // concurrent Athena queries to avoid throttling
   const originMap = new Map<string, { lat: number; lng: number }>();
 
-  for (let batchStart = 0; batchStart < adIds.length; batchStart += BATCH_SIZE) {
-    const batch = adIds.slice(batchStart, batchStart + BATCH_SIZE);
-    const adIdFilter = batch.map(id => `'${id.replace(/'/g, "''")}'`).join(',');
+  // Build all batches
+  const batches: string[][] = [];
+  for (let i = 0; i < adIds.length; i += BATCH_SIZE) {
+    batches.push(adIds.slice(i, i + BATCH_SIZE));
+  }
 
-    const originQuery = `
-      SELECT
-        ad_id,
-        date,
-        ROUND(MIN_BY(TRY_CAST(latitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lat,
-        ROUND(MIN_BY(TRY_CAST(longitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lng
-      FROM ${tableName}
-      WHERE ad_id IN (${adIdFilter})
-        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
-        ${dateWhere}
-      GROUP BY ad_id, date
-    `;
+  console.log(`[LAB] Resolving origins: ${adIds.length} devices in ${batches.length} batches (parallel=${MAX_PARALLEL})`);
 
-    try {
-      const originRes = await runQuery(originQuery);
+  // Execute batches with controlled parallelism
+  let completed = 0;
+  for (let chunkStart = 0; chunkStart < batches.length; chunkStart += MAX_PARALLEL) {
+    const chunk = batches.slice(chunkStart, chunkStart + MAX_PARALLEL);
+
+    const results = await Promise.all(
+      chunk.map(async (batch) => {
+        const adIdFilter = batch.map(id => `'${id.replace(/'/g, "''")}'`).join(',');
+        const originQuery = `
+          SELECT
+            ad_id,
+            date,
+            ROUND(MIN_BY(TRY_CAST(latitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lat,
+            ROUND(MIN_BY(TRY_CAST(longitude AS DOUBLE), utc_timestamp), ${COORDINATE_PRECISION}) as origin_lng
+          FROM ${tableName}
+          WHERE ad_id IN (${adIdFilter})
+            AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+            AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+            AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+            ${dateWhere}
+          GROUP BY ad_id, date
+        `;
+        try {
+          return await runQuery(originQuery);
+        } catch (err: any) {
+          console.warn(`[LAB] Origin batch query failed:`, err.message);
+          return null;
+        }
+      })
+    );
+
+    for (const originRes of results) {
+      if (!originRes) continue;
       for (const row of originRes.rows) {
         const key = `${row.ad_id}|${row.date}`;
         const lat = parseFloat(String(row.origin_lat));
@@ -482,13 +503,15 @@ export async function resolveOrigins(
           originMap.set(key, { lat, lng });
         }
       }
-    } catch (err: any) {
-      console.warn(`[LAB] Origin batch query failed:`, err.message);
     }
 
-    if (batchStart + BATCH_SIZE < adIds.length) {
-      report({ step: 'geocoding', percent: 66 + Math.round((batchStart / adIds.length) * 4), message: 'Fetching device origins...', detail: `${Math.min(batchStart + BATCH_SIZE, adIds.length)}/${adIds.length} devices` });
-    }
+    completed += chunk.length;
+    report({
+      step: 'geocoding',
+      percent: 66 + Math.round((completed / batches.length) * 4),
+      message: 'Fetching device origins...',
+      detail: `${Math.min(completed * BATCH_SIZE, adIds.length)}/${adIds.length} devices`,
+    });
   }
 
   console.log(`[LAB] Origins resolved: ${originMap.size} device-day pairs`);
