@@ -442,6 +442,9 @@ export async function analyzeOrigins(
     poiFilter = `AND poi_id IN (${poiList})`;
   }
 
+  const minPings = filters.minPings && filters.minPings > 1 ? filters.minPings : 0;
+  const havingClause = minPings > 0 ? `HAVING COUNT(*) >= ${minPings}` : '';
+
   // Optimized query: MIN_BY to get first ping coordinates per device-day
   // No window functions, no self-join on all_pings — just one pass
   const originsQuery = `
@@ -476,6 +479,7 @@ export async function analyzeOrigins(
         MIN_BY(lng, utc_timestamp) as origin_lng
       FROM valid_pings
       GROUP BY ad_id, date
+      ${havingClause}
     )
     SELECT
       ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,

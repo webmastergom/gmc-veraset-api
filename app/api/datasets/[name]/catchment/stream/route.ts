@@ -30,6 +30,8 @@ export async function GET(
   if (dateTo) filters.dateTo = dateTo;
   const poiIds = searchParams.get('poiIds');
   if (poiIds) filters.poiIds = poiIds.split(',').map((s) => s.trim()).filter(Boolean);
+  const minPings = parseInt(searchParams.get('minPings') || '', 10);
+  if (minPings > 0) filters.minPings = minPings;
 
   const encoder = new TextEncoder();
 

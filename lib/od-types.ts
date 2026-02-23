@@ -11,6 +11,7 @@ export interface ODFilters {
   dateFrom?: string;
   dateTo?: string;
   poiIds?: string[];
+  minPings?: number; // Minimum pings per device-day to include (default: 1 = no filter)
 }
 
 export interface ODZipcode {

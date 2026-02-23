@@ -109,6 +109,7 @@ export default function DatasetAnalysisPage() {
     summary: { totalZipcodes: number; devicesMatchedToZipcode: number };
   } | null>(null);
   const [loadingCatchment, setLoadingCatchment] = useState(false);
+  const [catchmentMinPings, setCatchmentMinPings] = useState(1);
   const [catchmentProgress, setCatchmentProgress] = useState<{
     step: string;
     percent: number;
@@ -266,7 +267,10 @@ export default function DatasetAnalysisPage() {
     setCatchment(null);
     setCatchmentProgress({ step: 'initializing', percent: 0, message: 'Starting analysis...' });
 
-    const es = new EventSource(`/api/datasets/${datasetName}/catchment/stream`);
+    const streamParams = new URLSearchParams();
+    if (catchmentMinPings > 1) streamParams.set('minPings', String(catchmentMinPings));
+    const qs = streamParams.toString();
+    const es = new EventSource(`/api/datasets/${datasetName}/catchment/stream${qs ? `?${qs}` : ''}`);
 
     es.addEventListener('progress', (event) => {
       try {
@@ -307,7 +311,7 @@ export default function DatasetAnalysisPage() {
       // If we didn't get a result yet, try the regular endpoint as fallback
       if (!catchment) {
         setCatchmentProgress({ step: 'running_queries', percent: 50, message: 'Reconnecting...', detail: 'Falling back to standard request' });
-        fetch(`/api/datasets/${datasetName}/catchment`, { credentials: 'include' })
+        fetch(`/api/datasets/${datasetName}/catchment${qs ? `?${qs}` : ''}`, { credentials: 'include' })
           .then((res) => {
             if (!res.ok) throw new Error(res.statusText);
             return res.json();
@@ -569,7 +573,20 @@ export default function DatasetAnalysisPage() {
                     Where do visitors come from? First GPS ping of each device-day, geocoded to postal code.
                   </CardDescription>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex items-center gap-2">
+                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground whitespace-nowrap">
+                    Min pings
+                    <select
+                      value={catchmentMinPings}
+                      onChange={(e) => setCatchmentMinPings(Number(e.target.value))}
+                      disabled={loadingCatchment}
+                      className="h-7 rounded-md border border-input bg-background px-2 text-xs"
+                    >
+                      {[1, 2, 3, 5, 10].map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                  </label>
                   <Button
                     variant="outline"
                     size="sm"
