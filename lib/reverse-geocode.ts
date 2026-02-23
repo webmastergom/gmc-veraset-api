@@ -129,10 +129,97 @@ export type GeocodeClassification =
   | { type: 'unmatched'; devices: number }
   | { type: 'nominatim_truncated'; devices: number; lat: number; lng: number };
 
+// ── Spatial grid index ──────────────────────────────────────────────────
+// Instead of scanning all polygons for every point (O(n) per lookup),
+// we divide each country into a grid. Each cell maps to the few features
+// whose bounding box overlaps it, reducing lookups to O(1) grid + O(k) polygon checks.
+
+const GRID_RESOLUTION = 0.1; // degrees per cell (~11 km)
+const MAX_CELLS_PER_FEATURE = 5000; // safety cap for huge features (overseas territories)
+
+interface FeatureBBox {
+  minLat: number; maxLat: number; minLng: number; maxLng: number;
+}
+
+interface CountrySpatialIndex {
+  features: ZipcodeFeature[];
+  bboxes: FeatureBBox[];
+  grid: Map<string, number[]>;     // grid cell key → feature indices
+  overflow: number[];              // features too large for grid (checked for every point)
+}
+
+function computeFeatureBBox(feature: ZipcodeFeature): FeatureBBox {
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  const visitRing = (ring: number[][]) => {
+    for (const coord of ring) {
+      const lng = coord[0], lat = coord[1];
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+    }
+  };
+  const geom = feature.geometry;
+  if (geom.type === 'Polygon') {
+    for (const ring of geom.coordinates as number[][][]) visitRing(ring);
+  } else if (geom.type === 'MultiPolygon') {
+    for (const poly of geom.coordinates as number[][][][]) {
+      for (const ring of poly) visitRing(ring);
+    }
+  }
+  return { minLat, maxLat, minLng, maxLng };
+}
+
+function gridCellKey(latCell: number, lngCell: number): string {
+  return `${latCell},${lngCell}`;
+}
+
+function buildSpatialIndex(features: ZipcodeFeature[]): CountrySpatialIndex {
+  const bboxes: FeatureBBox[] = [];
+  const grid = new Map<string, number[]>();
+  const overflow: number[] = [];
+
+  for (let i = 0; i < features.length; i++) {
+    const feature = features[i];
+    if (!feature.geometry) {
+      bboxes.push({ minLat: 0, maxLat: 0, minLng: 0, maxLng: 0 });
+      continue;
+    }
+
+    const bbox = computeFeatureBBox(feature);
+    bboxes.push(bbox);
+
+    const minCellLat = Math.floor(bbox.minLat / GRID_RESOLUTION);
+    const maxCellLat = Math.floor(bbox.maxLat / GRID_RESOLUTION);
+    const minCellLng = Math.floor(bbox.minLng / GRID_RESOLUTION);
+    const maxCellLng = Math.floor(bbox.maxLng / GRID_RESOLUTION);
+
+    const cellSpan = (maxCellLat - minCellLat + 1) * (maxCellLng - minCellLng + 1);
+    if (cellSpan > MAX_CELLS_PER_FEATURE) {
+      overflow.push(i);
+      continue;
+    }
+
+    for (let cLat = minCellLat; cLat <= maxCellLat; cLat++) {
+      for (let cLng = minCellLng; cLng <= maxCellLng; cLng++) {
+        const key = gridCellKey(cLat, cLng);
+        const existing = grid.get(key);
+        if (existing) {
+          existing.push(i);
+        } else {
+          grid.set(key, [i]);
+        }
+      }
+    }
+  }
+
+  console.log(`[GEOCODE] Spatial index: ${features.length} features, ${grid.size} grid cells, ${overflow.length} overflow`);
+  return { features, bboxes, grid, overflow };
+}
+
 // ── In-memory caches ───────────────────────────────────────────────────
 
-// Country → loaded features (lazy-loaded per country)
-const countryFeaturesCache = new Map<string, ZipcodeFeature[]>();
+const countrySpatialIndexCache = new Map<string, CountrySpatialIndex>();
 
 // Coordinate cache: "lat,lng" → result
 const geocodeCache = new Map<string, { country: string; result: NormalizedProps } | null>();
@@ -199,32 +286,33 @@ async function loadCountryFeaturesFromS3(country: string): Promise<ZipcodeFeatur
 }
 
 /**
- * Load country features: local disk first, S3 fallback.
+ * Load country spatial index: local disk first, S3 fallback.
  * Synchronous for cache hits, async for S3 downloads.
- * Returns cached features or [] if loading.
+ * Returns cached index or null if still loading.
  */
-function loadCountryFeatures(country: string): ZipcodeFeature[] {
-  if (countryFeaturesCache.has(country)) return countryFeaturesCache.get(country)!;
+function loadCountryIndex(country: string): CountrySpatialIndex | null {
+  if (countrySpatialIndexCache.has(country)) return countrySpatialIndexCache.get(country)!;
 
   // Try local disk
   const local = loadCountryFeaturesLocal(country);
   if (local) {
-    countryFeaturesCache.set(country, local);
-    return local;
+    const index = buildSpatialIndex(local);
+    countrySpatialIndexCache.set(country, index);
+    return index;
   }
 
-  // Start S3 download in background (returns [] for this call)
+  // Start S3 download in background (returns null for this call)
   if (!s3DownloadPromises.has(country)) {
     const promise = loadCountryFeaturesFromS3(country).then((features) => {
-      countryFeaturesCache.set(country, features);
+      const index = buildSpatialIndex(features);
+      countrySpatialIndexCache.set(country, index);
       s3DownloadPromises.delete(country);
       return features;
     });
     s3DownloadPromises.set(country, promise);
   }
 
-  // For now return empty — next call will have the cached data
-  return [];
+  return null;
 }
 
 /**
@@ -235,7 +323,7 @@ async function ensureCountriesLoaded(points: Array<{ lat: number; lng: number }>
   const needed = new Set<string>();
   for (const p of points) {
     for (const c of getCandidateCountries(p.lat, p.lng)) {
-      if (!countryFeaturesCache.has(c)) needed.add(c);
+      if (!countrySpatialIndexCache.has(c)) needed.add(c);
     }
   }
 
@@ -246,13 +334,15 @@ async function ensureCountriesLoaded(points: Array<{ lat: number; lng: number }>
   for (const country of needed) {
     const local = loadCountryFeaturesLocal(country);
     if (local) {
-      countryFeaturesCache.set(country, local);
+      const index = buildSpatialIndex(local);
+      countrySpatialIndexCache.set(country, index);
     } else {
       if (s3DownloadPromises.has(country)) {
         promises.push(s3DownloadPromises.get(country)!);
       } else {
         const p = loadCountryFeaturesFromS3(country).then((features) => {
-          countryFeaturesCache.set(country, features);
+          const index = buildSpatialIndex(features);
+          countrySpatialIndexCache.set(country, index);
           s3DownloadPromises.delete(country);
           return features;
         });
@@ -315,8 +405,27 @@ export function getZipcode(lat: number, lng: number): ZipcodeResult | null {
   let result: { country: string; result: NormalizedProps } | null = null;
 
   for (const country of candidates) {
-    const features = loadCountryFeatures(country);
-    for (const feature of features) {
+    const index = loadCountryIndex(country);
+    if (!index) continue;
+
+    // Grid lookup: only check features whose bbox overlaps this cell
+    const cellLat = Math.floor(lat / GRID_RESOLUTION);
+    const cellLng = Math.floor(lng / GRID_RESOLUTION);
+    const candidateIndices = index.grid.get(gridCellKey(cellLat, cellLng)) || [];
+
+    // Check grid candidates + overflow features
+    const toCheck = candidateIndices.length + index.overflow.length > 0
+      ? [...candidateIndices, ...index.overflow]
+      : [];
+
+    for (const idx of toCheck) {
+      const feature = index.features[idx];
+      if (!feature.geometry) continue;
+
+      // Quick bbox pre-filter
+      const bbox = index.bboxes[idx];
+      if (lat < bbox.minLat || lat > bbox.maxLat || lng < bbox.minLng || lng > bbox.maxLng) continue;
+
       try {
         if (booleanPointInPolygon(pt, feature as any)) {
           const parsed = parseProperties(country, feature.properties);
