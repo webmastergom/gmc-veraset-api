@@ -6,13 +6,16 @@ export const revalidate = 0;
 
 /**
  * GET /api/jobs/refresh
- * One-shot: check Veraset for ALL non-terminal jobs and update S3.
- * Call this when stale jobs need their status refreshed in bulk.
+ * Check Veraset for non-terminal jobs and update S3.
  *
- * Changed from POST to GET because POST requests systematically return
- * 405 Method Not Allowed on the current Vercel deployment.
+ * Processes jobs one at a time with a 4s timeout per Veraset call.
+ * Tracks elapsed time and stops before hitting Vercel's 10s limit.
+ * Call multiple times if you have many stale jobs.
  */
 export async function GET(request: NextRequest): Promise<NextResponse> {
+  const startTime = Date.now();
+  const MAX_TOTAL_MS = 8000; // Stop processing after 8s to stay within 10s limit
+
   try {
     const verasetApiKey = process.env.VERASET_API_KEY?.trim();
     if (!verasetApiKey) {
@@ -31,15 +34,20 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     }
 
     const results: Array<{ jobId: string; name: string; before: string; after: string; error?: string }> = [];
+    let stoppedEarly = false;
 
-    // Check each job sequentially to avoid overwhelming Veraset API
-    // Use 6s timeout per job to stay within Vercel's 10s function limit
-    // (we process sequentially, so we can only check ~1 job before timeout)
-    // For bulk refreshes with many jobs, call this endpoint multiple times
     for (const job of nonTerminal) {
+      // Check if we're running out of time BEFORE starting another API call
+      const elapsed = Date.now() - startTime;
+      if (elapsed > MAX_TOTAL_MS) {
+        console.log(`[REFRESH] Stopping early after ${elapsed}ms (processed ${results.length}/${nonTerminal.length})`);
+        stoppedEarly = true;
+        break;
+      }
+
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 6000); // 6s timeout per job
+        const timeout = setTimeout(() => controller.abort(), 4000); // 4s per job
 
         const res = await fetch(
           `https://platform.prd.veraset.tech/v1/job/${job.jobId}`,
@@ -69,18 +77,28 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           results.push({ jobId: job.jobId, name: job.name, before: job.status, after: job.status, error: `Veraset ${res.status}` });
         }
       } catch (err: any) {
-        console.warn(`[REFRESH] Error checking ${job.jobId}:`, err.message);
-        results.push({ jobId: job.jobId, name: job.name, before: job.status, after: job.status, error: err.message });
+        const isAbort = err.name === 'AbortError';
+        console.warn(`[REFRESH] ${isAbort ? 'Timeout' : 'Error'} checking ${job.jobId}:`, err.message);
+        results.push({ jobId: job.jobId, name: job.name, before: job.status, after: job.status, error: isAbort ? 'timeout' : err.message });
       }
     }
 
     const updated = results.filter(r => r.before !== r.after);
-    console.log(`[REFRESH] Done. Updated ${updated.length}/${nonTerminal.length} jobs`);
+    const remaining = nonTerminal.length - results.length;
+    const elapsedTotal = Date.now() - startTime;
+
+    console.log(`[REFRESH] Done in ${elapsedTotal}ms. Updated ${updated.length}/${results.length} checked. ${remaining} remaining.`);
 
     return NextResponse.json({
-      message: `Refreshed ${updated.length} of ${nonTerminal.length} non-terminal jobs`,
+      message: stoppedEarly
+        ? `Checked ${results.length} of ${nonTerminal.length} jobs (stopped at ${elapsedTotal}ms to avoid timeout). Call again to process remaining ${remaining}.`
+        : `Refreshed ${updated.length} of ${nonTerminal.length} non-terminal jobs`,
       updated: updated.length,
+      checked: results.length,
       total: nonTerminal.length,
+      remaining,
+      stoppedEarly,
+      elapsedMs: elapsedTotal,
       results,
     });
 
