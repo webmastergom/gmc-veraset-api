@@ -1,20 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAllJobs, updateJobStatus } from "@/lib/jobs";
+import { getJob, updateJobStatus } from "@/lib/jobs";
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 /**
- * GET /api/jobs/refresh
- * Check Veraset for non-terminal jobs and update S3.
+ * GET /api/jobs/refresh?ids=id1,id2,id3
  *
- * Processes jobs one at a time with a 4s timeout per Veraset call.
- * Tracks elapsed time and stops before hitting Vercel's 10s limit.
- * Call multiple times if you have many stale jobs.
+ * Check Veraset for specific jobs and update S3.
+ * Pass job IDs as comma-separated query param to SKIP the expensive getAllJobs() call.
+ * Without ?ids, falls back to reading all jobs (slow, ~11s on cold start).
+ *
+ * Processes jobs one at a time with a 3s timeout per Veraset call.
+ * Stops before hitting Vercel's 10s limit.
  */
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const startTime = Date.now();
-  const MAX_TOTAL_MS = 8000; // Stop processing after 8s to stay within 10s limit
+  const MAX_TOTAL_MS = 8000;
 
   try {
     const verasetApiKey = process.env.VERASET_API_KEY?.trim();
@@ -22,32 +24,51 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: 'VERASET_API_KEY not configured' }, { status: 500 });
     }
 
-    const allJobs = await getAllJobs();
-    const nonTerminal = allJobs.filter(
-      (j) => j.status === 'QUEUED' || j.status === 'RUNNING' || j.status === 'SCHEDULED'
-    );
+    // Fast path: specific job IDs passed as query param (skips getAllJobs)
+    const idsParam = request.nextUrl.searchParams.get('ids');
 
-    console.log(`[REFRESH] Found ${nonTerminal.length} non-terminal jobs to check`);
+    let jobsToCheck: Array<{ jobId: string; name: string; status: string }> = [];
 
-    if (nonTerminal.length === 0) {
+    if (idsParam) {
+      const ids = idsParam.split(',').map(id => id.trim()).filter(Boolean);
+      console.log(`[REFRESH] Fast path: checking ${ids.length} specific jobs`);
+
+      // Read each job individually (each ~1s, much faster than getAllJobs ~11s)
+      for (const id of ids) {
+        if (Date.now() - startTime > MAX_TOTAL_MS) break;
+        const job = await getJob(id);
+        if (job && (job.status === 'QUEUED' || job.status === 'RUNNING' || job.status === 'SCHEDULED')) {
+          jobsToCheck.push({ jobId: job.jobId, name: job.name, status: job.status });
+        }
+      }
+    } else {
+      // Slow fallback: read all jobs
+      const { getAllJobs } = await import('@/lib/jobs');
+      const allJobs = await getAllJobs();
+      jobsToCheck = allJobs
+        .filter(j => j.status === 'QUEUED' || j.status === 'RUNNING' || j.status === 'SCHEDULED')
+        .map(j => ({ jobId: j.jobId, name: j.name, status: j.status }));
+    }
+
+    console.log(`[REFRESH] ${jobsToCheck.length} non-terminal jobs to check [${Date.now()-startTime}ms]`);
+
+    if (jobsToCheck.length === 0) {
       return NextResponse.json({ message: 'No non-terminal jobs to refresh', updated: 0 });
     }
 
     const results: Array<{ jobId: string; name: string; before: string; after: string; error?: string }> = [];
     let stoppedEarly = false;
 
-    for (const job of nonTerminal) {
-      // Check if we're running out of time BEFORE starting another API call
+    for (const job of jobsToCheck) {
       const elapsed = Date.now() - startTime;
       if (elapsed > MAX_TOTAL_MS) {
-        console.log(`[REFRESH] Stopping early after ${elapsed}ms (processed ${results.length}/${nonTerminal.length})`);
         stoppedEarly = true;
         break;
       }
 
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 4000); // 4s per job
+        const timeout = setTimeout(() => controller.abort(), 3000);
 
         const res = await fetch(
           `https://platform.prd.veraset.tech/v1/job/${job.jobId}`,
@@ -65,37 +86,34 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           const errorMsg = data.error_message || data.data?.error_message;
 
           if (newStatus && newStatus !== job.status) {
-            console.log(`[REFRESH] ${job.jobId} (${job.name}): ${job.status} -> ${newStatus}`);
+            console.log(`[REFRESH] ${job.jobId}: ${job.status} -> ${newStatus}`);
             await updateJobStatus(job.jobId, newStatus, errorMsg);
             results.push({ jobId: job.jobId, name: job.name, before: job.status, after: newStatus });
           } else {
             results.push({ jobId: job.jobId, name: job.name, before: job.status, after: job.status });
           }
         } else {
-          const errText = await res.text().catch(() => '');
-          console.warn(`[REFRESH] Veraset ${res.status} for ${job.jobId}: ${errText.substring(0, 200)}`);
           results.push({ jobId: job.jobId, name: job.name, before: job.status, after: job.status, error: `Veraset ${res.status}` });
         }
       } catch (err: any) {
         const isAbort = err.name === 'AbortError';
-        console.warn(`[REFRESH] ${isAbort ? 'Timeout' : 'Error'} checking ${job.jobId}:`, err.message);
         results.push({ jobId: job.jobId, name: job.name, before: job.status, after: job.status, error: isAbort ? 'timeout' : err.message });
       }
     }
 
     const updated = results.filter(r => r.before !== r.after);
-    const remaining = nonTerminal.length - results.length;
+    const remaining = jobsToCheck.length - results.length;
     const elapsedTotal = Date.now() - startTime;
 
-    console.log(`[REFRESH] Done in ${elapsedTotal}ms. Updated ${updated.length}/${results.length} checked. ${remaining} remaining.`);
+    console.log(`[REFRESH] Done in ${elapsedTotal}ms. Updated ${updated.length}/${results.length}. ${remaining} remaining.`);
 
     return NextResponse.json({
       message: stoppedEarly
-        ? `Checked ${results.length} of ${nonTerminal.length} jobs (stopped at ${elapsedTotal}ms to avoid timeout). Call again to process remaining ${remaining}.`
-        : `Refreshed ${updated.length} of ${nonTerminal.length} non-terminal jobs`,
+        ? `Checked ${results.length} of ${jobsToCheck.length} jobs (stopped at ${elapsedTotal}ms). Call again for remaining ${remaining}.`
+        : `Refreshed ${updated.length} of ${jobsToCheck.length} non-terminal jobs`,
       updated: updated.length,
       checked: results.length,
-      total: nonTerminal.length,
+      total: jobsToCheck.length,
       remaining,
       stoppedEarly,
       elapsedMs: elapsedTotal,

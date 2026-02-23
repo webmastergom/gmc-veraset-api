@@ -1,7 +1,23 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+/**
+ * POST /api/health
+ * Diagnostic: verify that POST requests work on Vercel.
+ * Returns the request method, timestamp, and body echo.
+ */
+export async function POST(request: NextRequest) {
+  let body: any = null;
+  try { body = await request.json(); } catch { body = null; }
+  return NextResponse.json({
+    method: 'POST',
+    ok: true,
+    timestamp: new Date().toISOString(),
+    bodyReceived: body,
+  });
+}
 
 /**
  * GET /api/health
