@@ -24,6 +24,7 @@ interface Job {
   summaryMetrics?: string;
   objectCount?: number;
   external?: boolean;
+  apiKeyName?: string;
   audienceAgentEnabled?: boolean;
 }
 
@@ -65,6 +66,7 @@ export default function JobsPage() {
           summaryMetrics: job.summaryMetrics || job.summary_metrics,
           objectCount: job.objectCount || job.object_count,
           external: job.external || false,
+          apiKeyName: job.apiKeyName,
           audienceAgentEnabled: job.audienceAgentEnabled || false,
         }));
         setJobs(normalizedJobs);
@@ -182,7 +184,7 @@ export default function JobsPage() {
                 <div className="flex flex-wrap gap-1.5 mt-2">
                   {job.external && (
                     <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                      External
+                      {job.apiKeyName || 'External'}
                     </span>
                   )}
                   {job.audienceAgentEnabled && (
@@ -272,7 +274,7 @@ export default function JobsPage() {
                           </Link>
                           {job.external && (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                              External
+                              {job.apiKeyName || 'External'}
                             </span>
                           )}
                           {job.audienceAgentEnabled && (

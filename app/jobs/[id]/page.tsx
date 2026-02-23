@@ -33,6 +33,7 @@ async function getJob(id: string) {
       type: job.type,
       poi_count: job.poiCount || 0,
       external: job.external || false,
+      api_key_name: job.apiKeyName,
       config: {
         dateRange: job.dateRange,
         radius: job.radius,
@@ -126,9 +127,14 @@ export default async function JobDetailPage({
           <div className="flex items-center gap-2 text-blue-400">
             <Info className="w-4 h-4" />
             <span className="font-medium">External Job</span>
+            {job.api_key_name && (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                {job.api_key_name}
+              </span>
+            )}
           </div>
           <p className="text-sm text-blue-300/80 mt-1">
-            This job was created via the external API.
+            This job was created via the external API{job.api_key_name ? ` using the "${job.api_key_name}" key` : ''}.
           </p>
         </div>
       )}
