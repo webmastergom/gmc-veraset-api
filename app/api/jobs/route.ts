@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAllJobs, getAllJobsSummary, createJob, updateJobStatus } from "@/lib/jobs";
+import { getAllJobs, getAllJobsSummary, createJob } from "@/lib/jobs";
 import { canCreateJob, incrementUsage } from "@/lib/usage";
 import { createJobSchema } from "@/lib/validation";
 import { logger } from "@/lib/logger";
@@ -25,50 +25,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       jobs = await getAllJobsSummary();
       console.log(`[JOBS GET] Found ${jobs.length} jobs from getAllJobsSummary`);
 
-      // Check Veraset for non-terminal jobs so the list shows fresh status.
-      // Without this, jobs stay stuck at QUEUED/RUNNING until someone visits the detail page.
-      const verasetApiKey = process.env.VERASET_API_KEY?.trim();
-      if (verasetApiKey) {
-        const nonTerminal = jobs.filter(
-          (j: any) => j.status === 'QUEUED' || j.status === 'RUNNING' || j.status === 'SCHEDULED'
-        );
-
-        if (nonTerminal.length > 0) {
-          console.log(`[JOBS GET] Checking Veraset for ${nonTerminal.length} non-terminal jobs`);
-
-          const checks = nonTerminal.map(async (job: any) => {
-            try {
-              const jobId = job.jobId;
-              if (!jobId) return;
-
-              const res = await fetch(
-                `https://platform.prd.veraset.tech/v1/job/${jobId}`,
-                {
-                  cache: 'no-store',
-                  headers: { 'X-API-Key': verasetApiKey, 'Content-Type': 'application/json' },
-                }
-              );
-
-              if (res.ok) {
-                const data = await res.json();
-                const newStatus = data.status || data.data?.status;
-                if (newStatus && newStatus !== job.status) {
-                  console.log(`[JOBS GET] ${jobId}: ${job.status} -> ${newStatus}`);
-                  await updateJobStatus(jobId, newStatus, data.error_message || data.data?.error_message);
-                  job.status = newStatus;
-                  if (data.error_message || data.data?.error_message) {
-                    job.errorMessage = data.error_message || data.data?.error_message;
-                  }
-                }
-              }
-            } catch (err: any) {
-              console.warn(`[JOBS GET] Failed Veraset check:`, err.message);
-            }
-          });
-
-          await Promise.allSettled(checks);
-        }
-      }
+      // NOTE: Veraset status checking for non-terminal jobs is handled by
+      // GET /api/jobs/[id] when the user views a specific job detail page.
+      // Doing it here would add N API calls + N S3 writes to the list
+      // endpoint, risking timeouts on Vercel serverless (10s limit).
 
     } catch (getJobsError: any) {
       console.error('[JOBS GET] Error calling getAllJobs:', getJobsError?.message);
