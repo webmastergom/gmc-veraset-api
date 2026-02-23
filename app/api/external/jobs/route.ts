@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllJobs, createJob } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
+import { getApiKeyById } from '@/lib/api-keys';
 import { BUCKET } from '@/lib/s3-config';
 import { externalCreateJobSchema, validateRequestBody } from '@/lib/validation';
 import { canCreateJob, incrementUsage } from '@/lib/usage';
@@ -178,7 +179,14 @@ export async function POST(request: NextRequest) {
       }
     });
 
-    // 7. Save job to S3
+    // 7. Look up API key name for tracking
+    let apiKeyName: string | undefined;
+    if (auth.keyId) {
+      const apiKeyInfo = await getApiKeyById(auth.keyId);
+      apiKeyName = apiKeyInfo?.name;
+    }
+
+    // 8. Save job to S3
     const job = await createJob({
       jobId,
       name: body.name,
@@ -190,6 +198,8 @@ export async function POST(request: NextRequest) {
       status: 'QUEUED',
       s3SourcePath: `s3://veraset-prd-platform-us-west-2/output/garritz/${jobId}/`,
       external: true,
+      apiKeyId: auth.keyId,
+      apiKeyName,
       poiMapping,
       poiNames,
       country: body.country,
@@ -197,10 +207,10 @@ export async function POST(request: NextRequest) {
       externalPois: body.pois,
     });
 
-    // 8. Increment usage — external jobs consume a real Veraset API call
+    // 9. Increment usage — external jobs consume a real Veraset API call
     await incrementUsage(jobId);
 
-    // 9. Return response
+    // 10. Return response
     return NextResponse.json({
       job_id: jobId,
       status: 'QUEUED',

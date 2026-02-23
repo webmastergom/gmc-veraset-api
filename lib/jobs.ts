@@ -27,6 +27,8 @@ export interface Job {
   updatedAt?: string;
   summaryMetrics?: string;
   external?: boolean; // true = created outside app, doesn't count toward quota
+  apiKeyId?: string; // ID of the API key used to create this job (external jobs only)
+  apiKeyName?: string; // Name/label of the API key used (e.g., "Cinema Republica")
   poiMapping?: Record<string, string>; // Maps Veraset POI IDs (geo_radius_X) to original GeoJSON IDs
   poiNames?: Record<string, string>; // Maps Veraset POI IDs (geo_radius_X) to human-readable names from GeoJSON properties.name
   country?: string; // ISO 2-letter country code (e.g., "ES")
