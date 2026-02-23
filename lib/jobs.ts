@@ -109,20 +109,11 @@ export interface Job {
 }
 
 type JobsData = Record<string, Job>;
+type JobIndexData = Record<string, Partial<Job>>;
 
 const DEFAULT_JOBS: JobsData = {};
 
-/**
- * Get all jobs sorted by creation date (newest first)
- */
-export async function getAllJobs(): Promise<Job[]> {
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  return Object.values(data).sort((a, b) =>
-    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
-}
-
-/** Fields stripped from the list endpoint response to reduce payload size. */
+/** Fields stripped from the index / list endpoint to reduce payload size. */
 const HEAVY_FIELDS: (keyof Job)[] = [
   'verasetPayload',
   'auditTrail',
@@ -133,111 +124,219 @@ const HEAVY_FIELDS: (keyof Job)[] = [
   'poiNames',
 ];
 
+// ── Per-job file helpers ────────────────────────────────────────────────
+// Each job is stored as config/jobs/{jobId}.json (~0.5–5 MB).
+// A lightweight index at config/jobs-index.json (~100 KB) powers the list view.
+// This replaces the monolithic config/jobs.json (258 MB) that was too large
+// for Vercel's 10s serverless function limit.
+
+function jobKey(jobId: string): string {
+  return `jobs/${jobId}`;
+}
+
+/** Strip heavy fields to create an index entry */
+function toIndexEntry(job: Job): Partial<Job> & { hasSyncProgress?: boolean; hasVerification?: boolean } {
+  const entry: Record<string, any> = {};
+  for (const key of Object.keys(job) as (keyof Job)[]) {
+    if (!HEAVY_FIELDS.includes(key)) {
+      entry[key] = job[key];
+    }
+  }
+  entry.hasSyncProgress = !!job.syncProgress?.dayProgress;
+  entry.hasVerification = !!job.verificationResult;
+  return entry as Partial<Job>;
+}
+
+// ── Index management ────────────────────────────────────────────────────
+
+async function getIndex(): Promise<JobIndexData> {
+  return await initConfigIfNeeded<JobIndexData>('jobs-index', {});
+}
+
+async function upsertIndex(jobId: string, entry: Partial<Job>): Promise<void> {
+  invalidateCache('jobs-index');
+  const index = await getIndex();
+  index[jobId] = entry;
+  await putConfig('jobs-index', index);
+}
+
+// ── Public API ──────────────────────────────────────────────────────────
+
 /**
- * Get all jobs for the list view — strips heavy nested fields that are only
- * needed on the detail page.  Reduces response from ~500KB+ to ~20KB for
- * a typical 20-job account.  Keeps AWS costs marginal (same single S3 GET).
+ * Get all jobs sorted by creation date (newest first).
+ * Reads individual per-job files in parallel.
+ */
+export async function getAllJobs(): Promise<Job[]> {
+  const index = await getIndex();
+  const ids = Object.keys(index);
+
+  if (ids.length === 0) {
+    // Fallback: pre-migration monolithic file
+    const data = await getConfig<JobsData>('jobs');
+    if (data) {
+      return Object.values(data).sort((a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+    }
+    return [];
+  }
+
+  // Read individual job files in parallel
+  const jobs = await Promise.all(ids.map(id => getConfig<Job>(jobKey(id))));
+  return jobs
+    .filter((j): j is Job => j !== null)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+}
+
+/**
+ * Get all jobs for the list view — reads from the lightweight index only.
+ * Strips heavy nested fields that are only needed on the detail page.
+ * Reduces response from ~500KB+ to ~20KB for a typical 20-job account.
  */
 export async function getAllJobsSummary(): Promise<Partial<Job>[]> {
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  return Object.values(data)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-    .map((job) => {
-      const summary: Record<string, any> = {};
-      for (const key of Object.keys(job) as (keyof Job)[]) {
-        if (!HEAVY_FIELDS.includes(key)) {
-          summary[key] = job[key];
-        }
-      }
-      // Keep lightweight sync status indicators
-      summary.hasSyncProgress = !!job.syncProgress?.dayProgress;
-      summary.hasVerification = !!job.verificationResult;
-      return summary as Partial<Job>;
-    });
+  const index = await getIndex();
+  const entries = Object.values(index);
+
+  if (entries.length === 0) {
+    // Fallback: pre-migration monolithic file
+    const data = await getConfig<JobsData>('jobs');
+    if (data) {
+      return Object.values(data)
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .map((job) => {
+          const summary: Record<string, any> = {};
+          for (const key of Object.keys(job) as (keyof Job)[]) {
+            if (!HEAVY_FIELDS.includes(key)) {
+              summary[key] = job[key];
+            }
+          }
+          summary.hasSyncProgress = !!job.syncProgress?.dayProgress;
+          summary.hasVerification = !!job.verificationResult;
+          return summary as Partial<Job>;
+        });
+    }
+    return [];
+  }
+
+  return entries.sort((a, b) =>
+    new Date((b.createdAt as string) || '').getTime() - new Date((a.createdAt as string) || '').getTime()
+  );
 }
 
 /**
  * Get jobs enabled for the Audience Agent (SUCCESS status + audienceAgentEnabled)
  */
 export async function getAudienceEnabledJobs(): Promise<Job[]> {
-  const all = await getAllJobs();
-  return all.filter(j => j.status === 'SUCCESS' && j.audienceAgentEnabled === true);
+  const index = await getIndex();
+  const eligibleIds = Object.entries(index)
+    .filter(([_, j]) => j.status === 'SUCCESS' && j.audienceAgentEnabled === true)
+    .map(([id]) => id);
+
+  if (eligibleIds.length === 0) return [];
+
+  const jobs = await Promise.all(eligibleIds.map(id => getConfig<Job>(jobKey(id))));
+  return jobs.filter((j): j is Job => j !== null);
 }
 
 /**
- * Get a specific job by ID
+ * Get a specific job by ID.
+ * Reads from per-job file (fast: ~1 MB) with fallback to monolithic file.
  */
 export async function getJob(jobId: string): Promise<Job | null> {
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  return data[jobId] || null;
+  // Try per-job file first (fast: single file read)
+  const job = await getConfig<Job>(jobKey(jobId));
+  if (job) return job;
+
+  // Fallback: monolithic file (pre-migration)
+  const data = await getConfig<JobsData>('jobs');
+  return data?.[jobId] || null;
 }
 
 /**
- * Create a new job
+ * Create a new job.
+ * Writes per-job file + updates index. Does NOT touch the monolithic jobs.json.
  */
 export async function createJob(job: Omit<Job, 'createdAt' | 'updatedAt'>): Promise<Job> {
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  
   const newJob: Job = {
     ...job,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  
-  data[job.jobId] = newJob;
-  
+
   try {
-    await putConfig('jobs', data);
+    // Write individual job file (compact JSON, ~0.5–2 MB)
+    await putConfig(jobKey(job.jobId), newJob, { compact: true });
+    // Update lightweight index (~100 KB)
+    await upsertIndex(job.jobId, toIndexEntry(newJob));
     console.log(`✅ Job created: ${job.jobId} - ${job.name}`);
   } catch (error) {
     console.error(`❌ Failed to save job ${job.jobId}:`, error);
     throw error;
   }
-  
+
   return newJob;
 }
 
 /**
- * Update an existing job
- * CRITICAL: This function performs atomic updates - it reads, merges, and writes in one operation.
- * Multiple concurrent calls may still race, but each call sees the latest state before updating.
+ * Update an existing job.
+ * Reads and writes only the per-job file (~1 MB). Updates index only for
+ * state-level changes (status, sync completion), not for frequent progress updates.
+ *
+ * CRITICAL: Performs atomic updates — reads, merges, and writes in one operation.
+ * Multiple concurrent calls may still race, but each call sees the latest state.
  */
 export async function updateJob(jobId: string, updates: Partial<Job>): Promise<Job | null> {
-  // Invalidate cache to ensure we read the latest state from S3 before writing.
-  // Without this, the 60s in-memory cache could cause stale reads that overwrite
-  // concurrent changes or fail to find newly-created jobs.
-  invalidateCache('jobs');
+  // Invalidate per-job cache to ensure fresh read from S3
+  invalidateCache(jobKey(jobId));
 
-  // Read current state (now guaranteed fresh from S3)
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  
-  if (!data[jobId]) {
-    console.error(`❌ Job not found: ${jobId}`);
-    return null;
+  // Read individual job file (fast: ~1 MB)
+  let currentJob = await getConfig<Job>(jobKey(jobId));
+
+  if (!currentJob) {
+    // Fallback: try monolithic file (pre-migration)
+    const data = await getConfig<JobsData>('jobs');
+    currentJob = data?.[jobId] || null;
+    if (!currentJob) {
+      console.error(`❌ Job not found: ${jobId}`);
+      return null;
+    }
   }
-  
+
   // CRITICAL: Preserve syncedAt if sync is complete and update is just progress
   // This prevents late progress callbacks from overwriting completion status
-  const currentJob = data[jobId];
   const isSyncComplete = !!currentJob.syncedAt;
   const isProgressUpdate = 'objectCount' in updates || 'totalBytes' in updates || 'syncProgress' in updates;
-  
-  // If sync is complete and this is just a progress update, preserve syncedAt
+
   if (isSyncComplete && isProgressUpdate && !('syncedAt' in updates)) {
-    // Don't allow progress updates to overwrite completion
-    // But allow explicit syncedAt updates (e.g., from markJobSynced)
     console.log(`[UPDATE JOB] Preserving syncedAt=${currentJob.syncedAt} for completed sync`);
   }
-  
+
   // Merge updates atomically
-  data[jobId] = {
+  const updatedJob: Job = {
     ...currentJob,
     ...updates,
     updatedAt: new Date().toISOString(),
   };
-  
+
   try {
-    await putConfig('jobs', data);
+    // Write individual job file (compact JSON)
+    await putConfig(jobKey(jobId), updatedJob, { compact: true });
+
+    // Update index only for state-level changes (skip frequent progress updates)
+    const isProgressOnly = isProgressUpdate
+      && !('status' in updates)
+      && !('syncedAt' in updates)
+      && !('syncCancelledAt' in updates)
+      && !('errorMessage' in updates)
+      && !('s3DestPath' in updates)
+      && !('name' in updates)
+      && !('country' in updates)
+      && !('audienceAgentEnabled' in updates);
+
+    if (!isProgressOnly) {
+      await upsertIndex(jobId, toIndexEntry(updatedJob));
+    }
+
     // Only log if it's not a frequent progress update to reduce noise
     if (!isProgressUpdate || updates.syncedAt) {
       console.log(`✅ Job updated: ${jobId}${updates.syncedAt ? ' (sync completed)' : ''}`);
@@ -246,8 +345,8 @@ export async function updateJob(jobId: string, updates: Partial<Job>): Promise<J
     console.error(`❌ Failed to update job ${jobId}:`, error);
     throw error;
   }
-  
-  return data[jobId];
+
+  return updatedJob;
 }
 
 /**
@@ -313,7 +412,7 @@ export async function markJobSynced(
 ): Promise<Job | null> {
   const job = await getJob(jobId);
   if (!job) return null;
-  
+
   return updateJob(jobId, {
     s3DestPath,
     objectCount,
@@ -328,48 +427,59 @@ export async function markJobSynced(
 const SYNC_LOCK_TTL_MS = 600_000; // 10 min
 
 /**
- * Try to acquire sync lock. Returns true if acquired, false if another sync is in progress or lock not expired.
+ * Try to acquire sync lock. Returns true if acquired, false if another sync
+ * is in progress or lock not expired.
+ * Reads/writes only the per-job file (fast).
  */
 export async function tryAcquireSyncLock(jobId: string): Promise<boolean> {
-  // Invalidate cache to ensure we read the latest lock state from S3.
-  // Without this, the 60s in-memory cache could show a stale lock that
-  // was already released, or miss a lock acquired by another request.
-  invalidateCache('jobs');
+  invalidateCache(jobKey(jobId));
 
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  const job = data[jobId];
-  if (!job) return false;
+  const job = await getConfig<Job>(jobKey(jobId));
+  if (!job) {
+    // Fallback: try monolithic file
+    const data = await getConfig<JobsData>('jobs');
+    if (!data?.[jobId]) return false;
+    // If found in monolithic, migrate to per-job file
+    const migrated = data[jobId];
+    migrated.syncLock = new Date().toISOString();
+    migrated.updatedAt = new Date().toISOString();
+    await putConfig(jobKey(jobId), migrated, { compact: true });
+    return true;
+  }
+
   const lock = job.syncLock;
   if (lock) {
     const age = Date.now() - new Date(lock).getTime();
     if (age < SYNC_LOCK_TTL_MS) return false;
   }
-  data[jobId] = {
+
+  const updatedJob: Job = {
     ...job,
     syncLock: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  await putConfig('jobs', data);
+
+  await putConfig(jobKey(jobId), updatedJob, { compact: true });
   return true;
 }
 
 /**
  * Release sync lock (call when sync finishes or fails).
+ * Reads/writes only the per-job file (fast).
  */
 export async function releaseSyncLock(jobId: string): Promise<void> {
-  // Invalidate cache to ensure we read the latest state from S3.
-  // Without this, the 60s cache could cause us to read stale job data
-  // and write it back, "resurrecting" a lock that was already cleared.
-  invalidateCache('jobs');
+  invalidateCache(jobKey(jobId));
 
-  const data = await initConfigIfNeeded<JobsData>('jobs', DEFAULT_JOBS);
-  if (!data[jobId]) return;
-  data[jobId] = {
-    ...data[jobId],
+  const job = await getConfig<Job>(jobKey(jobId));
+  if (!job) return;
+
+  const updatedJob: Job = {
+    ...job,
     syncLock: null,
     updatedAt: new Date().toISOString(),
   };
-  await putConfig('jobs', data);
+
+  await putConfig(jobKey(jobId), updatedJob, { compact: true });
 }
 
 /**

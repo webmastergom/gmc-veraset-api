@@ -137,16 +137,13 @@ export async function getConfig<T>(key: string): Promise<T | null> {
  * Write a JSON config file to S3 with validation.
  * Invalidates the in-memory cache for this key.
  */
-export async function putConfig<T>(key: string, data: T): Promise<void> {
+export async function putConfig<T>(key: string, data: T, options?: { compact?: boolean }): Promise<void> {
   try {
     if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
       throw new Error('AWS credentials not configured');
     }
 
-    const json = JSON.stringify(data, null, 2);
-
-    // Validate JSON before saving
-    JSON.parse(json);
+    const json = options?.compact ? JSON.stringify(data) : JSON.stringify(data, null, 2);
 
     const command = new PutObjectCommand({
       Bucket: BUCKET,
@@ -161,7 +158,7 @@ export async function putConfig<T>(key: string, data: T): Promise<void> {
     invalidateCache(key);
     setCache(key, data);
 
-    console.log(`✅ Saved config/${key}.json`);
+    console.log(`✅ Saved config/${key}.json (${(json.length/1024).toFixed(0)}KB${options?.compact ? ' compact' : ''})`);
   } catch (error: any) {
     console.error(`❌ Error saving config/${key}.json:`, error.message || error);
     throw error;
