@@ -40,7 +40,7 @@ export function middleware(request: NextRequest) {
     const corsHeaders = isExternalRoute 
       ? {
           'Access-Control-Allow-Origin': origin || '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, X-Requested-With',
           'Access-Control-Allow-Credentials': 'false',
         }

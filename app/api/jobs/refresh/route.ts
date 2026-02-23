@@ -2,14 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 import { getAllJobs, updateJobStatus } from "@/lib/jobs";
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60; // Allow up to 60s for this one-shot operation
+export const revalidate = 0;
 
 /**
- * POST /api/jobs/refresh
+ * GET /api/jobs/refresh
  * One-shot: check Veraset for ALL non-terminal jobs and update S3.
  * Call this when stale jobs need their status refreshed in bulk.
+ *
+ * Changed from POST to GET because POST requests systematically return
+ * 405 Method Not Allowed on the current Vercel deployment.
  */
-export async function POST(request: NextRequest): Promise<NextResponse> {
+export async function GET(request: NextRequest): Promise<NextResponse> {
   try {
     const verasetApiKey = process.env.VERASET_API_KEY?.trim();
     if (!verasetApiKey) {
@@ -30,10 +33,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const results: Array<{ jobId: string; name: string; before: string; after: string; error?: string }> = [];
 
     // Check each job sequentially to avoid overwhelming Veraset API
+    // Use 6s timeout per job to stay within Vercel's 10s function limit
+    // (we process sequentially, so we can only check ~1 job before timeout)
+    // For bulk refreshes with many jobs, call this endpoint multiple times
     for (const job of nonTerminal) {
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout per job
+        const timeout = setTimeout(() => controller.abort(), 6000); // 6s timeout per job
 
         const res = await fetch(
           `https://platform.prd.veraset.tech/v1/job/${job.jobId}`,

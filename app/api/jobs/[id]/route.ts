@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getJob, updateJob, updateJobStatus } from "@/lib/jobs";
+import { getJob, updateJob } from "@/lib/jobs";
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -24,49 +24,10 @@ export async function GET(
       );
     }
 
-    // Always check Veraset for non-terminal jobs so polling gets fresh status.
-    // Without this, status would never update (polling would return stale S3 data).
-    const isNonTerminal = job.status === 'QUEUED' || job.status === 'RUNNING' || job.status === 'SCHEDULED';
-
-    if (isNonTerminal) {
-      try {
-        const apiKey = process.env.VERASET_API_KEY?.trim();
-
-        if (apiKey) {
-          console.log(`🔄 Checking Veraset status for job ${id} (current: ${job.status})`);
-          const verasetResponse = await fetch(
-            `https://platform.prd.veraset.tech/v1/job/${params.id}`,
-            {
-              cache: 'no-store',
-              headers: {
-                'X-API-Key': apiKey,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
-
-          if (verasetResponse.ok) {
-            const verasetData = await verasetResponse.json();
-            const newStatus = verasetData.status || verasetData.data?.status;
-
-            if (newStatus && newStatus !== job.status) {
-              console.log(`✅ Status changed: ${job.status} -> ${newStatus}`);
-              const updatedJob = await updateJobStatus(
-                id,
-                newStatus as any,
-                verasetData.error_message || verasetData.data?.error_message
-              );
-              return NextResponse.json(updatedJob);
-            }
-          } else {
-            const errorText = await verasetResponse.text();
-            console.warn(`⚠️ Veraset API returned ${verasetResponse.status} for ${id}:`, errorText);
-          }
-        }
-      } catch (verasetError: any) {
-        console.warn(`❌ Failed to check Veraset status for ${id}:`, verasetError.message || verasetError);
-      }
-    }
+    // NOTE: Veraset status checking has been moved to GET /api/jobs/[id]/refresh.
+    // Doing it here caused Vercel serverless 500 errors because the Veraset API call
+    // has no timeout and can exceed Vercel's 10s function limit, killing the process.
+    // The frontend should call /api/jobs/[id]/refresh when status updates are needed.
 
     return NextResponse.json(job);
 

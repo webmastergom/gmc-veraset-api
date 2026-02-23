@@ -33,20 +33,49 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
 
   const fetchStatus = useCallback(async () => {
     if (!isMountedRef.current) return
-    
+
     try {
       setLoading(true)
       setError(null)
       console.log(`🔄 Fetching status for job ${jobId}...`)
-      
-      // GET /api/jobs/[id] always checks Veraset for non-terminal jobs - no need for separate /refresh
+
+      // First get current job data from S3
       const jobStatus = await getJobStatus(jobId)
-      
+
       if (!isMountedRef.current) return
-      
+
+      // If job is non-terminal, also call refresh endpoint to check Veraset and update S3.
+      // GET /api/jobs/[id] only reads from S3 (no Veraset check) to avoid timeouts.
+      const isNonTerminal = jobStatus.status === "QUEUED" || jobStatus.status === "RUNNING" || jobStatus.status === "SCHEDULED"
+
+      if (isNonTerminal) {
+        try {
+          console.log(`🔄 Checking Veraset for non-terminal job ${jobId}...`)
+          const refreshRes = await fetch(`/api/jobs/${jobId}/refresh`, {
+            cache: 'no-store',
+            credentials: 'include',
+          })
+          if (refreshRes.ok) {
+            const refreshData = await refreshRes.json()
+            if (refreshData.job) {
+              // Use the refreshed status
+              jobStatus.status = refreshData.job.status
+              if (refreshData.statusChanged) {
+                console.log(`✅ Status updated via refresh: ${refreshData.oldStatus} -> ${refreshData.newStatus}`)
+              }
+            }
+          }
+        } catch (refreshErr) {
+          // Refresh failed but we still have the S3 status, continue
+          console.warn(`⚠️ Refresh failed for ${jobId}, using cached status`)
+        }
+      }
+
+      if (!isMountedRef.current) return
+
       console.log(`✅ Job ${jobId} status: ${jobStatus.status}`)
       setStatus(jobStatus)
-      
+
       // Stop polling if job is complete
       if (jobStatus.status === "SUCCESS" || jobStatus.status === "FAILED") {
         console.log(`🛑 Job ${jobId} completed, stopping polling`)
@@ -55,16 +84,16 @@ export function JobStatusPolling({ jobId }: { jobId: string }) {
           intervalRef.current = null
         }
       }
-      
+
       // Continue polling for SCHEDULED, QUEUED, or RUNNING
       if (jobStatus.status === "SCHEDULED" || jobStatus.status === "QUEUED" || jobStatus.status === "RUNNING") {
         console.log(`🔄 Job ${jobId} is ${jobStatus.status}, continuing to poll...`)
       }
-      
+
       return jobStatus
     } catch (err) {
       if (!isMountedRef.current) return
-      
+
       console.error(`❌ Error fetching job status for ${jobId}:`, err)
       const errorMessage = err instanceof Error ? err.message : "Failed to fetch job status"
       setError(errorMessage)

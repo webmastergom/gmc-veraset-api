@@ -17,7 +17,6 @@ export function RefreshStatusButton({ jobId }: { jobId: string }) {
     try {
       console.log(`🔄 Manually refreshing status for job ${jobId}...`)
       const response = await fetch(`/api/jobs/${jobId}/refresh`, {
-        method: 'POST',
         cache: 'no-store',
       })
 

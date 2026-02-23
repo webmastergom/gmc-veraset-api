@@ -63,7 +63,6 @@ export function S3StorageSection({
     try {
       // Force refresh from Veraset
       const refreshResponse = await fetch(`/api/jobs/${jobId}/refresh`, {
-        method: 'POST',
         cache: 'no-store',
       })
       
