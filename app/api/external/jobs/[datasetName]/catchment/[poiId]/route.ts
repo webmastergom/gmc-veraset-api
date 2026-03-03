@@ -19,29 +19,27 @@ function reversePoiMapping(poiMapping: Record<string, string>): Record<string, s
 }
 
 /**
- * GET /api/external/jobs/[datasetName]/catchment
- * Catchment analysis: origin of visitors by postal code.
- * Uses OD methodology: first ping of each device-day = origin, reverse geocoded.
+ * GET /api/external/jobs/[datasetName]/catchment/[poiId]
+ * Catchment analysis for a single POI.
  *
- * Optional query param: ?poi_ids=id1,id2 to filter by specific POIs.
- * The datasetName param here is actually a jobId.
+ * datasetName = jobId, poiId = the original POI ID the client sent when creating the job.
  */
 export async function GET(
   request: NextRequest,
-  context: { params: Promise<{ datasetName: string }> }
+  context: { params: Promise<{ datasetName: string; poiId: string }> }
 ): Promise<NextResponse> {
   let jobId: string | undefined;
 
   try {
     const params = await context.params;
     jobId = params.datasetName;
+    const poiId = decodeURIComponent(params.poiId);
 
-    console.log(`[CATCHMENT-OD] GET /api/external/jobs/${jobId}/catchment`);
+    console.log(`[CATCHMENT-POI] GET /api/external/jobs/${jobId}/catchment/${poiId}`);
 
     // 1. Validate API key
     const auth = await validateApiKeyFromRequest(request);
     if (!auth.valid) {
-      console.error(`[CATCHMENT-OD] Unauthorized: ${auth.error}`);
       return NextResponse.json(
         { error: 'Unauthorized', message: auth.error },
         { status: 401 }
@@ -53,7 +51,6 @@ export async function GET(
     try {
       job = await getJob(jobId);
     } catch (error: any) {
-      console.error(`[CATCHMENT-OD] Error fetching job ${jobId}:`, error.message);
       return NextResponse.json(
         { error: 'Internal Server Error', message: 'Failed to fetch job' },
         { status: 500 }
@@ -89,51 +86,30 @@ export async function GET(
     const s3Path = job.s3DestPath.replace('s3://', '').replace(`${BUCKET}/`, '');
     const datasetName = s3Path.split('/').filter(Boolean)[0] || s3Path.replace(/\/$/, '');
 
-    // 3b. Parse optional poi_ids filter
-    const poiIdsParam = request.nextUrl.searchParams.get('poi_ids');
-    let verasetPoiIds: string[] | undefined;
-    let filteredPoiNames: string[] | undefined;
+    // 4. Resolve POI ID to Veraset ID
+    const poiMapping = job.poiMapping || {};
+    const reversedMap = reversePoiMapping(poiMapping);
+    const verasetPoiId = reversedMap[poiId];
 
-    if (poiIdsParam) {
-      const requestedPoiIds = poiIdsParam.split(',').map(id => id.trim()).filter(Boolean);
-      if (requestedPoiIds.length === 0) {
-        return NextResponse.json(
-          { error: 'Invalid poi_ids parameter. Provide comma-separated POI IDs.' },
-          { status: 400 }
-        );
-      }
-
-      const poiMapping = job.poiMapping || {};
-      const reversedMap = reversePoiMapping(poiMapping);
-
-      // Validate all requested POI IDs exist
-      const invalidIds = requestedPoiIds.filter(id => !reversedMap[id]);
-      if (invalidIds.length > 0) {
-        const availableIds = Object.values(poiMapping);
-        return NextResponse.json(
-          {
-            error: 'Invalid POI IDs',
-            message: `POI IDs not found: ${invalidIds.join(', ')}`,
-            available_poi_ids: availableIds,
-          },
-          { status: 400 }
-        );
-      }
-
-      verasetPoiIds = requestedPoiIds.map(id => reversedMap[id]);
-      filteredPoiNames = requestedPoiIds;
-      console.log(`[CATCHMENT-OD] Filtering by POIs: ${requestedPoiIds.join(', ')} → Veraset IDs: ${verasetPoiIds.join(', ')}`);
+    if (!verasetPoiId) {
+      const availableIds = Object.values(poiMapping);
+      return NextResponse.json(
+        {
+          error: 'Invalid POI ID',
+          message: `POI '${poiId}' not found in this job.`,
+          available_poi_ids: availableIds,
+        },
+        { status: 400 }
+      );
     }
 
-    // 4. Check cache (v5 = multi-country GeoJSON, no Nominatim)
+    // 5. Check cache
     const CATCHMENT_VERSION = 'v5';
-    const poiSuffix = verasetPoiIds ? `-pois-${[...verasetPoiIds].sort().join(',')}` : '';
-    const cacheKey = `catchment-${CATCHMENT_VERSION}-${jobId}${poiSuffix}`;
+    const cacheKey = `catchment-${CATCHMENT_VERSION}-${jobId}-poi-${poiId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
       if (cached) {
-        console.log(`[CATCHMENT-OD] Serving cached result for job ${jobId}${poiSuffix}`);
-        logger.log(`Serving cached catchment-od for job ${jobId}${poiSuffix}`);
+        console.log(`[CATCHMENT-POI] Serving cached result for job ${jobId}, poi ${poiId}`);
         return NextResponse.json(cached, {
           status: 200,
           headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' },
@@ -143,17 +119,16 @@ export async function GET(
       // No cache, continue
     }
 
-    // 5. Run OD analysis
-    const filters = verasetPoiIds ? { poiIds: verasetPoiIds } : {};
-    console.log(`[CATCHMENT-OD] Computing origin analysis for job ${jobId}, dataset: ${datasetName}${verasetPoiIds ? `, POI filter: ${verasetPoiIds.join(',')}` : ''}`);
-    logger.log(`Computing catchment-od for job ${jobId}, dataset: ${datasetName}`);
+    // 6. Run analysis filtered to this POI
+    console.log(`[CATCHMENT-POI] Computing for job ${jobId}, dataset: ${datasetName}, poi: ${poiId} (${verasetPoiId})`);
+    logger.log(`Computing catchment for job ${jobId}, poi ${poiId}`);
 
     let res;
     try {
-      res = await analyzeOrigins(datasetName, filters);
+      res = await analyzeOrigins(datasetName, { poiIds: [verasetPoiId] });
     } catch (error: any) {
-      console.error(`[CATCHMENT-OD ERROR] Analysis failed:`, error.message);
-      logger.error(`Catchment-OD analysis failed for job ${jobId}`, { error: error.message });
+      console.error(`[CATCHMENT-POI ERROR] Analysis failed:`, error.message);
+      logger.error(`Catchment-POI analysis failed for job ${jobId}, poi ${poiId}`, { error: error.message });
 
       if (error.message?.includes('Access Denied') ||
           error.message?.includes('AccessDeniedException') ||
@@ -162,7 +137,6 @@ export async function GET(
           {
             error: 'Dataset not accessible',
             message: 'The job data may not be synced yet or AWS permissions are insufficient.',
-            details: error.message,
           },
           { status: 409 }
         );
@@ -170,25 +144,18 @@ export async function GET(
 
       if (error.message?.includes('AWS credentials not configured')) {
         return NextResponse.json(
-          {
-            error: 'Configuration Error',
-            message: 'AWS credentials not configured.',
-          },
+          { error: 'Configuration Error', message: 'AWS credentials not configured.' },
           { status: 503 }
         );
       }
 
       return NextResponse.json(
-        {
-          error: 'Internal Server Error',
-          message: 'Failed to compute catchment analysis',
-          details: error.message,
-        },
+        { error: 'Internal Server Error', message: 'Failed to compute catchment analysis' },
         { status: 500 }
       );
     }
 
-    // 6. Build response — backward compatible with cloud-garritz
+    // 7. Build response
     const zipcodes = res.origins.map((z) => ({
       zipcode: z.zipcode,
       city: z.city,
@@ -202,16 +169,20 @@ export async function GET(
 
     const totalMatched = zipcodes.reduce((s, z) => s + z.devices, 0);
 
-    const response: Record<string, any> = {
+    // Find POI name from job metadata
+    const poiNames = job.poiNames || {};
+    const poiName = poiNames[verasetPoiId] || poiId;
+
+    const response = {
       job_id: jobId,
+      poi: { id: poiId, name: poiName },
       analyzed_at: res.analyzedAt,
-      ...(filteredPoiNames ? { filtered_pois: filteredPoiNames } : {}),
       methodology: {
         approach: 'origin_first_ping',
-        description: 'First GPS ping of each device-day, reverse geocoded to postal code.',
+        description: 'First GPS ping of each device-day, reverse geocoded to postal code. Filtered to visitors of this specific POI.',
       },
       coverage: {
-        totalDevicesVisitedPois: res.totalDevicesVisitedPois,
+        totalDevicesVisitedPoi: res.totalDevicesVisitedPois,
         totalDeviceDays: res.totalDeviceDays,
         devicesMatchedToZipcode: totalMatched,
         coverageRatePercent: res.coverageRatePercent,
@@ -227,12 +198,12 @@ export async function GET(
       zipcodes,
     };
 
-    // 7. Cache result
+    // 8. Cache result
     try {
       await putConfig(cacheKey, response);
-      logger.log(`Cached catchment-od for job ${jobId}`);
+      logger.log(`Cached catchment for job ${jobId}, poi ${poiId}`);
     } catch (err: any) {
-      logger.warn(`Failed to cache catchment-od for job ${jobId}`, { error: err.message });
+      logger.warn(`Failed to cache catchment for job ${jobId}, poi ${poiId}`, { error: err.message });
     }
 
     return NextResponse.json(response, {
@@ -242,14 +213,11 @@ export async function GET(
 
   } catch (error: any) {
     const errorJobId = jobId || 'unknown';
-    console.error(`[CATCHMENT-OD ERROR] GET /api/external/jobs/${errorJobId}/catchment:`, error.message);
-    logger.error(`GET /api/external/jobs/${errorJobId}/catchment error:`, error);
+    console.error(`[CATCHMENT-POI ERROR] GET /api/external/jobs/${errorJobId}/catchment/:poiId:`, error.message);
+    logger.error(`GET /api/external/jobs/${errorJobId}/catchment/:poiId error:`, error);
 
     return NextResponse.json(
-      {
-        error: 'Internal Server Error',
-        message: error.message || 'An unexpected error occurred',
-      },
+      { error: 'Internal Server Error', message: error.message || 'An unexpected error occurred' },
       { status: 500 }
     );
   }

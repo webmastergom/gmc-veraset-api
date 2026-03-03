@@ -10,6 +10,15 @@ export const revalidate = 0;
 export const maxDuration = 300; // 5 minutes for Athena queries + reverse geocoding
 
 /**
+ * Reverse a poiMapping { verasetId: originalId } → { originalId: verasetId }
+ */
+function reversePoiMapping(poiMapping: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(poiMapping).map(([verasetId, originalId]) => [originalId, verasetId])
+  );
+}
+
+/**
  * GET /api/external/jobs/[datasetName]/od
  * Get origin-destination analysis for a job.
  *
@@ -18,6 +27,7 @@ export const maxDuration = 300; // 5 minutes for Athena queries + reverse geocod
  * - Destination = last GPS ping of the day (where they went after)
  * Results are reverse geocoded and aggregated by zipcode.
  *
+ * Optional query param: ?poi_ids=id1,id2 to filter by specific POIs.
  * The datasetName param here is actually a jobId.
  */
 export async function GET(
@@ -91,14 +101,50 @@ export async function GET(
 
     console.log(`[OD] Dataset name extracted: ${datasetName} from path: ${job.s3DestPath}`);
 
+    // 3b. Parse optional poi_ids filter
+    const poiIdsParam = request.nextUrl.searchParams.get('poi_ids');
+    let verasetPoiIds: string[] | undefined;
+    let filteredPoiNames: string[] | undefined;
+
+    if (poiIdsParam) {
+      const requestedPoiIds = poiIdsParam.split(',').map(id => id.trim()).filter(Boolean);
+      if (requestedPoiIds.length === 0) {
+        return NextResponse.json(
+          { error: 'Invalid poi_ids parameter. Provide comma-separated POI IDs.' },
+          { status: 400 }
+        );
+      }
+
+      const poiMapping = job.poiMapping || {};
+      const reversedMap = reversePoiMapping(poiMapping);
+
+      const invalidIds = requestedPoiIds.filter(id => !reversedMap[id]);
+      if (invalidIds.length > 0) {
+        const availableIds = Object.values(poiMapping);
+        return NextResponse.json(
+          {
+            error: 'Invalid POI IDs',
+            message: `POI IDs not found: ${invalidIds.join(', ')}`,
+            available_poi_ids: availableIds,
+          },
+          { status: 400 }
+        );
+      }
+
+      verasetPoiIds = requestedPoiIds.map(id => reversedMap[id]);
+      filteredPoiNames = requestedPoiIds;
+      console.log(`[OD] Filtering by POIs: ${requestedPoiIds.join(', ')} → Veraset IDs: ${verasetPoiIds.join(', ')}`);
+    }
+
     // 4. Check for cached result
     const OD_VERSION = 'v1';
-    const cacheKey = `od-${OD_VERSION}-${jobId}`;
+    const poiSuffix = verasetPoiIds ? `-pois-${[...verasetPoiIds].sort().join(',')}` : '';
+    const cacheKey = `od-${OD_VERSION}-${jobId}${poiSuffix}`;
     try {
       const cached = await getConfig<any>(cacheKey);
       if (cached) {
-        console.log(`[OD] Serving cached result for job ${jobId}`);
-        logger.log(`Serving cached OD analysis for job ${jobId}`);
+        console.log(`[OD] Serving cached result for job ${jobId}${poiSuffix}`);
+        logger.log(`Serving cached OD analysis for job ${jobId}${poiSuffix}`);
         return NextResponse.json(cached, {
           status: 200,
           headers: {
@@ -112,12 +158,13 @@ export async function GET(
     }
 
     // 5. Run OD analysis
-    console.log(`[OD] Computing OD analysis for job ${jobId}, dataset: ${datasetName}`);
+    const filters = verasetPoiIds ? { poiIds: verasetPoiIds } : {};
+    console.log(`[OD] Computing OD analysis for job ${jobId}, dataset: ${datasetName}${verasetPoiIds ? `, POI filter: ${verasetPoiIds.join(',')}` : ''}`);
     logger.log(`Computing OD analysis for job ${jobId}, dataset: ${datasetName}`);
 
     let result;
     try {
-      result = await analyzeOriginDestination(datasetName, {});
+      result = await analyzeOriginDestination(datasetName, filters);
     } catch (error: any) {
       console.error(`[OD ERROR] Analysis failed:`, error.message);
       logger.error(`OD analysis failed for job ${jobId}`, { error: error.message });
@@ -156,9 +203,10 @@ export async function GET(
     }
 
     // 6. Build response
-    const response = {
+    const response: Record<string, any> = {
       job_id: jobId,
       analyzed_at: result.analyzedAt,
+      ...(filteredPoiNames ? { filtered_pois: filteredPoiNames } : {}),
       methodology: result.methodology,
       coverage: result.coverage,
       summary: {
