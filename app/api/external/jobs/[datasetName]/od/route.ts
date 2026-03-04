@@ -137,7 +137,7 @@ export async function GET(
     }
 
     // 4. Check for cached result
-    const OD_VERSION = 'v2';
+    const OD_VERSION = 'v3';
     const poiSuffix = verasetPoiIds ? `-pois-${[...verasetPoiIds].sort().join(',')}` : '';
     const cacheKey = `od-${OD_VERSION}-${jobId}${poiSuffix}`;
     try {

@@ -176,7 +176,10 @@ export async function analyzeOriginDestination(
       ROUND(dest_lng, ${COORDINATE_PRECISION}) as dest_lng,
       COUNT(*) as device_days,
       HOUR(origin_time) as arrival_hour,
-      HOUR(first_poi_visit) as poi_arrival_hour
+      CASE
+        WHEN first_poi_visit > origin_time THEN HOUR(first_poi_visit)
+        ELSE -1
+      END as poi_arrival_hour
     FROM device_day_trips
     WHERE rn = 1
     GROUP BY
@@ -185,7 +188,10 @@ export async function analyzeOriginDestination(
       ROUND(dest_lat, ${COORDINATE_PRECISION}),
       ROUND(dest_lng, ${COORDINATE_PRECISION}),
       HOUR(origin_time),
-      HOUR(first_poi_visit)
+      CASE
+        WHEN first_poi_visit > origin_time THEN HOUR(first_poi_visit)
+        ELSE -1
+      END
     ORDER BY device_days DESC
     LIMIT 100000
   `;
@@ -243,7 +249,7 @@ export async function analyzeOriginDestination(
     const dLng = parseFloat(String(row.dest_lng));
     const deviceDays = parseInt(String(row.device_days)) || 0;
     const hour = parseInt(String(row.arrival_hour)) || 0;
-    const poiArrivalHour = parseInt(String(row.poi_arrival_hour)) || 0;
+    const poiArrivalHour = parseInt(String(row.poi_arrival_hour));
 
     if (isNaN(oLat) || isNaN(oLng) || isNaN(dLat) || isNaN(dLng)) continue;
 
@@ -270,8 +276,11 @@ export async function analyzeOriginDestination(
     // Temporal patterns (first ping of day — residential inference)
     hourMap.set(hour, (hourMap.get(hour) || 0) + deviceDays);
 
-    // POI arrival patterns (first visit to POI)
-    poiArrivalHourMap.set(poiArrivalHour, (poiArrivalHourMap.get(poiArrivalHour) || 0) + deviceDays);
+    // POI arrival patterns — only count true arrivals (device came from elsewhere first)
+    // poi_arrival_hour = -1 means the device was already at the POI at start of day
+    if (!isNaN(poiArrivalHour) && poiArrivalHour >= 0) {
+      poiArrivalHourMap.set(poiArrivalHour, (poiArrivalHourMap.get(poiArrivalHour) || 0) + deviceDays);
+    }
   }
 
   console.log(`[OD] Total device-days: ${totalDeviceDays}`);
