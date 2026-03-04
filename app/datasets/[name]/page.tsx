@@ -30,6 +30,7 @@ import {
   Search,
   MapPinned,
   BarChart3,
+  Zap,
 } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -89,6 +90,7 @@ export default function DatasetAnalysisPage() {
   const [loading, setLoading] = useState(false);
   const [downloadingFull, setDownloadingFull] = useState(false);
   const [downloadingMaids, setDownloadingMaids] = useState(false);
+  const [activating, setActivating] = useState(false);
   const [catchment, setCatchment] = useState<{
     zipcodes: Array<{
       zipcode: string;
@@ -245,6 +247,26 @@ export default function DatasetAnalysisPage() {
       toast({ title: 'Export failed', description: e.message || 'Error downloading MAIDs list', variant: 'destructive' });
     } finally {
       setDownloadingMaids(false);
+    }
+  };
+
+  const handleActivate = async () => {
+    setActivating(true);
+    try {
+      const res = await fetch(`/api/datasets/${datasetName}/activate`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.details || 'Activation failed');
+      toast({
+        title: 'Activation complete',
+        description: `${data.deviceCount.toLocaleString()} MAIDs uploaded to ${data.s3Path}`,
+      });
+    } catch (e: any) {
+      toast({ title: 'Activation failed', description: e.message || 'Error activating devices', variant: 'destructive' });
+    } finally {
+      setActivating(false);
     }
   };
 
@@ -422,6 +444,14 @@ export default function DatasetAnalysisPage() {
               <Download className="mr-2 h-4 w-4" />
             )}
             Download MAIDs list
+          </Button>
+          <Button variant="outline" onClick={handleActivate} disabled={activating} title="Upload MAIDs to S3 activations folder">
+            {activating ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Zap className="mr-2 h-4 w-4" />
+            )}
+            Activate
           </Button>
           <Button variant="outline" onClick={runAudit} disabled={auditLoading} title="Compare with Veraset source; detect asymmetries">
             {auditLoading ? (

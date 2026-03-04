@@ -233,3 +233,73 @@ export async function exportDevices(
     createdAt: new Date().toISOString(),
   };
 }
+
+export interface ActivationResult {
+  success: boolean;
+  deviceCount: number;
+  s3Path: string;
+  folderName: string;
+  createdAt: string;
+}
+
+/**
+ * Sanitize a job name for use as an S3 folder name.
+ */
+function sanitizeFolderName(name: string): string {
+  return name
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-zA-Z0-9\-_]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
+ * Export all MAIDs from a dataset and upload to activations/{jobName}/maids.csv in S3.
+ */
+export async function activateDevices(
+  datasetName: string,
+  jobName: string
+): Promise<ActivationResult> {
+  const tableName = getTableName(datasetName);
+
+  if (!(await tableExists(datasetName))) {
+    await createTableForDataset(datasetName);
+  }
+
+  const sql = `
+    SELECT DISTINCT ad_id
+    FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+  `;
+
+  const result = await runQuery(sql);
+  console.log(`[ACTIVATE] Query returned ${result.rows.length} unique MAIDs for ${datasetName}`);
+
+  const csvContent = 'ad_id\n' + result.rows.map((r) => r.ad_id).join('\n');
+  const folderName = sanitizeFolderName(jobName) || datasetName;
+  const activationKey = `activations/${folderName}/maids.csv`;
+
+  await s3Client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: activationKey,
+    Body: csvContent,
+    ContentType: 'text/csv',
+    Metadata: {
+      'activation-dataset': datasetName,
+      'activation-job-name': jobName,
+      'activation-created': new Date().toISOString(),
+    },
+  }));
+
+  console.log(`[ACTIVATE] Uploaded ${result.rows.length} MAIDs to s3://${BUCKET}/${activationKey}`);
+
+  return {
+    success: true,
+    deviceCount: result.rows.length,
+    s3Path: `s3://${BUCKET}/${activationKey}`,
+    folderName,
+    createdAt: new Date().toISOString(),
+  };
+}
