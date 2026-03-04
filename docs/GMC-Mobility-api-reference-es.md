@@ -48,12 +48,20 @@ while true; do
   sleep 300  # 5 minutos
 done
 
-# 4. Obtener catchment (origenes residenciales)
+# 4. Obtener catchment (origenes residenciales) — global
 curl -s "$BASE_URL/api/external/jobs/$JOB_ID/catchment" \
   -H "X-API-Key: $API_KEY" | jq '.'
 
-# 5. Obtener origen-destino
+# 5. Obtener catchment de un solo POI
+curl -s "$BASE_URL/api/external/jobs/$JOB_ID/catchment/poi_001" \
+  -H "X-API-Key: $API_KEY" | jq '.'
+
+# 6. Obtener origen-destino — global
 curl -s "$BASE_URL/api/external/jobs/$JOB_ID/od" \
+  -H "X-API-Key: $API_KEY" | jq '.'
+
+# 7. Obtener origen-destino de un solo POI
+curl -s "$BASE_URL/api/external/jobs/$JOB_ID/od/poi_001" \
   -H "X-API-Key: $API_KEY" | jq '.'
 ```
 
@@ -101,7 +109,7 @@ while True:
 
     time.sleep(300)  # 5 minutos
 
-# 3. Catchment (origenes residenciales)
+# 3. Catchment global (origenes residenciales)
 catchment = requests.get(
     f"{BASE_URL}/api/external/jobs/{job_id}/catchment",
     headers=HEADERS
@@ -110,7 +118,15 @@ catchment = requests.get(
 for z in catchment["zipcodes"][:5]:
     print(f"  {z['zipcode']} {z['city']}: {z['devices']} dispositivos ({z['percentage']}%)")
 
-# 4. Origen-Destino
+# 4. Catchment de un solo POI
+poi_catchment = requests.get(
+    f"{BASE_URL}/api/external/jobs/{job_id}/catchment/poi_001",
+    headers=HEADERS
+).json()
+
+print(f"POI: {poi_catchment['poi']['name']}, Zipcodes: {poi_catchment['summary']['total_zipcodes']}")
+
+# 5. Origen-Destino global
 od = requests.get(
     f"{BASE_URL}/api/external/jobs/{job_id}/od",
     headers=HEADERS
@@ -118,6 +134,14 @@ od = requests.get(
 
 print(f"Top origen: {od['summary']['top_origin_city']}")
 print(f"Top destino: {od['summary']['top_destination_city']}")
+
+# 6. Origen-Destino de un solo POI
+poi_od = requests.get(
+    f"{BASE_URL}/api/external/jobs/{job_id}/od/poi_001",
+    headers=HEADERS
+).json()
+
+print(f"POI: {poi_od['poi']['name']}, Device-days: {poi_od['summary']['total_device_days']}")
 ```
 
 ### JavaScript (Node.js / fetch)
@@ -162,15 +186,27 @@ const poll = async () => {
 const result = await poll();
 console.log(`Pings: ${result.results.total_pings}, Dispositivos: ${result.results.total_devices}`);
 
-// 3. Catchment
+// 3. Catchment global
 const catchment = await fetch(
   `${BASE_URL}/api/external/jobs/${job.job_id}/catchment`, { headers }
 ).then((r) => r.json());
 
-// 4. Origen-Destino
+// 4. Catchment de un solo POI
+const poiCatchment = await fetch(
+  `${BASE_URL}/api/external/jobs/${job.job_id}/catchment/poi_001`, { headers }
+).then((r) => r.json());
+console.log(`POI: ${poiCatchment.poi.name}, Zipcodes: ${poiCatchment.summary.total_zipcodes}`);
+
+// 5. Origen-Destino global
 const od = await fetch(
   `${BASE_URL}/api/external/jobs/${job.job_id}/od`, { headers }
 ).then((r) => r.json());
+
+// 6. Origen-Destino de un solo POI
+const poiOd = await fetch(
+  `${BASE_URL}/api/external/jobs/${job.job_id}/od/poi_001`, { headers }
+).then((r) => r.json());
+console.log(`POI: ${poiOd.poi.name}, Device-days: ${poiOd.summary.total_device_days}`);
 ```
 
 ---
@@ -445,6 +481,8 @@ Por defecto el catchment incluye visitantes de **todos los POIs** del job. Puede
 
 Si un POI ID no existe en el job, recibes un error 400 con la lista de `available_poi_ids`.
 
+> **Nota tecnica (matching de POI IDs):** Internamente, Veraset asigna IDs propios a los POIs (formato `geo_radius_X`). Los datos Parquet pueden contener el ID original del cliente (ej: `estanco_001`) o el ID de Veraset (ej: `geo_radius_0`). La API busca automaticamente con **ambos formatos** para garantizar resultados correctos independientemente de cual use el dataset.
+
 #### Ejemplos de Peticion
 
 ```bash
@@ -510,6 +548,34 @@ curl -H "X-API-Key: TU_API_KEY" \
 }
 ```
 
+#### Respuesta Per-POI (`/catchment/:poiId`)
+
+Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional con la identidad del POI:
+
+```json
+{
+  "job_id": "abc123xyz",
+  "poi": { "id": "estanco_001", "name": "Estanco Sol" },
+  "analyzed_at": "2026-02-07T13:05:00.000Z",
+  "methodology": { "approach": "origin_first_ping", "description": "..." },
+  "coverage": {
+    "totalDevicesVisitedPoi": 234,
+    "totalDeviceDays": 890,
+    "devicesMatchedToZipcode": 185,
+    "coverageRatePercent": 79.1,
+    "geocodingComplete": true
+  },
+  "summary": {
+    "total_devices_analyzed": 234,
+    "devices_matched_to_zipcode": 185,
+    "total_zipcodes": 42,
+    "top_zipcode": "28001",
+    "top_city": "Madrid"
+  },
+  "zipcodes": [...]
+}
+```
+
 #### Campos Adicionales (cuando se filtra por POI)
 
 | Campo | Presente cuando | Descripcion |
@@ -564,6 +630,8 @@ Misma mecanica que catchment:
 |-------|---------|-------------|
 | Query param | `?poi_ids=estanco_001,estanco_002` | Multiples POIs a la vez |
 | Path param | `/od/estanco_001` | Un solo POI |
+
+> **Nota:** Aplica el mismo matching dual de POI IDs descrito en la seccion de catchment (busca tanto por ID original como por ID de Veraset).
 
 #### Ejemplos de Peticion
 
@@ -623,7 +691,42 @@ curl -H "X-API-Key: TU_API_KEY" \
       "percentOfTotal": 3.87
     }
   ],
-  "temporal_patterns": {}
+  "temporal_patterns": [
+    { "hour": 0, "deviceDays": 120, "percentOfTotal": 1.2 },
+    { "hour": 1, "deviceDays": 85, "percentOfTotal": 0.9 },
+    { "hour": 8, "deviceDays": 2500, "percentOfTotal": 8.1 },
+    { "hour": 9, "deviceDays": 3200, "percentOfTotal": 10.4 },
+    { "hour": 12, "deviceDays": 2800, "percentOfTotal": 9.1 },
+    { "hour": 13, "deviceDays": 3100, "percentOfTotal": 10.1 },
+    { "hour": 17, "deviceDays": 2900, "percentOfTotal": 9.4 },
+    { "hour": 18, "deviceDays": 3400, "percentOfTotal": 11.0 }
+  ]
+}
+```
+
+> **Nota:** `temporal_patterns` contiene una entrada para cada hora del dia (0-23) en la que se observo actividad. Horas sin actividad pueden omitirse del array.
+
+#### Respuesta Per-POI (`/od/:poiId`)
+
+Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional:
+
+```json
+{
+  "job_id": "abc123xyz",
+  "poi": { "id": "estanco_001", "name": "Estanco Sol" },
+  "analyzed_at": "2026-02-07T14:05:00.000Z",
+  "methodology": { "approach": "first_last_ping", "description": "..." },
+  "coverage": { "totalDeviceDays": 890, "originMatchRate": 82.3, "destinationMatchRate": 79.8 },
+  "summary": {
+    "total_device_days": 890,
+    "top_origin_zipcode": "28013",
+    "top_origin_city": "Madrid",
+    "top_destination_zipcode": "28020",
+    "top_destination_city": "Madrid"
+  },
+  "origins": [...],
+  "destinations": [...],
+  "temporal_patterns": [...]
 }
 ```
 
@@ -645,7 +748,15 @@ curl -H "X-API-Key: TU_API_KEY" \
 | `summary.top_destination_city` | Ciudad de destino mas frecuente |
 | `origins[]` | Array de origenes ordenados por frecuencia (misma estructura que catchment zipcodes) |
 | `destinations[]` | Array de destinos ordenados por frecuencia |
-| `temporal_patterns` | Patrones temporales (si estan disponibles) |
+| `temporal_patterns[]` | Patrones de llegada por hora UTC (ver tabla abajo) |
+
+#### Campos de `temporal_patterns[]`
+
+| Campo | Tipo | Descripcion |
+|-------|------|-------------|
+| `hour` | number | Hora del dia UTC (0-23) |
+| `deviceDays` | number | Numero de pares dispositivo-dia con primera visita al POI en esta hora |
+| `percentOfTotal` | number | Porcentaje sobre el total de device-days |
 
 ---
 
@@ -788,10 +899,12 @@ def webhook():
 | HTTP Status | Error | Descripcion | Que hacer |
 |-------------|-------|-------------|-----------|
 | 400 | Validation Error | El body fallo la validacion. El mensaje indica los campos con error. | Revisar el campo `error` — incluye la ruta del campo y el problema especifico. |
+| 400 | Invalid POI ID | El POI ID no existe en el job (para endpoints per-POI). | Revisar el campo `available_poi_ids` en la respuesta para ver los IDs validos. |
 | 401 | Unauthorized | API key faltante o invalida | Verificar que envias `X-API-Key` header o `api_key` query param con una key valida. |
 | 404 | Not Found | Job ID o dataset name no encontrado | Verificar el ID. Usa "Listar Jobs" para ver los disponibles. |
 | 409 | Job Not Ready | Job no completado aun (para catchment/OD) | Esperar a que el status sea `SUCCESS` antes de pedir catchment u OD. |
 | 409 | Not Synced | Job completado pero datos aun transfiriendose | Reintentar en 1-2 minutos. La sincronizacion es automatica. |
+| 409 | Dataset not accessible | Datos del job aun no sincronizados en S3 | Reintentar en unos minutos. Puede indicar problemas de permisos AWS. |
 | 429 | Rate Limited | Demasiadas peticiones en la ventana de 1 minuto | Esperar segun header `Retry-After`. Limite: 100 req/min por ruta. |
 | 429 | Limit Reached | Limite mensual de creacion de jobs alcanzado | Contactar al administrador para aumentar el limite. |
 | 502 | Upstream Error | La llamada a la API de Veraset fallo | Error transitorio. Reintentar despues de unos segundos. |
@@ -808,6 +921,18 @@ Los errores de validacion incluyen detalle por campo:
 }
 ```
 
+### Error de POI ID Invalido (400)
+
+Cuando el POI ID no existe en el job, la respuesta incluye los IDs disponibles:
+
+```json
+{
+  "error": "Invalid POI ID",
+  "message": "POI 'estanco_999' not found in this job.",
+  "available_poi_ids": ["estanco_001", "estanco_002", "estanco_003"]
+}
+```
+
 ---
 
 ## Flujo Tipico de Uso
@@ -816,11 +941,11 @@ Los errores de validacion incluyen detalle por campo:
 Crear                Monitorear               Analizar
 ─────                ──────────               ────────
 
-POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/catchment
-  |                    |        |        |
-  |  job_id            | QUEUED |        ├──> GET /jobs/:id/od
-  |<───────            | RUNNING|        |
-  |                    | (auto- |        └──> GET /jobs/:name/analysis
+POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/catchment          (global)
+  |                    |        |        ├──> GET /jobs/:id/catchment/:poiId   (por POI)
+  |  job_id            | QUEUED |        ├──> GET /jobs/:id/od                 (global)
+  |<───────            | RUNNING|        ├──> GET /jobs/:id/od/:poiId          (por POI)
+  |                    | (auto- |        └──> GET /jobs/:name/analysis         (metricas diarias)
   |  webhook?          |  check)|
   |  ─ ─ ─ ─ ─ ─ ─ ─> |        |
   |                    v        |
@@ -834,8 +959,10 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
 2. **`GET /api/external/jobs/:jobId/status`** — Consultar periodicamente (cada 5 min) hasta que `status = "SUCCESS"`. Alternativamente, registrar un `webhook_url` y esperar la notificacion.
 3. Cuando `status = "SUCCESS"` y `synced = true`:
    - Los **resultados basicos** (pings, dispositivos, resumen por POI) ya estan en la respuesta de status.
-   - **`GET /api/external/jobs/:jobId/catchment`** — Origenes residenciales (de donde vienen los visitantes).
-   - **`GET /api/external/jobs/:jobId/od`** — Origen-destino (de donde vienen y a donde van).
+   - **`GET /api/external/jobs/:jobId/catchment`** — Origenes residenciales de todos los POIs.
+   - **`GET /api/external/jobs/:jobId/catchment/:poiId`** — Origenes residenciales de un POI especifico.
+   - **`GET /api/external/jobs/:jobId/od`** — Origen-destino de todos los POIs.
+   - **`GET /api/external/jobs/:jobId/od/:poiId`** — Origen-destino de un POI especifico.
    - **`GET /api/external/jobs/:datasetName/analysis`** — Metricas diarias y POIs activos.
 
 ### Tiempos Tipicos
@@ -844,10 +971,14 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
 |-----------|---------------|
 | Creacion del job | Instantaneo (< 2s) |
 | Procesamiento del job (QUEUED -> SUCCESS) | 1-4 horas |
-| Primera peticion de catchment | 1-5 minutos |
+| Primera peticion de catchment (global) | 1-5 minutos |
+| Primera peticion de catchment (por POI) | 1-3 minutos |
 | Catchment cacheado (peticiones posteriores) | < 1 segundo |
-| Primera peticion de OD | 1-5 minutos |
+| Primera peticion de OD (global) | 1-5 minutos |
+| Primera peticion de OD (por POI) | 1-3 minutos |
 | OD cacheado (peticiones posteriores) | < 1 segundo |
+| Analisis diario (primera peticion) | 30-90 segundos |
+| Analisis diario cacheado | < 1 segundo |
 
 ### Intervalo de Polling Recomendado
 

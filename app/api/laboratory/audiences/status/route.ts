@@ -217,11 +217,13 @@ export async function GET(request: NextRequest): Promise<Response> {
           const baseUrl = process.env.VERCEL_URL
             ? `https://${process.env.VERCEL_URL}`
             : request.nextUrl.origin;
+          const continueUrl = `${baseUrl}/api/laboratory/audiences/continue`;
+          console.log(`[STATUS] Triggering /continue at ${continueUrl}`);
 
           // Forward the auth cookie so /continue passes middleware
           const cookieHeader = request.headers.get('cookie') || '';
 
-          fetch(`${baseUrl}/api/laboratory/audiences/continue`, {
+          fetch(continueUrl, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -232,9 +234,16 @@ export async function GET(request: NextRequest): Promise<Response> {
               country,
               runId: status.runId,
             }),
-          }).catch(err => {
-            console.error('[STATUS] Failed to trigger /continue:', err);
-          });
+          })
+            .then(async (res) => {
+              if (!res.ok) {
+                const text = await res.text();
+                console.error(`[STATUS] /continue returned ${res.status}:`, text.slice(0, 200));
+              }
+            })
+            .catch(err => {
+              console.error('[STATUS] Failed to trigger /continue:', err.message || err);
+            });
 
           console.log(`[STATUS] Triggered /continue for run ${status.runId}`);
         }

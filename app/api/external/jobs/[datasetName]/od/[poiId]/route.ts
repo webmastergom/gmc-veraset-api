@@ -104,7 +104,7 @@ export async function GET(
     }
 
     // 5. Check cache
-    const OD_VERSION = 'v1';
+    const OD_VERSION = 'v2';
     const cacheKey = `od-${OD_VERSION}-${jobId}-poi-${poiId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
@@ -120,12 +120,17 @@ export async function GET(
     }
 
     // 6. Run OD analysis filtered to this POI
-    console.log(`[OD-POI] Computing for job ${jobId}, dataset: ${datasetName}, poi: ${poiId} (${verasetPoiId})`);
+    // Query with BOTH the Veraset ID (geo_radius_X) and the original client ID (poi_123)
+    // because Parquet data may contain either format in the poi_ids array.
+    const poiIdsToQuery = verasetPoiId !== poiId
+      ? [verasetPoiId, poiId]
+      : [verasetPoiId];
+    console.log(`[OD-POI] Computing for job ${jobId}, dataset: ${datasetName}, poi: ${poiId} (veraset: ${verasetPoiId}), querying: [${poiIdsToQuery.join(', ')}]`);
     logger.log(`Computing OD for job ${jobId}, poi ${poiId}`);
 
     let result;
     try {
-      result = await analyzeOriginDestination(datasetName, { poiIds: [verasetPoiId] });
+      result = await analyzeOriginDestination(datasetName, { poiIds: poiIdsToQuery });
     } catch (error: any) {
       console.error(`[OD-POI ERROR] Analysis failed:`, error.message);
       logger.error(`OD-POI analysis failed for job ${jobId}, poi ${poiId}`, { error: error.message });
