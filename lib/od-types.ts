@@ -64,4 +64,6 @@ export interface ODAnalysisResult {
   origins: ODZipcode[];
   destinations: ODZipcode[];
   temporalPatterns: ODTemporalPattern[];
+  /** Actual POI arrival patterns — hour of first visit to the POI (not first ping of day) */
+  poiArrivalPatterns?: ODTemporalPattern[];
 }

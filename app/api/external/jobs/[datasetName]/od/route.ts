@@ -137,7 +137,7 @@ export async function GET(
     }
 
     // 4. Check for cached result
-    const OD_VERSION = 'v1';
+    const OD_VERSION = 'v2';
     const poiSuffix = verasetPoiIds ? `-pois-${[...verasetPoiIds].sort().join(',')}` : '';
     const cacheKey = `od-${OD_VERSION}-${jobId}${poiSuffix}`;
     try {
@@ -219,6 +219,7 @@ export async function GET(
       origins: result.origins,
       destinations: result.destinations,
       temporal_patterns: result.temporalPatterns,
+      poi_arrival_patterns: result.poiArrivalPatterns || [],
     };
 
     console.log(`[OD] Analysis completed successfully`, {

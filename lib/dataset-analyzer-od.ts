@@ -149,6 +149,7 @@ export async function analyzeOriginDestination(
       SELECT
         p.ad_id,
         p.date,
+        v.first_poi_visit,
         FIRST_VALUE(p.lat) OVER (
           PARTITION BY p.ad_id, p.date ORDER BY p.utc_timestamp ASC
         ) as origin_lat,
@@ -174,7 +175,8 @@ export async function analyzeOriginDestination(
       ROUND(dest_lat, ${COORDINATE_PRECISION}) as dest_lat,
       ROUND(dest_lng, ${COORDINATE_PRECISION}) as dest_lng,
       COUNT(*) as device_days,
-      HOUR(origin_time) as arrival_hour
+      HOUR(origin_time) as arrival_hour,
+      HOUR(first_poi_visit) as poi_arrival_hour
     FROM device_day_trips
     WHERE rn = 1
     GROUP BY
@@ -182,7 +184,8 @@ export async function analyzeOriginDestination(
       ROUND(origin_lng, ${COORDINATE_PRECISION}),
       ROUND(dest_lat, ${COORDINATE_PRECISION}),
       ROUND(dest_lng, ${COORDINATE_PRECISION}),
-      HOUR(origin_time)
+      HOUR(origin_time),
+      HOUR(first_poi_visit)
     ORDER BY device_days DESC
     LIMIT 100000
   `;
@@ -230,6 +233,7 @@ export async function analyzeOriginDestination(
   const originMap = new Map<string, { lat: number; lng: number; deviceDays: number }>();
   const destMap = new Map<string, { lat: number; lng: number; deviceDays: number }>();
   const hourMap = new Map<number, number>();
+  const poiArrivalHourMap = new Map<number, number>();
   let totalDeviceDays = 0;
 
   for (const row of odRes.rows) {
@@ -239,6 +243,7 @@ export async function analyzeOriginDestination(
     const dLng = parseFloat(String(row.dest_lng));
     const deviceDays = parseInt(String(row.device_days)) || 0;
     const hour = parseInt(String(row.arrival_hour)) || 0;
+    const poiArrivalHour = parseInt(String(row.poi_arrival_hour)) || 0;
 
     if (isNaN(oLat) || isNaN(oLng) || isNaN(dLat) || isNaN(dLng)) continue;
 
@@ -262,8 +267,11 @@ export async function analyzeOriginDestination(
       destMap.set(dKey, { lat: dLat, lng: dLng, deviceDays });
     }
 
-    // Temporal patterns
+    // Temporal patterns (first ping of day — residential inference)
     hourMap.set(hour, (hourMap.get(hour) || 0) + deviceDays);
+
+    // POI arrival patterns (first visit to POI)
+    poiArrivalHourMap.set(poiArrivalHour, (poiArrivalHourMap.get(poiArrivalHour) || 0) + deviceDays);
   }
 
   console.log(`[OD] Total device-days: ${totalDeviceDays}`);
@@ -315,11 +323,22 @@ export async function analyzeOriginDestination(
     source: z.source,
   }));
 
-  // Build temporal patterns (24 hours)
+  // Build temporal patterns (24 hours) — first ping of day (residential inference)
   const temporalPatterns: ODTemporalPattern[] = [];
   for (let h = 0; h < 24; h++) {
     const dd = hourMap.get(h) || 0;
     temporalPatterns.push({
+      hour: h,
+      deviceDays: dd,
+      percentOfTotal: totalDeviceDays > 0 ? Math.round((dd / totalDeviceDays) * 10000) / 100 : 0,
+    });
+  }
+
+  // Build POI arrival patterns (24 hours) — actual first visit to POI
+  const poiArrivalPatterns: ODTemporalPattern[] = [];
+  for (let h = 0; h < 24; h++) {
+    const dd = poiArrivalHourMap.get(h) || 0;
+    poiArrivalPatterns.push({
       hour: h,
       deviceDays: dd,
       percentOfTotal: totalDeviceDays > 0 ? Math.round((dd / totalDeviceDays) * 10000) / 100 : 0,
@@ -375,6 +394,7 @@ export async function analyzeOriginDestination(
     origins,
     destinations,
     temporalPatterns,
+    poiArrivalPatterns,
   };
 }
 
@@ -603,6 +623,11 @@ function buildEmptyResult(datasetName: string, filters: ODFilters): ODAnalysisRe
     origins: [],
     destinations: [],
     temporalPatterns: Array.from({ length: 24 }, (_, h) => ({
+      hour: h,
+      deviceDays: 0,
+      percentOfTotal: 0,
+    })),
+    poiArrivalPatterns: Array.from({ length: 24 }, (_, h) => ({
       hour: h,
       deviceDays: 0,
       percentOfTotal: 0,
