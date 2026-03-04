@@ -176,7 +176,10 @@ export async function analyzeOriginDestination(
       ROUND(dest_lng, ${COORDINATE_PRECISION}) as dest_lng,
       COUNT(*) as device_days,
       HOUR(origin_time) as arrival_hour,
-      HOUR(first_poi_visit) as poi_arrival_hour
+      CASE
+        WHEN first_poi_visit > origin_time THEN HOUR(first_poi_visit)
+        ELSE -1
+      END as poi_arrival_hour
     FROM device_day_trips
     WHERE rn = 1
     GROUP BY
@@ -185,7 +188,10 @@ export async function analyzeOriginDestination(
       ROUND(dest_lat, ${COORDINATE_PRECISION}),
       ROUND(dest_lng, ${COORDINATE_PRECISION}),
       HOUR(origin_time),
-      HOUR(first_poi_visit)
+      CASE
+        WHEN first_poi_visit > origin_time THEN HOUR(first_poi_visit)
+        ELSE -1
+      END
     ORDER BY device_days DESC
     LIMIT 100000
   `;
@@ -270,8 +276,9 @@ export async function analyzeOriginDestination(
     // Temporal patterns (first ping of day — residential inference)
     hourMap.set(hour, (hourMap.get(hour) || 0) + deviceDays);
 
-    // POI arrival patterns — first time device appeared at the POI each day
-    if (!isNaN(poiArrivalHour)) {
+    // POI arrival patterns — only count true arrivals (device started day elsewhere, then came to POI)
+    // poi_arrival_hour = -1 means the device's first daily ping was already at the POI (likely a resident)
+    if (!isNaN(poiArrivalHour) && poiArrivalHour >= 0) {
       poiArrivalHourMap.set(poiArrivalHour, (poiArrivalHourMap.get(poiArrivalHour) || 0) + deviceDays);
     }
   }

@@ -104,7 +104,7 @@ export async function GET(
     }
 
     // 5. Check cache
-    const OD_VERSION = 'v5';
+    const OD_VERSION = 'v6';
     const cacheKey = `od-${OD_VERSION}-${jobId}-poi-${poiId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
