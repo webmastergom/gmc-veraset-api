@@ -205,12 +205,28 @@ export async function analyzeOriginDestination(
       ${dateWhere} ${poiFilter}
   `;
 
-  let odRes, totalRes;
+  // POI activity by hour — counts ALL pings at the POI grouped by hour of day
+  // This answers "when is this POI busy?" regardless of where devices came from
+  const poiActivityQuery = `
+    SELECT
+      HOUR(utc_timestamp) as touch_hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      ${dateWhere} ${poiFilter}
+    GROUP BY HOUR(utc_timestamp)
+    ORDER BY touch_hour
+  `;
+
+  let odRes, totalRes, activityRes;
   try {
-    console.log(`[OD] Executing OD + total queries in parallel...`);
-    [odRes, totalRes] = await Promise.all([
+    console.log(`[OD] Executing OD + total + activity queries in parallel...`);
+    [odRes, totalRes, activityRes] = await Promise.all([
       runQuery(odQuery),
       runQuery(totalQuery),
+      runQuery(poiActivityQuery),
     ]);
   } catch (error: any) {
     const errorMsg = error.message || String(error);
@@ -354,6 +370,21 @@ export async function analyzeOriginDestination(
     });
   }
 
+  // Build POI activity by hour (all pings at the POI) — shows when POI is busy
+  const poiActivityByHour: ODTemporalPattern[] = [];
+  const totalPoiPings = activityRes.rows.reduce(
+    (sum: number, r: any) => sum + (parseInt(String(r.pings)) || 0), 0
+  );
+  for (let h = 0; h < 24; h++) {
+    const row = activityRes.rows.find((r: any) => parseInt(String(r.touch_hour)) === h);
+    const pings = row ? parseInt(String(row.pings)) || 0 : 0;
+    poiActivityByHour.push({
+      hour: h,
+      deviceDays: pings, // using pings count (reusing field name for simplicity)
+      percentOfTotal: totalPoiPings > 0 ? Math.round((pings / totalPoiPings) * 10000) / 100 : 0,
+    });
+  }
+
   const devicesWithOrigin = originAgg.zipcodes.reduce((s, z) => s + z.devices, 0);
   const devicesWithDest = destAgg.zipcodes.reduce((s, z) => s + z.devices, 0);
   const geocodingComplete = originAgg.nominatimTruncated === 0 && destAgg.nominatimTruncated === 0;
@@ -404,6 +435,7 @@ export async function analyzeOriginDestination(
     destinations,
     temporalPatterns,
     poiArrivalPatterns,
+    poiActivityByHour,
   };
 }
 
@@ -637,6 +669,11 @@ function buildEmptyResult(datasetName: string, filters: ODFilters): ODAnalysisRe
       percentOfTotal: 0,
     })),
     poiArrivalPatterns: Array.from({ length: 24 }, (_, h) => ({
+      hour: h,
+      deviceDays: 0,
+      percentOfTotal: 0,
+    })),
+    poiActivityByHour: Array.from({ length: 24 }, (_, h) => ({
       hour: h,
       deviceDays: 0,
       percentOfTotal: 0,

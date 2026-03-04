@@ -104,7 +104,7 @@ export async function GET(
     }
 
     // 5. Check cache
-    const OD_VERSION = 'v6';
+    const OD_VERSION = 'v7';
     const cacheKey = `od-${OD_VERSION}-${jobId}-poi-${poiId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
@@ -181,6 +181,7 @@ export async function GET(
       destinations: result.destinations,
       temporal_patterns: result.temporalPatterns,
       poi_arrival_patterns: result.poiArrivalPatterns || [],
+      poi_activity_by_hour: result.poiActivityByHour || [],
     };
 
     console.log(`[OD-POI] Analysis completed for poi ${poiId}`, {

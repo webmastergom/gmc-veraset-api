@@ -66,4 +66,6 @@ export interface ODAnalysisResult {
   temporalPatterns: ODTemporalPattern[];
   /** Actual POI arrival patterns — hour of first visit to the POI (not first ping of day) */
   poiArrivalPatterns?: ODTemporalPattern[];
+  /** POI activity distribution by hour — counts all pings at the POI grouped by hour */
+  poiActivityByHour?: ODTemporalPattern[];
 }
