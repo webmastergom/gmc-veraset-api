@@ -1,15 +1,13 @@
 /**
  * Postal Code → MAID lookup.
  *
- * Strategy:
- * 1. Get ALL devices in the dataset with their first ping per day (origin)
- * 2. Reverse geocode each origin coordinate to a postal code
- * 3. Filter: keep only devices whose origin postal code is in the requested set
- * 4. Return the list of matching ad_ids with counts
- *
- * This reuses the same methodology as catchment analysis (first-ping-of-day)
- * but inverts the query: instead of "which zipcodes do visitors come from?",
- * it answers "which devices live in these zipcodes?".
+ * Strategy (mirrors catchment / analyzeOrigins exactly):
+ * 1. Find POI visitors (devices with at least one poi_id ping)
+ * 2. Get ALL pings for those visitors, filter by accuracy
+ * 3. First ping per device-day = origin (same as catchment)
+ * 4. Reverse geocode each origin coordinate to a postal code
+ * 5. Filter: keep only devices whose origin postal code is in the requested set
+ * 6. Return the list of matching ad_ids with counts
  */
 
 import { runQuery, createTableForDataset, tableExists, getTableName } from './athena';
@@ -91,23 +89,42 @@ export async function analyzePostalMaid(
   if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
-  // Query: get first ping per device-day for ALL devices in the dataset
-  // We get ad_id-level granularity (not aggregated by coordinate) so we can
-  // link each device back to its postal code
+  // Query: mirrors catchment (analyzeOrigins) exactly.
+  // 1. poi_visitors: only devices that visited at least one POI
+  // 2. valid_pings: all pings for those visitors (not just POI pings)
+  // 3. first_pings: first ping per device-day (MIN_BY timestamp)
+  // 4. Group by ad_id + rounded coordinate to preserve device identity
   const originsQuery = `
     WITH
+    poi_visitors AS (
+      SELECT DISTINCT ad_id
+      FROM ${tableName}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${dateWhere}
+    ),
+    valid_pings AS (
+      SELECT
+        t.ad_id,
+        t.date,
+        t.utc_timestamp,
+        TRY_CAST(t.latitude AS DOUBLE) as lat,
+        TRY_CAST(t.longitude AS DOUBLE) as lng
+      FROM ${tableName} t
+      INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
+      WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+        ${dateWhere}
+    ),
     first_pings AS (
       SELECT
         ad_id,
         date,
-        MIN_BY(TRY_CAST(latitude AS DOUBLE), utc_timestamp) as origin_lat,
-        MIN_BY(TRY_CAST(longitude AS DOUBLE), utc_timestamp) as origin_lng
-      FROM ${tableName}
-      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
-        ${dateWhere}
+        MIN_BY(lat, utc_timestamp) as origin_lat,
+        MIN_BY(lng, utc_timestamp) as origin_lng
+      FROM valid_pings
       GROUP BY ad_id, date
     )
     SELECT
@@ -121,10 +138,13 @@ export async function analyzePostalMaid(
     ORDER BY device_days DESC
   `;
 
+  // Total devices query — same as catchment: only POI visitors
   const totalQuery = `
     SELECT COUNT(DISTINCT ad_id) as total_devices
     FROM ${tableName}
-    WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
       ${dateWhere}
   `;
 

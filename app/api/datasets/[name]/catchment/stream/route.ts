@@ -54,6 +54,12 @@ export async function GET(
         try { controller.close(); } catch { /* already closed */ }
       });
 
+      // Keepalive: send SSE comment every 15s to prevent connection idle timeout
+      const keepalive = setInterval(() => {
+        if (aborted) return;
+        try { controller.enqueue(encoder.encode(': keepalive\n\n')); } catch { /* closed */ }
+      }, 15_000);
+
       try {
         const result = await analyzeOrigins(datasetName, filters, (progress) => {
           if (aborted) return;
@@ -112,6 +118,8 @@ export async function GET(
           });
         }
       } finally {
+        clearInterval(keepalive);
+        await new Promise(resolve => setTimeout(resolve, 200));
         try { controller.close(); } catch { /* already closed */ }
       }
     },

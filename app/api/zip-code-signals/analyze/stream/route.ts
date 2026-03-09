@@ -70,6 +70,12 @@ export async function POST(request: NextRequest): Promise<Response> {
         try { controller.close(); } catch { /* already closed */ }
       });
 
+      // Keepalive: send SSE comment every 15s to prevent connection idle timeout
+      const keepalive = setInterval(() => {
+        if (aborted) return;
+        try { controller.enqueue(encoder.encode(': keepalive\n\n')); } catch { /* closed */ }
+      }, 15_000);
+
       try {
         const result = await analyzePostalMaid(body.datasetName, filters, (progress) => {
           if (aborted) return;
@@ -92,7 +98,8 @@ export async function POST(request: NextRequest): Promise<Response> {
           });
         }
       } finally {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        clearInterval(keepalive);
+        await new Promise(resolve => setTimeout(resolve, 200));
         try { controller.close(); } catch { /* already closed */ }
       }
     },
