@@ -15,6 +15,7 @@ import {
   FlaskConical,
   Users,
   MapPinned,
+  Settings,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -29,6 +30,7 @@ const navigation = [
   { name: 'Zip Code Signals', href: '/zip-code-signals', icon: MapPinned },
   { name: 'Audit', href: '/audit', icon: ShieldCheck },
   { name: 'API Keys', href: '/api-keys', icon: Key },
+  { name: 'Settings', href: '/settings', icon: Settings },
 ]
 
 export function Sidebar() {

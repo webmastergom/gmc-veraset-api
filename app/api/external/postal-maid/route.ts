@@ -76,9 +76,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     // 3. Resolve dataset from country config
     const countryUpper = country.toUpperCase();
-    const entry = getDatasetForCountry(countryUpper);
+    const entry = await getDatasetForCountry(countryUpper);
     if (!entry) {
-      const available = getConfiguredCountries();
+      const available = await getConfiguredCountries();
       return NextResponse.json(
         {
           error: 'Country not configured',

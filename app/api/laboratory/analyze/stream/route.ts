@@ -67,7 +67,11 @@ export async function POST(request: NextRequest): Promise<Response> {
         });
 
         if (aborted) return;
-        send('result', result as unknown as Record<string, unknown>);
+
+        // Send result directly (NOT via send()) so serialization errors propagate
+        const payload = JSON.stringify(result);
+        console.log(`[LAB-STREAM] Result payload size: ${payload.length} chars, devices: ${result.segment?.totalDevices ?? 0}`);
+        controller.enqueue(encoder.encode(`event: result\ndata: ${payload}\n\n`));
       } catch (error: any) {
         if (!aborted) {
           send('progress', {

@@ -164,6 +164,88 @@ curl -X GET "https://your-domain.com/api/external/jobs/spain-nicotine-full-jan/a
 
 ---
 
+### 3. Postal Code → MAID Lookup (by Country)
+
+Look up mobile advertising IDs (MAIDs) whose residential origin falls within the given postal codes. The dataset is resolved automatically from the country code (configured in Settings).
+
+**Endpoint**: `POST /api/external/postal-maid`
+
+**Authentication**: Required
+
+**Request Body**:
+```json
+{
+  "postal_codes": ["28001", "28002", "28003"],
+  "country": "ES",
+  "date_from": "2026-01-01",
+  "date_to": "2026-01-31"
+}
+```
+
+**Request Fields**:
+- `postal_codes` (array, required): Array of postal code strings to look up
+- `country` (string, required): 2-letter ISO country code (e.g. "ES", "FR", "MX")
+- `date_from` (string, optional): Start date filter (YYYY-MM-DD)
+- `date_to` (string, optional): End date filter (YYYY-MM-DD)
+
+**Response**: Gzip-compressed text file with one MAID per line.
+
+**Response Headers**:
+- `Content-Type: application/gzip`
+- `Content-Disposition: attachment; filename="postal-maid-ES-28001-28002-20260309.txt.gz"`
+- `X-Total-Maids`: Number of MAIDs in the file (e.g. `14523`)
+- `X-Cache`: `HIT` if served from cache, `MISS` if freshly computed
+
+**Error Responses**:
+- `400`: Invalid postal codes or country format
+- `401`: Invalid API key
+- `404`: Country not yet configured — includes `available_countries` array
+- `500`: Internal error
+
+**Example Request**:
+```bash
+curl -X POST "https://your-domain.com/api/external/postal-maid" \
+  -H "X-API-Key: your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"postal_codes": ["28001", "28002"], "country": "ES"}' \
+  --output maids.txt.gz
+
+# Decompress and inspect
+gunzip maids.txt.gz
+wc -l maids.txt      # number of MAIDs
+head maids.txt        # preview first MAIDs
+```
+
+**Python Example**:
+```python
+import requests
+import gzip
+
+response = requests.post(
+    f"{API_BASE_URL}/postal-maid",
+    headers=headers,
+    json={
+        "postal_codes": ["28001", "28002"],
+        "country": "ES"
+    }
+)
+
+if response.status_code == 200:
+    total = response.headers.get("X-Total-Maids", "?")
+    print(f"Got {total} MAIDs")
+
+    maids = gzip.decompress(response.content).decode().strip().split("\n")
+    print(f"First 5: {maids[:5]}")
+
+    with open("maids.txt.gz", "wb") as f:
+        f.write(response.content)
+elif response.status_code == 404:
+    data = response.json()
+    print(f"Country not configured. Available: {data['available_countries']}")
+```
+
+---
+
 ## Error Responses
 
 All endpoints return standard HTTP status codes. Error responses follow this format:

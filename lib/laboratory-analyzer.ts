@@ -190,6 +190,7 @@ export function buildSpatialJoinQueries(
     FROM visits v
     WHERE v.dwell_minutes >= 0
     ORDER BY v.ad_id, v.date, v.visit_start
+    LIMIT 500000
   `;
 
   // CTAS-compatible version: no ORDER BY (not supported in CTAS), no NULL origin columns
@@ -550,7 +551,7 @@ export async function geocodeOrigins(
     const result = geocoded[i];
     const point = geocodePoints[i];
     const key = `${point.lat},${point.lng}`;
-    if (result.type === 'geojson_local') {
+    if (result.type === 'geojson_local' || result.type === 'nominatim_match') {
       coordToZip.set(key, {
         zipcode: result.postcode,
         city: result.city,

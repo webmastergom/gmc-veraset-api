@@ -1,10 +1,11 @@
 /**
  * Country → default dataset mapping for external postal-maid API.
  *
- * The team populates this manually as datasets become available per country.
- * The dataset name must match the S3 prefix that getTableName() converts
- * to an Athena table.
+ * Reads from S3 config (managed via Settings UI) with a local fallback.
+ * The team manages this via /settings in the UI.
  */
+
+import { getConfig } from './s3-config';
 
 export interface CountryDatasetEntry {
   /** S3/Athena dataset name (same string passed to analyzePostalMaid) */
@@ -13,22 +14,21 @@ export interface CountryDatasetEntry {
   label: string;
 }
 
-/**
- * Map of ISO 3166-1 alpha-2 country code → dataset entry.
- * Add entries here as datasets are onboarded per country.
- */
-export const COUNTRY_DATASETS: Record<string, CountryDatasetEntry> = {
-  // ES: { dataset: 'Spain-Cities-Pois-March-2026', label: 'Spain' },
-  // FR: { dataset: 'France-90pct-March-2026', label: 'France' },
-  // MX: { dataset: 'Mexico-Cities-Pois-March-2026', label: 'Mexico' },
-};
+interface CountryDatasetConfig {
+  entries: Record<string, CountryDatasetEntry>;
+  updatedAt: string;
+}
+
+const CONFIG_KEY = 'country-dataset-config';
 
 /** Look up the dataset for a country code. Returns undefined if not configured. */
-export function getDatasetForCountry(country: string): CountryDatasetEntry | undefined {
-  return COUNTRY_DATASETS[country.toUpperCase()];
+export async function getDatasetForCountry(country: string): Promise<CountryDatasetEntry | undefined> {
+  const config = await getConfig<CountryDatasetConfig>(CONFIG_KEY);
+  return config?.entries?.[country.toUpperCase()];
 }
 
 /** All currently configured country codes (sorted). */
-export function getConfiguredCountries(): string[] {
-  return Object.keys(COUNTRY_DATASETS).sort();
+export async function getConfiguredCountries(): Promise<string[]> {
+  const config = await getConfig<CountryDatasetConfig>(CONFIG_KEY);
+  return config?.entries ? Object.keys(config.entries).sort() : [];
 }
