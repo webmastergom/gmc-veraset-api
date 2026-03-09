@@ -329,6 +329,53 @@ export async function fetchQueryResults(queryId: string): Promise<QueryResult> {
   return { columns, rows: allDataRows };
 }
 
+/**
+ * Start an Athena query and wait for it to complete.
+ * Returns the queryId and output location WITHOUT fetching rows.
+ * Use this when the Athena result CSV itself is the desired output
+ * (e.g., copy it via S3 instead of loading millions of rows into memory).
+ */
+export async function startQueryAndWait(sql: string): Promise<{
+  queryId: string;
+  outputCsvKey: string;
+}> {
+  const queryId = await startQueryAsync(sql);
+
+  // Poll for completion (same logic as runQuery)
+  let state: QueryExecutionState = 'QUEUED';
+  let attempts = 0;
+  const maxAttempts = 1800; // 15 minutes max
+
+  while ((state === 'QUEUED' || state === 'RUNNING') && attempts < maxAttempts) {
+    await new Promise(r => setTimeout(r, 500));
+    attempts++;
+
+    const status = await checkQueryStatus(queryId);
+    state = status.state as QueryExecutionState;
+
+    if (attempts % 20 === 0) {
+      console.log(`   ⏳ Query ${queryId}: ${state} (${Math.floor(attempts * 0.5)}s elapsed)`);
+    }
+
+    if (state === 'FAILED') {
+      throw new Error(`Athena query failed: ${status.error}`);
+    }
+    if (state === 'CANCELLED') {
+      throw new Error('Athena query was cancelled');
+    }
+  }
+
+  if (state !== 'SUCCEEDED') {
+    throw new Error(`Query ${queryId} did not complete within ${Math.floor(attempts * 0.5)}s`);
+  }
+
+  console.log(`✅ Query ${queryId} completed (${Math.floor(attempts * 0.5)}s)`);
+
+  // Athena writes results to: {OUTPUT_LOCATION}{queryId}.csv
+  const outputCsvKey = `athena-results/${queryId}.csv`;
+  return { queryId, outputCsvKey };
+}
+
 // ── CTAS (Create Table As Select) Functions ──────────────────────────────
 
 /**

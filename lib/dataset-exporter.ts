@@ -2,8 +2,8 @@
  * Dataset export using AWS Athena
  */
 
-import { runQuery, createTableForDataset, tableExists, getTableName } from './athena';
-import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { runQuery, createTableForDataset, tableExists, getTableName, startQueryAndWait } from './athena';
+import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from './s3-config';
 
 const EXPORT_MAX_ROWS = 500000;
@@ -255,7 +255,14 @@ function sanitizeFolderName(name: string): string {
 }
 
 /**
- * Export all MAIDs from a dataset and upload to activations/{jobName}/maids.csv in S3.
+ * Export all MAIDs from a dataset to staging/activations/{folderName}/maids.csv.
+ *
+ * Instead of loading millions of rows into memory, this:
+ * 1. Runs a COUNT query for the device count (returns 1 row).
+ * 2. Runs a SELECT DISTINCT query and waits for Athena to finish.
+ * 3. Copies the Athena result CSV directly to the activations folder via S3 CopyObject.
+ *
+ * This works for datasets of any size without OOM or timeout issues.
  */
 export async function activateDevices(
   datasetName: string,
@@ -267,37 +274,39 @@ export async function activateDevices(
     await createTableForDataset(datasetName);
   }
 
-  const sql = `
-    SELECT DISTINCT ad_id
-    FROM ${tableName}
-    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-    WHERE poi_id IS NOT NULL AND poi_id != ''
-  `;
+  // 1. Get device count (1 row result, fast)
+  const countSql = `SELECT COUNT(DISTINCT ad_id) as cnt FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
+  const countResult = await runQuery(countSql);
+  const deviceCount = parseInt(String(countResult.rows[0]?.cnt)) || 0;
+  console.log(`[ACTIVATE] ${datasetName}: ${deviceCount} distinct MAIDs`);
 
-  const result = await runQuery(sql);
-  console.log(`[ACTIVATE] Query returned ${result.rows.length} unique MAIDs for ${datasetName}`);
+  // 2. Run the DISTINCT query — wait for completion but don't fetch rows
+  const distinctSql = `SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
+  const { outputCsvKey } = await startQueryAndWait(distinctSql);
 
-  const csvContent = 'ad_id\n' + result.rows.map((r) => r.ad_id).join('\n');
+  // 3. Copy the Athena result CSV directly to the activations folder
   const folderName = sanitizeFolderName(jobName) || datasetName;
-  const activationKey = `activations/${folderName}/maids.csv`;
+  const activationKey = `staging/activations/${folderName}/maids.csv`;
 
-  await s3Client.send(new PutObjectCommand({
+  await s3Client.send(new CopyObjectCommand({
     Bucket: BUCKET,
+    CopySource: `${BUCKET}/${outputCsvKey}`,
     Key: activationKey,
-    Body: csvContent,
     ContentType: 'text/csv',
+    MetadataDirective: 'REPLACE',
     Metadata: {
       'activation-dataset': datasetName,
       'activation-job-name': jobName,
+      'activation-maid-count': String(deviceCount),
       'activation-created': new Date().toISOString(),
     },
   }));
 
-  console.log(`[ACTIVATE] Uploaded ${result.rows.length} MAIDs to s3://${BUCKET}/${activationKey}`);
+  console.log(`[ACTIVATE] Copied ${deviceCount} MAIDs to s3://${BUCKET}/${activationKey}`);
 
   return {
     success: true,
-    deviceCount: result.rows.length,
+    deviceCount,
     s3Path: `s3://${BUCKET}/${activationKey}`,
     folderName,
     createdAt: new Date().toISOString(),
