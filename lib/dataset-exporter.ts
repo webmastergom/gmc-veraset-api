@@ -289,19 +289,11 @@ export async function activateDevices(
   const csvKey = `staging/${handle}.csv`;
   const specKey = `staging/${handle}.csv.spec.yml`;
 
-  // Upload data file first
+  // Upload data file first (simple copy, no metadata to avoid signature issues)
   await s3Client.send(new CopyObjectCommand({
     Bucket: BUCKET,
     CopySource: `${BUCKET}/${outputCsvKey}`,
     Key: csvKey,
-    ContentType: 'text/csv',
-    MetadataDirective: 'REPLACE',
-    Metadata: {
-      'activation-dataset': datasetName,
-      'activation-job-name': jobName,
-      'activation-maid-count': String(deviceCount),
-      'activation-created': new Date().toISOString(),
-    },
   }));
 
   // Upload spec file (triggers Karlsgate processing — must go after data file)
