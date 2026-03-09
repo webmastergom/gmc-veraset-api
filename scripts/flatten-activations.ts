@@ -1,19 +1,23 @@
 /**
- * One-time migration: flatten activation folders.
+ * One-time migration: move activation CSVs to staging/ for Karlsgate.
  *
- * Before: staging/activations/{name}/maids.csv
- * After:  staging/activations/{name}.csv
+ * Before: staging/activations/{name}.csv
+ * After:  staging/{name}.csv + staging/{name}.csv.spec.yml
+ *
+ * The Karlsgate node watches staging/ for paired .csv + .spec.yml files.
  *
  * Usage: npx tsx scripts/flatten-activations.ts
  */
 
-import { S3Client, ListObjectsV2Command, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, ListObjectsV2Command, CopyObjectCommand, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
 const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 const REGION = process.env.AWS_REGION || 'us-west-2';
 const PREFIX = 'staging/activations/';
 
 const s3 = new S3Client({ region: REGION });
+
+const SPEC_CONTENT = 'identifiers:\n  - "*"\nattributes:\n  - "*"\n';
 
 async function main() {
   console.log(`Listing objects in s3://${BUCKET}/${PREFIX}...`);
@@ -27,33 +31,44 @@ async function main() {
   const keys = (res.Contents || []).map(o => o.Key!).filter(Boolean);
   console.log(`Found ${keys.length} objects total.`);
 
-  // Find keys that match the old pattern: staging/activations/{folder}/maids.csv
-  const oldPattern = keys.filter(k => k.endsWith('/maids.csv') && k.startsWith(PREFIX));
+  // Find .csv files in staging/activations/
+  const csvFiles = keys.filter(k => k.endsWith('.csv'));
 
-  if (oldPattern.length === 0) {
-    console.log('No folders to flatten. All good!');
+  if (csvFiles.length === 0) {
+    console.log('No CSV files to migrate.');
     return;
   }
 
-  console.log(`\nFound ${oldPattern.length} folder(s) to flatten:\n`);
+  console.log(`\nMigrating ${csvFiles.length} activation file(s) to staging/:\n`);
 
-  for (const oldKey of oldPattern) {
-    // Extract folder name: staging/activations/{folderName}/maids.csv → folderName
-    const relativePath = oldKey.slice(PREFIX.length); // "{folderName}/maids.csv"
-    const folderName = relativePath.split('/')[0];
-    const newKey = `${PREFIX}${folderName}.csv`;
+  for (const oldKey of csvFiles) {
+    // Extract handle: staging/activations/{name}.csv → {name}
+    const handle = oldKey.slice(PREFIX.length).replace(/\.csv$/, '');
+    if (!handle) continue;
+
+    const newCsvKey = `staging/${handle}.csv`;
+    const newSpecKey = `staging/${handle}.csv.spec.yml`;
 
     console.log(`  ${oldKey}`);
-    console.log(`  → ${newKey}`);
+    console.log(`  → ${newCsvKey}`);
+    console.log(`  → ${newSpecKey}`);
 
-    // Copy to flat path
+    // Copy CSV to staging/
     await s3.send(new CopyObjectCommand({
       Bucket: BUCKET,
       CopySource: `${BUCKET}/${oldKey}`,
-      Key: newKey,
+      Key: newCsvKey,
     }));
 
-    // Delete the old nested file
+    // Create spec file
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: newSpecKey,
+      Body: SPEC_CONTENT,
+      ContentType: 'text/yaml',
+    }));
+
+    // Delete old file
     await s3.send(new DeleteObjectCommand({
       Bucket: BUCKET,
       Key: oldKey,
@@ -62,7 +77,7 @@ async function main() {
     console.log(`  ✓ done\n`);
   }
 
-  console.log(`Flattened ${oldPattern.length} activation file(s).`);
+  console.log(`Migrated ${csvFiles.length} activation file(s) to staging/.`);
 }
 
 main().catch(err => {

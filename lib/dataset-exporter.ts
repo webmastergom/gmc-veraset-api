@@ -284,14 +284,16 @@ export async function activateDevices(
   const distinctSql = `SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
   const { outputCsvKey } = await startQueryAndWait(distinctSql);
 
-  // 3. Copy the Athena result CSV directly to the activations folder
-  const folderName = sanitizeFolderName(jobName) || datasetName;
-  const activationKey = `staging/activations/${folderName}.csv`;
+  // 3. Copy the Athena result CSV to staging/ (Karlsgate node watches this folder)
+  const handle = sanitizeFolderName(jobName) || datasetName;
+  const csvKey = `staging/${handle}.csv`;
+  const specKey = `staging/${handle}.csv.spec.yml`;
 
+  // Upload data file first
   await s3Client.send(new CopyObjectCommand({
     Bucket: BUCKET,
     CopySource: `${BUCKET}/${outputCsvKey}`,
-    Key: activationKey,
+    Key: csvKey,
     ContentType: 'text/csv',
     MetadataDirective: 'REPLACE',
     Metadata: {
@@ -302,13 +304,22 @@ export async function activateDevices(
     },
   }));
 
-  console.log(`[ACTIVATE] Copied ${deviceCount} MAIDs to s3://${BUCKET}/${activationKey}`);
+  // Upload spec file (triggers Karlsgate processing — must go after data file)
+  const specContent = 'identifiers:\n  - "*"\nattributes:\n  - "*"\n';
+  await s3Client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: specKey,
+    Body: specContent,
+    ContentType: 'text/yaml',
+  }));
+
+  console.log(`[ACTIVATE] Uploaded ${deviceCount} MAIDs to s3://${BUCKET}/${csvKey} + spec`);
 
   return {
     success: true,
     deviceCount,
-    s3Path: `s3://${BUCKET}/${activationKey}`,
-    folderName,
+    s3Path: `s3://${BUCKET}/${csvKey}`,
+    folderName: handle,
     createdAt: new Date().toISOString(),
   };
 }
