@@ -1,5 +1,6 @@
 import Link from 'next/link'
 import { CheckCircle, Clock, AlertCircle } from 'lucide-react'
+import { ExternalBadge } from '@/components/ui/external-badge'
 
 const statusConfig = {
   SUCCESS: { icon: CheckCircle, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-500/10' },
@@ -36,9 +37,7 @@ export function RecentJobs({ jobs }: { jobs: any[] }) {
                     {job.name}
                   </p>
                   {(job as any).external && (
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                      External
-                    </span>
+                    <ExternalBadge apiKeyName={(job as any).apiKeyName} />
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground">

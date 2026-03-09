@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import Link from "next/link"
 import { Plus, LayoutGrid, List, Search, Calendar, MapPin, Database, ExternalLink, Clock, Users } from "lucide-react"
+import { ExternalBadge } from "@/components/ui/external-badge"
 
 type ViewMode = 'modern' | 'classic';
 
@@ -183,9 +184,7 @@ export default function JobsPage() {
                 </div>
                 <div className="flex flex-wrap gap-1.5 mt-2">
                   {job.external && (
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                      {job.apiKeyName || 'External'}
-                    </span>
+                    <ExternalBadge apiKeyName={job.apiKeyName} />
                   )}
                   {job.audienceAgentEnabled && (
                     <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">
@@ -273,9 +272,7 @@ export default function JobsPage() {
                             {job.name}
                           </Link>
                           {job.external && (
-                            <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                              {job.apiKeyName || 'External'}
-                            </span>
+                            <ExternalBadge apiKeyName={job.apiKeyName} />
                           )}
                           {job.audienceAgentEnabled && (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">

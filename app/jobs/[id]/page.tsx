@@ -3,6 +3,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
 import { ArrowLeft, RefreshCw, Database, ExternalLink, Info, AlertTriangle, ShieldCheck, Users } from "lucide-react"
+import { getApiKeyColor } from "@/lib/api-key-colors"
 import { JobStatusPolling } from "@/components/jobs/job-status-polling"
 import { S3StorageSection } from "@/components/jobs/s3-storage-section"
 import { JobAuditDialog } from "@/components/jobs/job-audit-dialog"
@@ -122,22 +123,25 @@ export default async function JobDetailPage({
       </div>
 
       {/* External Job Notice */}
-      {job.external && (
-        <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4 mb-6">
-          <div className="flex items-center gap-2 text-blue-400">
-            <Info className="w-4 h-4" />
-            <span className="font-medium">External Job</span>
-            {job.api_key_name && (
-              <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
-                {job.api_key_name}
-              </span>
-            )}
+      {job.external && (() => {
+        const color = getApiKeyColor(job.api_key_name);
+        return (
+          <div className={`${color.bg} border ${color.border} rounded-lg p-4 mb-6`}>
+            <div className={`flex items-center gap-2 ${color.text}`}>
+              <Info className="w-4 h-4" />
+              <span className="font-medium">External Job</span>
+              {job.api_key_name && (
+                <span className={`text-xs px-2 py-0.5 rounded-full ${color.bgSolid} ${color.text} border ${color.border}`}>
+                  {job.api_key_name}
+                </span>
+              )}
+            </div>
+            <p className={`text-sm ${color.text} opacity-80 mt-1`}>
+              This job was created via the external API{job.api_key_name ? ` using the "${job.api_key_name}" key` : ''}.
+            </p>
           </div>
-          <p className="text-sm text-blue-300/80 mt-1">
-            This job was created via the external API{job.api_key_name ? ` using the "${job.api_key_name}" key` : ''}.
-          </p>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Date Range Discrepancy Warning */}
       {job.date_range_discrepancy && job.date_range_discrepancy.missingDays > 0 && (
