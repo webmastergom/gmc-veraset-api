@@ -104,7 +104,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'Film',
     group: 'entertainment',
     color: 'text-rose-400',
-    categories: ['cinema', 'drive_in_theater', 'outdoor_movies', 'film_festival'],
+    categories: ['cinema', 'drive_in_theater', 'outdoor_movies', 'film_festivals_and_organizations'],
   },
   {
     id: 'sports_event_attendees',
@@ -113,7 +113,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'Trophy',
     group: 'entertainment',
     color: 'text-lime-400',
-    categories: ['stadium_arena', 'sports_and_recreation_venue'],
+    categories: ['stadium_arena'],
   },
   {
     id: 'nightlife',
@@ -175,7 +175,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'GraduationCap',
     group: 'education',
     color: 'text-cyan-400',
-    categories: ['school', 'university', 'college'],
+    categories: ['school', 'college_university'],
     minDwellMinutes: 30,
   },
 
@@ -196,7 +196,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'Wine',
     group: 'food',
     color: 'text-amber-400',
-    categories: ['fine_dining', 'wine_bar', 'cocktail_bar', 'champagne_bar'],
+    categories: ['wine_bar', 'cocktail_bar', 'champagne_bar'],
     minDwellMinutes: 45,
   },
   {
@@ -218,7 +218,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'Train',
     group: 'transport',
     color: 'text-blue-400',
-    categories: ['subway_station', 'metro_station'],
+    categories: ['metro_station'],
   },
   {
     id: 'bus_users',
@@ -286,7 +286,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'Home',
     group: 'retail',
     color: 'text-teal-400',
-    categories: ['home_improvement_store', 'furniture_store', 'garden_center'],
+    categories: ['home_improvement_store', 'furniture_store', 'nursery_and_gardening'],
   },
   {
     id: 'supermarket_shoppers',
@@ -306,7 +306,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'Sparkles',
     group: 'wellness',
     color: 'text-fuchsia-400',
-    categories: ['spa', 'massage', 'medical_spa', 'day_spa', 'health_spa'],
+    categories: ['spas', 'massage', 'medical_spa', 'day_spa', 'health_spa'],
   },
 
   // ── Families & Pets ────────────────────────────────────────────────────
@@ -317,7 +317,7 @@ export const AUDIENCE_CATALOG: AudienceDefinition[] = [
     icon: 'PawPrint',
     group: 'families',
     color: 'text-orange-300',
-    categories: ['pet_store', 'pet_grooming', 'pet_boarding', 'dog_park'],
+    categories: ['pet_store', 'pet_groomer', 'pet_boarding', 'dog_park'],
   },
   {
     id: 'family_entertainment',
