@@ -59,9 +59,16 @@ export async function analyzePostalMaid(
     throw new Error('Country code is required for reverse geocoding.');
   }
 
-  // Normalize postal codes (trim, uppercase)
+  // Normalize postal codes (trim, uppercase, strip country prefix like "ES-" or "CO-")
   const requestedPostalCodes = new Set(
-    filters.postalCodes.map(pc => pc.trim().toUpperCase())
+    filters.postalCodes.map(pc => {
+      let code = pc.trim().toUpperCase();
+      // Strip 2-letter country prefix (e.g. "ES-28001" → "28001")
+      if (/^[A-Z]{2}-/.test(code)) {
+        code = code.slice(3);
+      }
+      return code;
+    })
   );
 
   // Ensure Athena table exists
