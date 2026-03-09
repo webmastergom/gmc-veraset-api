@@ -376,6 +376,86 @@ export async function startQueryAndWait(sql: string): Promise<{
   return { queryId, outputCsvKey };
 }
 
+/**
+ * Run an Athena query and return results by downloading the CSV from S3.
+ *
+ * Much faster than runQuery() for large result sets because it avoids
+ * paginating through GetQueryResults (1000 rows/page = hundreds of API calls).
+ * Instead: run query → wait → download CSV from S3 (single GetObject).
+ *
+ * Use this for queries that return 10K+ rows (e.g., reading from temp tables).
+ */
+export async function runQueryViaS3(sql: string): Promise<QueryResult> {
+  const { queryId, outputCsvKey } = await startQueryAndWait(sql);
+
+  // Download the result CSV from S3
+  const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+  const response = await s3Client.send(new GetObjectCommand({
+    Bucket: BUCKET,
+    Key: outputCsvKey,
+  }));
+
+  const csvText = await response.Body?.transformToString();
+  if (!csvText) return { columns: [], rows: [] };
+
+  // Parse CSV: first line is header, remaining lines are data
+  const lines = csvText.split('\n');
+  if (lines.length < 2) return { columns: [], rows: [] };
+
+  // Athena CSV wraps values in quotes: "col1","col2",...
+  const parseCSVLine = (line: string): string[] => {
+    const values: string[] = [];
+    let i = 0;
+    while (i < line.length) {
+      if (line[i] === '"') {
+        // Quoted value — find closing quote (handle escaped quotes "")
+        let end = i + 1;
+        while (end < line.length) {
+          if (line[end] === '"') {
+            if (end + 1 < line.length && line[end + 1] === '"') {
+              end += 2; // escaped quote
+            } else {
+              break;
+            }
+          } else {
+            end++;
+          }
+        }
+        values.push(line.substring(i + 1, end).replace(/""/g, '"'));
+        i = end + 2; // skip closing quote + comma
+      } else {
+        // Unquoted value
+        const comma = line.indexOf(',', i);
+        if (comma === -1) {
+          values.push(line.substring(i));
+          break;
+        } else {
+          values.push(line.substring(i, comma));
+          i = comma + 1;
+        }
+      }
+    }
+    return values;
+  };
+
+  const columns = parseCSVLine(lines[0]);
+  const rows: Record<string, any>[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const values = parseCSVLine(line);
+    const row: Record<string, any> = {};
+    for (let j = 0; j < columns.length; j++) {
+      row[columns[j]] = values[j] ?? '';
+    }
+    rows.push(row);
+  }
+
+  console.log(`✅ runQueryViaS3: ${rows.length} rows parsed from ${outputCsvKey} (query ${queryId})`);
+  return { columns, rows };
+}
+
 // ── CTAS (Create Table As Select) Functions ──────────────────────────────
 
 /**

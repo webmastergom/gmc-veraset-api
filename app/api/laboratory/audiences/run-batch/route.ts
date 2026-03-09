@@ -48,9 +48,9 @@ export async function POST(request: NextRequest): Promise<Response> {
   // Check if a run is already active for this dataset+country
   const existing = await getRunStatus(datasetId, country);
   if (existing && existing.status === 'running') {
-    // Check if stale (> 30 min = timed out)
+    // Check if stale (> 90 min = timed out)
     const elapsed = Date.now() - new Date(existing.startedAt).getTime();
-    if (elapsed < 30 * 60 * 1000) {
+    if (elapsed < 90 * 60 * 1000) {
       return Response.json(
         { error: 'A run is already in progress', runId: existing.runId },
         { status: 409 },

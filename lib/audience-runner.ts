@@ -12,7 +12,7 @@ import { s3Client, BUCKET, listObjects } from './s3-config';
 import { analyzeLaboratory, runSpatialJoin, buildSpatialJoinQueries, buildOriginsCTASQuery, resolveOrigins, geocodeOrigins, processVisitsForRecipe } from './laboratory-analyzer';
 import type { ParsedVisit, GeoInfo } from './laboratory-analyzer';
 import type { LabAnalysisResult, LabProgressCallback, PoiCategory } from './laboratory-types';
-import { startQueryAsync, fetchQueryResults, ensureTableForDataset, runQuery, startCTASAsync, tempTableName, dropTempTable, cleanupTempS3 } from './athena';
+import { startQueryAsync, fetchQueryResults, ensureTableForDataset, runQuery, runQueryViaS3, startCTASAsync, tempTableName, dropTempTable, cleanupTempS3 } from './athena';
 import {
   AUDIENCE_CATALOG,
   audienceToLabConfig,
@@ -436,9 +436,12 @@ export async function continueBatchProcessing(
     await options.saveStatus({ phase: 'processing', percent: 70, message: 'Reading materialized results from temp tables...' });
   }
 
+  // Use runQueryViaS3 for temp tables — downloads CSV from S3 in one call
+  // instead of paginating through GetQueryResults (1000 rows/page).
+  // For 500K visits this is ~5s vs ~100s+ with pagination.
   const [visitsRes, originsRes, totalRes] = await Promise.all([
-    runQuery(`SELECT ad_id, date, poi_id, category, dwell_minutes, visit_hour, ping_count FROM ${visitsTableName}`),
-    runQuery(`SELECT ad_id, date, origin_lat, origin_lng FROM ${originsTableName}`),
+    runQueryViaS3(`SELECT ad_id, date, poi_id, category, dwell_minutes, visit_hour, ping_count FROM ${visitsTableName}`),
+    runQueryViaS3(`SELECT ad_id, date, origin_lat, origin_lng FROM ${originsTableName}`),
     fetchQueryResults(totalDevicesQueryId),
   ]);
 

@@ -7,8 +7,9 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 // Maximum time before we consider a run as stale/timed out.
-// With async Athena CTAS, the full pipeline can take 30-40 min for large datasets.
-const MAX_RUN_DURATION_MS = 45 * 60 * 1000;
+// With async Athena CTAS, the full pipeline can take 60+ min for large datasets
+// (Q1 spatial ~30-40min + Q3 origins ~20-30min + processing ~5min).
+const MAX_RUN_DURATION_MS = 90 * 60 * 1000;
 
 /**
  * GET /api/laboratory/audiences/status?datasetId=X&country=Y
