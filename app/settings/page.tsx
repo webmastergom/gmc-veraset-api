@@ -160,12 +160,18 @@ export default function SettingsPage() {
     if (!confirm(`Delete "${handle}" and all associated files from staging?`)) return;
     setDeletingHandle(handle);
     try {
-      const res = await fetch(`/api/settings/staging?handle=${encodeURIComponent(handle)}`, { method: 'DELETE' });
+      const res = await fetch(`/api/settings/staging?handle=${encodeURIComponent(handle)}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
       if (res.ok) {
         setStagingListings(prev => prev.filter(l => l.handle !== handle));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(`Delete failed: ${data.error || res.statusText}`);
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      alert(`Delete failed: ${err.message}`);
     } finally {
       setDeletingHandle(null);
     }
