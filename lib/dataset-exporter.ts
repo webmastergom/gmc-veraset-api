@@ -281,7 +281,7 @@ export async function activateDevices(
   console.log(`[ACTIVATE] ${datasetName}: ${deviceCount} distinct MAIDs`);
 
   // 2. Run the DISTINCT query — wait for completion but don't fetch rows
-  const distinctSql = `SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
+  const distinctSql = `SELECT DISTINCT ad_id AS maid FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
   const { outputCsvKey } = await startQueryAndWait(distinctSql);
 
   // 3. Copy the Athena result CSV to staging/ (Karlsgate node watches this folder)
@@ -297,7 +297,7 @@ export async function activateDevices(
   }));
 
   // Upload spec file (triggers Karlsgate processing — must go after data file)
-  const specContent = 'identifiers:\n  - ad_id: maid\nattributes:\n  - ad_id\n';
+  const specContent = 'identifiers:\n  - maid\n';
   await s3Client.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: specKey,
