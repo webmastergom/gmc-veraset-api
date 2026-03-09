@@ -106,6 +106,7 @@ export default function SettingsPage() {
   // Staging state
   const [stagingListings, setStagingListings] = useState<StagingListing[]>([]);
   const [stagingLoading, setStagingLoading] = useState(false);
+  const [deletingHandle, setDeletingHandle] = useState<string | null>(null);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -154,6 +155,21 @@ export default function SettingsPage() {
     loadDatasets();
     loadStaging();
   }, [loadConfig, loadDatasets, loadStaging]);
+
+  const handleDeleteStaging = async (handle: string) => {
+    if (!confirm(`Delete "${handle}" and all associated files from staging?`)) return;
+    setDeletingHandle(handle);
+    try {
+      const res = await fetch(`/api/settings/staging?handle=${encodeURIComponent(handle)}`, { method: 'DELETE' });
+      if (res.ok) {
+        setStagingListings(prev => prev.filter(l => l.handle !== handle));
+      }
+    } catch {
+      // ignore
+    } finally {
+      setDeletingHandle(null);
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -452,6 +468,7 @@ export default function SettingsPage() {
                         <TableHead className="w-24">Spec</TableHead>
                         <TableHead className="w-32">Status</TableHead>
                         <TableHead className="w-32">Uploaded</TableHead>
+                        <TableHead className="w-16"></TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -501,6 +518,21 @@ export default function SettingsPage() {
                           </TableCell>
                           <TableCell className="text-sm text-muted-foreground">
                             {listing.csv ? timeAgo(listing.csv.lastModified) : '—'}
+                          </TableCell>
+                          <TableCell>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleDeleteStaging(listing.handle)}
+                              disabled={deletingHandle === listing.handle}
+                              className="text-destructive hover:text-destructive"
+                            >
+                              {deletingHandle === listing.handle ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="w-4 h-4" />
+                              )}
+                            </Button>
                           </TableCell>
                         </TableRow>
                       ))}

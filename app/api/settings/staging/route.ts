@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { isAuthenticated } from '@/lib/auth';
 
@@ -74,6 +74,40 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ listings, raw: objects });
   } catch (error: any) {
     console.error('GET /api/settings/staging error:', error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
+/**
+ * DELETE /api/settings/staging?handle=Spain
+ * Deletes all files associated with a staging handle:
+ *   {handle}.csv, {handle}.csv.spec.yml, {handle}._error_.txt, {handle}._importing_
+ */
+export async function DELETE(req: NextRequest) {
+  if (!isAuthenticated(req)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const handle = req.nextUrl.searchParams.get('handle');
+  if (!handle) {
+    return NextResponse.json({ error: 'Missing handle parameter' }, { status: 400 });
+  }
+
+  try {
+    // List all objects matching this handle
+    const suffixes = ['.csv', '.csv.spec.yml', '._error_.txt', '._importing_'];
+    const keysToDelete = suffixes.map(s => ({ Key: `${PREFIX}${handle}${s}` }));
+
+    await s3Client.send(new DeleteObjectsCommand({
+      Bucket: BUCKET,
+      Delete: { Objects: keysToDelete, Quiet: true },
+    }));
+
+    console.log(`[STAGING] Deleted handle "${handle}" (${keysToDelete.length} keys)`);
+
+    return NextResponse.json({ success: true, handle, deletedKeys: keysToDelete.map(k => k.Key) });
+  } catch (error: any) {
+    console.error('DELETE /api/settings/staging error:', error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
