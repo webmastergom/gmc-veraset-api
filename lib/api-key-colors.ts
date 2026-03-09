@@ -3,15 +3,16 @@
  * Each API key name always gets the same color.
  */
 
+// Maximally distinct colors on dark backgrounds — no two should look alike
 const COLOR_PALETTE = [
-  { bg: 'bg-purple-500/10', text: 'text-purple-400', border: 'border-purple-500/20', bgSolid: 'bg-purple-500/20' },
+  { bg: 'bg-violet-500/10', text: 'text-violet-400', border: 'border-violet-500/20', bgSolid: 'bg-violet-500/20' },
   { bg: 'bg-pink-500/10', text: 'text-pink-400', border: 'border-pink-500/20', bgSolid: 'bg-pink-500/20' },
   { bg: 'bg-cyan-500/10', text: 'text-cyan-400', border: 'border-cyan-500/20', bgSolid: 'bg-cyan-500/20' },
   { bg: 'bg-orange-500/10', text: 'text-orange-400', border: 'border-orange-500/20', bgSolid: 'bg-orange-500/20' },
   { bg: 'bg-emerald-500/10', text: 'text-emerald-400', border: 'border-emerald-500/20', bgSolid: 'bg-emerald-500/20' },
-  { bg: 'bg-rose-500/10', text: 'text-rose-400', border: 'border-rose-500/20', bgSolid: 'bg-rose-500/20' },
+  { bg: 'bg-red-500/10', text: 'text-red-400', border: 'border-red-500/20', bgSolid: 'bg-red-500/20' },
   { bg: 'bg-amber-500/10', text: 'text-amber-400', border: 'border-amber-500/20', bgSolid: 'bg-amber-500/20' },
-  { bg: 'bg-indigo-500/10', text: 'text-indigo-400', border: 'border-indigo-500/20', bgSolid: 'bg-indigo-500/20' },
+  { bg: 'bg-sky-500/10', text: 'text-sky-400', border: 'border-sky-500/20', bgSolid: 'bg-sky-500/20' },
 ] as const;
 
 function hashString(str: string): number {
