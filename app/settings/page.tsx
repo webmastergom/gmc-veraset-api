@@ -36,7 +36,7 @@ import {
   FolderSync,
   FileText,
   FileCheck,
-  CircleAlert,
+  AlertCircle,
   RefreshCw,
   Import,
 } from 'lucide-react';
@@ -480,7 +480,7 @@ export default function SettingsPage() {
                           <TableCell>
                             {listing.error ? (
                               <Badge variant="destructive" className="text-xs gap-1">
-                                <CircleAlert className="w-3 h-3" />
+                                <AlertCircle className="w-3 h-3" />
                                 Error
                               </Badge>
                             ) : listing.importing ? (
