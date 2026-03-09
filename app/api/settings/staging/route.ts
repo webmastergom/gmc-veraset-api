@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ListObjectsV2Command, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { ListObjectsV2Command, PutObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { isAuthenticated } from '@/lib/auth';
 
@@ -20,7 +20,7 @@ export async function GET(req: NextRequest) {
     }));
 
     const objects = (res.Contents || [])
-      .filter(o => o.Key && o.Key !== PREFIX) // skip the folder itself
+      .filter(o => o.Key && o.Key !== PREFIX && (o.Size || 0) > 0) // skip folder itself + 0-byte (soft-deleted) files
       .map(o => ({
         key: o.Key!,
         name: o.Key!.slice(PREFIX.length),
@@ -80,8 +80,11 @@ export async function GET(req: NextRequest) {
 
 /**
  * DELETE /api/settings/staging?handle=Spain
- * Deletes all files associated with a staging handle:
- *   {handle}.csv, {handle}.csv.spec.yml, {handle}._error_.txt, {handle}._importing_
+ * Soft-deletes all files associated with a staging handle by overwriting them
+ * with empty content (0 bytes). This is a workaround because the IAM user
+ * doesn't have s3:DeleteObject permission. The GET handler filters out 0-byte files.
+ *
+ * Files: {handle}.csv, {handle}.csv.spec.yml, {handle}._error_.txt, {handle}._importing_
  */
 export async function DELETE(req: NextRequest) {
   if (!isAuthenticated(req)) {
@@ -95,30 +98,33 @@ export async function DELETE(req: NextRequest) {
 
   try {
     const suffixes = ['.csv', '.csv.spec.yml', '._error_.txt', '._importing_'];
-    const deleted: string[] = [];
+    const cleared: string[] = [];
     const errors: string[] = [];
 
     for (const suffix of suffixes) {
       const key = `${PREFIX}${handle}${suffix}`;
       try {
-        await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
-        deleted.push(key);
+        // Overwrite with empty content — effectively "soft delete"
+        // The GET handler filters out objects with size 0
+        await s3Client.send(new PutObjectCommand({
+          Bucket: BUCKET,
+          Key: key,
+          Body: '',
+          ContentType: 'application/octet-stream',
+        }));
+        cleared.push(key);
       } catch (e: any) {
-        // Only ignore NoSuchKey — propagate real errors
-        if (e.name === 'NoSuchKey' || e.Code === 'NoSuchKey') {
-          continue;
-        }
         errors.push(`${key}: ${e.name || e.Code || e.message}`);
       }
     }
 
     if (errors.length > 0) {
-      console.error(`[STAGING] Delete errors for "${handle}":`, errors);
+      console.error(`[STAGING] Clear errors for "${handle}":`, errors);
       return NextResponse.json({ error: `Delete failed: ${errors.join('; ')}` }, { status: 500 });
     }
 
-    console.log(`[STAGING] Deleted handle "${handle}" (${deleted.length} files)`);
-    return NextResponse.json({ success: true, handle, deletedKeys: deleted });
+    console.log(`[STAGING] Cleared handle "${handle}" (${cleared.length} files overwritten with empty content)`);
+    return NextResponse.json({ success: true, handle, clearedKeys: cleared });
   } catch (error: any) {
     console.error('DELETE /api/settings/staging error:', error);
     return NextResponse.json({ error: error.message }, { status: 500 });
