@@ -37,7 +37,7 @@ export async function POST(
   } catch (error: any) {
     console.error(`POST /api/datasets/${datasetName}/activate error:`, error);
     return NextResponse.json(
-      { error: 'Activation failed', details: error.message },
+      { error: 'Activation failed', details: error.message, stack: error.stack?.split('\n').slice(0, 5) },
       { status: 500 }
     );
   }
