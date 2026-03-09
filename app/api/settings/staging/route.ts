@@ -96,15 +96,25 @@ export async function DELETE(req: NextRequest) {
   try {
     const suffixes = ['.csv', '.csv.spec.yml', '._error_.txt', '._importing_'];
     const deleted: string[] = [];
+    const errors: string[] = [];
 
     for (const suffix of suffixes) {
       const key = `${PREFIX}${handle}${suffix}`;
       try {
         await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
         deleted.push(key);
-      } catch {
-        // File may not exist, that's fine
+      } catch (e: any) {
+        // Only ignore NoSuchKey — propagate real errors
+        if (e.name === 'NoSuchKey' || e.Code === 'NoSuchKey') {
+          continue;
+        }
+        errors.push(`${key}: ${e.name || e.Code || e.message}`);
       }
+    }
+
+    if (errors.length > 0) {
+      console.error(`[STAGING] Delete errors for "${handle}":`, errors);
+      return NextResponse.json({ error: `Delete failed: ${errors.join('; ')}` }, { status: 500 });
     }
 
     console.log(`[STAGING] Deleted handle "${handle}" (${deleted.length} files)`);
