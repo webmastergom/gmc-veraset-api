@@ -286,7 +286,7 @@ export async function activateDevices(
 
   // 3. Copy the Athena result CSV directly to the activations folder
   const folderName = sanitizeFolderName(jobName) || datasetName;
-  const activationKey = `staging/activations/${folderName}/maids.csv`;
+  const activationKey = `staging/activations/${folderName}.csv`;
 
   await s3Client.send(new CopyObjectCommand({
     Bucket: BUCKET,

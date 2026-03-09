@@ -59,7 +59,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [datasets, setDatasets] = useState<string[]>([]);
+  const [datasets, setDatasets] = useState<{ id: string; name: string }[]>([]);
   const [newCountry, setNewCountry] = useState('');
   const [newDataset, setNewDataset] = useState('');
 
@@ -80,8 +80,10 @@ export default function SettingsPage() {
       const res = await fetch('/api/datasets');
       if (res.ok) {
         const data = await res.json();
-        const names = (data.datasets || []).map((d: any) => d.name || d).filter(Boolean);
-        setDatasets(names);
+        const list = (data.datasets || [])
+          .map((d: any) => ({ id: d.id || d.name || d, name: d.name || d.id || d }))
+          .filter((d: any) => d.id);
+        setDatasets(list);
       }
     } catch {
       // Datasets list is optional
@@ -231,7 +233,7 @@ export default function SettingsPage() {
                     </Select>
                   </div>
                   <div className="flex-1">
-                    <Label className="text-xs mb-1 block">Dataset Name</Label>
+                    <Label className="text-xs mb-1 block">Dataset</Label>
                     {datasets.length > 0 ? (
                       <Select value={newDataset} onValueChange={setNewDataset}>
                         <SelectTrigger>
@@ -239,7 +241,9 @@ export default function SettingsPage() {
                         </SelectTrigger>
                         <SelectContent>
                           {datasets.map(ds => (
-                            <SelectItem key={ds} value={ds}>{ds}</SelectItem>
+                            <SelectItem key={ds.id} value={ds.id}>
+                              {ds.name !== ds.id ? `${ds.name} (${ds.id})` : ds.id}
+                            </SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
@@ -289,7 +293,9 @@ export default function SettingsPage() {
                                     </SelectTrigger>
                                     <SelectContent>
                                       {datasets.map(ds => (
-                                        <SelectItem key={ds} value={ds}>{ds}</SelectItem>
+                                        <SelectItem key={ds.id} value={ds.id}>
+                                          {ds.name !== ds.id ? `${ds.name} (${ds.id})` : ds.id}
+                                        </SelectItem>
                                       ))}
                                     </SelectContent>
                                   </Select>
