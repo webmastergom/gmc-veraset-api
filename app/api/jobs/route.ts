@@ -8,6 +8,7 @@ import { z } from "zod";
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+export const maxDuration = 60;
 
 /**
  * GET /api/jobs
@@ -298,12 +299,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       timestamp: new Date().toISOString(),
     };
 
-    // 5. Call Veraset API with 7s timeout (Vercel kills at 10s)
+    // 5. Call Veraset API with 45s timeout (maxDuration=60s gives headroom)
     const verasetUrl = `https://platform.prd.veraset.tech${verasetEndpoint}`;
     console.log(`[JOBS POST] Calling Veraset ${verasetEndpoint} [${Date.now()-t0}ms]`);
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 7000);
+    const timeout = setTimeout(() => controller.abort(), 45000);
     const verasetResponse = await fetch(verasetUrl, {
       method: "POST",
       signal: controller.signal,
@@ -390,7 +391,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const isAbort = error.name === 'AbortError';
     console.error(`[JOBS POST] ${isAbort ? 'TIMEOUT' : 'ERROR'} after ${Date.now()-t0}ms:`, error.message);
     return NextResponse.json(
-      { error: isAbort ? 'Veraset API timeout (7s)' : 'Failed to create job', details: error.message, jobName },
+      { error: isAbort ? 'Veraset API timeout (45s)' : 'Failed to create job', details: error.message, jobName },
       { status: isAbort ? 504 : 500 }
     );
   }
