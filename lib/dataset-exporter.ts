@@ -299,7 +299,7 @@ export async function activateDevices(
   }));
 
   // Upload spec file (triggers Karlsgate processing — must go after data file)
-  const specContent = 'identifiers:\n  - maid\nattributes:\n  - country\n';
+  const specContent = 'identifiers:\n  - name: maid\n    type: uuid-maid\nattributes:\n  - country\n';
   await s3Client.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: specKey,
