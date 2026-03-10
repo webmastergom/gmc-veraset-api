@@ -91,6 +91,10 @@ export default function DatasetAnalysisPage() {
   const [downloadingFull, setDownloadingFull] = useState(false);
   const [downloadingMaids, setDownloadingMaids] = useState(false);
   const [activating, setActivating] = useState(false);
+  const [activateModal, setActivateModal] = useState(false);
+  const [activateStep, setActivateStep] = useState('');
+  const [activatePercent, setActivatePercent] = useState(0);
+  const [activateMessage, setActivateMessage] = useState('');
   const [catchment, setCatchment] = useState<{
     zipcodes: Array<{
       zipcode: string;
@@ -252,18 +256,53 @@ export default function DatasetAnalysisPage() {
 
   const handleActivate = async () => {
     setActivating(true);
+    setActivateModal(true);
+    setActivateStep('');
+    setActivatePercent(0);
+    setActivateMessage('Iniciando activación...');
+
     try {
-      const res = await fetch(`/api/datasets/${datasetName}/activate`, {
-        method: 'POST',
-        credentials: 'include',
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || data.details || 'Activation failed');
-      toast({
-        title: 'Activation complete',
-        description: `${data.deviceCount.toLocaleString()} MAIDs uploaded to ${data.s3Path}`,
+      const eventSource = new EventSource(`/api/datasets/${datasetName}/activate/stream`);
+
+      await new Promise<void>((resolve, reject) => {
+        eventSource.addEventListener('progress', (e) => {
+          const data = JSON.parse(e.data);
+          setActivateStep(data.step);
+          setActivatePercent(data.percent);
+          setActivateMessage(data.message);
+        });
+
+        eventSource.addEventListener('result', (e) => {
+          const data = JSON.parse(e.data);
+          setActivatePercent(100);
+          setActivateMessage(`${data.deviceCount.toLocaleString()} MAIDs activados (${data.devicesWithZipcode?.toLocaleString() || 0} con zip code)`);
+          eventSource.close();
+          toast({
+            title: 'Activation complete',
+            description: `${data.deviceCount.toLocaleString()} MAIDs uploaded to ${data.folderName}`,
+          });
+          resolve();
+        });
+
+        eventSource.addEventListener('error', (e: any) => {
+          try {
+            const data = JSON.parse(e.data);
+            eventSource.close();
+            reject(new Error(data.error || 'Activation failed'));
+          } catch {
+            // SSE connection error
+            eventSource.close();
+            reject(new Error('Connection lost'));
+          }
+        });
+
+        eventSource.onerror = () => {
+          eventSource.close();
+          reject(new Error('Connection lost'));
+        };
       });
     } catch (e: any) {
+      setActivateMessage(`Error: ${e.message}`);
       toast({ title: 'Activation failed', description: e.message || 'Error activating devices', variant: 'destructive' });
     } finally {
       setActivating(false);
@@ -816,6 +855,33 @@ export default function DatasetAnalysisPage() {
               )}
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+      {/* Activate progress modal */}
+      <Dialog open={activateModal} onOpenChange={(open) => { if (!activating) setActivateModal(open); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Activating for Karlsgate</DialogTitle>
+            <DialogDescription>{datasetName}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <Progress value={activatePercent} className="h-2" />
+            <div className="flex items-center gap-2 text-sm">
+              {activating ? (
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              ) : activatePercent === 100 ? (
+                <CheckCircle className="h-4 w-4 text-green-500" />
+              ) : (
+                <AlertTriangle className="h-4 w-4 text-red-500" />
+              )}
+              <span className="text-muted-foreground">{activateMessage}</span>
+            </div>
+            {activatePercent === 100 && !activating && (
+              <Button variant="outline" className="w-full" onClick={() => setActivateModal(false)}>
+                Cerrar
+              </Button>
+            )}
+          </div>
         </DialogContent>
       </Dialog>
     </MainLayout>

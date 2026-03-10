@@ -6,7 +6,7 @@ import { getCountryForDataset } from '@/lib/country-dataset-config';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-export const maxDuration = 180;
+export const maxDuration = 300;
 
 const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 

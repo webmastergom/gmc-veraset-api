@@ -319,7 +319,7 @@ function loadCountryIndex(country: string): CountrySpatialIndex | null {
  * Ensure all candidate countries for a set of points are loaded (including from S3).
  * Call this before batchReverseGeocode for S3-fallback environments.
  */
-async function ensureCountriesLoaded(points: Array<{ lat: number; lng: number }>): Promise<void> {
+export async function ensureCountriesLoaded(points: Array<{ lat: number; lng: number }>): Promise<void> {
   const needed = new Set<string>();
   for (const p of points) {
     for (const c of getCandidateCountries(p.lat, p.lng)) {
