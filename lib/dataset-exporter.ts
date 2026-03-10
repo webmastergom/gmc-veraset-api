@@ -266,7 +266,8 @@ function sanitizeFolderName(name: string): string {
  */
 export async function activateDevices(
   datasetName: string,
-  jobName: string
+  jobName: string,
+  countryCode?: string
 ): Promise<ActivationResult> {
   const tableName = getTableName(datasetName);
 
@@ -278,10 +279,11 @@ export async function activateDevices(
   const countSql = `SELECT COUNT(DISTINCT ad_id) as cnt FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
   const countResult = await runQuery(countSql);
   const deviceCount = parseInt(String(countResult.rows[0]?.cnt)) || 0;
-  console.log(`[ACTIVATE] ${datasetName}: ${deviceCount} distinct MAIDs`);
+  console.log(`[ACTIVATE] ${datasetName}: ${deviceCount} distinct MAIDs, country=${countryCode || 'unknown'}`);
 
-  // 2. Run the DISTINCT query — wait for completion but don't fetch rows
-  const distinctSql = `SELECT DISTINCT ad_id AS maid FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
+  // 2. Run the DISTINCT query with country attribute — wait for completion
+  const countryLiteral = countryCode ? `'${countryCode}'` : `''`;
+  const distinctSql = `SELECT DISTINCT ad_id AS maid, ${countryLiteral} AS country FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
   const { outputCsvKey } = await startQueryAndWait(distinctSql);
 
   // 3. Copy the Athena result CSV to staging/ (Karlsgate node watches this folder)
@@ -297,7 +299,7 @@ export async function activateDevices(
   }));
 
   // Upload spec file (triggers Karlsgate processing — must go after data file)
-  const specContent = 'identifiers:\n  - maid\n';
+  const specContent = 'identifiers:\n  - maid\nattributes:\n  - country\n';
   await s3Client.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: specKey,
@@ -305,7 +307,7 @@ export async function activateDevices(
     ContentType: 'text/yaml',
   }));
 
-  console.log(`[ACTIVATE] Uploaded ${deviceCount} MAIDs to s3://${BUCKET}/${csvKey} + spec`);
+  console.log(`[ACTIVATE] Uploaded ${deviceCount} MAIDs to s3://${BUCKET}/${csvKey} + spec (country=${countryCode})`);
 
   return {
     success: true,

@@ -32,3 +32,13 @@ export async function getConfiguredCountries(): Promise<string[]> {
   const config = await getConfig<CountryDatasetConfig>(CONFIG_KEY);
   return config?.entries ? Object.keys(config.entries).sort() : [];
 }
+
+/** Reverse lookup: find the country code for a given dataset name. */
+export async function getCountryForDataset(datasetName: string): Promise<string | undefined> {
+  const config = await getConfig<CountryDatasetConfig>(CONFIG_KEY);
+  if (!config?.entries) return undefined;
+  for (const [code, entry] of Object.entries(config.entries)) {
+    if (entry.dataset === datasetName) return code;
+  }
+  return undefined;
+}

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { activateDevices } from '@/lib/dataset-exporter';
 import { getAllJobs } from '@/lib/jobs';
 import { isAuthenticated } from '@/lib/auth';
+import { getCountryForDataset } from '@/lib/country-dataset-config';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -32,7 +33,10 @@ export async function POST(
 
     const jobName = job?.name || datasetName;
 
-    const result = await activateDevices(datasetName, jobName);
+    // Resolve country code from country→dataset config (reverse lookup)
+    const countryCode = await getCountryForDataset(datasetName);
+
+    const result = await activateDevices(datasetName, jobName, countryCode);
     return NextResponse.json(result);
   } catch (error: any) {
     console.error(`POST /api/datasets/${datasetName}/activate error:`, error);
