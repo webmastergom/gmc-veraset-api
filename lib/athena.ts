@@ -335,7 +335,10 @@ export async function fetchQueryResults(queryId: string): Promise<QueryResult> {
  * Use this when the Athena result CSV itself is the desired output
  * (e.g., copy it via S3 instead of loading millions of rows into memory).
  */
-export async function startQueryAndWait(sql: string): Promise<{
+export async function startQueryAndWait(
+  sql: string,
+  onPoll?: (elapsedSeconds: number, state: string) => void,
+): Promise<{
   queryId: string;
   outputCsvKey: string;
 }> {
@@ -354,7 +357,9 @@ export async function startQueryAndWait(sql: string): Promise<{
     state = status.state as QueryExecutionState;
 
     if (attempts % 20 === 0) {
-      console.log(`   ⏳ Query ${queryId}: ${state} (${Math.floor(attempts * 0.5)}s elapsed)`);
+      const elapsed = Math.floor(attempts * 0.5);
+      console.log(`   ⏳ Query ${queryId}: ${state} (${elapsed}s elapsed)`);
+      onPoll?.(elapsed, state);
     }
 
     if (state === 'FAILED') {

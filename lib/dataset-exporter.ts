@@ -313,11 +313,17 @@ export async function activateDevices(
   `;
 
   console.log(`[ACTIVATE] ${datasetName}: running MAIDs + home location queries in parallel...`);
+  let queryElapsed = 0;
+  const onQueryPoll = (elapsed: number, state: string) => {
+    queryElapsed = elapsed;
+    // Send progress updates every ~10s so the SSE stream stays alive
+    progress('queries', Math.min(10 + Math.floor(elapsed / 5), 38), `Queries Athena en progreso (${state}, ${elapsed}s)...`);
+  };
   const [maidsResult, homeResult] = await Promise.all([
-    startQueryAndWait(maidsSql),
-    startQueryAndWait(homeSql),
+    startQueryAndWait(maidsSql, onQueryPoll),
+    startQueryAndWait(homeSql, onQueryPoll),
   ]);
-  progress('queries', 40, 'Queries completadas. Descargando resultados...');
+  progress('queries', 40, `Queries completadas en ${queryElapsed}s. Descargando resultados...`);
 
   // 2. Download home locations CSV and build lookup map
   const homeResponse = await s3Client.send(new GetObjectCommand({

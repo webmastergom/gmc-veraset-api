@@ -265,6 +265,8 @@ export default function DatasetAnalysisPage() {
       const eventSource = new EventSource(`/api/datasets/${datasetName}/activate/stream`);
 
       await new Promise<void>((resolve, reject) => {
+        let completed = false;
+
         eventSource.addEventListener('progress', (e) => {
           const data = JSON.parse(e.data);
           setActivateStep(data.step);
@@ -273,6 +275,7 @@ export default function DatasetAnalysisPage() {
         });
 
         eventSource.addEventListener('result', (e) => {
+          completed = true;
           const data = JSON.parse(e.data);
           setActivatePercent(100);
           setActivateMessage(`${data.deviceCount.toLocaleString()} MAIDs activados (${data.devicesWithZipcode?.toLocaleString() || 0} con zip code)`);
@@ -285,6 +288,7 @@ export default function DatasetAnalysisPage() {
         });
 
         eventSource.addEventListener('error', (e: any) => {
+          completed = true;
           try {
             const data = JSON.parse(e.data);
             eventSource.close();
@@ -297,6 +301,9 @@ export default function DatasetAnalysisPage() {
         });
 
         eventSource.onerror = () => {
+          // Ignore onerror after successful result or server-sent error —
+          // EventSource fires onerror when the stream closes normally too.
+          if (completed) return;
           eventSource.close();
           reject(new Error('Connection lost'));
         };
