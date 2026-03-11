@@ -261,6 +261,32 @@ function sanitizeFolderName(name: string): string {
     .replace(/^-|-$/g, '');
 }
 
+/** Country center points — used to pre-load just ONE country's GeoJSON for activation geocoding. */
+const COUNTRY_CENTERS: Record<string, { lat: number; lng: number }> = {
+  DE: { lat: 51.16, lng: 10.45 },
+  FR: { lat: 46.60, lng: 2.21 },
+  ES: { lat: 40.46, lng: -3.75 },
+  MX: { lat: 23.63, lng: -102.55 },
+  UK: { lat: 53.48, lng: -2.24 },
+  CR: { lat: 9.93, lng: -84.09 },
+  GT: { lat: 14.64, lng: -90.51 },
+  EC: { lat: -1.83, lng: -78.18 },
+  CO: { lat: 4.57, lng: -74.30 },
+  BR: { lat: -14.24, lng: -51.93 },
+  AR: { lat: -38.42, lng: -63.62 },
+  CL: { lat: -35.68, lng: -71.54 },
+  PE: { lat: -9.19, lng: -75.02 },
+  IT: { lat: 41.87, lng: 12.57 },
+  PT: { lat: 39.40, lng: -8.22 },
+  NL: { lat: 52.13, lng: 5.29 },
+  BE: { lat: 50.50, lng: 4.47 },
+  AT: { lat: 47.52, lng: 14.55 },
+  PL: { lat: 51.92, lng: 19.15 },
+  SE: { lat: 60.13, lng: 18.64 },
+  US: { lat: 37.09, lng: -95.71 },
+  IE: { lat: 53.14, lng: -7.69 },
+};
+
 /** Detect ISO country code from job/dataset name. Returns 2-letter code or undefined. */
 function detectCountryFromName(name: string): string | undefined {
   const n = name.toLowerCase();
@@ -738,9 +764,17 @@ export async function activateDevicesMultiPhase(
       message: `${locations.length.toLocaleString()} ubicaciones únicas. Geocodificando...`,
     };
 
-    // Load GeoJSON for needed countries
-    const points = locations.map(l => ({ lat: l.lat, lng: l.lng }));
-    await ensureCountriesLoaded(points);
+    // Only load GeoJSON for the primary country — loading ALL countries from
+    // 274K scattered points (visitors from worldwide) takes 60s+ on Vercel.
+    // Points outside the target country get zipcode "UNKNOWN" in the JOIN.
+    const cc = state.countryCode || '';
+    const countryCenter = COUNTRY_CENTERS[cc];
+    if (countryCenter) {
+      await ensureCountriesLoaded([countryCenter]);
+      console.log(`[ACTIVATE] Loaded GeoJSON for ${cc}`);
+    } else {
+      console.warn(`[ACTIVATE] No country center for "${cc}", skipping geocoding`);
+    }
 
     // Geocode each unique location (fast: ~10-100μs per lookup with spatial index)
     const geoLines: string[] = [];
