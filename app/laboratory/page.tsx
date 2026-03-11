@@ -318,7 +318,7 @@ export default function LaboratoryPage() {
     }));
   };
 
-  // ── Run analysis ────────────────────────────────────────────────────
+  // ── Run analysis (multi-phase polling) ──────────────────────────────
   const runAnalysis = async () => {
     if (!canRun || !selectedDataset) return;
 
@@ -350,108 +350,64 @@ export default function LaboratoryPage() {
     const abort = new AbortController();
     abortRef.current = abort;
 
+    const poll = async (): Promise<void> => {
+      if (abort.signal.aborted) return;
+
+      try {
+        const response = await fetch('/api/laboratory/analyze/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(config),
+          credentials: 'include',
+          signal: abort.signal,
+        });
+
+        if (!response.ok) {
+          const errBody = await response.json().catch(() => ({}));
+          throw new Error(errBody.error || `Server error: ${response.status}`);
+        }
+
+        const state = await response.json();
+
+        if (abort.signal.aborted) return;
+
+        // Update progress
+        if (state.progress) {
+          setProgress(state.progress);
+        }
+
+        if (state.status === 'completed') {
+          setResult(state.result);
+          setPhase('results');
+          setProgress(null);
+          return;
+        }
+
+        if (state.status === 'error') {
+          throw new Error(state.error || 'Analysis failed');
+        }
+
+        // Still running — poll again in 2.5s
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        return poll();
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          setPhase('recipe');
+          setProgress(null);
+          return;
+        }
+        throw err;
+      }
+    };
+
     try {
-      const response = await fetch('/api/laboratory/analyze/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config),
-        credentials: 'include',
-        signal: abort.signal,
-      });
-
-      if (!response.ok || !response.body) {
-        throw new Error(`Server error: ${response.status}`);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let gotResult = false;
-      let backendError = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // SSE messages are delimited by double newlines
-        const messages = buffer.split('\n\n');
-        buffer = messages.pop() || ''; // keep incomplete message in buffer
-
-        for (const msg of messages) {
-          const lines = msg.split('\n');
-          let eventType = '';
-          let dataStr = '';
-          for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              eventType = line.slice(7).trim();
-            } else if (line.startsWith('data: ')) {
-              dataStr += line.slice(6);
-            }
-          }
-          if (!eventType || !dataStr) continue;
-          try {
-            const data = JSON.parse(dataStr);
-            if (eventType === 'progress') {
-              // Detect backend error sent as progress event
-              if (data.step === 'error') {
-                backendError = data.message || 'Analysis failed';
-              } else {
-                setProgress(data);
-              }
-            } else if (eventType === 'result') {
-              gotResult = true;
-              setResult(data);
-              setPhase('results');
-              setProgress(null);
-            }
-          } catch { /* ignore parse errors */ }
-        }
-      }
-
-      // Process any remaining data in the buffer (last SSE message may not end with \n\n)
-      if (buffer.trim()) {
-        const lines = buffer.trim().split('\n');
-        let eventType = '';
-        let dataStr = '';
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            eventType = line.slice(7).trim();
-          } else if (line.startsWith('data: ')) {
-            dataStr += line.slice(6);
-          }
-        }
-        if (eventType && dataStr) {
-          try {
-            const data = JSON.parse(dataStr);
-            if (eventType === 'progress' && data.step === 'error') {
-              backendError = data.message || 'Analysis failed';
-            } else if (eventType === 'result') {
-              gotResult = true;
-              setResult(data);
-              setPhase('results');
-              setProgress(null);
-            }
-          } catch { /* ignore parse errors */ }
-        }
-      }
-
-      // Handle end of stream
-      if (!gotResult) {
-        setError(backendError || 'Analysis completed but no results were returned. Please try again.');
-        setPhase('recipe');
-        setProgress(null);
-      }
+      await poll();
     } catch (err: any) {
-      if (err.name === 'AbortError') {
+      if (err.name !== 'AbortError') {
+        setError(err.message || 'Analysis failed');
         setPhase('recipe');
         setProgress(null);
-        return;
       }
-      setError(err.message || 'Analysis failed');
-      setPhase('recipe');
-      setProgress(null);
     }
   };
 
