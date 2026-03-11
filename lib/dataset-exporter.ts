@@ -849,8 +849,8 @@ export async function activateDevicesMultiPhase(
     const fileSize = head.ContentLength || 0;
     console.log(`[ACTIVATE] Athena result size: ${(fileSize / (1024 * 1024)).toFixed(1)} MB`);
 
-    if (fileSize <= 4.5 * 1024 * 1024 * 1024) {
-      // Under 4.5GB — simple CopyObject
+    if (fileSize <= 100 * 1024 * 1024) {
+      // Under 100MB — simple CopyObject (fast enough to complete in seconds)
       await s3Client.send(new CopyObjectCommand({
         Bucket: BUCKET,
         CopySource: `${BUCKET}/${athenaOutputKey}`,
@@ -858,8 +858,8 @@ export async function activateDevicesMultiPhase(
         ContentType: 'text/csv',
       }));
     } else {
-      // Over 4.5GB — use multipart copy
-      console.log(`[ACTIVATE] File too large for CopyObject, using multipart copy...`);
+      // Over 100MB — use concurrent multipart copy (CopyObject takes ~96s for 4GB!)
+      console.log(`[ACTIVATE] Using concurrent multipart copy for ${(fileSize / (1024 * 1024)).toFixed(0)} MB file...`);
       await multipartCopyS3(BUCKET, athenaOutputKey, csvKey);
     }
 
@@ -903,13 +903,16 @@ export async function activateDevicesMultiPhase(
 }
 
 /**
- * Server-side multipart copy for large S3 objects (>5GB).
- * Uses UploadPartCopy — no data is downloaded to the function.
+ * Server-side multipart copy for large S3 objects.
+ * Uses concurrent UploadPartCopy — no data is downloaded to the function.
+ * CopyObject takes ~96s for 4GB (exceeds 60s Vercel limit), but concurrent
+ * multipart copy with 10 parallel 100MB parts completes in ~15-20s.
  */
 async function multipartCopyS3(bucket: string, sourceKey: string, destKey: string): Promise<void> {
   const head = await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: sourceKey }));
   const fileSize = head.ContentLength || 0;
   const partSize = 100 * 1024 * 1024; // 100 MB parts
+  const concurrency = 10; // 10 concurrent copy requests
 
   const { UploadId } = await s3Client.send(new CreateMultipartUploadCommand({
     Bucket: bucket,
@@ -917,34 +920,53 @@ async function multipartCopyS3(bucket: string, sourceKey: string, destKey: strin
     ContentType: 'text/csv',
   }));
 
-  const parts: { ETag: string; PartNumber: number }[] = [];
-  let offset = 0;
-  let partNumber = 1;
+  try {
+    const totalParts = Math.ceil(fileSize / partSize);
+    const parts: { ETag: string; PartNumber: number }[] = new Array(totalParts);
 
-  while (offset < fileSize) {
-    const end = Math.min(offset + partSize - 1, fileSize - 1);
-    const res = await s3Client.send(new UploadPartCopyCommand({
+    // Copy parts in concurrent batches
+    for (let batch = 0; batch < totalParts; batch += concurrency) {
+      const batchEnd = Math.min(batch + concurrency, totalParts);
+      const promises: Promise<void>[] = [];
+
+      for (let i = batch; i < batchEnd; i++) {
+        const offset = i * partSize;
+        const end = Math.min(offset + partSize - 1, fileSize - 1);
+        const partNumber = i + 1;
+
+        promises.push(
+          s3Client.send(new UploadPartCopyCommand({
+            Bucket: bucket,
+            Key: destKey,
+            CopySource: `${bucket}/${sourceKey}`,
+            UploadId,
+            PartNumber: partNumber,
+            CopySourceRange: `bytes=${offset}-${end}`,
+          })).then(res => {
+            parts[i] = { ETag: res.CopyPartResult?.ETag || '', PartNumber: partNumber };
+          })
+        );
+      }
+
+      await Promise.all(promises);
+    }
+
+    await s3Client.send(new CompleteMultipartUploadCommand({
       Bucket: bucket,
       Key: destKey,
-      CopySource: `${bucket}/${sourceKey}`,
       UploadId,
-      PartNumber: partNumber,
-      CopySourceRange: `bytes=${offset}-${end}`,
+      MultipartUpload: { Parts: parts },
     }));
 
-    parts.push({ ETag: res.CopyPartResult?.ETag || '', PartNumber: partNumber });
-    offset = end + 1;
-    partNumber++;
+    console.log(`[ACTIVATE] Multipart copy complete: ${totalParts} parts (${concurrency} concurrent), ${(fileSize / (1024 * 1024)).toFixed(0)} MB`);
+  } catch (err) {
+    // Abort the multipart upload on error to avoid orphaned parts
+    try {
+      const { AbortMultipartUploadCommand } = await import('@aws-sdk/client-s3');
+      await s3Client.send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: destKey, UploadId }));
+    } catch { /* ignore abort errors */ }
+    throw err;
   }
-
-  await s3Client.send(new CompleteMultipartUploadCommand({
-    Bucket: bucket,
-    Key: destKey,
-    UploadId,
-    MultipartUpload: { Parts: parts },
-  }));
-
-  console.log(`[ACTIVATE] Multipart copy complete: ${partNumber - 1} parts, ${(fileSize / (1024 * 1024)).toFixed(1)} MB`);
 }
 
 /**
