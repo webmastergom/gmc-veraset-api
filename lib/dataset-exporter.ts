@@ -518,7 +518,7 @@ export async function activateDevices(
 // ── Multi-phase activation (works within 60s Vercel Hobby limit) ─────
 
 export interface ActivationState {
-  status: 'starting' | 'queries_running' | 'geocoding' | 'join_running' | 'finalizing' | 'completed' | 'error';
+  status: 'starting' | 'queries_running' | 'geocoding' | 'geo_joining' | 'join_running' | 'finalizing' | 'completed' | 'error';
   datasetName: string;
   jobName: string;
   countryCode: string;
@@ -803,11 +803,6 @@ export async function activateDevicesMultiPhase(
     setCountryFilter(null);
 
     console.log(`[ACTIVATE] ${state.datasetName}: geocoded ${geoLines.length}/${locations.length} locations`);
-    state.progress = {
-      step: 'geocode',
-      percent: 50,
-      message: `Geocodificadas ${geoLines.length.toLocaleString()} de ${locations.length.toLocaleString()} ubicaciones. Iniciando JOIN...`,
-    };
 
     // Upload geocode lookup CSV (NO HEADER — external table reads positionally)
     const geoDir = `athena-temp/${state.geoTableName}`;
@@ -818,6 +813,22 @@ export async function activateDevicesMultiPhase(
       Body: geoCsvContent,
       ContentType: 'text/csv',
     }));
+    console.log(`[ACTIVATE] ${state.datasetName}: uploaded geo CSV (${geoLines.length} entries)`);
+
+    // Advance to geo_joining — table creation + JOINs happen in the next invocation
+    state.status = 'geo_joining';
+    state.progress = {
+      step: 'geocode',
+      percent: 45,
+      message: `Geocodificadas ${geoLines.length.toLocaleString()} de ${locations.length.toLocaleString()} ubicaciones. Creando tabla...`,
+    };
+    await saveActivationState(state);
+    return state;
+  }
+
+  // ── Phase 3b: Create geo table + start Athena JOINs ──────────────────
+  if (state.status === 'geo_joining') {
+    const geoDir = `athena-temp/${state.geoTableName}`;
 
     // Create external table for geocode lookup
     const createGeoTableSql = `
@@ -831,7 +842,7 @@ export async function activateDevicesMultiPhase(
       LOCATION 's3://${BUCKET}/${geoDir}/'
     `;
     await runQuery(createGeoTableSql);
-    console.log(`[ACTIVATE] ${state.datasetName}: created geo table ${state.geoTableName} (${geoLines.length} entries)`);
+    console.log(`[ACTIVATE] ${state.datasetName}: created geo table ${state.geoTableName}`);
 
     // Start the final JOIN query — Athena produces the CSV (no Node.js download needed!)
     const tableName = getTableName(datasetName);
