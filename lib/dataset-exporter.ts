@@ -601,6 +601,15 @@ export async function activateDevicesMultiPhase(
     state = null;
   }
 
+  // If state is stale (>10 min without update), reset — it likely timed out
+  if (state && state.updatedAt) {
+    const ageMs = Date.now() - new Date(state.updatedAt).getTime();
+    if (ageMs > 10 * 60 * 1000) {
+      console.log(`[ACTIVATE] ${datasetName}: stale state (${Math.round(ageMs / 60000)}min old, status=${state.status}), resetting`);
+      state = null;
+    }
+  }
+
   if (!state) {
     // ── Phase 1: Start Athena queries ──────────────────────────
     const tableName = getTableName(datasetName);
