@@ -161,17 +161,30 @@ export default function DatasetAnalysisPage() {
     setLoading(true);
     setAnalysis(null);
     try {
-      const res = await fetch(`/api/datasets/${datasetName}/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-        credentials: 'include',
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.details || err.error || res.statusText);
-      }
-      const data: AnalysisResult = await res.json();
+      // Multi-phase polling — each call completes within 60s
+      const poll = async (): Promise<AnalysisResult> => {
+        const res = await fetch(`/api/datasets/${datasetName}/analyze/poll`, {
+          method: 'POST',
+          credentials: 'include',
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || err.details || `HTTP ${res.status}`);
+        }
+        const state = await res.json();
+
+        if (state.status === 'error') {
+          throw new Error(state.error || state.progress?.message || 'Analysis failed');
+        }
+        if (state.status === 'completed' && state.result) {
+          return state.result as AnalysisResult;
+        }
+        // Not done yet — wait and poll again
+        await new Promise(r => setTimeout(r, 2500));
+        return poll();
+      };
+
+      const data = await poll();
       setAnalysis(data);
     } catch (e: any) {
       alert(`Analysis failed: ${e.message || 'Unknown error'}`);
