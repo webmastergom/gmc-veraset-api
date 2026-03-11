@@ -262,52 +262,38 @@ export default function DatasetAnalysisPage() {
     setActivateMessage('Iniciando activación...');
 
     try {
-      const eventSource = new EventSource(`/api/datasets/${datasetName}/activate/stream`);
+      // Multi-phase polling approach — each call completes within 60s
+      const poll = async (): Promise<void> => {
+        const res = await fetch(`/api/datasets/${datasetName}/activate/poll`, { method: 'POST' });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: 'Activation failed' }));
+          throw new Error(err.error || err.progress?.message || `HTTP ${res.status}`);
+        }
+        const state = await res.json();
 
-      await new Promise<void>((resolve, reject) => {
-        let completed = false;
+        setActivateStep(state.progress.step);
+        setActivatePercent(state.progress.percent);
+        setActivateMessage(state.progress.message);
 
-        eventSource.addEventListener('progress', (e) => {
-          const data = JSON.parse(e.data);
-          setActivateStep(data.step);
-          setActivatePercent(data.percent);
-          setActivateMessage(data.message);
-        });
+        if (state.status === 'error') {
+          throw new Error(state.error || state.progress.message || 'Activation failed');
+        }
 
-        eventSource.addEventListener('result', (e) => {
-          completed = true;
-          const data = JSON.parse(e.data);
-          setActivatePercent(100);
-          setActivateMessage(`${data.deviceCount.toLocaleString()} MAIDs activados (${data.devicesWithZipcode?.toLocaleString() || 0} con zip code)`);
-          eventSource.close();
+        if (state.status === 'completed') {
+          const r = state.result;
           toast({
             title: 'Activation complete',
-            description: `${data.deviceCount.toLocaleString()} MAIDs uploaded to ${data.folderName}`,
+            description: `${r.deviceCount.toLocaleString()} MAIDs uploaded to ${r.folderName}`,
           });
-          resolve();
-        });
+          return;
+        }
 
-        eventSource.addEventListener('error', (e: any) => {
-          completed = true;
-          try {
-            const data = JSON.parse(e.data);
-            eventSource.close();
-            reject(new Error(data.error || 'Activation failed'));
-          } catch {
-            // SSE connection error
-            eventSource.close();
-            reject(new Error('Connection lost'));
-          }
-        });
+        // Not done yet — wait 2s and poll again
+        await new Promise(r => setTimeout(r, 2000));
+        return poll();
+      };
 
-        eventSource.onerror = () => {
-          // Ignore onerror after successful result or server-sent error —
-          // EventSource fires onerror when the stream closes normally too.
-          if (completed) return;
-          eventSource.close();
-          reject(new Error('Connection lost'));
-        };
-      });
+      await poll();
     } catch (e: any) {
       setActivateMessage(`Error: ${e.message}`);
       toast({ title: 'Activation failed', description: e.message || 'Error activating devices', variant: 'destructive' });

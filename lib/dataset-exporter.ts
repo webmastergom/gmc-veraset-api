@@ -2,7 +2,7 @@
  * Dataset export using AWS Athena
  */
 
-import { runQuery, createTableForDataset, tableExists, getTableName, startQueryAndWait } from './athena';
+import { runQuery, createTableForDataset, tableExists, getTableName, startQueryAndWait, startQueryAsync, checkQueryStatus } from './athena';
 import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { s3Client, BUCKET } from './s3-config';
@@ -456,4 +456,340 @@ export async function activateDevices(
     folderName: handle,
     createdAt: new Date().toISOString(),
   };
+}
+
+// ── Multi-phase activation (works within 60s Vercel Hobby limit) ─────
+
+export interface ActivationState {
+  status: 'starting' | 'queries_running' | 'geocoding' | 'building_csv' | 'completed' | 'error';
+  datasetName: string;
+  jobName: string;
+  countryCode: string;
+  handle: string;
+  maidsQueryId?: string;
+  homeQueryId?: string;
+  /** S3 key where geocoded lookup (ad_id,zipcode) is stored */
+  geocodedKey?: string;
+  /** S3 key for the final join query output */
+  joinQueryId?: string;
+  progress: { step: string; percent: number; message: string };
+  result?: ActivationResult;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
+const ACTIVATION_CONFIG_PREFIX = 'config/activations';
+
+async function getActivationState(datasetName: string): Promise<ActivationState | null> {
+  try {
+    const res = await s3Client.send(new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: `${ACTIVATION_CONFIG_PREFIX}/${datasetName}.json`,
+    }));
+    const body = await res.Body?.transformToString();
+    return body ? JSON.parse(body) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveActivationState(state: ActivationState): Promise<void> {
+  state.updatedAt = new Date().toISOString();
+  await s3Client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: `${ACTIVATION_CONFIG_PREFIX}/${state.datasetName}.json`,
+    Body: JSON.stringify(state),
+    ContentType: 'application/json',
+  }));
+}
+
+/**
+ * Start or advance a multi-phase Karlsgate activation.
+ * Each call completes within ~50s (safe for 60s Vercel timeout).
+ * Frontend calls this repeatedly (polling) until status === 'completed' or 'error'.
+ */
+export async function activateDevicesMultiPhase(
+  datasetName: string,
+  jobName: string,
+  countryCode?: string,
+): Promise<ActivationState> {
+  let state = await getActivationState(datasetName);
+
+  // If there's a completed/error state from a previous run, start fresh
+  if (state && (state.status === 'completed' || state.status === 'error')) {
+    state = null;
+  }
+
+  if (!state) {
+    // ── Phase 1: Start Athena queries ──────────────────────────
+    const tableName = getTableName(datasetName);
+    if (!(await tableExists(datasetName))) {
+      await createTableForDataset(datasetName);
+    }
+
+    const maidsSql = `SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
+    const homeSql = `
+      WITH night_pings AS (
+        SELECT ad_id,
+          TRY_CAST(latitude AS DOUBLE) as lat,
+          TRY_CAST(longitude AS DOUBLE) as lng,
+          utc_timestamp
+        FROM ${tableName}
+        WHERE (HOUR(utc_timestamp) >= 20 OR HOUR(utc_timestamp) < 4)
+          AND CARDINALITY(poi_ids) = 0
+          AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+          AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+          AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < 200)
+          AND ad_id IS NOT NULL AND ad_id != ''
+      )
+      SELECT ad_id,
+        ROUND(APPROX_PERCENTILE(lat, 0.5), 4) as home_lat,
+        ROUND(APPROX_PERCENTILE(lng, 0.5), 4) as home_lng
+      FROM night_pings
+      GROUP BY ad_id
+      HAVING COUNT(*) >= 3
+        AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
+    `;
+
+    const [maidsQueryId, homeQueryId] = await Promise.all([
+      startQueryAsync(maidsSql),
+      startQueryAsync(homeSql),
+    ]);
+
+    const handle = sanitizeFolderName(jobName) || datasetName;
+    state = {
+      status: 'queries_running',
+      datasetName,
+      jobName,
+      countryCode: countryCode || '',
+      handle,
+      maidsQueryId,
+      homeQueryId,
+      progress: { step: 'queries', percent: 10, message: 'Queries Athena iniciadas...' },
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await saveActivationState(state);
+    console.log(`[ACTIVATE] ${datasetName}: started queries ${maidsQueryId} + ${homeQueryId}`);
+    return state;
+  }
+
+  // ── Phase 2: Poll Athena queries ──────────────────────────
+  if (state.status === 'queries_running') {
+    const [maidsStatus, homeStatus] = await Promise.all([
+      checkQueryStatus(state.maidsQueryId!),
+      checkQueryStatus(state.homeQueryId!),
+    ]);
+
+    if (maidsStatus.state === 'FAILED') {
+      state.status = 'error';
+      state.error = `MAIDs query failed: ${maidsStatus.error}`;
+      state.progress = { step: 'error', percent: 0, message: state.error };
+      await saveActivationState(state);
+      return state;
+    }
+    if (homeStatus.state === 'FAILED') {
+      state.status = 'error';
+      state.error = `Home locations query failed: ${homeStatus.error}`;
+      state.progress = { step: 'error', percent: 0, message: state.error };
+      await saveActivationState(state);
+      return state;
+    }
+
+    const maidsDone = maidsStatus.state === 'SUCCEEDED';
+    const homeDone = homeStatus.state === 'SUCCEEDED';
+
+    if (maidsDone && homeDone) {
+      state.status = 'geocoding';
+      state.progress = { step: 'queries', percent: 40, message: 'Queries completadas. Geocodificando...' };
+      await saveActivationState(state);
+      console.log(`[ACTIVATE] ${state.datasetName}: both queries completed`);
+      // Fall through to geocoding phase (still have time in this invocation)
+    } else {
+      const statusMsg = `MAIDs: ${maidsStatus.state}, Home: ${homeStatus.state}`;
+      state.progress = { step: 'queries', percent: 20, message: `Esperando queries... (${statusMsg})` };
+      await saveActivationState(state);
+      return state;
+    }
+  }
+
+  // ── Phase 3: Geocode home locations ──────────────────────────
+  if (state.status === 'geocoding') {
+    const homeOutputKey = `athena-results/${state.homeQueryId}.csv`;
+    const homeResponse = await s3Client.send(new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: homeOutputKey,
+    }));
+
+    // Stream home CSV → build homeMap
+    const homeMap = new Map<string, { lat: number; lng: number }>();
+    const homeRl = createInterface({ input: homeResponse.Body as Readable, crlfDelay: Infinity });
+    let homeHeader = true;
+    for await (const line of homeRl) {
+      if (homeHeader) { homeHeader = false; continue; }
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const parts = trimmed.replace(/"/g, '').split(',');
+      const adId = parts[0];
+      const lat = parseFloat(parts[1]);
+      const lng = parseFloat(parts[2]);
+      if (adId && !isNaN(lat) && !isNaN(lng)) {
+        homeMap.set(adId, { lat, lng });
+      }
+    }
+
+    state.progress = { step: 'geocode', percent: 50, message: `${homeMap.size.toLocaleString()} devices con home. Geocodificando...` };
+
+    // Get unique locations
+    const uniqueLocations = new Map<string, { lat: number; lng: number }>();
+    homeMap.forEach(({ lat, lng }) => {
+      const key = `${lat},${lng}`;
+      if (!uniqueLocations.has(key)) uniqueLocations.set(key, { lat, lng });
+    });
+
+    const points: Array<{ lat: number; lng: number }> = [];
+    uniqueLocations.forEach(v => points.push(v));
+    await ensureCountriesLoaded(points);
+
+    const zipLookup = new Map<string, string>();
+    for (const { lat, lng } of points) {
+      const result = getZipcode(lat, lng);
+      zipLookup.set(`${lat},${lng}`, result?.postcode || 'UNKNOWN');
+    }
+
+    // Build geocoded CSV (ad_id,zipcode) and upload to S3
+    const geocodedLines: string[] = ['ad_id,zipcode'];
+    let devicesWithZipcode = 0;
+    homeMap.forEach(({ lat, lng }, adId) => {
+      const zip = zipLookup.get(`${lat},${lng}`) || 'UNKNOWN';
+      if (zip !== 'UNKNOWN') devicesWithZipcode++;
+      geocodedLines.push(`${adId},${zip}`);
+    });
+
+    const geocodedKey = `staging/.temp/${state.handle}-geocoded.csv`;
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: geocodedKey,
+      Body: geocodedLines.join('\n'),
+      ContentType: 'text/csv',
+    }));
+
+    state.geocodedKey = geocodedKey;
+    state.status = 'building_csv';
+    state.progress = {
+      step: 'geocode',
+      percent: 70,
+      message: `Geocodificadas ${zipLookup.size.toLocaleString()} ubicaciones (${devicesWithZipcode.toLocaleString()} con zip)`,
+    };
+    await saveActivationState(state);
+    console.log(`[ACTIVATE] ${state.datasetName}: geocoded ${zipLookup.size} locations, uploaded ${geocodedKey}`);
+    return state;
+  }
+
+  // ── Phase 4: Stream MAIDs + geocoded lookup → final CSV → S3 ─────
+  if (state.status === 'building_csv') {
+    state.progress = { step: 'build_csv', percent: 72, message: 'Construyendo CSV final (streaming)...' };
+
+    // Load geocoded lookup into memory (it's the filtered subset, manageable)
+    const geoResponse = await s3Client.send(new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: state.geocodedKey!,
+    }));
+    const geoCsv = await geoResponse.Body?.transformToString() || '';
+    const geoMap = new Map<string, string>();
+    const geoLines = geoCsv.split('\n');
+    for (let i = 1; i < geoLines.length; i++) {
+      const line = geoLines[i].trim();
+      if (!line) continue;
+      const [adId, zip] = line.split(',');
+      if (adId) geoMap.set(adId, zip || 'UNKNOWN');
+    }
+
+    // Stream MAIDs from S3 → join with geoMap → stream upload to S3
+    const maidsOutputKey = `athena-results/${state.maidsQueryId}.csv`;
+    const maidsResponse = await s3Client.send(new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: maidsOutputKey,
+    }));
+
+    const csvKey = `staging/${state.handle}.csv`;
+    const specKey = `staging/${state.handle}.csv.spec.yml`;
+
+    const outputStream = new PassThrough();
+    const upload = new Upload({
+      client: s3Client,
+      params: { Bucket: BUCKET, Key: csvKey, Body: outputStream, ContentType: 'text/csv' },
+      partSize: 5 * 1024 * 1024,
+      queueSize: 4,
+    });
+
+    outputStream.write('maid,country,zipcode\n');
+
+    const rl = createInterface({ input: maidsResponse.Body as Readable, crlfDelay: Infinity });
+    let isHeader = true;
+    let deviceCount = 0;
+    let devicesWithZipcode = 0;
+    for await (const line of rl) {
+      if (isHeader) { isHeader = false; continue; }
+      const adId = line.trim().replace(/"/g, '');
+      if (!adId) continue;
+      const zip = geoMap.get(adId) || 'UNKNOWN';
+      if (zip !== 'UNKNOWN') devicesWithZipcode++;
+      outputStream.write(`${adId},${state.countryCode},${zip}\n`);
+      deviceCount++;
+    }
+
+    outputStream.end();
+    await upload.done();
+
+    // Upload spec
+    const specContent = 'identifiers:\n  - name: maid\n    type: uuid-maid\nattributes:\n  - country\n  - zipcode\n';
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: specKey,
+      Body: specContent,
+      ContentType: 'text/yaml',
+    }));
+
+    // Clean up temp geocoded file
+    try {
+      await s3Client.send(new PutObjectCommand({ Bucket: BUCKET, Key: state.geocodedKey!, Body: '' }));
+    } catch { /* ignore cleanup errors */ }
+
+    const result: ActivationResult = {
+      success: true,
+      deviceCount,
+      devicesWithZipcode,
+      s3Path: `s3://${BUCKET}/${csvKey}`,
+      folderName: state.handle,
+      createdAt: new Date().toISOString(),
+    };
+
+    state.status = 'completed';
+    state.result = result;
+    state.progress = {
+      step: 'done',
+      percent: 100,
+      message: `${deviceCount.toLocaleString()} MAIDs activados (${devicesWithZipcode.toLocaleString()} con zip code)`,
+    };
+    await saveActivationState(state);
+    console.log(`[ACTIVATE] ${state.datasetName}: completed! ${deviceCount} MAIDs → ${csvKey}`);
+    return state;
+  }
+
+  return state;
+}
+
+/**
+ * Reset activation state (e.g., to retry after error).
+ */
+export async function resetActivationState(datasetName: string): Promise<void> {
+  try {
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: `${ACTIVATION_CONFIG_PREFIX}/${datasetName}.json`,
+      Body: '',
+    }));
+  } catch { /* ignore */ }
 }
