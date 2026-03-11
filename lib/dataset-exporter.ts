@@ -612,14 +612,16 @@ export async function activateDevicesMultiPhase(
       )
     `;
 
-    // Query 1: DISTINCT rounded home locations (small result — ~50K-200K rows)
-    // Uses integer keys (lat*1000, lng*1000) to avoid floating point issues in JOINs
+    // Query 1: DISTINCT rounded home locations (small result — ~200K-300K rows)
+    // Uses integer keys (lat*100, lng*100) — 2 decimal places (~1.1km precision).
+    // 3 decimals produces 9M+ unique locations (too many for 60s geocoding).
+    // 2 decimals is more than enough for zipcode estimation.
     const uniqueLocsSql = `
       WITH ${nightPingsCTE},
       homes AS (
         SELECT
-          CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 3) * 1000 AS BIGINT) as lat_key,
-          CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 3) * 1000 AS BIGINT) as lng_key
+          CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 2) * 100 AS BIGINT) as lat_key,
+          CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 2) * 100 AS BIGINT) as lng_key
         FROM night_pings
         GROUP BY ad_id
         HAVING COUNT(*) >= 3 AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
@@ -631,8 +633,8 @@ export async function activateDevicesMultiPhase(
     const homeCTASSelect = `
       WITH ${nightPingsCTE}
       SELECT ad_id,
-        CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 3) * 1000 AS BIGINT) as lat_key,
-        CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 3) * 1000 AS BIGINT) as lng_key
+        CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 2) * 100 AS BIGINT) as lat_key,
+        CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 2) * 100 AS BIGINT) as lng_key
       FROM night_pings
       GROUP BY ad_id
       HAVING COUNT(*) >= 3 AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
@@ -725,7 +727,7 @@ export async function activateDevicesMultiPhase(
       const latKey = parseInt(latKeyStr);
       const lngKey = parseInt(lngKeyStr);
       if (!isNaN(latKey) && !isNaN(lngKey)) {
-        locations.push({ latKey, lngKey, lat: latKey / 1000, lng: lngKey / 1000 });
+        locations.push({ latKey, lngKey, lat: latKey / 100, lng: lngKey / 100 });
       }
     }
 
