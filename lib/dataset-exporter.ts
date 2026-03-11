@@ -2,8 +2,8 @@
  * Dataset export using AWS Athena
  */
 
-import { runQuery, createTableForDataset, tableExists, getTableName, startQueryAndWait, startQueryAsync, checkQueryStatus } from './athena';
-import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { runQuery, createTableForDataset, tableExists, getTableName, startQueryAndWait, startQueryAsync, checkQueryStatus, startCTASAsync, dropTempTable, fetchQueryResults } from './athena';
+import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand, GetObjectCommand, CreateMultipartUploadCommand, UploadPartCopyCommand, CompleteMultipartUploadCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { s3Client, BUCKET } from './s3-config';
 import { getZipcode, ensureCountriesLoaded } from './reverse-geocode';
@@ -461,17 +461,25 @@ export async function activateDevices(
 // ── Multi-phase activation (works within 60s Vercel Hobby limit) ─────
 
 export interface ActivationState {
-  status: 'starting' | 'queries_running' | 'geocoding' | 'building_csv' | 'completed' | 'error';
+  status: 'starting' | 'queries_running' | 'geocoding' | 'join_running' | 'finalizing' | 'completed' | 'error';
   datasetName: string;
   jobName: string;
   countryCode: string;
   handle: string;
-  maidsQueryId?: string;
-  homeQueryId?: string;
-  /** S3 key where geocoded lookup (ad_id,zipcode) is stored */
-  geocodedKey?: string;
-  /** S3 key for the final join query output */
+  /** Unique run ID for temp table names */
+  runId?: string;
+  /** Athena query ID for DISTINCT rounded home locations */
+  uniqueLocsQueryId?: string;
+  /** Athena CTAS query ID for home locations table */
+  homeCTASQueryId?: string;
+  /** Temp table name for home locations (Parquet) */
+  homeTableName?: string;
+  /** Temp table name for geocode lookup (CSV) */
+  geoTableName?: string;
+  /** Athena query ID for the final JOIN */
   joinQueryId?: string;
+  /** Athena query ID for device count */
+  countQueryId?: string;
   progress: { step: string; percent: number; message: string };
   result?: ActivationResult;
   error?: string;
@@ -507,7 +515,17 @@ async function saveActivationState(state: ActivationState): Promise<void> {
 /**
  * Start or advance a multi-phase Karlsgate activation.
  * Each call completes within ~50s (safe for 60s Vercel timeout).
- * Frontend calls this repeatedly (polling) until status === 'completed' or 'error'.
+ *
+ * Architecture:
+ * - Phase 1: Start Athena queries (unique locations + home CTAS)
+ * - Phase 2: Poll queries
+ * - Phase 3: Download small unique-locations CSV, geocode, create lookup table, start JOIN
+ * - Phase 4: Poll JOIN query
+ * - Phase 5: Copy Athena result to staging, upload spec
+ *
+ * The key insight: NEVER download large CSVs (MAIDs 86M rows, home 25M rows).
+ * Only download the small unique-locations CSV (~50K-200K rows).
+ * Athena does the heavy JOIN and produces the final CSV.
  */
 export async function activateDevicesMultiPhase(
   datasetName: string,
@@ -521,6 +539,11 @@ export async function activateDevicesMultiPhase(
     state = null;
   }
 
+  // If state has old format (no runId), start fresh
+  if (state && !state.runId) {
+    state = null;
+  }
+
   if (!state) {
     // ── Phase 1: Start Athena queries ──────────────────────────
     const tableName = getTableName(datasetName);
@@ -528,9 +551,20 @@ export async function activateDevicesMultiPhase(
       await createTableForDataset(datasetName);
     }
 
-    const maidsSql = `SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''`;
-    const homeSql = `
-      WITH night_pings AS (
+    const runId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const handle = sanitizeFolderName(jobName) || datasetName;
+    const homeTableName = `temp_home_${runId}`;
+    const geoTableName = `temp_geo_${runId}`;
+
+    // Drop temp tables if they somehow exist from a previous failed run
+    await Promise.all([
+      dropTempTable(homeTableName).catch(() => {}),
+      dropTempTable(geoTableName).catch(() => {}),
+    ]);
+
+    // CTE shared by both queries
+    const nightPingsCTE = `
+      night_pings AS (
         SELECT ad_id,
           TRY_CAST(latitude AS DOUBLE) as lat,
           TRY_CAST(longitude AS DOUBLE) as lng,
@@ -543,205 +577,291 @@ export async function activateDevicesMultiPhase(
           AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < 200)
           AND ad_id IS NOT NULL AND ad_id != ''
       )
-      SELECT ad_id,
-        ROUND(APPROX_PERCENTILE(lat, 0.5), 4) as home_lat,
-        ROUND(APPROX_PERCENTILE(lng, 0.5), 4) as home_lng
-      FROM night_pings
-      GROUP BY ad_id
-      HAVING COUNT(*) >= 3
-        AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
     `;
 
-    const [maidsQueryId, homeQueryId] = await Promise.all([
-      startQueryAsync(maidsSql),
-      startQueryAsync(homeSql),
+    // Query 1: DISTINCT rounded home locations (small result — ~50K-200K rows)
+    // Uses integer keys (lat*1000, lng*1000) to avoid floating point issues in JOINs
+    const uniqueLocsSql = `
+      WITH ${nightPingsCTE},
+      homes AS (
+        SELECT
+          CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 3) * 1000 AS BIGINT) as lat_key,
+          CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 3) * 1000 AS BIGINT) as lng_key
+        FROM night_pings
+        GROUP BY ad_id
+        HAVING COUNT(*) >= 3 AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
+      )
+      SELECT DISTINCT lat_key, lng_key FROM homes
+    `;
+
+    // Query 2: CTAS — materializes home locations as a Parquet table for efficient JOIN
+    const homeCTASSelect = `
+      WITH ${nightPingsCTE}
+      SELECT ad_id,
+        CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 3) * 1000 AS BIGINT) as lat_key,
+        CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 3) * 1000 AS BIGINT) as lng_key
+      FROM night_pings
+      GROUP BY ad_id
+      HAVING COUNT(*) >= 3 AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
+    `;
+
+    const [uniqueLocsQueryId, homeCTASQueryId] = await Promise.all([
+      startQueryAsync(uniqueLocsSql),
+      startCTASAsync(homeCTASSelect, homeTableName),
     ]);
 
-    const handle = sanitizeFolderName(jobName) || datasetName;
     state = {
       status: 'queries_running',
       datasetName,
       jobName,
       countryCode: countryCode || '',
       handle,
-      maidsQueryId,
-      homeQueryId,
-      progress: { step: 'queries', percent: 10, message: 'Queries Athena iniciadas...' },
+      runId,
+      uniqueLocsQueryId,
+      homeCTASQueryId,
+      homeTableName,
+      geoTableName,
+      progress: { step: 'queries', percent: 10, message: 'Queries Athena iniciadas (locations + home CTAS)...' },
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     await saveActivationState(state);
-    console.log(`[ACTIVATE] ${datasetName}: started queries ${maidsQueryId} + ${homeQueryId}`);
+    console.log(`[ACTIVATE] ${datasetName}: started unique_locs(${uniqueLocsQueryId}) + home_ctas(${homeCTASQueryId})`);
     return state;
   }
 
   // ── Phase 2: Poll Athena queries ──────────────────────────
   if (state.status === 'queries_running') {
-    const [maidsStatus, homeStatus] = await Promise.all([
-      checkQueryStatus(state.maidsQueryId!),
-      checkQueryStatus(state.homeQueryId!),
+    const [locsStatus, homeStatus] = await Promise.all([
+      checkQueryStatus(state.uniqueLocsQueryId!),
+      checkQueryStatus(state.homeCTASQueryId!),
     ]);
 
-    if (maidsStatus.state === 'FAILED') {
+    if (locsStatus.state === 'FAILED') {
       state.status = 'error';
-      state.error = `MAIDs query failed: ${maidsStatus.error}`;
+      state.error = `Unique locations query failed: ${locsStatus.error}`;
       state.progress = { step: 'error', percent: 0, message: state.error };
       await saveActivationState(state);
       return state;
     }
     if (homeStatus.state === 'FAILED') {
       state.status = 'error';
-      state.error = `Home locations query failed: ${homeStatus.error}`;
+      state.error = `Home CTAS query failed: ${homeStatus.error}`;
       state.progress = { step: 'error', percent: 0, message: state.error };
       await saveActivationState(state);
       return state;
     }
 
-    const maidsDone = maidsStatus.state === 'SUCCEEDED';
+    const locsDone = locsStatus.state === 'SUCCEEDED';
     const homeDone = homeStatus.state === 'SUCCEEDED';
 
-    if (maidsDone && homeDone) {
+    if (locsDone && homeDone) {
       state.status = 'geocoding';
-      state.progress = { step: 'queries', percent: 40, message: 'Queries completadas. Geocodificando...' };
+      state.progress = { step: 'queries', percent: 30, message: 'Queries completadas. Preparando geocodificación...' };
       await saveActivationState(state);
       console.log(`[ACTIVATE] ${state.datasetName}: both queries completed`);
-      // Fall through to geocoding phase (still have time in this invocation)
+      return state; // Don't fall through — geocoding phase does heavy work
     } else {
-      const statusMsg = `MAIDs: ${maidsStatus.state}, Home: ${homeStatus.state}`;
+      const statusMsg = `Locations: ${locsStatus.state}, Home: ${homeStatus.state}`;
       state.progress = { step: 'queries', percent: 20, message: `Esperando queries... (${statusMsg})` };
       await saveActivationState(state);
       return state;
     }
   }
 
-  // ── Phase 3: Geocode home locations ──────────────────────────
+  // ── Phase 3: Geocode unique locations + start Athena JOIN ──────
   if (state.status === 'geocoding') {
-    const homeOutputKey = `athena-results/${state.homeQueryId}.csv`;
-    const homeResponse = await s3Client.send(new GetObjectCommand({
+    // Download unique locations CSV (SMALL — ~50K-200K rows, a few MB)
+    const locsOutputKey = `athena-results/${state.uniqueLocsQueryId}.csv`;
+    const locsResponse = await s3Client.send(new GetObjectCommand({
       Bucket: BUCKET,
-      Key: homeOutputKey,
+      Key: locsOutputKey,
     }));
+    const locsCsv = await locsResponse.Body?.transformToString() || '';
 
-    // Stream home CSV → build homeMap
-    const homeMap = new Map<string, { lat: number; lng: number }>();
-    const homeRl = createInterface({ input: homeResponse.Body as Readable, crlfDelay: Infinity });
-    let homeHeader = true;
-    for await (const line of homeRl) {
-      if (homeHeader) { homeHeader = false; continue; }
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const parts = trimmed.replace(/"/g, '').split(',');
-      const adId = parts[0];
-      const lat = parseFloat(parts[1]);
-      const lng = parseFloat(parts[2]);
-      if (adId && !isNaN(lat) && !isNaN(lng)) {
-        homeMap.set(adId, { lat, lng });
+    // Parse lat_key, lng_key → actual coordinates
+    const locations: { latKey: number; lngKey: number; lat: number; lng: number }[] = [];
+    const locsLines = locsCsv.split('\n');
+    for (let i = 1; i < locsLines.length; i++) {
+      const line = locsLines[i].trim().replace(/"/g, '');
+      if (!line) continue;
+      const [latKeyStr, lngKeyStr] = line.split(',');
+      const latKey = parseInt(latKeyStr);
+      const lngKey = parseInt(lngKeyStr);
+      if (!isNaN(latKey) && !isNaN(lngKey)) {
+        locations.push({ latKey, lngKey, lat: latKey / 1000, lng: lngKey / 1000 });
       }
     }
 
-    state.progress = { step: 'geocode', percent: 50, message: `${homeMap.size.toLocaleString()} devices con home. Geocodificando...` };
+    console.log(`[ACTIVATE] ${state.datasetName}: ${locations.length} unique locations to geocode`);
+    state.progress = {
+      step: 'geocode',
+      percent: 35,
+      message: `${locations.length.toLocaleString()} ubicaciones únicas. Geocodificando...`,
+    };
 
-    // Get unique locations
-    const uniqueLocations = new Map<string, { lat: number; lng: number }>();
-    homeMap.forEach(({ lat, lng }) => {
-      const key = `${lat},${lng}`;
-      if (!uniqueLocations.has(key)) uniqueLocations.set(key, { lat, lng });
-    });
-
-    const points: Array<{ lat: number; lng: number }> = [];
-    uniqueLocations.forEach(v => points.push(v));
+    // Load GeoJSON for needed countries
+    const points = locations.map(l => ({ lat: l.lat, lng: l.lng }));
     await ensureCountriesLoaded(points);
 
-    const zipLookup = new Map<string, string>();
-    for (const { lat, lng } of points) {
-      const result = getZipcode(lat, lng);
-      zipLookup.set(`${lat},${lng}`, result?.postcode || 'UNKNOWN');
+    // Geocode each unique location (fast: ~10-100μs per lookup with spatial index)
+    const geoLines: string[] = [];
+    for (const loc of locations) {
+      const result = getZipcode(loc.lat, loc.lng);
+      if (result?.postcode) {
+        geoLines.push(`${loc.latKey},${loc.lngKey},${result.postcode}`);
+      }
     }
 
-    // Build geocoded CSV (ad_id,zipcode) and upload to S3
-    const geocodedLines: string[] = ['ad_id,zipcode'];
-    let devicesWithZipcode = 0;
-    homeMap.forEach(({ lat, lng }, adId) => {
-      const zip = zipLookup.get(`${lat},${lng}`) || 'UNKNOWN';
-      if (zip !== 'UNKNOWN') devicesWithZipcode++;
-      geocodedLines.push(`${adId},${zip}`);
-    });
+    console.log(`[ACTIVATE] ${state.datasetName}: geocoded ${geoLines.length}/${locations.length} locations`);
+    state.progress = {
+      step: 'geocode',
+      percent: 50,
+      message: `Geocodificadas ${geoLines.length.toLocaleString()} de ${locations.length.toLocaleString()} ubicaciones. Iniciando JOIN...`,
+    };
 
-    const geocodedKey = `staging/.temp/${state.handle}-geocoded.csv`;
+    // Upload geocode lookup CSV (NO HEADER — external table reads positionally)
+    const geoDir = `athena-temp/${state.geoTableName}`;
+    const geoCsvContent = geoLines.length > 0 ? geoLines.join('\n') + '\n' : '0,0,EMPTY\n';
     await s3Client.send(new PutObjectCommand({
       Bucket: BUCKET,
-      Key: geocodedKey,
-      Body: geocodedLines.join('\n'),
+      Key: `${geoDir}/data.csv`,
+      Body: geoCsvContent,
       ContentType: 'text/csv',
     }));
 
-    state.geocodedKey = geocodedKey;
-    state.status = 'building_csv';
-    state.progress = {
-      step: 'geocode',
-      percent: 70,
-      message: `Geocodificadas ${zipLookup.size.toLocaleString()} ubicaciones (${devicesWithZipcode.toLocaleString()} con zip)`,
-    };
+    // Create external table for geocode lookup
+    const createGeoTableSql = `
+      CREATE EXTERNAL TABLE ${state.geoTableName} (
+        lat_key BIGINT,
+        lng_key BIGINT,
+        zipcode STRING
+      )
+      ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+      STORED AS TEXTFILE
+      LOCATION 's3://${BUCKET}/${geoDir}/'
+    `;
+    await runQuery(createGeoTableSql);
+    console.log(`[ACTIVATE] ${state.datasetName}: created geo table ${state.geoTableName} (${geoLines.length} entries)`);
+
+    // Start the final JOIN query — Athena produces the CSV (no Node.js download needed!)
+    const tableName = getTableName(datasetName);
+    const joinSql = `
+      WITH all_devices AS (
+        SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''
+      )
+      SELECT
+        d.ad_id as maid,
+        '${state.countryCode}' as country,
+        COALESCE(g.zipcode, 'UNKNOWN') as zipcode
+      FROM all_devices d
+      LEFT JOIN ${state.homeTableName} h ON d.ad_id = h.ad_id
+      LEFT JOIN ${state.geoTableName} g ON h.lat_key = g.lat_key AND h.lng_key = g.lng_key
+    `;
+
+    // Count query — runs in parallel, gets device/zipcode counts
+    const countSql = `
+      WITH all_devices AS (
+        SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND ad_id != ''
+      )
+      SELECT
+        COUNT(*) as total_devices,
+        COUNT(g.zipcode) as devices_with_zip
+      FROM all_devices d
+      LEFT JOIN ${state.homeTableName} h ON d.ad_id = h.ad_id
+      LEFT JOIN ${state.geoTableName} g ON h.lat_key = g.lat_key AND h.lng_key = g.lng_key
+    `;
+
+    const [joinQueryId, countQueryId] = await Promise.all([
+      startQueryAsync(joinSql),
+      startQueryAsync(countSql),
+    ]);
+
+    state.joinQueryId = joinQueryId;
+    state.countQueryId = countQueryId;
+    state.status = 'join_running';
+    state.progress = { step: 'join', percent: 55, message: 'JOIN query en progreso en Athena...' };
     await saveActivationState(state);
-    console.log(`[ACTIVATE] ${state.datasetName}: geocoded ${zipLookup.size} locations, uploaded ${geocodedKey}`);
+    console.log(`[ACTIVATE] ${state.datasetName}: started join(${joinQueryId}) + count(${countQueryId})`);
     return state;
   }
 
-  // ── Phase 4: Stream MAIDs + geocoded lookup → final CSV → S3 ─────
-  if (state.status === 'building_csv') {
-    state.progress = { step: 'build_csv', percent: 72, message: 'Construyendo CSV final (streaming)...' };
+  // ── Phase 4: Poll JOIN + count queries ──────────────────────
+  if (state.status === 'join_running') {
+    const [joinStatus, countStatus] = await Promise.all([
+      checkQueryStatus(state.joinQueryId!),
+      checkQueryStatus(state.countQueryId!),
+    ]);
 
-    // Load geocoded lookup into memory (it's the filtered subset, manageable)
-    const geoResponse = await s3Client.send(new GetObjectCommand({
-      Bucket: BUCKET,
-      Key: state.geocodedKey!,
-    }));
-    const geoCsv = await geoResponse.Body?.transformToString() || '';
-    const geoMap = new Map<string, string>();
-    const geoLines = geoCsv.split('\n');
-    for (let i = 1; i < geoLines.length; i++) {
-      const line = geoLines[i].trim();
-      if (!line) continue;
-      const [adId, zip] = line.split(',');
-      if (adId) geoMap.set(adId, zip || 'UNKNOWN');
+    if (joinStatus.state === 'FAILED') {
+      state.status = 'error';
+      state.error = `Join query failed: ${joinStatus.error}`;
+      state.progress = { step: 'error', percent: 0, message: state.error };
+      await saveActivationState(state);
+      return state;
+    }
+    // Count query failure is non-critical
+    if (countStatus.state === 'FAILED') {
+      console.warn(`[ACTIVATE] Count query failed (non-critical): ${countStatus.error}`);
     }
 
-    // Stream MAIDs from S3 → join with geoMap → stream upload to S3
-    const maidsOutputKey = `athena-results/${state.maidsQueryId}.csv`;
-    const maidsResponse = await s3Client.send(new GetObjectCommand({
-      Bucket: BUCKET,
-      Key: maidsOutputKey,
-    }));
+    const joinDone = joinStatus.state === 'SUCCEEDED';
+    const countDone = countStatus.state === 'SUCCEEDED' || countStatus.state === 'FAILED';
 
+    if (joinDone && countDone) {
+      state.status = 'finalizing';
+      state.progress = { step: 'finalizing', percent: 80, message: 'Copiando resultado a staging...' };
+      await saveActivationState(state);
+      // Fall through to finalizing
+    } else {
+      const statusMsg = `Join: ${joinStatus.state}, Count: ${countStatus.state}`;
+      state.progress = { step: 'join', percent: 65, message: `Esperando queries... (${statusMsg})` };
+      await saveActivationState(state);
+      return state;
+    }
+  }
+
+  // ── Phase 5: Copy result to staging + cleanup ────────────────
+  if (state.status === 'finalizing') {
     const csvKey = `staging/${state.handle}.csv`;
     const specKey = `staging/${state.handle}.csv.spec.yml`;
+    const athenaOutputKey = `athena-results/${state.joinQueryId}.csv`;
 
-    const outputStream = new PassThrough();
-    const upload = new Upload({
-      client: s3Client,
-      params: { Bucket: BUCKET, Key: csvKey, Body: outputStream, ContentType: 'text/csv' },
-      partSize: 5 * 1024 * 1024,
-      queueSize: 4,
-    });
-
-    outputStream.write('maid,country,zipcode\n');
-
-    const rl = createInterface({ input: maidsResponse.Body as Readable, crlfDelay: Infinity });
-    let isHeader = true;
+    // Get device counts from count query
     let deviceCount = 0;
     let devicesWithZipcode = 0;
-    for await (const line of rl) {
-      if (isHeader) { isHeader = false; continue; }
-      const adId = line.trim().replace(/"/g, '');
-      if (!adId) continue;
-      const zip = geoMap.get(adId) || 'UNKNOWN';
-      if (zip !== 'UNKNOWN') devicesWithZipcode++;
-      outputStream.write(`${adId},${state.countryCode},${zip}\n`);
-      deviceCount++;
+    try {
+      const countResult = await fetchQueryResults(state.countQueryId!);
+      const row = countResult.rows[0];
+      if (row) {
+        deviceCount = Number(row.total_devices) || 0;
+        devicesWithZipcode = Number(row.devices_with_zip) || 0;
+      }
+    } catch (e: any) {
+      console.warn(`[ACTIVATE] Failed to fetch count results: ${e.message}`);
     }
 
-    outputStream.end();
-    await upload.done();
+    // Copy Athena result CSV to staging (server-side, no download!)
+    const head = await s3Client.send(new HeadObjectCommand({
+      Bucket: BUCKET,
+      Key: athenaOutputKey,
+    }));
+    const fileSize = head.ContentLength || 0;
+    console.log(`[ACTIVATE] Athena result size: ${(fileSize / (1024 * 1024)).toFixed(1)} MB`);
+
+    if (fileSize <= 4.5 * 1024 * 1024 * 1024) {
+      // Under 4.5GB — simple CopyObject
+      await s3Client.send(new CopyObjectCommand({
+        Bucket: BUCKET,
+        CopySource: `${BUCKET}/${athenaOutputKey}`,
+        Key: csvKey,
+        ContentType: 'text/csv',
+      }));
+    } else {
+      // Over 4.5GB — use multipart copy
+      console.log(`[ACTIVATE] File too large for CopyObject, using multipart copy...`);
+      await multipartCopyS3(BUCKET, athenaOutputKey, csvKey);
+    }
 
     // Upload spec
     const specContent = 'identifiers:\n  - name: maid\n    type: uuid-maid\nattributes:\n  - country\n  - zipcode\n';
@@ -752,10 +872,11 @@ export async function activateDevicesMultiPhase(
       ContentType: 'text/yaml',
     }));
 
-    // Clean up temp geocoded file
-    try {
-      await s3Client.send(new PutObjectCommand({ Bucket: BUCKET, Key: state.geocodedKey!, Body: '' }));
-    } catch { /* ignore cleanup errors */ }
+    // Cleanup temp Athena tables (best-effort, fire-and-forget)
+    Promise.all([
+      dropTempTable(state.homeTableName!).catch(() => {}),
+      dropTempTable(state.geoTableName!).catch(() => {}),
+    ]).catch(() => {});
 
     const result: ActivationResult = {
       success: true,
@@ -779,6 +900,51 @@ export async function activateDevicesMultiPhase(
   }
 
   return state;
+}
+
+/**
+ * Server-side multipart copy for large S3 objects (>5GB).
+ * Uses UploadPartCopy — no data is downloaded to the function.
+ */
+async function multipartCopyS3(bucket: string, sourceKey: string, destKey: string): Promise<void> {
+  const head = await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: sourceKey }));
+  const fileSize = head.ContentLength || 0;
+  const partSize = 100 * 1024 * 1024; // 100 MB parts
+
+  const { UploadId } = await s3Client.send(new CreateMultipartUploadCommand({
+    Bucket: bucket,
+    Key: destKey,
+    ContentType: 'text/csv',
+  }));
+
+  const parts: { ETag: string; PartNumber: number }[] = [];
+  let offset = 0;
+  let partNumber = 1;
+
+  while (offset < fileSize) {
+    const end = Math.min(offset + partSize - 1, fileSize - 1);
+    const res = await s3Client.send(new UploadPartCopyCommand({
+      Bucket: bucket,
+      Key: destKey,
+      CopySource: `${bucket}/${sourceKey}`,
+      UploadId,
+      PartNumber: partNumber,
+      CopySourceRange: `bytes=${offset}-${end}`,
+    }));
+
+    parts.push({ ETag: res.CopyPartResult?.ETag || '', PartNumber: partNumber });
+    offset = end + 1;
+    partNumber++;
+  }
+
+  await s3Client.send(new CompleteMultipartUploadCommand({
+    Bucket: bucket,
+    Key: destKey,
+    UploadId,
+    MultipartUpload: { Parts: parts },
+  }));
+
+  console.log(`[ACTIVATE] Multipart copy complete: ${partNumber - 1} parts, ${(fileSize / (1024 * 1024)).toFixed(1)} MB`);
 }
 
 /**
