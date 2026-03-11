@@ -746,7 +746,7 @@ export async function activateDevicesMultiPhase(
 
   // ── Phase 3: Geocode unique locations + start Athena JOIN ──────
   if (state.status === 'geocoding') {
-    // Download unique locations CSV (SMALL — ~50K-200K rows, a few MB)
+    // Download unique locations CSV (SMALL — ~30K rows at 1-decimal precision)
     const locsOutputKey = `athena-results/${state.uniqueLocsQueryId}.csv`;
     const locsResponse = await s3Client.send(new GetObjectCommand({
       Bucket: BUCKET,
@@ -754,8 +754,8 @@ export async function activateDevicesMultiPhase(
     }));
     const locsCsv = await locsResponse.Body?.transformToString() || '';
 
-    // Parse lat_key, lng_key → actual coordinates
-    const locations: { latKey: number; lngKey: number; lat: number; lng: number }[] = [];
+    // Parse lat_key, lng_key
+    const locations: { latKey: number; lngKey: number }[] = [];
     const locsLines = locsCsv.split('\n');
     for (let i = 1; i < locsLines.length; i++) {
       const line = locsLines[i].trim().replace(/"/g, '');
@@ -764,7 +764,7 @@ export async function activateDevicesMultiPhase(
       const latKey = parseInt(latKeyStr);
       const lngKey = parseInt(lngKeyStr);
       if (!isNaN(latKey) && !isNaN(lngKey)) {
-        locations.push({ latKey, lngKey, lat: latKey / 10, lng: lngKey / 10 });
+        locations.push({ latKey, lngKey });
       }
     }
 
@@ -775,32 +775,54 @@ export async function activateDevicesMultiPhase(
       message: `${locations.length.toLocaleString()} unique locations. Geocoding...`,
     };
 
-    // Only load GeoJSON for the primary country — loading ALL countries from
-    // 274K scattered points (visitors from worldwide) takes 60s+ on Vercel.
-    // Points outside the target country get zipcode "UNKNOWN" in the JOIN.
     const cc = state.countryCode || '';
-    if (cc) {
-      setCountryFilter([cc]);
-    }
-    const countryCenter = COUNTRY_CENTERS[cc];
-    if (countryCenter) {
-      await ensureCountriesLoaded([countryCenter]);
-      console.log(`[ACTIVATE] Loaded GeoJSON for ${cc}`);
-    } else {
-      console.warn(`[ACTIVATE] No country center for "${cc}", skipping geocoding`);
-    }
+    let geoLines: string[] = [];
 
-    // Geocode each unique location (fast: ~10-100μs per lookup with spatial index)
-    const geoLines: string[] = [];
-    for (const loc of locations) {
-      const result = getZipcode(loc.lat, loc.lng);
-      if (result?.postcode) {
-        geoLines.push(`${loc.latKey},${loc.lngKey},${result.postcode}`);
+    // Fast path: try pre-computed geocode cache from S3 (~600KB CSV vs 40MB+ GeoJSON)
+    const cacheKey = `config/geocode-cache/${cc}.csv`;
+    let usedCache = false;
+    if (cc) {
+      try {
+        const cacheRes = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: cacheKey }));
+        const cacheCsv = await cacheRes.Body?.transformToString() || '';
+        const cacheMap = new Map<string, string>();
+        for (const line of cacheCsv.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const [lk, nk, zc] = trimmed.split(',');
+          cacheMap.set(`${lk},${nk}`, zc);
+        }
+        console.log(`[ACTIVATE] Loaded geocode cache for ${cc}: ${cacheMap.size} entries`);
+
+        for (const loc of locations) {
+          const zc = cacheMap.get(`${loc.latKey},${loc.lngKey}`);
+          if (zc) {
+            geoLines.push(`${loc.latKey},${loc.lngKey},${zc}`);
+          }
+        }
+        usedCache = true;
+        console.log(`[ACTIVATE] Cache hit: ${geoLines.length}/${locations.length} locations matched`);
+      } catch {
+        console.log(`[ACTIVATE] No geocode cache for ${cc}, falling back to GeoJSON`);
       }
     }
 
-    // Remove country filter after geocoding
-    setCountryFilter(null);
+    // Slow path: load GeoJSON + geocode (works for small countries <15MB)
+    if (!usedCache) {
+      if (cc) setCountryFilter([cc]);
+      const countryCenter = COUNTRY_CENTERS[cc];
+      if (countryCenter) {
+        await ensureCountriesLoaded([countryCenter]);
+        console.log(`[ACTIVATE] Loaded GeoJSON for ${cc}`);
+      }
+      for (const loc of locations) {
+        const result = getZipcode(loc.latKey / 10, loc.lngKey / 10);
+        if (result?.postcode) {
+          geoLines.push(`${loc.latKey},${loc.lngKey},${result.postcode}`);
+        }
+      }
+      setCountryFilter(null);
+    }
 
     console.log(`[ACTIVATE] ${state.datasetName}: geocoded ${geoLines.length}/${locations.length} locations`);
 
