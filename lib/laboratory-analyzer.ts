@@ -17,7 +17,7 @@
  */
 
 import { runQuery, ensureTableForDataset, getTableName } from './athena';
-import { batchReverseGeocode } from './reverse-geocode';
+import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
 import { toIsoCountry } from './country-inference';
 import type {
   LabConfig,
@@ -527,6 +527,7 @@ export async function resolveOrigins(
  */
 export async function geocodeOrigins(
   visits: ParsedVisit[],
+  countryCode?: string,
 ): Promise<Map<string, GeoInfo>> {
   const coordMap = new Map<string, { lat: number; lng: number; devices: number }>();
   for (const v of visits) {
@@ -544,7 +545,16 @@ export async function geocodeOrigins(
     lat: p.lat, lng: p.lng, deviceCount: p.devices,
   }));
 
+  // Set country filter to use pre-computed cache (fast) and avoid loading all GeoJSONs
+  if (countryCode) {
+    setCountryFilter([countryCode]);
+  }
+
   const geocoded = await batchReverseGeocode(geocodePoints);
+
+  if (countryCode) {
+    setCountryFilter(null);
+  }
 
   const coordToZip = new Map<string, GeoInfo>();
   for (let i = 0; i < geocodePoints.length; i++) {
@@ -928,7 +938,8 @@ export async function analyzeLaboratory(
 
   // 5. Geocode
   report({ step: 'geocoding', percent: 72, message: 'Geocoding device origins...', detail: 'Resolving to postal codes' });
-  const coordToZip = await geocodeOrigins(visits);
+  const isoCountry = country ? toIsoCountry(country) : undefined;
+  const coordToZip = await geocodeOrigins(visits, isoCountry);
   report({ step: 'geocoding', percent: 78, message: 'Geocoding complete', detail: `${coordToZip.size} points matched` });
 
   // 6. Process visits for recipe

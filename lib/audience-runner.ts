@@ -217,7 +217,7 @@ export async function runBatchAudienceAnalysis(
   // 5. Run ONE geocoding pass
   report({ phase: 'geocoding', current: 0, total: audiences.length, percent: 60, message: 'Geocoding device origins...' });
 
-  const coordToZip = await geocodeOrigins(visits);
+  const coordToZip = await geocodeOrigins(visits, country);
   console.log(`[AUDIENCE-BATCH] Geocoded ${coordToZip.size} unique coordinates`);
 
   // Save status: geocoding complete
@@ -502,7 +502,7 @@ export async function continueBatchProcessing(
     await options.saveStatus({ phase: 'processing', percent: 78, message: 'Geocoding device origins...' });
   }
 
-  const coordToZip = await geocodeOrigins(visits);
+  const coordToZip = await geocodeOrigins(visits, country);
   console.log(`[AUDIENCE-BATCH-CONTINUE] Geocoded ${coordToZip.size} unique coordinates`);
 
   if (options?.saveStatus) {
