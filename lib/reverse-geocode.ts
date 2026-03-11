@@ -290,8 +290,27 @@ async function loadCountryFeaturesFromS3(country: string): Promise<ZipcodeFeatur
  * Synchronous for cache hits, async for S3 downloads.
  * Returns cached index or null if still loading.
  */
+/**
+ * Optional country filter — when set, only these countries will be loaded/searched.
+ * Used by activation & catchment to avoid loading 10+ GeoJSON files on Vercel.
+ * Call setCountryFilter(null) to remove the filter.
+ */
+let countryFilter: Set<string> | null = null;
+
+export function setCountryFilter(countries: string[] | null): void {
+  countryFilter = countries ? new Set(countries.map(c => c.toUpperCase())) : null;
+  if (countries) {
+    console.log(`[GEOCODE] Country filter set: ${countries.join(', ')}`);
+  } else {
+    console.log(`[GEOCODE] Country filter removed`);
+  }
+}
+
 function loadCountryIndex(country: string): CountrySpatialIndex | null {
   if (countrySpatialIndexCache.has(country)) return countrySpatialIndexCache.get(country)!;
+
+  // Skip if country is not in the filter (when filter is active)
+  if (countryFilter && !countryFilter.has(country)) return null;
 
   // Try local disk
   const local = loadCountryFeaturesLocal(country);

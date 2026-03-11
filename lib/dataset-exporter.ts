@@ -6,7 +6,7 @@ import { runQuery, createTableForDataset, tableExists, getTableName, startQueryA
 import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand, GetObjectCommand, CreateMultipartUploadCommand, UploadPartCopyCommand, CompleteMultipartUploadCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { s3Client, BUCKET } from './s3-config';
-import { getZipcode, ensureCountriesLoaded } from './reverse-geocode';
+import { getZipcode, ensureCountriesLoaded, setCountryFilter } from './reverse-geocode';
 import { Readable, PassThrough } from 'stream';
 import { createInterface } from 'readline';
 
@@ -768,6 +768,9 @@ export async function activateDevicesMultiPhase(
     // 274K scattered points (visitors from worldwide) takes 60s+ on Vercel.
     // Points outside the target country get zipcode "UNKNOWN" in the JOIN.
     const cc = state.countryCode || '';
+    if (cc) {
+      setCountryFilter([cc]);
+    }
     const countryCenter = COUNTRY_CENTERS[cc];
     if (countryCenter) {
       await ensureCountriesLoaded([countryCenter]);
@@ -784,6 +787,9 @@ export async function activateDevicesMultiPhase(
         geoLines.push(`${loc.latKey},${loc.lngKey},${result.postcode}`);
       }
     }
+
+    // Remove country filter after geocoding
+    setCountryFilter(null);
 
     console.log(`[ACTIVATE] ${state.datasetName}: geocoded ${geoLines.length}/${locations.length} locations`);
     state.progress = {

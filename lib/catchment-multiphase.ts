@@ -14,7 +14,8 @@ import {
 } from './athena';
 import { s3Client, BUCKET } from './s3-config';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-import { batchReverseGeocode, aggregateByZipcode } from './reverse-geocode';
+import { batchReverseGeocode, aggregateByZipcode, setCountryFilter } from './reverse-geocode';
+import { getCountryForDataset } from './country-dataset-config';
 import type { ODZipcode } from './od-types';
 
 // ── State ────────────────────────────────────────────────────────────
@@ -298,9 +299,35 @@ export async function catchmentMultiPhase(
     state.progress = { step: 'geocoding', percent: 65, message: `Geocodificando ${originPoints.length.toLocaleString()} clusters...` };
     // Don't save state here — we want to complete geocoding in this same call
 
+    // Determine primary country — limit GeoJSON loading to avoid 60s timeout
+    let primaryCountry = await getCountryForDataset(state.datasetName);
+    if (!primaryCountry) {
+      // Try to detect from job name by looking up the job
+      try {
+        const { getAllJobs } = await import('./jobs');
+        const allJobs = await getAllJobs();
+        const job = allJobs.find((j: any) => {
+          if (!j.s3DestPath) return false;
+          const path = j.s3DestPath.replace('s3://', '').replace(`${BUCKET}/`, '');
+          const folder = path.split('/').filter(Boolean)[0] || path.replace(/\/$/, '');
+          return folder === state.datasetName;
+        });
+        if (job?.name) {
+          primaryCountry = detectCountryFromJobName(job.name);
+        }
+      } catch { /* ignore */ }
+    }
+    if (primaryCountry) {
+      setCountryFilter([primaryCountry]);
+      console.log(`[CATCHMENT] Country filter set to: ${primaryCountry}`);
+    }
+
     // Reverse geocode
     console.log(`[CATCHMENT] ${state.datasetName}: geocoding ${originPoints.length} origin clusters...`);
     const classified = await batchReverseGeocode(originPoints);
+
+    // Remove country filter
+    setCountryFilter(null);
 
     state.progress = { step: 'aggregating', percent: 90, message: 'Agregando por código postal...' };
 
@@ -339,4 +366,35 @@ export async function catchmentMultiPhase(
 
   // Shouldn't reach here
   return state!;
+}
+
+/** Detect country code from job name. */
+function detectCountryFromJobName(name: string): string | undefined {
+  const n = name.toLowerCase();
+  const map: Record<string, string> = {
+    germany: 'DE', deutschland: 'DE',
+    france: 'FR', francia: 'FR',
+    spain: 'ES', 'españa': 'ES', espana: 'ES',
+    mexico: 'MX', 'méxico': 'MX',
+    'united kingdom': 'UK', ' uk ': 'UK',
+    'costa rica': 'CR',
+    guatemala: 'GT',
+    ecuador: 'EC',
+    colombia: 'CO',
+    brazil: 'BR', brasil: 'BR',
+    argentina: 'AR',
+    chile: 'CL',
+    peru: 'PE', 'perú': 'PE',
+    italy: 'IT', italia: 'IT',
+    portugal: 'PT',
+    netherlands: 'NL',
+    belgium: 'BE',
+    switzerland: 'CH', suiza: 'CH',
+    austria: 'AT',
+    poland: 'PL', polonia: 'PL',
+  };
+  for (const [keyword, code] of Object.entries(map)) {
+    if (n.includes(keyword)) return code;
+  }
+  return undefined;
 }
