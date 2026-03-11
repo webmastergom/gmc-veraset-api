@@ -638,16 +638,18 @@ export async function activateDevicesMultiPhase(
       )
     `;
 
-    // Query 1: DISTINCT rounded home locations (small result — ~200K-300K rows)
-    // Uses integer keys (lat*100, lng*100) — 2 decimal places (~1.1km precision).
-    // 3 decimals produces 9M+ unique locations (too many for 60s geocoding).
-    // 2 decimals is more than enough for zipcode estimation.
+    // Query 1: DISTINCT rounded home locations
+    // Uses integer keys (lat*10, lng*10) — 1 decimal place (~11km precision).
+    // 2 decimals produces 600K+ locations for large datasets like Mexico,
+    // which combined with 41MB GeoJSON parsing exceeds 60s.
+    // 1 decimal keeps it under 30K locations — fast enough for any dataset.
+    // Zipcode areas are typically larger than 11km, so precision is sufficient.
     const uniqueLocsSql = `
       WITH ${nightPingsCTE},
       homes AS (
         SELECT
-          CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 2) * 100 AS BIGINT) as lat_key,
-          CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 2) * 100 AS BIGINT) as lng_key
+          CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 1) * 10 AS BIGINT) as lat_key,
+          CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 1) * 10 AS BIGINT) as lng_key
         FROM night_pings
         GROUP BY ad_id
         HAVING COUNT(*) >= 3 AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
@@ -659,8 +661,8 @@ export async function activateDevicesMultiPhase(
     const homeCTASSelect = `
       WITH ${nightPingsCTE}
       SELECT ad_id,
-        CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 2) * 100 AS BIGINT) as lat_key,
-        CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 2) * 100 AS BIGINT) as lng_key
+        CAST(ROUND(APPROX_PERCENTILE(lat, 0.5), 1) * 10 AS BIGINT) as lat_key,
+        CAST(ROUND(APPROX_PERCENTILE(lng, 0.5), 1) * 10 AS BIGINT) as lng_key
       FROM night_pings
       GROUP BY ad_id
       HAVING COUNT(*) >= 3 AND COUNT(DISTINCT DATE(utc_timestamp)) >= 2
@@ -753,7 +755,7 @@ export async function activateDevicesMultiPhase(
       const latKey = parseInt(latKeyStr);
       const lngKey = parseInt(lngKeyStr);
       if (!isNaN(latKey) && !isNaN(lngKey)) {
-        locations.push({ latKey, lngKey, lat: latKey / 100, lng: lngKey / 100 });
+        locations.push({ latKey, lngKey, lat: latKey / 10, lng: lngKey / 10 });
       }
     }
 
