@@ -4,8 +4,11 @@
 
 import { runQuery, createTableForDataset, tableExists, getTableName, startQueryAndWait } from './athena';
 import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { s3Client, BUCKET } from './s3-config';
 import { getZipcode, ensureCountriesLoaded } from './reverse-geocode';
+import { Readable, PassThrough } from 'stream';
+import { createInterface } from 'readline';
 
 const EXPORT_MAX_ROWS = 500000;
 
@@ -325,19 +328,20 @@ export async function activateDevices(
   ]);
   progress('queries', 40, `Queries completadas en ${queryElapsed}s. Descargando resultados...`);
 
-  // 2. Download home locations CSV and build lookup map
+  // 2. Stream home locations CSV and build lookup map
   const homeResponse = await s3Client.send(new GetObjectCommand({
     Bucket: BUCKET,
     Key: homeResult.outputCsvKey,
   }));
-  const homeCsv = await homeResponse.Body?.transformToString() || '';
 
   const homeMap = new Map<string, { lat: number; lng: number }>();
-  const homeLines = homeCsv.split('\n');
-  for (let i = 1; i < homeLines.length; i++) {
-    const line = homeLines[i].trim();
-    if (!line) continue;
-    const parts = line.replace(/"/g, '').split(',');
+  const homeRl = createInterface({ input: homeResponse.Body as Readable, crlfDelay: Infinity });
+  let homeHeader = true;
+  for await (const line of homeRl) {
+    if (homeHeader) { homeHeader = false; continue; }
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parts = trimmed.replace(/"/g, '').split(',');
     const adId = parts[0];
     const lat = parseFloat(parts[1]);
     const lng = parseFloat(parts[2]);
@@ -369,22 +373,46 @@ export async function activateDevices(
   }
   progress('geocode', 70, `Geocodificadas ${zipLookup.size.toLocaleString()} ubicaciones`);
 
-  // 4. Download MAIDs CSV and build final CSV with maid,country,zipcode
-  progress('build_csv', 72, 'Descargando lista de MAIDs...');
+  // 4. Stream MAIDs CSV from S3 → build final CSV → stream upload to S3
+  //    (avoids loading the entire MAIDs file into memory for large datasets)
+  progress('build_csv', 72, 'Procesando MAIDs y subiendo CSV (streaming)...');
+
+  const handle = sanitizeFolderName(jobName) || datasetName;
+  const csvKey = `staging/${handle}.csv`;
+  const specKey = `staging/${handle}.csv.spec.yml`;
+
   const maidsResponse = await s3Client.send(new GetObjectCommand({
     Bucket: BUCKET,
     Key: maidsResult.outputCsvKey,
   }));
-  const maidsCsv = await maidsResponse.Body?.transformToString() || '';
 
   const country = countryCode || '';
-  const csvLines: string[] = ['maid,country,zipcode'];
-  const maidsLines = maidsCsv.split('\n');
+  let deviceCount = 0;
   let devicesWithZipcode = 0;
-  for (let i = 1; i < maidsLines.length; i++) {
-    const line = maidsLines[i].trim();
-    if (!line) continue;
-    const adId = line.replace(/"/g, '');
+
+  // PassThrough stream pipes processed lines directly to S3 multipart upload
+  const outputStream = new PassThrough();
+  const upload = new Upload({
+    client: s3Client,
+    params: {
+      Bucket: BUCKET,
+      Key: csvKey,
+      Body: outputStream,
+      ContentType: 'text/csv',
+    },
+    // 5 MB parts, 4 concurrent uploads
+    partSize: 5 * 1024 * 1024,
+    queueSize: 4,
+  });
+
+  outputStream.write('maid,country,zipcode\n');
+
+  // Stream input line-by-line from S3 → transform → write to output
+  const rl = createInterface({ input: maidsResponse.Body as Readable, crlfDelay: Infinity });
+  let isHeader = true;
+  for await (const line of rl) {
+    if (isHeader) { isHeader = false; continue; }
+    const adId = line.trim().replace(/"/g, '');
     if (!adId) continue;
 
     const home = homeMap.get(adId);
@@ -393,24 +421,20 @@ export async function activateDevices(
       zipcode = zipLookup.get(`${home.lat},${home.lng}`) || 'UNKNOWN';
       if (zipcode !== 'UNKNOWN') devicesWithZipcode++;
     }
-    csvLines.push(`${adId},${country},${zipcode}`);
+    outputStream.write(`${adId},${country},${zipcode}\n`);
+    deviceCount++;
+
+    // Send progress updates every 1M rows to keep connection alive
+    if (deviceCount % 1_000_000 === 0) {
+      const pct = Math.min(72 + Math.floor((deviceCount / 1_000_000) * 0.5), 84);
+      progress('build_csv', pct, `Procesando MAIDs: ${deviceCount.toLocaleString()}...`);
+    }
   }
 
-  const deviceCount = csvLines.length - 1;
-  progress('build_csv', 80, `CSV listo: ${deviceCount.toLocaleString()} MAIDs, ${devicesWithZipcode.toLocaleString()} con zip code`);
+  outputStream.end();
+  await upload.done();
 
-  // 5. Upload CSV + spec to staging
-  const handle = sanitizeFolderName(jobName) || datasetName;
-  const csvKey = `staging/${handle}.csv`;
-  const specKey = `staging/${handle}.csv.spec.yml`;
-
-  progress('upload', 85, 'Subiendo CSV a staging...');
-  await s3Client.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: csvKey,
-    Body: csvLines.join('\n'),
-    ContentType: 'text/csv',
-  }));
+  progress('build_csv', 85, `CSV subido: ${deviceCount.toLocaleString()} MAIDs, ${devicesWithZipcode.toLocaleString()} con zip code`);
 
   progress('upload', 95, 'Subiendo spec file...');
   const specContent = 'identifiers:\n  - name: maid\n    type: uuid-maid\nattributes:\n  - country\n  - zipcode\n';
