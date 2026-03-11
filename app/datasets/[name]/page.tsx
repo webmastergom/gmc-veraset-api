@@ -329,79 +329,84 @@ export default function DatasetAnalysisPage() {
     );
   };
 
-  const loadCatchment = () => {
+  const loadCatchment = async () => {
     setLoadingCatchment(true);
     setCatchment(null);
     setCatchmentProgress({ step: 'initializing', percent: 0, message: 'Starting analysis...' });
 
-    const streamParams = new URLSearchParams();
-    if (catchmentMinPings > 1) streamParams.set('minPings', String(catchmentMinPings));
-    const qs = streamParams.toString();
-    const es = new EventSource(`/api/datasets/${datasetName}/catchment/stream${qs ? `?${qs}` : ''}`);
+    try {
+      const params = new URLSearchParams();
+      if (catchmentMinPings > 1) params.set('minPings', String(catchmentMinPings));
+      const qs = params.toString();
 
-    es.addEventListener('progress', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        setCatchmentProgress({
-          step: data.step,
-          percent: data.percent,
-          message: data.message,
-          detail: data.detail,
+      // Multi-phase polling — each call completes within 60s
+      const poll = async (): Promise<void> => {
+        const res = await fetch(`/api/datasets/${datasetName}/catchment/poll${qs ? `?${qs}` : ''}`, {
+          method: 'POST',
+          credentials: 'include',
         });
-        if (data.step === 'error') {
-          es.close();
-          setLoadingCatchment(false);
-          alert(`Catchment failed: ${data.message}`);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || `HTTP ${res.status}`);
         }
-      } catch { /* ignore parse errors */ }
-    });
+        const state = await res.json();
 
-    es.addEventListener('result', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        setCatchment({
-          zipcodes: data.zipcodes || [],
-          coverage: data.coverage,
-          summary: {
-            totalZipcodes: data.summary?.totalZipcodes ?? 0,
-            devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
-          },
-        });
-      } catch { /* ignore */ }
-      es.close();
+        if (state.status === 'error') {
+          throw new Error(state.error || state.progress?.message || 'Catchment failed');
+        }
+
+        // Update progress
+        if (state.progress) {
+          setCatchmentProgress({
+            step: state.progress.step,
+            percent: state.progress.percent,
+            message: state.progress.message,
+          });
+        }
+
+        if (state.status === 'completed' && state.result) {
+          const result = state.result;
+          const zipcodes = result.origins?.map((z: any) => ({
+            zipcode: z.zipcode,
+            city: z.city,
+            province: z.province,
+            region: z.region,
+            devices: z.devices,
+            percentOfTotal: z.percentOfTotal,
+            percentage: z.percentOfTotal,
+            source: z.source,
+          })) || [];
+
+          const totalMatched = zipcodes.reduce((s: number, z: any) => s + z.devices, 0);
+
+          setCatchment({
+            zipcodes,
+            coverage: {
+              totalDevicesVisitedPois: result.totalDevicesVisitedPois,
+              devicesMatchedToZipcode: totalMatched,
+              geocodingComplete: result.geocodingComplete,
+              classificationRatePercent: result.coverageRatePercent,
+            },
+            summary: {
+              totalZipcodes: zipcodes.length,
+              devicesMatchedToZipcode: totalMatched,
+            },
+          });
+          return;
+        }
+
+        // Not done yet — wait and poll again
+        await new Promise(r => setTimeout(r, 2500));
+        return poll();
+      };
+
+      await poll();
+    } catch (e: any) {
+      alert(`Catchment failed: ${e.message || 'Unknown error'}`);
+    } finally {
       setLoadingCatchment(false);
       setCatchmentProgress(null);
-    });
-
-    es.onerror = () => {
-      es.close();
-      // If we didn't get a result yet, try the regular endpoint as fallback
-      if (!catchment) {
-        setCatchmentProgress({ step: 'running_queries', percent: 50, message: 'Reconnecting...', detail: 'Falling back to standard request' });
-        fetch(`/api/datasets/${datasetName}/catchment${qs ? `?${qs}` : ''}`, { credentials: 'include' })
-          .then((res) => {
-            if (!res.ok) throw new Error(res.statusText);
-            return res.json();
-          })
-          .then((data) => {
-            setCatchment({
-              zipcodes: data.zipcodes || [],
-              coverage: data.coverage,
-              summary: {
-                totalZipcodes: data.summary?.totalZipcodes ?? 0,
-                devicesMatchedToZipcode: data.summary?.devicesMatchedToZipcode ?? data.coverage?.devicesMatchedToZipcode ?? 0,
-              },
-            });
-          })
-          .catch((e) => {
-            alert(`Catchment failed: ${e.message || 'Unknown error'}`);
-          })
-          .finally(() => {
-            setLoadingCatchment(false);
-            setCatchmentProgress(null);
-          });
-      }
-    };
+    }
   };
 
   const runAudit = async () => {
