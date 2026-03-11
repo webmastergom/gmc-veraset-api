@@ -261,6 +261,37 @@ function sanitizeFolderName(name: string): string {
     .replace(/^-|-$/g, '');
 }
 
+/** Detect ISO country code from job/dataset name. Returns 2-letter code or undefined. */
+function detectCountryFromName(name: string): string | undefined {
+  const n = name.toLowerCase();
+  const map: Record<string, string> = {
+    germany: 'DE', deutschland: 'DE',
+    france: 'FR', francia: 'FR',
+    spain: 'ES', españa: 'ES', espana: 'ES',
+    mexico: 'MX', méxico: 'MX',
+    'united kingdom': 'UK', uk: 'UK',
+    'costa rica': 'CR',
+    guatemala: 'GT',
+    ecuador: 'EC',
+    colombia: 'CO',
+    brazil: 'BR', brasil: 'BR',
+    argentina: 'AR',
+    chile: 'CL',
+    peru: 'PE', perú: 'PE',
+    italy: 'IT', italia: 'IT',
+    portugal: 'PT',
+    netherlands: 'NL',
+    belgium: 'BE',
+    switzerland: 'CH', suiza: 'CH',
+    austria: 'AT',
+    poland: 'PL', polonia: 'PL',
+  };
+  for (const [keyword, code] of Object.entries(map)) {
+    if (n.includes(keyword)) return code;
+  }
+  return undefined;
+}
+
 /**
  * Export all MAIDs from a dataset to staging/{handle}.csv for Karlsgate.
  *
@@ -563,6 +594,9 @@ export async function activateDevicesMultiPhase(
     ]);
 
     // CTE shared by both queries
+    // NOTE: We do NOT filter by CARDINALITY(poi_ids) = 0 because cohort datasets
+    // (geofenced) have poi_ids on EVERY ping, so that filter would eliminate all rows.
+    // Nighttime pings near POIs are still valid for home estimation in urban areas.
     const nightPingsCTE = `
       night_pings AS (
         SELECT ad_id,
@@ -571,7 +605,6 @@ export async function activateDevicesMultiPhase(
           utc_timestamp
         FROM ${tableName}
         WHERE (HOUR(utc_timestamp) >= 20 OR HOUR(utc_timestamp) < 4)
-          AND CARDINALITY(poi_ids) = 0
           AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
           AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
           AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < 200)
@@ -610,11 +643,14 @@ export async function activateDevicesMultiPhase(
       startCTASAsync(homeCTASSelect, homeTableName),
     ]);
 
+    // Resolve country code: explicit param > name-based detection > empty
+    const resolvedCountry = countryCode || detectCountryFromName(jobName) || '';
+
     state = {
       status: 'queries_running',
       datasetName,
       jobName,
-      countryCode: countryCode || '',
+      countryCode: resolvedCountry,
       handle,
       runId,
       uniqueLocsQueryId,
