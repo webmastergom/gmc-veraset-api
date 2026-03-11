@@ -272,7 +272,7 @@ export default function DatasetAnalysisPage() {
     setActivateModal(true);
     setActivateStep('');
     setActivatePercent(0);
-    setActivateMessage('Iniciando activación...');
+    setActivateMessage('Starting activation...');
 
     try {
       // Multi-phase polling approach — each call completes within 60s

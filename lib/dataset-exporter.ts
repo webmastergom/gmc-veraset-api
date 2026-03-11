@@ -377,13 +377,13 @@ export async function activateDevices(
   const onQueryPoll = (elapsed: number, state: string) => {
     queryElapsed = elapsed;
     // Send progress updates every ~10s so the SSE stream stays alive
-    progress('queries', Math.min(10 + Math.floor(elapsed / 5), 38), `Queries Athena en progreso (${state}, ${elapsed}s)...`);
+    progress('queries', Math.min(10 + Math.floor(elapsed / 5), 38), `Athena queries in progress (${state}, ${elapsed}s)...`);
   };
   const [maidsResult, homeResult] = await Promise.all([
     startQueryAndWait(maidsSql, onQueryPoll),
     startQueryAndWait(homeSql, onQueryPoll),
   ]);
-  progress('queries', 40, `Queries completadas en ${queryElapsed}s. Descargando resultados...`);
+  progress('queries', 40, `Queries completed in ${queryElapsed}s. Downloading results...`);
 
   // 2. Stream home locations CSV and build lookup map
   const homeResponse = await s3Client.send(new GetObjectCommand({
@@ -406,7 +406,7 @@ export async function activateDevices(
       homeMap.set(adId, { lat, lng });
     }
   }
-  progress('geocode', 50, `${homeMap.size.toLocaleString()} devices con home location. Geocodificando...`);
+  progress('geocode', 50, `${homeMap.size.toLocaleString()} devices with home location. Geocoding...`);
 
   // 3. Reverse geocode unique home locations
   const uniqueLocations = new Map<string, { lat: number; lng: number }>();
@@ -419,7 +419,7 @@ export async function activateDevices(
 
   const points: Array<{ lat: number; lng: number }> = [];
   uniqueLocations.forEach(v => points.push(v));
-  progress('geocode', 55, `Cargando GeoJSON para ${points.length.toLocaleString()} ubicaciones...`);
+  progress('geocode', 55, `Loading GeoJSON for ${points.length.toLocaleString()} locations...`);
   await ensureCountriesLoaded(points);
 
   const zipLookup = new Map<string, string>();
@@ -428,11 +428,11 @@ export async function activateDevices(
     const key = `${lat},${lng}`;
     zipLookup.set(key, result?.postcode || 'UNKNOWN');
   }
-  progress('geocode', 70, `Geocodificadas ${zipLookup.size.toLocaleString()} ubicaciones`);
+  progress('geocode', 70, `Geocoded ${zipLookup.size.toLocaleString()} locations`);
 
   // 4. Stream MAIDs CSV from S3 → build final CSV → stream upload to S3
   //    (avoids loading the entire MAIDs file into memory for large datasets)
-  progress('build_csv', 72, 'Procesando MAIDs y subiendo CSV (streaming)...');
+  progress('build_csv', 72, 'Processing MAIDs and uploading CSV (streaming)...');
 
   const handle = sanitizeFolderName(jobName) || datasetName;
   const csvKey = `staging/${handle}.csv`;
@@ -484,7 +484,7 @@ export async function activateDevices(
     // Send progress updates every 1M rows to keep connection alive
     if (deviceCount % 1_000_000 === 0) {
       const pct = Math.min(72 + Math.floor((deviceCount / 1_000_000) * 0.5), 84);
-      progress('build_csv', pct, `Procesando MAIDs: ${deviceCount.toLocaleString()}...`);
+      progress('build_csv', pct, `Processing MAIDs: ${deviceCount.toLocaleString()}...`);
     }
   }
 
@@ -732,13 +732,13 @@ export async function activateDevicesMultiPhase(
 
     if (locsDone && homeDone) {
       state.status = 'geocoding';
-      state.progress = { step: 'queries', percent: 30, message: 'Queries completadas. Preparando geocodificación...' };
+      state.progress = { step: 'queries', percent: 30, message: 'Queries completed. Preparing geocoding...' };
       await saveActivationState(state);
       console.log(`[ACTIVATE] ${state.datasetName}: both queries completed`);
       return state; // Don't fall through — geocoding phase does heavy work
     } else {
       const statusMsg = `Locations: ${locsStatus.state}, Home: ${homeStatus.state}`;
-      state.progress = { step: 'queries', percent: 20, message: `Esperando queries... (${statusMsg})` };
+      state.progress = { step: 'queries', percent: 20, message: `Waiting for queries... (${statusMsg})` };
       await saveActivationState(state);
       return state;
     }
@@ -772,7 +772,7 @@ export async function activateDevicesMultiPhase(
     state.progress = {
       step: 'geocode',
       percent: 35,
-      message: `${locations.length.toLocaleString()} ubicaciones únicas. Geocodificando...`,
+      message: `${locations.length.toLocaleString()} unique locations. Geocoding...`,
     };
 
     // Only load GeoJSON for the primary country — loading ALL countries from
@@ -820,7 +820,7 @@ export async function activateDevicesMultiPhase(
     state.progress = {
       step: 'geocode',
       percent: 45,
-      message: `Geocodificadas ${geoLines.length.toLocaleString()} de ${locations.length.toLocaleString()} ubicaciones. Creando tabla...`,
+      message: `Geocoded ${geoLines.length.toLocaleString()} of ${locations.length.toLocaleString()} locations. Creating table...`,
     };
     await saveActivationState(state);
     return state;
@@ -880,7 +880,7 @@ export async function activateDevicesMultiPhase(
     state.joinQueryId = joinQueryId;
     state.countQueryId = countQueryId;
     state.status = 'join_running';
-    state.progress = { step: 'join', percent: 55, message: 'JOIN query en progreso en Athena...' };
+    state.progress = { step: 'join', percent: 55, message: 'JOIN query running in Athena...' };
     await saveActivationState(state);
     console.log(`[ACTIVATE] ${state.datasetName}: started join(${joinQueryId}) + count(${countQueryId})`);
     return state;
@@ -910,12 +910,12 @@ export async function activateDevicesMultiPhase(
 
     if (joinDone && countDone) {
       state.status = 'finalizing';
-      state.progress = { step: 'finalizing', percent: 80, message: 'Copiando resultado a staging...' };
+      state.progress = { step: 'finalizing', percent: 80, message: 'Copying result to staging...' };
       await saveActivationState(state);
       // Fall through to finalizing
     } else {
       const statusMsg = `Join: ${joinStatus.state}, Count: ${countStatus.state}`;
-      state.progress = { step: 'join', percent: 65, message: `Esperando queries... (${statusMsg})` };
+      state.progress = { step: 'join', percent: 65, message: `Waiting for queries... (${statusMsg})` };
       await saveActivationState(state);
       return state;
     }

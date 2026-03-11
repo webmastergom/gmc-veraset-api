@@ -246,20 +246,20 @@ export default function NewJobPage() {
     
     // Show confirmation dialog for expensive operations
     const estimatedCost = daysDiff * poiCount; // Rough estimate
-    const confirmMessage = `⚠️ ALERTA MÁXIMA ⚠️\n\n` +
-      `Estás a punto de crear un job que costará más que tu primer carro:\n\n` +
-      `📊 Detalles del crimen:\n` +
-      `   • ${poiCount} POIs (cada uno más caro que un café en Starbucks)\n` +
-      `   • ${daysDiff} días de datos (${formData.dateRange.from} a ${formData.dateRange.to})\n` +
-      `   • Tipo: ${formData.type}\n` +
+    const confirmMessage = `⚠️ MAXIMUM ALERT ⚠️\n\n` +
+      `You're about to create a job that'll cost more than your first car:\n\n` +
+      `📊 Crime details:\n` +
+      `   • ${poiCount} POIs (each one pricier than a Starbucks latte)\n` +
+      `   • ${daysDiff} days of data (${formData.dateRange.from} to ${formData.dateRange.to})\n` +
+      `   • Type: ${formData.type}\n` +
       `   • Schema: ${formData.schema}\n\n` +
-      `💰 ESTIMADO: ~$${estimatedCost.toLocaleString()} en créditos Veraset\n\n` +
-      `💀 ADVERTENCIA: Este job es tan caro que:\n` +
-      `   • Tu jefe te va a preguntar "¿por qué?"\n` +
-      `   • Tu cuenta bancaria va a llorar\n` +
-      `   • Veraset va a comprar una isla con tu dinero\n\n` +
-      `🤡 ¿Estás SEGURO que quieres proceder?\n` +
-      `   (Presiona Cancelar si valoras tu presupuesto)`;
+      `💰 ESTIMATE: ~$${estimatedCost.toLocaleString()} in Veraset credits\n\n` +
+      `💀 WARNING: This job is so expensive that:\n` +
+      `   • Your boss will ask "why?"\n` +
+      `   • Your bank account will cry\n` +
+      `   • Veraset will buy an island with your money\n\n` +
+      `🤡 Are you SURE you want to proceed?\n` +
+      `   (Press Cancel if you value your budget)`;
     
     if (!window.confirm(confirmMessage)) {
       return
@@ -880,7 +880,7 @@ export default function NewJobPage() {
                       })
                     }}
                   >
-                    Últimos 7 días
+                    Last 7 days
                   </Button>
                   <Button
                     type="button"
@@ -900,7 +900,7 @@ export default function NewJobPage() {
                       })
                     }}
                   >
-                    Últimos 15 días
+                    Last 15 days
                   </Button>
                   <Button
                     type="button"
@@ -920,7 +920,7 @@ export default function NewJobPage() {
                       })
                     }}
                   >
-                    Últimos 30 días
+                    Last 30 days
                   </Button>
                 </div>
               </div>

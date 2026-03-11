@@ -710,7 +710,7 @@ export default function DatasetsPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Revisión directa del bucket S3 */}
+      {/* Direct S3 bucket review */}
       <Card className="mt-8 bg-[#0a0a0a] border-[#222]">
         <CardHeader>
           <button
@@ -723,10 +723,10 @@ export default function DatasetsPage() {
           >
             {bucketReviewOpen ? <ChevronDown className="h-5 w-5 text-gray-400" /> : <ChevronRight className="h-5 w-5 text-gray-400" />}
             <FolderOpen className="h-5 w-5 text-gray-400" />
-            <CardTitle className="text-lg text-white">Revisión directa del bucket S3 (Garritz)</CardTitle>
+            <CardTitle className="text-lg text-white">Direct S3 bucket review</CardTitle>
           </button>
           <CardDescription className="text-gray-500">
-            Lista de prefijos en el bucket sin pasar por el mapeo de jobs
+            List of prefixes in the bucket without going through the job mapping
           </CardDescription>
         </CardHeader>
         {bucketReviewOpen && (
@@ -740,13 +740,13 @@ export default function DatasetsPage() {
                 className="border-[#333]"
               >
                 {bucketLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-                Actualizar lista
+                Refresh list
               </Button>
               {bucketList && (
                 <span className="text-sm text-gray-500">
                   Bucket: <span className="font-mono">{bucketList.bucket}</span>
                   {bucketList.listedAt && (
-                    <> · Listado: {new Date(bucketList.listedAt).toLocaleString()}</>
+                    <> · Listed: {new Date(bucketList.listedAt).toLocaleString()}</>
                   )}
                 </span>
               )}
@@ -761,10 +761,10 @@ export default function DatasetsPage() {
                 <Table>
                   <TableHeader>
                     <TableRow className="border-[#222] hover:bg-transparent">
-                      <TableHead className="text-gray-400">Prefijo</TableHead>
-                      <TableHead className="text-gray-400 text-right">Objetos</TableHead>
-                      <TableHead className="text-gray-400 text-right">Tamaño</TableHead>
-                      <TableHead className="text-gray-400 w-[80px]">Tipo</TableHead>
+                      <TableHead className="text-gray-400">Prefix</TableHead>
+                      <TableHead className="text-gray-400 text-right">Objects</TableHead>
+                      <TableHead className="text-gray-400 text-right">Size</TableHead>
+                      <TableHead className="text-gray-400 w-[80px]">Type</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>

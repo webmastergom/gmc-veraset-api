@@ -191,7 +191,7 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
       allDates,
       expectedDates: expectedDates.length > 0 ? expectedDates : undefined,
       jobMetadata,
-      progress: { step: 'queries', percent: 20, message: `Queries Athena iniciadas (${allDates.length} días)...` },
+      progress: { step: 'queries', percent: 20, message: `Athena queries started (${allDates.length} days)...` },
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -224,14 +224,14 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
 
     if (!allDone) {
       const statusMsg = `Daily: ${dailyS.state}, Summary: ${summaryS.state}, Visits: ${visitsS.state}`;
-      state.progress = { step: 'queries', percent: 40, message: `Esperando queries... (${statusMsg})` };
+      state.progress = { step: 'queries', percent: 40, message: `Waiting for queries... (${statusMsg})` };
       await saveState(state);
       return state;
     }
 
     // All done — advance to processing
     state.status = 'processing';
-    state.progress = { step: 'queries', percent: 60, message: 'Queries completadas. Procesando resultados...' };
+    state.progress = { step: 'queries', percent: 60, message: 'Queries completed. Processing results...' };
     await saveState(state);
     // Fall through to processing
   }
@@ -373,7 +373,7 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
     state.progress = {
       step: 'done',
       percent: 100,
-      message: `Análisis completo: ${result.summary.uniqueDevices.toLocaleString()} devices, ${result.summary.daysAnalyzed} días`,
+      message: `Analysis complete: ${result.summary.uniqueDevices.toLocaleString()} devices, ${result.summary.daysAnalyzed} days`,
     };
     await saveState(state);
     console.log(`[ANALYSIS] ${datasetName}: completed — ${result.summary.uniqueDevices} devices, ${dailyData.length} days`);

@@ -781,7 +781,7 @@ export async function addPartitionsManually(
     
     // Update progress
     const progress = 30 + Math.floor((i / missingPartitions.length) * 10);
-    progressTracker?.update('adding_partitions', progress, `Agregando partición ${i + 1}/${missingPartitions.length}: ${date}...`);
+    progressTracker?.update('adding_partitions', progress, `Adding partition ${i + 1}/${missingPartitions.length}: ${date}...`);
     
     try {
       await runQuery(`ALTER TABLE ${tableName} ADD PARTITION (date='${date}') LOCATION 's3://${BUCKET}/${datasetName}/date=${date}/'`);

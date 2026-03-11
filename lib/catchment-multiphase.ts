@@ -223,14 +223,14 @@ export async function catchmentMultiPhase(
 
     if (!allDone) {
       const statusMsg = `Origins: ${originsS.state}, Total: ${totalS.state}`;
-      state.progress = { step: 'queries', percent: 35, message: `Esperando queries... (${statusMsg})` };
+      state.progress = { step: 'queries', percent: 35, message: `Waiting for queries... (${statusMsg})` };
       await saveState(state);
       return state;
     }
 
     // All done — advance to processing
     state.status = 'processing';
-    state.progress = { step: 'queries', percent: 55, message: 'Queries completadas. Geocodificando...' };
+    state.progress = { step: 'queries', percent: 55, message: 'Queries completed. Geocoding...' };
     await saveState(state);
     // Fall through to processing
   }
@@ -329,7 +329,7 @@ export async function catchmentMultiPhase(
     // Remove country filter
     setCountryFilter(null);
 
-    state.progress = { step: 'aggregating', percent: 90, message: 'Agregando por código postal...' };
+    state.progress = { step: 'aggregating', percent: 90, message: 'Aggregating by zipcode...' };
 
     // Aggregate by zipcode
     const agg = aggregateByZipcode(classified, totalDeviceDays);
@@ -358,7 +358,7 @@ export async function catchmentMultiPhase(
         ? Math.round((devicesWithOrigin / totalDeviceDays) * 10000) / 100
         : 0,
     };
-    state.progress = { step: 'completed', percent: 100, message: `${origins.length} códigos postales identificados` };
+    state.progress = { step: 'completed', percent: 100, message: `${origins.length} zipcodes identified` };
     await saveState(state);
     console.log(`[CATCHMENT] ${state.datasetName}: done — ${origins.length} zipcodes, ${devicesWithOrigin} device-days matched`);
     return state;
