@@ -38,6 +38,12 @@ const LARGE_COUNTRIES: Record<string, { minLat: number; maxLat: number; minLng: 
   CR: { minLat: 5, maxLat: 12, minLng: -88, maxLng: -82 },
   PA: { minLat: 7, maxLat: 10, minLng: -84, maxLng: -77 },
   CL: { minLat: -56, maxLat: -17, minLng: -76, maxLng: -66 },
+  FR: { minLat: 42, maxLat: 52, minLng: -5, maxLng: 9 },
+  DE: { minLat: 47, maxLat: 56, minLng: 5, maxLng: 16 },
+  IT: { minLat: 35, maxLat: 48, minLng: 6, maxLng: 19 },
+  CO: { minLat: -5, maxLat: 14, minLng: -82, maxLng: -66 },
+  PE: { minLat: -19, maxLat: 1, minLng: -82, maxLng: -68 },
+  UK: { minLat: 49, maxLat: 61, minLng: -8, maxLng: 2 },
 };
 
 // Country center points for ensureCountriesLoaded
@@ -50,6 +56,12 @@ const COUNTRY_CENTERS: Record<string, { lat: number; lng: number }> = {
   CR: { lat: 9.75, lng: -83.75 },
   PA: { lat: 8.54, lng: -80.78 },
   CL: { lat: -35.68, lng: -71.54 },
+  FR: { lat: 46.23, lng: 2.21 },
+  DE: { lat: 51.16, lng: 10.45 },
+  IT: { lat: 41.87, lng: 12.57 },
+  CO: { lat: 4.57, lng: -74.30 },
+  PE: { lat: -9.19, lng: -75.02 },
+  UK: { lat: 55.38, lng: -3.44 },
 };
 
 async function generateCache(cc: string) {
