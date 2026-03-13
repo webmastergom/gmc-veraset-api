@@ -340,8 +340,12 @@ export default function DatasetAnalysisPage() {
       const qs = params.toString();
 
       // Multi-phase polling — each call completes within 60s
+      let isFirstCall = true;
       const poll = async (): Promise<void> => {
-        const res = await fetch(`/api/datasets/${datasetName}/catchment/poll${qs ? `?${qs}` : ''}`, {
+        const resetParam = isFirstCall ? 'reset=true' : '';
+        isFirstCall = false;
+        const allParams = [resetParam, qs].filter(Boolean).join('&');
+        const res = await fetch(`/api/datasets/${datasetName}/catchment/poll${allParams ? `?${allParams}` : ''}`, {
           method: 'POST',
           credentials: 'include',
         });

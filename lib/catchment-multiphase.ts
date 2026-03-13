@@ -243,135 +243,191 @@ export async function catchmentMultiPhase(
 
   // ── Phase 3: Download results, geocode, aggregate ─────────
   if (state.status === 'processing') {
-    const ids = state.queryIds!;
+    try {
+      const ids = state.queryIds!;
 
-    // Download results from Athena output CSVs
-    const fetchCsv = async (queryId: string) => {
-      const res = await s3Client.send(new GetObjectCommand({
-        Bucket: BUCKET,
-        Key: `athena-results/${queryId}.csv`,
-      }));
-      const text = await res.Body?.transformToString() || '';
-      const lines = text.split('\n');
-      const headers = lines[0]?.replace(/"/g, '').split(',').map(h => h.trim()) || [];
-      const rows: Record<string, string>[] = [];
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        const values = line.replace(/"/g, '').split(',');
-        const row: Record<string, string> = {};
-        headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
-        rows.push(row);
+      // Download results from Athena output CSVs
+      const fetchCsv = async (queryId: string) => {
+        const res = await s3Client.send(new GetObjectCommand({
+          Bucket: BUCKET,
+          Key: `athena-results/${queryId}.csv`,
+        }));
+        const text = await res.Body?.transformToString() || '';
+        const lines = text.split('\n');
+        const headers = lines[0]?.replace(/"/g, '').split(',').map(h => h.trim()) || [];
+        const rows: Record<string, string>[] = [];
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const values = line.replace(/"/g, '').split(',');
+          const row: Record<string, string> = {};
+          headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
+          rows.push(row);
+        }
+        return rows;
+      };
+
+      const [originsRows, totalRows] = await Promise.all([
+        fetchCsv(ids.origins),
+        fetchCsv(ids.total),
+      ]);
+
+      const totalDevices = parseInt(String(totalRows[0]?.total_devices)) || 0;
+      console.log(`[CATCHMENT] ${state.datasetName}: ${totalDevices} total devices, ${originsRows.length} origin clusters`);
+
+      if (totalDevices === 0 || originsRows.length === 0) {
+        state.status = 'completed';
+        state.result = {
+          dataset: state.datasetName,
+          analyzedAt: new Date().toISOString(),
+          totalDevicesVisitedPois: totalDevices,
+          totalDeviceDays: 0,
+          origins: [],
+          geocodingComplete: true,
+          coverageRatePercent: 0,
+        };
+        state.progress = { step: 'completed', percent: 100, message: 'No data found' };
+        await saveState(state);
+        return state;
       }
-      return rows;
-    };
 
-    const [originsRows, totalRows] = await Promise.all([
-      fetchCsv(ids.origins),
-      fetchCsv(ids.total),
-    ]);
+      // Parse origin points
+      let totalDeviceDays = 0;
+      const originPoints = originsRows.map(row => {
+        const deviceDays = parseInt(String(row.device_days)) || 0;
+        totalDeviceDays += deviceDays;
+        return {
+          lat: parseFloat(String(row.origin_lat)),
+          lng: parseFloat(String(row.origin_lng)),
+          deviceCount: deviceDays,
+        };
+      }).filter(p => !isNaN(p.lat) && !isNaN(p.lng));
 
-    const totalDevices = parseInt(String(totalRows[0]?.total_devices)) || 0;
-    console.log(`[CATCHMENT] ${state.datasetName}: ${totalDevices} total devices, ${originsRows.length} origin clusters`);
+      state.progress = { step: 'geocoding', percent: 65, message: `Geocoding ${originPoints.length.toLocaleString()} clusters...` };
 
-    if (totalDevices === 0 || originsRows.length === 0) {
+      // Determine primary country — limit GeoJSON loading to avoid 60s timeout
+      let primaryCountry = await getCountryForDataset(state.datasetName);
+      if (!primaryCountry) {
+        // Try to detect from job name by looking up the job
+        try {
+          const { getAllJobs } = await import('./jobs');
+          const allJobs = await getAllJobs();
+          const job = allJobs.find((j: any) => {
+            if (!j.s3DestPath) return false;
+            const path = j.s3DestPath.replace('s3://', '').replace(`${BUCKET}/`, '');
+            const folder = path.split('/').filter(Boolean)[0] || path.replace(/\/$/, '');
+            return folder === state!.datasetName;
+          });
+          if (job?.name) {
+            primaryCountry = detectCountryFromJobName(job.name);
+          }
+        } catch { /* ignore */ }
+      }
+      // Fallback: detect country from median coordinates
+      if (!primaryCountry && originPoints.length > 0) {
+        primaryCountry = detectCountryFromCoordinates(originPoints);
+        if (primaryCountry) {
+          console.log(`[CATCHMENT] Country detected from coordinates: ${primaryCountry}`);
+        }
+      }
+      if (primaryCountry) {
+        setCountryFilter([primaryCountry]);
+        console.log(`[CATCHMENT] Country filter set to: ${primaryCountry}`);
+      }
+
+      // Reverse geocode
+      console.log(`[CATCHMENT] ${state.datasetName}: geocoding ${originPoints.length} origin clusters...`);
+      const classified = await batchReverseGeocode(originPoints);
+
+      // Remove country filter
+      setCountryFilter(null);
+
+      state.progress = { step: 'aggregating', percent: 90, message: 'Aggregating by zipcode...' };
+
+      // Aggregate by zipcode
+      const agg = aggregateByZipcode(classified, totalDeviceDays);
+
+      const origins: ODZipcode[] = agg.zipcodes.map(z => ({
+        zipcode: z.zipcode,
+        city: z.city,
+        province: z.province,
+        region: z.region,
+        devices: z.devices,
+        percentOfTotal: z.percentOfTotal,
+        source: z.source,
+      }));
+
+      const devicesWithOrigin = origins.reduce((s, z) => s + z.devices, 0);
+
       state.status = 'completed';
       state.result = {
         dataset: state.datasetName,
         analyzedAt: new Date().toISOString(),
         totalDevicesVisitedPois: totalDevices,
-        totalDeviceDays: 0,
-        origins: [],
-        geocodingComplete: true,
-        coverageRatePercent: 0,
+        totalDeviceDays,
+        origins,
+        geocodingComplete: agg.nominatimTruncated === 0,
+        coverageRatePercent: totalDeviceDays > 0
+          ? Math.round((devicesWithOrigin / totalDeviceDays) * 10000) / 100
+          : 0,
       };
-      state.progress = { step: 'completed', percent: 100, message: 'No data found' };
+      state.progress = { step: 'completed', percent: 100, message: `${origins.length} zipcodes identified` };
       await saveState(state);
+      console.log(`[CATCHMENT] ${state.datasetName}: done — ${origins.length} zipcodes, ${devicesWithOrigin} device-days matched`);
       return state;
+    } catch (err: any) {
+      // Save error to S3 so we don't loop forever on a failing Phase 3
+      console.error(`[CATCHMENT] ${state.datasetName} Phase 3 error:`, err.message);
+      state.status = 'error';
+      state.error = err.message || 'Geocoding/aggregation failed';
+      state.progress = { step: 'error', percent: 0, message: state.error };
+      await saveState(state).catch(() => {});
+      throw err; // Re-throw so the route handler also returns 500
     }
-
-    // Parse origin points
-    let totalDeviceDays = 0;
-    const originPoints = originsRows.map(row => {
-      const deviceDays = parseInt(String(row.device_days)) || 0;
-      totalDeviceDays += deviceDays;
-      return {
-        lat: parseFloat(String(row.origin_lat)),
-        lng: parseFloat(String(row.origin_lng)),
-        deviceCount: deviceDays,
-      };
-    }).filter(p => !isNaN(p.lat) && !isNaN(p.lng));
-
-    state.progress = { step: 'geocoding', percent: 65, message: `Geocoding ${originPoints.length.toLocaleString()} clusters...` };
-    // Don't save state here — we want to complete geocoding in this same call
-
-    // Determine primary country — limit GeoJSON loading to avoid 60s timeout
-    let primaryCountry = await getCountryForDataset(state.datasetName);
-    if (!primaryCountry) {
-      // Try to detect from job name by looking up the job
-      try {
-        const { getAllJobs } = await import('./jobs');
-        const allJobs = await getAllJobs();
-        const job = allJobs.find((j: any) => {
-          if (!j.s3DestPath) return false;
-          const path = j.s3DestPath.replace('s3://', '').replace(`${BUCKET}/`, '');
-          const folder = path.split('/').filter(Boolean)[0] || path.replace(/\/$/, '');
-          return folder === state.datasetName;
-        });
-        if (job?.name) {
-          primaryCountry = detectCountryFromJobName(job.name);
-        }
-      } catch { /* ignore */ }
-    }
-    if (primaryCountry) {
-      setCountryFilter([primaryCountry]);
-      console.log(`[CATCHMENT] Country filter set to: ${primaryCountry}`);
-    }
-
-    // Reverse geocode
-    console.log(`[CATCHMENT] ${state.datasetName}: geocoding ${originPoints.length} origin clusters...`);
-    const classified = await batchReverseGeocode(originPoints);
-
-    // Remove country filter
-    setCountryFilter(null);
-
-    state.progress = { step: 'aggregating', percent: 90, message: 'Aggregating by zipcode...' };
-
-    // Aggregate by zipcode
-    const agg = aggregateByZipcode(classified, totalDeviceDays);
-
-    const origins: ODZipcode[] = agg.zipcodes.map(z => ({
-      zipcode: z.zipcode,
-      city: z.city,
-      province: z.province,
-      region: z.region,
-      devices: z.devices,
-      percentOfTotal: z.percentOfTotal,
-      source: z.source,
-    }));
-
-    const devicesWithOrigin = origins.reduce((s, z) => s + z.devices, 0);
-
-    state.status = 'completed';
-    state.result = {
-      dataset: state.datasetName,
-      analyzedAt: new Date().toISOString(),
-      totalDevicesVisitedPois: totalDevices,
-      totalDeviceDays,
-      origins,
-      geocodingComplete: agg.nominatimTruncated === 0,
-      coverageRatePercent: totalDeviceDays > 0
-        ? Math.round((devicesWithOrigin / totalDeviceDays) * 10000) / 100
-        : 0,
-    };
-    state.progress = { step: 'completed', percent: 100, message: `${origins.length} zipcodes identified` };
-    await saveState(state);
-    console.log(`[CATCHMENT] ${state.datasetName}: done — ${origins.length} zipcodes, ${devicesWithOrigin} device-days matched`);
-    return state;
   }
 
   // Shouldn't reach here
   return state!;
+}
+
+/** Detect country from median coordinates using rough bounding boxes. */
+function detectCountryFromCoordinates(points: { lat: number; lng: number }[]): string | undefined {
+  // Use weighted median (top points by device count are first due to ORDER BY)
+  const sample = points.slice(0, Math.min(100, points.length));
+  const medLat = sample.reduce((s, p) => s + p.lat, 0) / sample.length;
+  const medLng = sample.reduce((s, p) => s + p.lng, 0) / sample.length;
+
+  // Rough country bounding boxes (mainland only for precision)
+  const boxes: [string, number, number, number, number][] = [
+    // [code, minLat, maxLat, minLng, maxLng]
+    ['FR', 42, 51, -5, 9],
+    ['ES', 36, 44, -10, 4],
+    ['DE', 47, 55, 5, 16],
+    ['IT', 36, 47, 6, 19],
+    ['PT', 37, 42, -10, -6],
+    ['UK', 50, 59, -8, 2],
+    ['NL', 51, 54, 3, 8],
+    ['BE', 49, 52, 2, 7],
+    ['MX', 14, 33, -118, -86],
+    ['US', 24, 50, -125, -66],
+    ['CO', -5, 14, -82, -66],
+    ['AR', -55, -21, -74, -53],
+    ['CL', -56, -17, -76, -66],
+    ['PE', -19, 0, -82, -68],
+    ['EC', -5, 2, -81, -75],
+    ['CR', 8, 11, -86, -82],
+    ['GT', 13, 18, -93, -88],
+    ['BR', -34, 6, -74, -34],
+    ['SE', 55, 70, 10, 25],
+    ['IE', 51, 56, -11, -5],
+  ];
+
+  for (const [code, minLat, maxLat, minLng, maxLng] of boxes) {
+    if (medLat >= minLat && medLat <= maxLat && medLng >= minLng && medLng <= maxLng) {
+      return code;
+    }
+  }
+  return undefined;
 }
 
 /** Detect country code from job name. */
