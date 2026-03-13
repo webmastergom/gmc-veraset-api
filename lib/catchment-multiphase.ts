@@ -96,9 +96,15 @@ export async function catchmentMultiPhase(
 ): Promise<CatchmentState> {
   let state = await getState(datasetName);
 
-  // Reset if previous run is done
-  if (state && (state.status === 'completed' || state.status === 'error')) {
-    state = null;
+  // Reset if previous run is done or stale (>10 min without completion)
+  if (state) {
+    const isTerminal = state.status === 'completed' || state.status === 'error';
+    const ageMs = Date.now() - new Date(state.updatedAt || state.startedAt).getTime();
+    const isStale = ageMs > 10 * 60 * 1000; // 10 minutes
+    if (isTerminal || isStale) {
+      if (isStale) console.log(`[CATCHMENT] ${datasetName}: resetting stale state (${Math.round(ageMs / 1000)}s old, status=${state.status})`);
+      state = null;
+    }
   }
 
   // ── Phase 1: Start Athena queries ──────────────────────────
@@ -187,7 +193,7 @@ export async function catchmentMultiPhase(
       datasetName,
       queryIds: { origins: originsId, total: totalId },
       filters,
-      progress: { step: 'queries', percent: 15, message: 'Queries Athena iniciadas...' },
+      progress: { step: 'running_queries', percent: 15, message: 'Athena queries started...' },
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -223,14 +229,14 @@ export async function catchmentMultiPhase(
 
     if (!allDone) {
       const statusMsg = `Origins: ${originsS.state}, Total: ${totalS.state}`;
-      state.progress = { step: 'queries', percent: 35, message: `Waiting for queries... (${statusMsg})` };
+      state.progress = { step: 'running_queries', percent: 35, message: `Waiting for queries... (${statusMsg})` };
       await saveState(state);
       return state;
     }
 
     // All done — advance to processing
     state.status = 'processing';
-    state.progress = { step: 'queries', percent: 55, message: 'Queries completed. Geocoding...' };
+    state.progress = { step: 'running_queries', percent: 55, message: 'Queries completed. Geocoding...' };
     await saveState(state);
     // Fall through to processing
   }
@@ -296,7 +302,7 @@ export async function catchmentMultiPhase(
       };
     }).filter(p => !isNaN(p.lat) && !isNaN(p.lng));
 
-    state.progress = { step: 'geocoding', percent: 65, message: `Geocodificando ${originPoints.length.toLocaleString()} clusters...` };
+    state.progress = { step: 'geocoding', percent: 65, message: `Geocoding ${originPoints.length.toLocaleString()} clusters...` };
     // Don't save state here — we want to complete geocoding in this same call
 
     // Determine primary country — limit GeoJSON loading to avoid 60s timeout
