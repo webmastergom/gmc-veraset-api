@@ -213,14 +213,14 @@ export async function catchmentMultiPhase(
     if (originsS.state === 'FAILED') {
       state.status = 'error';
       state.error = `Origins query failed: ${originsS.error}`;
-      state.progress = { step: 'error', percent: 0, message: state.error };
+      state.progress = { step: 'error', percent: 0, message: state.error || 'Unknown error' };
       await saveState(state);
       return state;
     }
     if (totalS.state === 'FAILED') {
       state.status = 'error';
       state.error = `Total query failed: ${totalS.error}`;
-      state.progress = { step: 'error', percent: 0, message: state.error };
+      state.progress = { step: 'error', percent: 0, message: state.error || 'Unknown error' };
       await saveState(state);
       return state;
     }
@@ -380,7 +380,7 @@ export async function catchmentMultiPhase(
       console.error(`[CATCHMENT] ${state.datasetName} Phase 3 error:`, err.message);
       state.status = 'error';
       state.error = err.message || 'Geocoding/aggregation failed';
-      state.progress = { step: 'error', percent: 0, message: state.error };
+      state.progress = { step: 'error', percent: 0, message: state.error || 'Unknown error' };
       await saveState(state).catch(() => {});
       throw err; // Re-throw so the route handler also returns 500
     }
