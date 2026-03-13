@@ -234,11 +234,11 @@ export async function catchmentMultiPhase(
       return state;
     }
 
-    // All done — advance to processing
+    // All done — advance to processing in the NEXT poll (fresh 60s window)
     state.status = 'processing';
-    state.progress = { step: 'running_queries', percent: 55, message: 'Queries completed. Geocoding...' };
+    state.progress = { step: 'geocoding', percent: 55, message: 'Queries completed. Starting geocoding...' };
     await saveState(state);
-    // Fall through to processing
+    return state;
   }
 
   // ── Phase 3: Download results, geocode, aggregate ─────────
