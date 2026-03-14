@@ -37,6 +37,79 @@ export interface ConsolidatedTemporalTrends {
   dayOfWeek: Array<{ day: number; dayName: string; avgPings: number; avgDevices: number }>;
 }
 
+export interface ODCluster {
+  originLat: number;
+  originLng: number;
+  destLat: number;
+  destLng: number;
+  departureHour: number;
+  poiArrivalHour: number;
+  deviceDays: number;
+}
+
+export interface ConsolidatedODReport {
+  megaJobId: string;
+  analyzedAt: string;
+  totalDeviceDays: number;
+  /** Aggregated origin clusters with zip code (after geocoding) */
+  origins: Array<{
+    lat: number;
+    lng: number;
+    zipCode: string;
+    city: string;
+    country: string;
+    deviceDays: number;
+  }>;
+  /** Aggregated destination clusters with zip code */
+  destinations: Array<{
+    lat: number;
+    lng: number;
+    zipCode: string;
+    city: string;
+    country: string;
+    deviceDays: number;
+  }>;
+  /** Departure hour distribution (0-23) */
+  departureByHour: Array<{ hour: number; deviceDays: number }>;
+  /** POI arrival hour distribution (0-23) */
+  arrivalByHour: Array<{ hour: number; deviceDays: number }>;
+}
+
+export interface ConsolidatedHourlyReport {
+  megaJobId: string;
+  analyzedAt: string;
+  /** POI activity by hour of day */
+  hourly: Array<{ hour: number; pings: number; devices: number }>;
+}
+
+export interface ConsolidatedCatchmentReport {
+  megaJobId: string;
+  analyzedAt: string;
+  totalDeviceDays: number;
+  /** Origins aggregated by zip code */
+  byZipCode: Array<{
+    zipCode: string;
+    city: string;
+    country: string;
+    lat: number;
+    lng: number;
+    deviceDays: number;
+  }>;
+  /** Departure hour distribution */
+  departureByHour: Array<{ hour: number; deviceDays: number }>;
+}
+
+export interface ConsolidatedMobilityReport {
+  megaJobId: string;
+  analyzedAt: string;
+  /** Top POI categories visited ±2h of target POI */
+  categories: Array<{
+    category: string;
+    deviceDays: number;
+    hits: number;
+  }>;
+}
+
 // ── Visits by POI consolidation (Athena UNION ALL) ────────────────────
 
 /**
@@ -203,6 +276,195 @@ export function buildTemporalTrends(
     weekly,
     monthly,
     dayOfWeek,
+  };
+}
+
+// ── OD result parser ─────────────────────────────────────────────────
+
+/**
+ * Parse OD query results into origin/destination clusters and hourly distributions.
+ * Geocoding is done separately by the consolidation route.
+ */
+export function parseConsolidatedOD(
+  rows: Record<string, any>[],
+): {
+  clusters: ODCluster[];
+  totalDeviceDays: number;
+} {
+  let totalDeviceDays = 0;
+  const clusters: ODCluster[] = [];
+
+  for (const row of rows) {
+    const deviceDays = parseInt(row.device_days, 10) || 0;
+    totalDeviceDays += deviceDays;
+    clusters.push({
+      originLat: parseFloat(row.origin_lat) || 0,
+      originLng: parseFloat(row.origin_lng) || 0,
+      destLat: parseFloat(row.dest_lat) || 0,
+      destLng: parseFloat(row.dest_lng) || 0,
+      departureHour: parseInt(row.departure_hour, 10) || 0,
+      poiArrivalHour: parseInt(row.poi_arrival_hour, 10) || 0,
+      deviceDays,
+    });
+  }
+
+  return { clusters, totalDeviceDays };
+}
+
+/**
+ * Aggregate OD clusters into origin/destination zip code tables.
+ * coordToZip is a map from "lat,lng" → { zipCode, city, country }.
+ */
+export function buildODReport(
+  megaJobId: string,
+  clusters: ODCluster[],
+  coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
+): ConsolidatedODReport {
+  const originByZip = new Map<string, { lat: number; lng: number; zip: string; city: string; country: string; deviceDays: number }>();
+  const destByZip = new Map<string, { lat: number; lng: number; zip: string; city: string; country: string; deviceDays: number }>();
+  const departureByHour = new Map<number, number>();
+  const arrivalByHour = new Map<number, number>();
+  let totalDeviceDays = 0;
+
+  for (const c of clusters) {
+    totalDeviceDays += c.deviceDays;
+
+    // Origins
+    const oKey = `${c.originLat},${c.originLng}`;
+    const oGeo = coordToZip.get(oKey) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const oZipKey = `${oGeo.zipCode}|${oGeo.city}|${oGeo.country}`;
+    const existing = originByZip.get(oZipKey);
+    if (existing) {
+      existing.deviceDays += c.deviceDays;
+    } else {
+      originByZip.set(oZipKey, { lat: c.originLat, lng: c.originLng, zip: oGeo.zipCode, city: oGeo.city, country: oGeo.country, deviceDays: c.deviceDays });
+    }
+
+    // Destinations
+    const dKey = `${c.destLat},${c.destLng}`;
+    const dGeo = coordToZip.get(dKey) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const dZipKey = `${dGeo.zipCode}|${dGeo.city}|${dGeo.country}`;
+    const dExisting = destByZip.get(dZipKey);
+    if (dExisting) {
+      dExisting.deviceDays += c.deviceDays;
+    } else {
+      destByZip.set(dZipKey, { lat: c.destLat, lng: c.destLng, zip: dGeo.zipCode, city: dGeo.city, country: dGeo.country, deviceDays: c.deviceDays });
+    }
+
+    // Hourly
+    departureByHour.set(c.departureHour, (departureByHour.get(c.departureHour) || 0) + c.deviceDays);
+    if (c.poiArrivalHour >= 0) {
+      arrivalByHour.set(c.poiArrivalHour, (arrivalByHour.get(c.poiArrivalHour) || 0) + c.deviceDays);
+    }
+  }
+
+  const origins = Array.from(originByZip.values())
+    .map((v) => ({ lat: v.lat, lng: v.lng, zipCode: v.zip, city: v.city, country: v.country, deviceDays: v.deviceDays }))
+    .sort((a, b) => b.deviceDays - a.deviceDays);
+
+  const destinations = Array.from(destByZip.values())
+    .map((v) => ({ lat: v.lat, lng: v.lng, zipCode: v.zip, city: v.city, country: v.country, deviceDays: v.deviceDays }))
+    .sort((a, b) => b.deviceDays - a.deviceDays);
+
+  return {
+    megaJobId,
+    analyzedAt: new Date().toISOString(),
+    totalDeviceDays,
+    origins,
+    destinations,
+    departureByHour: Array.from({ length: 24 }, (_, h) => ({ hour: h, deviceDays: departureByHour.get(h) || 0 })),
+    arrivalByHour: Array.from({ length: 24 }, (_, h) => ({ hour: h, deviceDays: arrivalByHour.get(h) || 0 })),
+  };
+}
+
+// ── Hourly result parser ─────────────────────────────────────────────
+
+export function parseConsolidatedHourly(
+  megaJobId: string,
+  rows: Record<string, any>[],
+): ConsolidatedHourlyReport {
+  const hourMap = new Map<number, { pings: number; devices: number }>();
+  for (const row of rows) {
+    const hour = parseInt(row.touch_hour, 10) || 0;
+    hourMap.set(hour, {
+      pings: parseInt(row.pings, 10) || 0,
+      devices: parseInt(row.devices, 10) || 0,
+    });
+  }
+
+  return {
+    megaJobId,
+    analyzedAt: new Date().toISOString(),
+    hourly: Array.from({ length: 24 }, (_, h) => ({
+      hour: h,
+      pings: hourMap.get(h)?.pings || 0,
+      devices: hourMap.get(h)?.devices || 0,
+    })),
+  };
+}
+
+// ── Catchment result parser ──────────────────────────────────────────
+
+/**
+ * Parse catchment origins and aggregate by zip code after geocoding.
+ */
+export function buildCatchmentReport(
+  megaJobId: string,
+  rows: Record<string, any>[],
+  coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
+): ConsolidatedCatchmentReport {
+  const byZip = new Map<string, { lat: number; lng: number; zip: string; city: string; country: string; deviceDays: number }>();
+  const hourMap = new Map<number, number>();
+  let totalDeviceDays = 0;
+
+  for (const row of rows) {
+    const lat = parseFloat(row.origin_lat) || 0;
+    const lng = parseFloat(row.origin_lng) || 0;
+    const deviceDays = parseInt(row.device_days, 10) || 0;
+    const hour = parseInt(row.departure_hour, 10) || 0;
+    totalDeviceDays += deviceDays;
+
+    const key = `${lat},${lng}`;
+    const geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const zipKey = `${geo.zipCode}|${geo.city}|${geo.country}`;
+
+    const existing = byZip.get(zipKey);
+    if (existing) {
+      existing.deviceDays += deviceDays;
+    } else {
+      byZip.set(zipKey, { lat, lng, zip: geo.zipCode, city: geo.city, country: geo.country, deviceDays });
+    }
+
+    hourMap.set(hour, (hourMap.get(hour) || 0) + deviceDays);
+  }
+
+  return {
+    megaJobId,
+    analyzedAt: new Date().toISOString(),
+    totalDeviceDays,
+    byZipCode: Array.from(byZip.values())
+      .map((v) => ({ zipCode: v.zip, city: v.city, country: v.country, lat: v.lat, lng: v.lng, deviceDays: v.deviceDays }))
+      .sort((a, b) => b.deviceDays - a.deviceDays),
+    departureByHour: Array.from({ length: 24 }, (_, h) => ({ hour: h, deviceDays: hourMap.get(h) || 0 })),
+  };
+}
+
+// ── Mobility result parser ───────────────────────────────────────────
+
+export function parseConsolidatedMobility(
+  megaJobId: string,
+  rows: Record<string, any>[],
+): ConsolidatedMobilityReport {
+  const categories = rows.map((row) => ({
+    category: String(row.category || 'UNKNOWN'),
+    deviceDays: parseInt(row.device_days, 10) || 0,
+    hits: parseInt(row.hits, 10) || 0,
+  }));
+
+  return {
+    megaJobId,
+    analyzedAt: new Date().toISOString(),
+    categories,
   };
 }
 

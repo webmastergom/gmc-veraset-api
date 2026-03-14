@@ -6,20 +6,46 @@ import {
   parseConsolidatedVisits,
   buildTemporalTrends,
   saveConsolidatedReport,
-  getConsolidatedReport,
+  parseConsolidatedOD,
+  buildODReport,
+  parseConsolidatedHourly,
+  buildCatchmentReport,
+  parseConsolidatedMobility,
 } from '@/lib/mega-report-consolidation';
+import {
+  startConsolidatedODQuery,
+  startConsolidatedHourlyQuery,
+  startConsolidatedCatchmentQuery,
+  startConsolidatedMobilityQuery,
+} from '@/lib/mega-consolidation-queries';
 import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
+import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 /**
- * Consolidation state, stored alongside the mega-job.
- * Tracks multi-phase progress (start query → poll → parse → temporal).
+ * Multi-query consolidation state, stored alongside the mega-job.
+ * Tracks parallel Athena queries across phases.
  */
 interface ConsolidationState {
-  phase: 'starting' | 'polling_visits' | 'parsing_visits' | 'temporal' | 'done';
-  visitsQueryId?: string;
+  phase: 'starting' | 'polling' | 'parsing_visits' | 'parsing_od' | 'done';
+  /** Query IDs for each report type */
+  queries?: {
+    visits?: string;
+    od?: string;
+    hourly?: string;
+    catchment?: string;
+    mobility?: string;
+  };
+  /** Track which queries have been parsed */
+  parsed?: {
+    visits?: boolean;
+    hourly?: boolean;
+    mobility?: boolean;
+  };
+  /** Optional POI filter */
+  poiIds?: string[];
   error?: string;
 }
 
@@ -27,12 +53,13 @@ const CONSOLIDATION_KEY = (id: string) => `mega-consolidation-state/${id}`;
 
 /**
  * POST /api/mega-jobs/[id]/consolidate
- * Multi-phase consolidation. Frontend polls until done.
+ * Multi-phase consolidation with parallel Athena queries. Frontend polls until done.
  *
- * Phase 1 (starting): Start UNION ALL query for visits.
- * Phase 2 (polling_visits): Poll until visits query completes.
- * Phase 3 (parsing_visits): Parse CSV, build visits report, start temporal.
- * Phase 4 (done): All reports saved.
+ * Phase 1 (starting): Start all Athena queries in parallel (visits, OD, hourly, catchment, mobility).
+ * Phase 2 (polling): Poll all queries until all SUCCEEDED.
+ * Phase 3 (parsing_visits): Parse visits + hourly + mobility (no geocoding needed).
+ * Phase 4 (parsing_od): Parse OD + catchment (requires geocoding → separate phase for timeout).
+ * Phase 5 (done): All reports saved.
  */
 export async function POST(
   _request: NextRequest,
@@ -45,6 +72,13 @@ export async function POST(
     if (!megaJob) {
       return NextResponse.json({ error: 'Mega-job not found' }, { status: 404 });
     }
+
+    // Parse optional POI filter from body
+    let poiIds: string[] | undefined;
+    try {
+      const body = await _request.json();
+      if (body?.poiIds?.length) poiIds = body.poiIds;
+    } catch { }
 
     // Load sub-jobs
     const subJobs = (
@@ -67,7 +101,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting' };
+      state = { phase: 'starting', poiIds };
     }
 
     // Update mega-job status
@@ -75,16 +109,38 @@ export async function POST(
       await updateMegaJob(id, { status: 'consolidating' });
     }
 
-    // ── Phase 1: Start visits query ─────────────────────────────────
+    // ── Phase 1: Start all queries in parallel ─────────────────────────
     if (state.phase === 'starting') {
       try {
-        const queryId = await startConsolidatedVisitsQuery(syncedJobs);
-        state = { phase: 'polling_visits', visitsQueryId: queryId };
+        const effectivePoiIds = state.poiIds || poiIds;
+
+        // Start all 5 queries in parallel
+        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId] = await Promise.all([
+          startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
+          startConsolidatedODQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
+          startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
+          startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+        ]);
+
+        state = {
+          phase: 'polling',
+          poiIds: effectivePoiIds,
+          queries: {
+            visits: visitsQId,
+            od: odQId,
+            hourly: hourlyQId,
+            catchment: catchmentQId,
+            mobility: mobilityQId,
+          },
+          parsed: {},
+        };
         await putConf(CONSOLIDATION_KEY(id), state);
 
+        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
-          progress: { step: 'visits_query', percent: 10, message: 'Visits query started...' },
+          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
         });
       } catch (err: any) {
         state = { phase: 'starting', error: err.message };
@@ -93,84 +149,271 @@ export async function POST(
       }
     }
 
-    // ── Phase 2: Poll visits query ──────────────────────────────────
-    if (state.phase === 'polling_visits' && state.visitsQueryId) {
-      const queryStatus = await checkQueryStatus(state.visitsQueryId);
+    // ── Phase 2: Poll all queries ──────────────────────────────────────
+    if (state.phase === 'polling' && state.queries) {
+      const queries = state.queries;
+      const statuses: Record<string, string> = {};
+      let allDone = true;
+      let anyFailed = false;
 
-      if (queryStatus.state === 'RUNNING' || queryStatus.state === 'QUEUED') {
+      // Check each query status
+      const queryEntries = Object.entries(queries).filter(([, qid]) => qid);
+      const statusResults = await Promise.all(
+        queryEntries.map(async ([name, qid]) => {
+          const s = await checkQueryStatus(qid!);
+          return { name, state: s.state, error: s.error };
+        })
+      );
+
+      for (const { name, state: qState, error } of statusResults) {
+        statuses[name] = qState;
+        if (qState === 'RUNNING' || qState === 'QUEUED') {
+          allDone = false;
+        }
+        if (qState === 'FAILED' || qState === 'CANCELLED') {
+          anyFailed = true;
+          console.error(`[MEGA] Query ${name} ${qState}: ${error || ''}`);
+        }
+      }
+
+      if (!allDone) {
+        const runningCount = Object.values(statuses).filter((s) => s === 'RUNNING' || s === 'QUEUED').length;
+        const doneCount = Object.values(statuses).filter((s) => s === 'SUCCEEDED').length;
         return NextResponse.json({
-          phase: state.phase,
-          progress: { step: 'visits_query', percent: 30, message: `Visits query: ${queryStatus.state}` },
+          phase: 'polling',
+          progress: {
+            step: 'polling_queries',
+            percent: 10 + Math.round((doneCount / queryEntries.length) * 30),
+            message: `Queries: ${doneCount} done, ${runningCount} running...`,
+          },
+          statuses,
         });
       }
 
-      if (queryStatus.state === 'FAILED' || queryStatus.state === 'CANCELLED') {
-        state = { phase: 'starting', error: `Visits query ${queryStatus.state}: ${queryStatus.error || ''}` };
-        await putConf(CONSOLIDATION_KEY(id), state);
-        return NextResponse.json({ error: `Query ${queryStatus.state}` }, { status: 500 });
-      }
-
-      // SUCCEEDED → advance to parsing
+      // All done (some may have failed) → advance to parsing
       state = { ...state, phase: 'parsing_visits' };
       await putConf(CONSOLIDATION_KEY(id), state);
       // Fall through to parsing
     }
 
-    // ── Phase 3: Parse visits + build temporal ──────────────────────
-    if (state.phase === 'parsing_visits' && state.visitsQueryId) {
-      // Fetch and parse visits results
-      const queryResult = await fetchQueryResults(state.visitsQueryId);
-      const visitsByPoi = parseConsolidatedVisits(queryResult.rows, syncedJobs);
+    // ── Phase 3: Parse visits + hourly + mobility (no geocoding) ───────
+    if (state.phase === 'parsing_visits' && state.queries) {
+      const reportKeys: Record<string, string> = {};
 
-      const visitsReport = {
-        megaJobId: id,
-        analyzedAt: new Date().toISOString(),
-        totalPois: visitsByPoi.length,
-        visitsByPoi,
-      };
+      // Parse visits
+      if (state.queries.visits && !state.parsed?.visits) {
+        try {
+          const queryResult = await fetchQueryResults(state.queries.visits);
+          const visitsByPoi = parseConsolidatedVisits(queryResult.rows, syncedJobs);
+          const visitsReport = {
+            megaJobId: id,
+            analyzedAt: new Date().toISOString(),
+            totalPois: visitsByPoi.length,
+            visitsByPoi,
+          };
+          reportKeys.visitsByPoi = await saveConsolidatedReport(id, 'visits', visitsReport);
+        } catch (err: any) {
+          console.error('[MEGA] Error parsing visits:', err.message);
+        }
+      }
 
-      const visitsKey = await saveConsolidatedReport(id, 'visits', visitsReport);
+      // Parse hourly
+      if (state.queries.hourly && !state.parsed?.hourly) {
+        try {
+          const queryResult = await fetchQueryResults(state.queries.hourly);
+          const hourlyReport = parseConsolidatedHourly(id, queryResult.rows);
+          reportKeys.hourly = await saveConsolidatedReport(id, 'hourly', hourlyReport);
+        } catch (err: any) {
+          console.error('[MEGA] Error parsing hourly:', err.message);
+        }
+      }
 
-      // Build temporal trends from sub-job daily data
-      // Load each sub-job's analysis result (if cached)
+      // Parse mobility
+      if (state.queries.mobility && !state.parsed?.mobility) {
+        try {
+          const queryResult = await fetchQueryResults(state.queries.mobility);
+          const mobilityReport = parseConsolidatedMobility(id, queryResult.rows);
+          reportKeys.mobility = await saveConsolidatedReport(id, 'mobility', mobilityReport);
+        } catch (err: any) {
+          console.error('[MEGA] Error parsing mobility:', err.message);
+        }
+      }
+
+      // Build temporal trends from sub-job dailyData (in-memory, no query)
       const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
-
       for (const job of syncedJobs) {
         const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
         if (!datasetName) continue;
-
         const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
         if (analysis?.dailyData) {
           dailyDataByJob.push(analysis.dailyData);
         }
       }
-
-      let temporalKey: string | undefined;
       if (dailyDataByJob.length > 0) {
         const temporal = buildTemporalTrends(id, dailyDataByJob);
-        temporalKey = await saveConsolidatedReport(id, 'temporal', temporal);
+        reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
       }
 
-      // Save report keys to mega-job
-      await updateMegaJob(id, {
-        status: 'completed',
-        consolidatedReports: {
-          visitsByPoi: visitsKey,
-          temporalTrends: temporalKey,
-        },
-      });
-
-      state = { phase: 'done' };
+      state = { ...state, phase: 'parsing_od', parsed: { visits: true, hourly: true, mobility: true } };
       await putConf(CONSOLIDATION_KEY(id), state);
 
       return NextResponse.json({
-        phase: 'done',
-        progress: { step: 'complete', percent: 100, message: 'Consolidation complete' },
-        reports: {
-          visitsByPoi: visitsReport.totalPois,
-          hasTemporalTrends: !!temporalKey,
-        },
+        phase: 'parsing_od',
+        progress: { step: 'parsing_geocode', percent: 60, message: 'Geocoding origins and destinations...' },
       });
+    }
+
+    // ── Phase 4: Parse OD + catchment (requires geocoding) ─────────────
+    if (state.phase === 'parsing_od' && state.queries) {
+      try {
+        const reportKeys: Record<string, string> = {};
+
+        // Collect all coordinates that need geocoding
+        const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+
+        let odClusters: ReturnType<typeof parseConsolidatedOD> | undefined;
+        let catchmentRows: Record<string, any>[] | undefined;
+
+        // Fetch OD results
+        if (state.queries.od) {
+          try {
+            const queryResult = await fetchQueryResults(state.queries.od);
+            odClusters = parseConsolidatedOD(queryResult.rows);
+            for (const c of odClusters.clusters) {
+              const oKey = `${c.originLat},${c.originLng}`;
+              const existing = coordsToGeocode.get(oKey);
+              coordsToGeocode.set(oKey, { lat: c.originLat, lng: c.originLng, deviceCount: (existing?.deviceCount || 0) + c.deviceDays });
+              const dKey = `${c.destLat},${c.destLng}`;
+              const dExisting = coordsToGeocode.get(dKey);
+              coordsToGeocode.set(dKey, { lat: c.destLat, lng: c.destLng, deviceCount: (dExisting?.deviceCount || 0) + c.deviceDays });
+            }
+          } catch (err: any) {
+            console.error('[MEGA] Error fetching OD results:', err.message);
+          }
+        }
+
+        // Fetch catchment results
+        if (state.queries.catchment) {
+          try {
+            const queryResult = await fetchQueryResults(state.queries.catchment);
+            catchmentRows = queryResult.rows;
+            for (const row of catchmentRows) {
+              const lat = parseFloat(row.origin_lat) || 0;
+              const lng = parseFloat(row.origin_lng) || 0;
+              const dd = parseInt(row.device_days, 10) || 0;
+              const key = `${lat},${lng}`;
+              const existing = coordsToGeocode.get(key);
+              coordsToGeocode.set(key, { lat, lng, deviceCount: (existing?.deviceCount || 0) + dd });
+            }
+          } catch (err: any) {
+            console.error('[MEGA] Error fetching catchment results:', err.message);
+          }
+        }
+
+        // Batch reverse geocode all coordinates
+        const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
+        if (coordsToGeocode.size > 0) {
+          // Detect country from first sub-job's data
+          const firstJob = syncedJobs[0];
+          const isoCountry = firstJob?.dateRange?.from ? undefined : undefined; // No country on job
+          // Try to detect from POI collection
+          const datasetName = firstJob?.s3DestPath?.replace(/\/$/, '').split('/').pop();
+          let detectedCountry: string | undefined;
+          if (datasetName) {
+            const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
+            detectedCountry = analysis?.country;
+          }
+          if (detectedCountry) {
+            setCountryFilter([detectedCountry]);
+          }
+
+          const points = Array.from(coordsToGeocode.values());
+          // Use 1-decimal precision for geocoding (×10 performance)
+          const roundedPoints = points.map((p) => ({
+            lat: Math.round(p.lat * 10) / 10,
+            lng: Math.round(p.lng * 10) / 10,
+            deviceCount: p.deviceCount,
+          }));
+
+          // Deduplicate rounded points
+          const uniqueRounded = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+          for (const p of roundedPoints) {
+            const key = `${p.lat},${p.lng}`;
+            const ex = uniqueRounded.get(key);
+            if (ex) ex.deviceCount += p.deviceCount;
+            else uniqueRounded.set(key, { ...p });
+          }
+
+          const geocoded = await batchReverseGeocode(Array.from(uniqueRounded.values()));
+
+          // Build lookup map from rounded coords
+          const roundedLookup = new Map<string, { zipCode: string; city: string; country: string }>();
+          for (const g of geocoded) {
+            if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
+              // Find the original point that produced this result
+              roundedLookup.set(`${g.country}|${g.postcode}`, { zipCode: g.postcode, city: g.city, country: g.country });
+            }
+          }
+
+          // Map original coords to geocoded results via rounded matching
+          for (const [key, p] of coordsToGeocode.entries()) {
+            const roundedKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            // Find the geocoded result for this rounded point
+            const roundedP = uniqueRounded.get(roundedKey);
+            if (roundedP) {
+              // Find in geocoded array by index
+              const idx = Array.from(uniqueRounded.keys()).indexOf(roundedKey);
+              if (idx >= 0 && idx < geocoded.length) {
+                const g = geocoded[idx];
+                if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
+                  coordToZip.set(key, { zipCode: g.postcode, city: g.city, country: g.country });
+                } else if (g.type === 'foreign') {
+                  coordToZip.set(key, { zipCode: 'FOREIGN', city: 'FOREIGN', country: g.country });
+                }
+              }
+            }
+          }
+
+          // Reset country filter
+          setCountryFilter(null);
+        }
+
+        // Build OD report
+        if (odClusters) {
+          const odReport = buildODReport(id, odClusters.clusters, coordToZip);
+          reportKeys.od = await saveConsolidatedReport(id, 'od', odReport);
+        }
+
+        // Build catchment report
+        if (catchmentRows) {
+          const catchmentReport = buildCatchmentReport(id, catchmentRows, coordToZip);
+          reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
+        }
+
+        // Update mega-job with all report keys
+        await updateMegaJob(id, {
+          status: 'completed',
+          consolidatedReports: reportKeys,
+        });
+
+        state = { phase: 'done' };
+        await putConf(CONSOLIDATION_KEY(id), state);
+
+        return NextResponse.json({
+          phase: 'done',
+          progress: { step: 'complete', percent: 100, message: 'Consolidation complete' },
+        });
+      } catch (err: any) {
+        console.error('[MEGA] Error in OD/catchment parsing:', err.message);
+        // Save partial results and mark as completed anyway
+        state = { phase: 'done', error: err.message };
+        await putConf(CONSOLIDATION_KEY(id), state);
+        await updateMegaJob(id, { status: 'completed' });
+        return NextResponse.json({
+          phase: 'done',
+          progress: { step: 'complete', percent: 100, message: `Completed with errors: ${err.message}` },
+        });
+      }
     }
 
     // Already done

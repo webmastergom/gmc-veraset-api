@@ -8,9 +8,21 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
-  Layers, ExternalLink, Loader2, Download, Play,
-  CheckCircle2, XCircle, Clock, BarChart3, TrendingUp,
+  Layers, ExternalLink, Loader2, Play,
+  CheckCircle2, XCircle, Clock,
+  BarChart3, TrendingUp, MapPin, Navigation,
+  Compass, Timer, Activity,
 } from 'lucide-react'
+
+import { CollapsibleCard } from '@/components/mega-jobs/collapsible-card'
+import { PoiFilter } from '@/components/mega-jobs/poi-filter'
+import { SummaryCards } from '@/components/mega-jobs/summary-cards'
+import { MegaDailyChart } from '@/components/mega-jobs/daily-chart'
+import { CatchmentPie } from '@/components/mega-jobs/catchment-pie'
+import { CatchmentMap } from '@/components/mega-jobs/catchment-map'
+import { ODTables } from '@/components/mega-jobs/od-tables'
+import { MobilityBar } from '@/components/mega-jobs/mobility-bar'
+import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
 
 const statusColors: Record<string, string> = {
   planning: 'bg-blue-500/20 text-blue-400',
@@ -39,8 +51,17 @@ export default function MegaJobDetailPage() {
   const [loading, setLoading] = useState(true)
   const [consolidating, setConsolidating] = useState(false)
   const [consolidateProgress, setConsolidateProgress] = useState<string>('')
+
+  // Reports
   const [visitsReport, setVisitsReport] = useState<any>(null)
   const [temporalReport, setTemporalReport] = useState<any>(null)
+  const [odReport, setODReport] = useState<any>(null)
+  const [hourlyReport, setHourlyReport] = useState<any>(null)
+  const [catchmentReport, setCatchmentReport] = useState<any>(null)
+  const [mobilityReport, setMobilityReport] = useState<any>(null)
+
+  // POI filter
+  const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([])
 
   const loadMegaJob = useCallback(async () => {
     try {
@@ -64,19 +85,26 @@ export default function MegaJobDetailPage() {
     return () => clearInterval(interval)
   }, [megaJob?.status, loadMegaJob])
 
-  // Load reports if completed
+  // Load all reports if completed
   useEffect(() => {
     if (megaJob?.status !== 'completed') return
 
-    fetch(`/api/mega-jobs/${id}/reports?type=visits`, { credentials: 'include' })
-      .then((r) => r.ok ? r.json() : null)
-      .then(setVisitsReport)
-      .catch(() => { })
+    const reportTypes = ['visits', 'temporal', 'od', 'hourly', 'catchment', 'mobility']
+    const setters: Record<string, (d: any) => void> = {
+      visits: setVisitsReport,
+      temporal: setTemporalReport,
+      od: setODReport,
+      hourly: setHourlyReport,
+      catchment: setCatchmentReport,
+      mobility: setMobilityReport,
+    }
 
-    fetch(`/api/mega-jobs/${id}/reports?type=temporal`, { credentials: 'include' })
-      .then((r) => r.ok ? r.json() : null)
-      .then(setTemporalReport)
-      .catch(() => { })
+    for (const type of reportTypes) {
+      fetch(`/api/mega-jobs/${id}/reports?type=${type}`, { credentials: 'include' })
+        .then((r) => r.ok ? r.json() : null)
+        .then((data) => setters[type](data))
+        .catch(() => { })
+    }
   }, [megaJob?.status, id])
 
   // ── Consolidation ───────────────────────────────────────────────
@@ -87,11 +115,13 @@ export default function MegaJobDetailPage() {
     try {
       let done = false
       let attempts = 0
-      while (!done && attempts < 30) {
+      while (!done && attempts < 60) {
         attempts++
         const res = await fetch(`/api/mega-jobs/${id}/consolidate`, {
           method: 'POST',
           credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
         })
         const data = await res.json()
 
@@ -134,8 +164,23 @@ export default function MegaJobDetailPage() {
     )
   }
 
-  const allSynced = megaJob.progress.synced === megaJob.progress.total
   const canConsolidate = (megaJob.status === 'running' || megaJob.status === 'partial') && megaJob.progress.synced > 0
+  const isCompleted = megaJob.status === 'completed'
+
+  // Build POI list from visits report for filter
+  const poiOptions = (visitsReport?.visitsByPoi || []).map((v: any) => ({
+    id: v.poiId,
+    name: v.poiName || v.poiId,
+  }))
+
+  // Compute summary stats
+  const totalPings = temporalReport?.daily?.reduce((s: number, d: any) => s + d.pings, 0) || 0
+  const totalDevices = temporalReport?.daily?.reduce((s: number, d: any) => s + d.devices, 0) || 0
+  const dateRange = {
+    from: temporalReport?.daily?.[0]?.date || '—',
+    to: temporalReport?.daily?.[temporalReport.daily.length - 1]?.date || '—',
+  }
+  const totalPois = visitsReport?.totalPois || 0
 
   return (
     <MainLayout>
@@ -180,167 +225,237 @@ export default function MegaJobDetailPage() {
           </Card>
         )}
 
-        {/* Progress overview */}
-        <div className="grid grid-cols-4 gap-4">
-          {[
-            { label: 'Total', value: megaJob.progress.total },
-            { label: 'Created', value: megaJob.progress.created },
-            { label: 'Synced', value: megaJob.progress.synced },
-            { label: 'Failed', value: megaJob.progress.failed },
-          ].map((s) => (
-            <Card key={s.label}>
-              <CardContent className="py-4 text-center">
-                <p className="text-2xl font-bold">{s.value}</p>
-                <p className="text-sm text-muted-foreground">{s.label}</p>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        {/* Progress overview (pre-consolidation) */}
+        {!isCompleted && (
+          <div className="grid grid-cols-4 gap-4">
+            {[
+              { label: 'Total', value: megaJob.progress.total },
+              { label: 'Created', value: megaJob.progress.created },
+              { label: 'Synced', value: megaJob.progress.synced },
+              { label: 'Failed', value: megaJob.progress.failed },
+            ].map((s) => (
+              <Card key={s.label}>
+                <CardContent className="py-4 text-center">
+                  <p className="text-2xl font-bold">{s.value}</p>
+                  <p className="text-sm text-muted-foreground">{s.label}</p>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        )}
 
-        {/* Sub-jobs grid */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Sub-jobs</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              {(megaJob.subJobs || []).map((job: any) => (
-                <div
-                  key={job.jobId}
-                  className="flex items-center justify-between p-3 rounded-lg border"
-                >
-                  <div className="flex items-center gap-3">
-                    {jobStatusIcon(job.status)}
-                    <div>
-                      <p className="font-medium text-sm">{job.name}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {job.dateRange?.from} to {job.dateRange?.to} | {job.poiCount} POIs
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Badge variant="outline" className="text-xs">
-                      {job.status}
-                    </Badge>
-                    {job.syncedAt && job.s3DestPath && (
-                      <Link href={`/datasets/${job.s3DestPath.replace(/\/$/, '').split('/').pop()}`}>
-                        <Button variant="ghost" size="sm">
-                          <ExternalLink className="h-3 w-3" />
-                        </Button>
-                      </Link>
-                    )}
+        {/* Sub-jobs grid (collapsible when completed) */}
+        <CollapsibleCard
+          title="Sub-jobs"
+          icon={<Layers className="h-4 w-4" />}
+          defaultOpen={!isCompleted}
+        >
+          <div className="space-y-2">
+            {(megaJob.subJobs || []).map((job: any) => (
+              <div
+                key={job.jobId}
+                className="flex items-center justify-between p-3 rounded-lg border"
+              >
+                <div className="flex items-center gap-3">
+                  {jobStatusIcon(job.status)}
+                  <div>
+                    <p className="font-medium text-sm">{job.name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {job.dateRange?.from} to {job.dateRange?.to} | {job.poiCount} POIs
+                    </p>
                   </div>
                 </div>
-              ))}
-              {(!megaJob.subJobs || megaJob.subJobs.length === 0) && (
-                <p className="text-sm text-muted-foreground text-center py-4">
-                  No sub-jobs yet
-                </p>
-              )}
-            </div>
-          </CardContent>
-        </Card>
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="text-xs">
+                    {job.status}
+                  </Badge>
+                  {job.syncedAt && job.s3DestPath && (
+                    <Link href={`/datasets/${job.s3DestPath.replace(/\/$/, '').split('/').pop()}`}>
+                      <Button variant="ghost" size="sm">
+                        <ExternalLink className="h-3 w-3" />
+                      </Button>
+                    </Link>
+                  )}
+                </div>
+              </div>
+            ))}
+            {(!megaJob.subJobs || megaJob.subJobs.length === 0) && (
+              <p className="text-sm text-muted-foreground text-center py-4">
+                No sub-jobs yet
+              </p>
+            )}
+          </div>
+        </CollapsibleCard>
 
-        {/* Consolidated reports */}
-        {megaJob.status === 'completed' && (
+        {/* ── CONSOLIDATED DASHBOARD ────────────────────────────────── */}
+        {isCompleted && (
           <>
-            {/* Visits by POI */}
-            {visitsReport && (
-              <Card>
-                <CardHeader className="flex flex-row items-center justify-between">
-                  <CardTitle className="flex items-center gap-2">
-                    <BarChart3 className="h-5 w-5" /> Consolidated Visits by POI
-                  </CardTitle>
-                  <a href={`/api/mega-jobs/${id}/reports/download?type=visits`}>
-                    <Button variant="outline" size="sm">
-                      <Download className="h-4 w-4 mr-2" /> CSV
-                    </Button>
-                  </a>
-                </CardHeader>
-                <CardContent>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    {visitsReport.totalPois} POIs across {megaJob.progress.synced} sub-jobs
-                  </p>
-                  <div className="max-h-96 overflow-y-auto">
-                    <table className="w-full text-sm">
-                      <thead className="sticky top-0 bg-background">
-                        <tr className="border-b">
-                          <th className="text-left py-2">POI</th>
-                          <th className="text-right py-2">Visits</th>
-                          <th className="text-right py-2">Devices</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {visitsReport.visitsByPoi.slice(0, 50).map((v: any) => (
-                          <tr key={v.poiId} className="border-b border-border/50">
-                            <td className="py-2">
-                              <p className="font-medium">{v.poiName}</p>
-                              <p className="text-xs text-muted-foreground">{v.poiId}</p>
-                            </td>
-                            <td className="text-right">{v.visits.toLocaleString()}</td>
-                            <td className="text-right">{v.devices.toLocaleString()}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    {visitsReport.visitsByPoi.length > 50 && (
-                      <p className="text-sm text-muted-foreground text-center py-2">
-                        Showing top 50 of {visitsReport.totalPois}. Download CSV for full data.
-                      </p>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
+            {/* POI filter */}
+            {poiOptions.length > 1 && (
+              <PoiFilter
+                pois={poiOptions}
+                selectedIds={selectedPoiIds}
+                onChange={setSelectedPoiIds}
+              />
             )}
 
-            {/* Temporal trends */}
-            {temporalReport && (
-              <Card>
-                <CardHeader className="flex flex-row items-center justify-between">
-                  <CardTitle className="flex items-center gap-2">
-                    <TrendingUp className="h-5 w-5" /> Temporal Trends
-                  </CardTitle>
-                  <a href={`/api/mega-jobs/${id}/reports/download?type=temporal`}>
-                    <Button variant="outline" size="sm">
-                      <Download className="h-4 w-4 mr-2" /> CSV
-                    </Button>
-                  </a>
-                </CardHeader>
-                <CardContent>
-                  <div className="grid grid-cols-3 gap-4 mb-4">
-                    <div>
-                      <p className="text-sm font-medium">Daily range</p>
-                      <p className="text-xs text-muted-foreground">
-                        {temporalReport.daily[0]?.date} to{' '}
-                        {temporalReport.daily[temporalReport.daily.length - 1]?.date}
-                      </p>
-                      <p className="text-sm">{temporalReport.daily.length} days</p>
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium">Weekly</p>
-                      <p className="text-sm">{temporalReport.weekly.length} weeks</p>
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium">Monthly</p>
-                      <p className="text-sm">{temporalReport.monthly.length} months</p>
-                    </div>
-                  </div>
+            {/* 1. Summary Cards */}
+            {(temporalReport || visitsReport) && (
+              <SummaryCards
+                totalPings={totalPings}
+                uniqueDevices={totalDevices}
+                dateRange={dateRange}
+                totalPois={totalPois}
+                subJobCount={megaJob.progress.synced}
+              />
+            )}
 
-                  {/* Day of week pattern */}
-                  <div>
-                    <p className="text-sm font-medium mb-2">Average by day of week</p>
-                    <div className="grid grid-cols-7 gap-2">
-                      {temporalReport.dayOfWeek.map((d: any) => (
-                        <div key={d.day} className="text-center p-2 rounded bg-muted/50">
-                          <p className="text-xs font-medium">{d.dayName.slice(0, 3)}</p>
-                          <p className="text-sm">{d.avgDevices.toLocaleString()}</p>
-                          <p className="text-xs text-muted-foreground">devices</p>
-                        </div>
+            {/* 2. Daily Activity Chart */}
+            {temporalReport?.daily && (
+              <CollapsibleCard
+                title="Daily Activity"
+                icon={<TrendingUp className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=temporal`}
+              >
+                <MegaDailyChart data={temporalReport.daily} />
+              </CollapsibleCard>
+            )}
+
+            {/* 3. Catchment Pie Chart (by zip code) */}
+            {catchmentReport?.byZipCode && (
+              <CollapsibleCard
+                title="Catchment by Zip Code"
+                icon={<MapPin className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=catchment`}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  {catchmentReport.totalDeviceDays.toLocaleString()} total device-days across{' '}
+                  {catchmentReport.byZipCode.length} zip codes
+                </p>
+                <CatchmentPie data={catchmentReport.byZipCode} />
+              </CollapsibleCard>
+            )}
+
+            {/* 4. Catchment Map */}
+            {catchmentReport?.byZipCode && (
+              <CollapsibleCard
+                title="Catchment Map"
+                icon={<Compass className="h-4 w-4" />}
+                defaultOpen={false}
+              >
+                <CatchmentMap data={catchmentReport.byZipCode} />
+              </CollapsibleCard>
+            )}
+
+            {/* 5. Origin & Destination */}
+            {odReport && (
+              <CollapsibleCard
+                title="Origin & Destination"
+                icon={<Navigation className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=od`}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  {odReport.totalDeviceDays.toLocaleString()} device-days analyzed
+                </p>
+                <ODTables
+                  origins={odReport.origins}
+                  destinations={odReport.destinations}
+                />
+              </CollapsibleCard>
+            )}
+
+            {/* 6. Mobility Trends (POI categories ±2h) */}
+            {mobilityReport?.categories && (
+              <CollapsibleCard
+                title="Mobility Trends (±2h of visit)"
+                icon={<Activity className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=mobility`}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  Top POI categories visited within 2 hours of visiting target POIs
+                </p>
+                <MobilityBar data={mobilityReport.categories} />
+              </CollapsibleCard>
+            )}
+
+            {/* 7. Catchment Hour-of-Day (departure from home) */}
+            {catchmentReport?.departureByHour && (
+              <CollapsibleCard
+                title="Departure Hour (Catchment)"
+                icon={<Timer className="h-4 w-4" />}
+                defaultOpen={false}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  Hour of first ping of the day (proxy for when visitors leave home)
+                </p>
+                <HourlyChart
+                  data={catchmentReport.departureByHour}
+                  dataKey="deviceDays"
+                  label="Device-Days"
+                  color="#f59e0b"
+                />
+              </CollapsibleCard>
+            )}
+
+            {/* 8. POI Visit Hour-of-Day */}
+            {hourlyReport?.hourly && (
+              <CollapsibleCard
+                title="POI Activity by Hour"
+                icon={<BarChart3 className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=hourly`}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  When POIs are busiest throughout the day
+                </p>
+                <HourlyChart
+                  data={hourlyReport.hourly}
+                  dataKey="devices"
+                  label="Devices"
+                  color="#3b82f6"
+                />
+              </CollapsibleCard>
+            )}
+
+            {/* Visits by POI table */}
+            {visitsReport && (
+              <CollapsibleCard
+                title="Visits by POI"
+                icon={<BarChart3 className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=visits`}
+                defaultOpen={false}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  {visitsReport.totalPois} POIs across {megaJob.progress.synced} sub-jobs
+                </p>
+                <div className="max-h-96 overflow-y-auto">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 bg-background">
+                      <tr className="border-b">
+                        <th className="text-left py-2">POI</th>
+                        <th className="text-right py-2">Visits</th>
+                        <th className="text-right py-2">Devices</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {visitsReport.visitsByPoi.slice(0, 50).map((v: any) => (
+                        <tr key={v.poiId} className="border-b border-border/50">
+                          <td className="py-2">
+                            <p className="font-medium">{v.poiName}</p>
+                            <p className="text-xs text-muted-foreground">{v.poiId}</p>
+                          </td>
+                          <td className="text-right">{v.visits.toLocaleString()}</td>
+                          <td className="text-right">{v.devices.toLocaleString()}</td>
+                        </tr>
                       ))}
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
+                    </tbody>
+                  </table>
+                  {visitsReport.visitsByPoi.length > 50 && (
+                    <p className="text-sm text-muted-foreground text-center py-2">
+                      Showing top 50 of {visitsReport.totalPois}. Download CSV for full data.
+                    </p>
+                  )}
+                </div>
+              </CollapsibleCard>
             )}
           </>
         )}
