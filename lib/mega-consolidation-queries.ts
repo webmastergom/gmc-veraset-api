@@ -295,7 +295,8 @@ export async function startConsolidatedMobilityQuery(
         a.lat,
         a.lng,
         CAST(FLOOR(a.lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
-        CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT) as lng_bucket
+        CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT) as lng_bucket,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing
       FROM all_pings a
       INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
       WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
@@ -319,6 +320,7 @@ export async function startConsolidatedMobilityQuery(
       SELECT
         p.ad_id,
         p.date,
+        p.timing,
         b.category,
         b.poi_name,
         111320 * SQRT(
@@ -332,20 +334,20 @@ export async function startConsolidatedMobilityQuery(
     ),
     closest AS (
       SELECT
-        ad_id, date, category, poi_name, distance_m,
-        ROW_NUMBER() OVER (PARTITION BY ad_id, date, category ORDER BY distance_m) as rn
+        ad_id, date, timing, category, poi_name, distance_m,
+        ROW_NUMBER() OVER (PARTITION BY ad_id, date, timing, category ORDER BY distance_m) as rn
       FROM matched
       WHERE distance_m <= 200
     )
     SELECT
+      timing,
       category,
       COUNT(DISTINCT CONCAT(ad_id, '-', date)) as device_days,
       COUNT(*) as hits
     FROM closest
     WHERE rn = 1
-    GROUP BY category
-    ORDER BY device_days DESC
-    LIMIT 50
+    GROUP BY timing, category
+    ORDER BY timing, device_days DESC
   `;
 
   console.log(`[MEGA-MOBILITY] Starting mobility trends query across ${syncedJobs.length} tables`);

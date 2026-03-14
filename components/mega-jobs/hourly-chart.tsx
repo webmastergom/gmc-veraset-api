@@ -52,11 +52,12 @@ export function HourlyChart({
     <ResponsiveContainer width="100%" height={280}>
       <BarChart data={fullData} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
         <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
-        <XAxis dataKey="hour" tick={{ fontSize: 11 }} />
-        <YAxis tick={{ fontSize: 12 }} tickFormatter={(v) => v.toLocaleString()} />
+        <XAxis dataKey="hour" tick={{ fontSize: 11, fill: 'hsl(var(--foreground))' }} />
+        <YAxis tick={{ fontSize: 12, fill: 'hsl(var(--foreground))' }} tickFormatter={(v) => v.toLocaleString()} />
         <Tooltip
-          contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))' }}
+          contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', color: 'hsl(var(--foreground))' }}
           labelStyle={{ color: 'hsl(var(--foreground))' }}
+          itemStyle={{ color: 'hsl(var(--foreground))' }}
           formatter={(value: number) => [value.toLocaleString(), label]}
         />
         <Bar dataKey={dataKey} name={label} fill={color} radius={[2, 2, 0, 0]} />

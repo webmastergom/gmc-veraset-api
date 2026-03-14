@@ -110,10 +110,20 @@ export async function GET(
       const report = await getConsolidatedReport<ConsolidatedMobilityReport>(id, 'mobility');
       if (!report) return NextResponse.json({ error: 'Mobility report not found' }, { status: 404 });
 
-      const header = 'category,device_days,hits';
-      const rows = report.categories.map((c) =>
-        `${escCsv(c.category)},${c.deviceDays},${c.hits}`
-      );
+      const header = 'timing,category,device_days,hits';
+      const rows: string[] = [];
+      for (const c of (report.before || [])) {
+        rows.push(`before,${escCsv(c.category)},${c.deviceDays},${c.hits}`);
+      }
+      for (const c of (report.after || [])) {
+        rows.push(`after,${escCsv(c.category)},${c.deviceDays},${c.hits}`);
+      }
+      // Fallback for legacy reports without before/after
+      if (rows.length === 0) {
+        for (const c of report.categories) {
+          rows.push(`combined,${escCsv(c.category)},${c.deviceDays},${c.hits}`);
+        }
+      }
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-mobility.csv`);
     }
 

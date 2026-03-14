@@ -45,16 +45,17 @@ export function MobilityBar({ data, maxBars = 20 }: MobilityBarProps) {
         margin={{ top: 8, right: 24, left: 120, bottom: 4 }}
       >
         <CartesianGrid strokeDasharray="3 3" className="stroke-muted" horizontal={false} />
-        <XAxis type="number" tick={{ fontSize: 12 }} tickFormatter={(v) => v.toLocaleString()} />
+        <XAxis type="number" tick={{ fontSize: 12, fill: 'hsl(var(--foreground))' }} tickFormatter={(v) => v.toLocaleString()} />
         <YAxis
           type="category"
           dataKey="category"
-          tick={{ fontSize: 11 }}
+          tick={{ fontSize: 11, fill: 'hsl(var(--foreground))' }}
           width={110}
         />
         <Tooltip
-          contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))' }}
+          contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', color: 'hsl(var(--foreground))' }}
           labelStyle={{ color: 'hsl(var(--foreground))' }}
+          itemStyle={{ color: 'hsl(var(--foreground))' }}
           formatter={(value: number) => [value.toLocaleString(), 'Device-Days']}
           labelFormatter={(_: any, payload: any) => payload?.[0]?.payload?.fullCategory || ''}
         />

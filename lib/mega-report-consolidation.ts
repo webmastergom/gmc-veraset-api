@@ -108,6 +108,18 @@ export interface ConsolidatedMobilityReport {
     deviceDays: number;
     hits: number;
   }>;
+  /** Categories visited BEFORE arriving at target POI (up to 2h prior) */
+  before: Array<{
+    category: string;
+    deviceDays: number;
+    hits: number;
+  }>;
+  /** Categories visited AFTER leaving target POI (up to 2h after) */
+  after: Array<{
+    category: string;
+    deviceDays: number;
+    hits: number;
+  }>;
 }
 
 // ── Visits by POI consolidation (Athena UNION ALL) ────────────────────
@@ -455,16 +467,38 @@ export function parseConsolidatedMobility(
   megaJobId: string,
   rows: Record<string, any>[],
 ): ConsolidatedMobilityReport {
-  const categories = rows.map((row) => ({
+  const all: Array<{ timing: string; category: string; deviceDays: number; hits: number }> = rows.map((row) => ({
+    timing: String(row.timing || 'after'),
     category: String(row.category || 'UNKNOWN'),
     deviceDays: parseInt(row.device_days, 10) || 0,
     hits: parseInt(row.hits, 10) || 0,
   }));
 
+  const before = all.filter((r) => r.timing === 'before').slice(0, 25);
+  const after = all.filter((r) => r.timing === 'after').slice(0, 25);
+
+  // Combined (legacy compat) — merge before + after, sum device_days
+  const merged = new Map<string, { deviceDays: number; hits: number }>();
+  for (const r of all) {
+    const existing = merged.get(r.category);
+    if (existing) {
+      existing.deviceDays += r.deviceDays;
+      existing.hits += r.hits;
+    } else {
+      merged.set(r.category, { deviceDays: r.deviceDays, hits: r.hits });
+    }
+  }
+  const categories = Array.from(merged.entries())
+    .map(([category, v]) => ({ category, ...v }))
+    .sort((a, b) => b.deviceDays - a.deviceDays)
+    .slice(0, 50);
+
   return {
     megaJobId,
     analyzedAt: new Date().toISOString(),
     categories,
+    before,
+    after,
   };
 }
 

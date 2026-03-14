@@ -62,8 +62,12 @@ export function CatchmentPie({ data, maxSlices = 12 }: CatchmentPieProps) {
           innerRadius={80}
           outerRadius={150}
           dataKey="value"
-          label={({ name, percent }) =>
-            percent > 0.03 ? `${name.split(' (')[0]} ${(percent * 100).toFixed(1)}%` : ''
+          label={({ name, percent, x, y, textAnchor }) =>
+            percent > 0.03 ? (
+              <text x={x} y={y} textAnchor={textAnchor} fill="hsl(var(--foreground))" fontSize={12}>
+                {`${name.split(' (')[0]} ${(percent * 100).toFixed(1)}%`}
+              </text>
+            ) : null
           }
           labelLine={false}
         >
@@ -72,13 +76,14 @@ export function CatchmentPie({ data, maxSlices = 12 }: CatchmentPieProps) {
           ))}
         </Pie>
         <Tooltip
-          contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))' }}
+          contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', color: 'hsl(var(--foreground))' }}
+          itemStyle={{ color: 'hsl(var(--foreground))' }}
           formatter={(value: number) => [
             `${value.toLocaleString()} device-days (${((value / total) * 100).toFixed(1)}%)`,
             '',
           ]}
         />
-        <Legend />
+        <Legend wrapperStyle={{ color: 'hsl(var(--foreground))' }} />
       </PieChart>
     </ResponsiveContainer>
   );

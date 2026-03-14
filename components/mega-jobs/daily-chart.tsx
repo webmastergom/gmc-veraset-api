@@ -60,18 +60,19 @@ export function MegaDailyChart({ data }: MegaDailyChartProps) {
           <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
           <XAxis
             dataKey="date"
-            tick={{ fontSize: 11 }}
+            tick={{ fontSize: 11, fill: 'hsl(var(--foreground))' }}
             angle={-45}
             textAnchor="end"
             height={60}
           />
-          <YAxis tick={{ fontSize: 12 }} tickFormatter={(v) => v.toLocaleString()} />
+          <YAxis tick={{ fontSize: 12, fill: 'hsl(var(--foreground))' }} tickFormatter={(v) => v.toLocaleString()} />
           <Tooltip
-            contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))' }}
+            contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', color: 'hsl(var(--foreground))' }}
             labelStyle={{ color: 'hsl(var(--foreground))' }}
+            itemStyle={{ color: 'hsl(var(--foreground))' }}
             formatter={(value: number) => [value.toLocaleString(), '']}
           />
-          <Legend />
+          <Legend wrapperStyle={{ color: 'hsl(var(--foreground))' }} />
           {showPings && (
             <Area
               type="monotone"
