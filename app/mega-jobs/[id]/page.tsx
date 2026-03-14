@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
   Layers, ExternalLink, Loader2, Play, Download,
-  CheckCircle2, XCircle, Clock,
+  CheckCircle2, XCircle, Clock, Map,
   BarChart3, TrendingUp, MapPin, Navigation,
   Compass, Timer, Activity,
 } from 'lucide-react'
@@ -23,6 +23,7 @@ import { CatchmentMap } from '@/components/mega-jobs/catchment-map'
 import { ODTables } from '@/components/mega-jobs/od-tables'
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar'
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
+import { MovementMap } from '@/components/analysis/movement-map'
 
 const statusColors: Record<string, string> = {
   planning: 'bg-blue-500/20 text-blue-400',
@@ -64,6 +65,8 @@ export default function MegaJobDetailPage() {
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([])
   // Bump to force report reload after re-consolidation
   const [reportVersion, setReportVersion] = useState(0)
+  // Movement map sub-job selector
+  const [movementSubJob, setMovementSubJob] = useState<string>('')
 
   const loadMegaJob = useCallback(async () => {
     try {
@@ -348,6 +351,42 @@ export default function MegaJobDetailPage() {
                 <MegaDailyChart data={temporalReport.daily} />
               </CollapsibleCard>
             )}
+
+            {/* 2b. Movement Map (select sub-job) */}
+            {(() => {
+              const syncedJobs = (megaJob.subJobs || []).filter((j: any) => j.syncedAt && j.s3DestPath);
+              if (syncedJobs.length === 0) return null;
+              const selectedJob = syncedJobs.find((j: any) => j.jobId === movementSubJob) || syncedJobs[0];
+              const dsName = selectedJob.s3DestPath.replace(/\/$/, '').split('/').pop();
+              return (
+                <CollapsibleCard
+                  title="Device Movements (50 sample)"
+                  icon={<Map className="h-4 w-4" />}
+                  defaultOpen={false}
+                >
+                  <div className="flex items-center gap-3 mb-4">
+                    <label className="text-sm text-muted-foreground whitespace-nowrap">Sub-job:</label>
+                    <select
+                      value={selectedJob.jobId}
+                      onChange={(e) => setMovementSubJob(e.target.value)}
+                      className="h-8 rounded-md border border-input bg-background px-2 text-sm flex-1 max-w-md"
+                    >
+                      {syncedJobs.map((j: any) => (
+                        <option key={j.jobId} value={j.jobId}>
+                          {j.name} ({j.dateRange?.from} → {j.dateRange?.to})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <MovementMap
+                    key={selectedJob.jobId}
+                    datasetName={dsName}
+                    dateFrom={selectedJob.dateRange?.from || ''}
+                    dateTo={selectedJob.dateRange?.to || ''}
+                  />
+                </CollapsibleCard>
+              );
+            })()}
 
             {/* 3. Catchment Pie Chart (by zip code) */}
             {catchmentReport?.byZipCode && (
