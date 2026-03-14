@@ -354,7 +354,46 @@ export async function startConsolidatedMobilityQuery(
   return await startQueryAsync(sql);
 }
 
-// ── Q5: MAIDs (unique device IDs) ──────────────────────────────────────
+// ── Q5: Temporal (daily pings / devices) ────────────────────────────────
+
+/**
+ * Build and start the consolidated temporal query across all sub-job tables.
+ * Returns daily pings, unique devices, and unique POI-visiting devices.
+ */
+export async function startConsolidatedTemporalQuery(
+  subJobs: Job[],
+  poiIds?: string[],
+): Promise<string> {
+  const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
+  if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for temporal query');
+
+  const poiFilter = buildPoiFilter(poiIds);
+
+  // All pings with POI visits
+  const poiPingsUnion = syncedJobs
+    .map((job) => {
+      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      return `SELECT date, ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+    })
+    .join('\n      UNION ALL\n      ');
+
+  const sql = `
+    SELECT
+      date,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM (
+      ${poiPingsUnion}
+    )
+    GROUP BY date
+    ORDER BY date
+  `;
+
+  console.log(`[MEGA-TEMPORAL] Starting temporal query across ${syncedJobs.length} tables`);
+  return await startQueryAsync(sql);
+}
+
+// ── Q6: MAIDs (unique device IDs) ──────────────────────────────────────
 
 /**
  * Build and start a query for all unique MAIDs (ad_id) that visited POIs.

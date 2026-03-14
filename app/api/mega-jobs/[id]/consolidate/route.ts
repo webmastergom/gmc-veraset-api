@@ -17,6 +17,7 @@ import {
   startConsolidatedHourlyQuery,
   startConsolidatedCatchmentQuery,
   startConsolidatedMobilityQuery,
+  startConsolidatedTemporalQuery,
   startConsolidatedMAIDsQuery,
 } from '@/lib/mega-consolidation-queries';
 import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
@@ -38,6 +39,7 @@ interface ConsolidationState {
     hourly?: string;
     catchment?: string;
     mobility?: string;
+    temporal?: string;
     maids?: string;
   };
   /** Track which queries have been parsed */
@@ -45,6 +47,7 @@ interface ConsolidationState {
     visits?: boolean;
     hourly?: boolean;
     mobility?: boolean;
+    temporal?: boolean;
   };
   /** Optional POI filter */
   poiIds?: string[];
@@ -116,13 +119,14 @@ export async function POST(
       try {
         const effectivePoiIds = state.poiIds || poiIds;
 
-        // Start all 6 queries in parallel
-        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, maidsQId] = await Promise.all([
+        // Start all 7 queries in parallel
+        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, maidsQId] = await Promise.all([
           startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
           startConsolidatedODQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
           startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
           startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
           startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedTemporalQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
           startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
         ]);
 
@@ -135,13 +139,14 @@ export async function POST(
             hourly: hourlyQId,
             catchment: catchmentQId,
             mobility: mobilityQId,
+            temporal: temporalQId,
             maids: maidsQId,
           },
           parsed: {},
         };
         await putConf(CONSOLIDATION_KEY(id), state);
 
-        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, maidsQId].filter(Boolean).length;
+        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, maidsQId].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
           progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
@@ -243,19 +248,32 @@ export async function POST(
         }
       }
 
-      // Build temporal trends from sub-job dailyData (in-memory, no query)
-      const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
-      for (const job of syncedJobs) {
-        const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
-        if (!datasetName) continue;
-        const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
-        if (analysis?.dailyData) {
-          dailyDataByJob.push(analysis.dailyData);
+      // Parse temporal (daily pings/devices from Athena query)
+      if (state.queries.temporal && !state.parsed?.temporal) {
+        try {
+          const queryResult = await fetchQueryResults(state.queries.temporal);
+          const dailyData = queryResult.rows.map((row: Record<string, any>) => ({
+            date: String(row.date || ''),
+            pings: parseInt(row.pings, 10) || 0,
+            devices: parseInt(row.devices, 10) || 0,
+          })).sort((a: any, b: any) => a.date.localeCompare(b.date));
+          const temporal = buildTemporalTrends(id, [dailyData]);
+          reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
+        } catch (err: any) {
+          console.error('[MEGA] Error parsing temporal:', err.message);
+          // Fallback: try building from sub-job analysis if available
+          const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
+          for (const job of syncedJobs) {
+            const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
+            if (!datasetName) continue;
+            const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
+            if (analysis?.dailyData) dailyDataByJob.push(analysis.dailyData);
+          }
+          if (dailyDataByJob.length > 0) {
+            const temporal = buildTemporalTrends(id, dailyDataByJob);
+            reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
+          }
         }
-      }
-      if (dailyDataByJob.length > 0) {
-        const temporal = buildTemporalTrends(id, dailyDataByJob);
-        reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
       }
 
       state = { ...state, phase: 'parsing_od', parsed: { visits: true, hourly: true, mobility: true } };
