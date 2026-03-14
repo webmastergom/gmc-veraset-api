@@ -5,7 +5,7 @@ import { getConfig } from '@/lib/s3-config';
 export const dynamic = 'force-dynamic';
 
 const REPORT_KEY = (ds: string, type: string) => `dataset-reports/${ds}/${type}`;
-const VALID_TYPES = ['od', 'hourly', 'catchment', 'mobility'];
+const VALID_TYPES = ['od', 'hourly', 'catchment', 'mobility', 'temporal'];
 
 /**
  * GET /api/datasets/[name]/reports?type=od|hourly|catchment|mobility

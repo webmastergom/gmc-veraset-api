@@ -118,6 +118,7 @@ export default function DatasetAnalysisPage() {
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
   const [mobilityReport, setMobilityReport] = useState<any>(null);
+  const [temporalReport, setTemporalReport] = useState<any>(null);
   const [reportVersion, setReportVersion] = useState(0);
 
   useEffect(() => {
@@ -140,12 +141,13 @@ export default function DatasetAnalysisPage() {
 
   // Load saved reports on mount
   useEffect(() => {
-    const types = ['od', 'hourly', 'catchment', 'mobility'];
+    const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
       hourly: setHourlyReport,
       catchment: setCatchmentReport,
       mobility: setMobilityReport,
+      temporal: setTemporalReport,
     };
 
     for (const type of types) {
@@ -370,7 +372,7 @@ export default function DatasetAnalysisPage() {
     devices: d.devices,
   })) || [];
 
-  const hasReports = odReport || hourlyReport || catchmentReport || mobilityReport;
+  const hasReports = odReport || hourlyReport || catchmentReport || mobilityReport || temporalReport;
 
   return (
     <MainLayout>
@@ -562,6 +564,44 @@ export default function DatasetAnalysisPage() {
       {/* ── FULL REPORTS (from Generate Full Report) ───────────────── */}
       {hasReports && (
         <div className="space-y-4 mt-4">
+          {/* Summary Cards */}
+          {temporalReport?.daily && (() => {
+            const daily = temporalReport.daily as { date: string; pings: number; devices: number }[];
+            const totalPings = daily.reduce((s: number, d: any) => s + d.pings, 0);
+            const totalDevices = daily.reduce((s: number, d: any) => s + d.devices, 0);
+            const dates = daily.map((d: any) => d.date).sort();
+            const dateFrom = dates[0] || '—';
+            const dateTo = dates[dates.length - 1] || '—';
+            const stats = [
+              { label: 'Total Pings', value: totalPings.toLocaleString(), icon: <Activity className="h-4 w-4 text-blue-400" /> },
+              { label: 'Unique Devices', value: totalDevices.toLocaleString(), icon: <Users className="h-4 w-4 text-cyan-400" /> },
+              { label: 'Date Range', value: `${dateFrom} — ${dateTo}`, icon: <Calendar className="h-4 w-4 text-green-400" /> },
+              { label: 'Days', value: daily.length.toString(), icon: <TrendingUp className="h-4 w-4 text-orange-400" /> },
+            ];
+            return (
+              <div className="grid grid-cols-4 gap-4">
+                {stats.map((s) => (
+                  <Card key={s.label}>
+                    <CardContent className="py-4 text-center">
+                      <div className="flex items-center justify-center gap-1.5 mb-1">
+                        {s.icon}
+                        <p className="text-xs text-muted-foreground uppercase tracking-wide">{s.label}</p>
+                      </div>
+                      <p className="text-xl font-bold">{s.value}</p>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* Temporal Daily Chart */}
+          {temporalReport?.daily && (
+            <CollapsibleCard title="Daily Activity (POI Visitors)" icon={<TrendingUp className="h-4 w-4" />}>
+              <MegaDailyChart data={temporalReport.daily} />
+            </CollapsibleCard>
+          )}
+
           {/* Catchment Pie */}
           {catchmentReport?.byZipCode && (
             <CollapsibleCard

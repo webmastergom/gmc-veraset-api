@@ -462,3 +462,31 @@ export async function startDatasetMobilityQuery(
   console.log(`[DATASET-MOBILITY] Starting mobility query for ${datasetName} (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
+
+// ── Temporal (daily pings/devices for POI visitors) ─────────────────
+
+/**
+ * Daily pings + unique devices of POI-visiting devices.
+ * Used for summary stats and temporal trend charts.
+ */
+export async function startDatasetTemporalQuery(
+  datasetName: string,
+): Promise<string> {
+  const table = getTableName(datasetName);
+
+  const sql = `
+    SELECT
+      date,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM ${table}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+    GROUP BY date
+    ORDER BY date
+  `;
+
+  console.log(`[DATASET-TEMPORAL] Starting temporal query for ${datasetName}`);
+  return await startQueryAsync(sql);
+}

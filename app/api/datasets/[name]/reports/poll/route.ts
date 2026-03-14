@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
-import { s3Client, BUCKET } from '@/lib/s3-config';
-import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
 import {
@@ -9,15 +7,16 @@ import {
   startDatasetHourlyQuery,
   startDatasetCatchmentQuery,
   startDatasetMobilityQuery,
+  startDatasetTemporalQuery,
 } from '@/lib/dataset-report-queries';
 import { extractPoiCoords, type PoiCoord } from '@/lib/mega-consolidation-queries';
-import { getJob } from '@/lib/jobs';
 import {
   parseConsolidatedOD,
   parseConsolidatedHourly,
   parseConsolidatedMobility,
   buildODReport,
   buildCatchmentReport,
+  buildTemporalTrends,
 } from '@/lib/mega-report-consolidation';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
@@ -48,7 +47,7 @@ async function saveReport(ds: string, type: string, data: any): Promise<void> {
 
 /**
  * POST /api/datasets/[name]/reports/poll
- * Multi-phase polling for OD, hourly, catchment, and mobility reports.
+ * Multi-phase polling for OD, hourly, catchment, mobility, and temporal reports.
  * Call repeatedly until phase === 'done'.
  */
 export async function POST(
@@ -87,11 +86,12 @@ export async function POST(
         console.warn(`[DS-REPORT] Could not extract POI coords: ${e.message}`);
       }
 
-      const [od, hourly, catchment, mobility] = await Promise.all([
+      const [od, hourly, catchment, mobility, temporal] = await Promise.all([
         startDatasetODQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
         startDatasetHourlyQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
         startDatasetCatchmentQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
         startDatasetMobilityQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
+        startDatasetTemporalQuery(datasetName).catch((e) => { console.error('[DS-REPORT] Temporal failed:', e.message); return undefined; }),
       ]);
 
       const queries: Record<string, string> = {};
@@ -99,6 +99,7 @@ export async function POST(
       if (hourly) queries.hourly = hourly;
       if (catchment) queries.catchment = catchment;
       if (mobility) queries.mobility = mobility;
+      if (temporal) queries.temporal = temporal;
 
       state = { phase: 'polling', queries };
       await saveState(datasetName, state);
@@ -112,6 +113,18 @@ export async function POST(
     // ── Phase 2: Poll queries ──────────────────────────────────────
     if (state.phase === 'polling' && state.queries) {
       const queryEntries = Object.entries(state.queries);
+
+      // If all queries were removed (all failed/expired), restart
+      if (queryEntries.length === 0) {
+        console.warn(`[DS-REPORT] All queries removed, restarting...`);
+        state = null as any;
+        await putConfig(STATE_KEY(datasetName), null as any, { compact: true }).catch(() => {});
+        return NextResponse.json({
+          phase: 'polling',
+          progress: { step: 'restarting', percent: 0, message: 'Restarting queries...' },
+        });
+      }
+
       let allDone = true;
 
       const statusResults = await Promise.all(
@@ -145,7 +158,20 @@ export async function POST(
         }
       }
 
+      // If ALL queries failed (e.g. all expired), reset state to restart
+      if (failedCount === queryEntries.length) {
+        console.warn(`[DS-REPORT] All ${failedCount} queries failed/expired, resetting to restart`);
+        state = { phase: 'done', error: 'All queries failed' };
+        await saveState(datasetName, state);
+        return NextResponse.json({
+          phase: 'done',
+          progress: { step: 'error', percent: 0, message: 'All queries failed or expired. Click Generate again to retry.' },
+        });
+      }
+
       if (!allDone) {
+        // Save state with removed failed queries
+        await saveState(datasetName, state);
         const runningCount = queryEntries.length - doneCount;
         return NextResponse.json({
           phase: 'polling',
@@ -163,7 +189,7 @@ export async function POST(
       // Fall through
     }
 
-    // ── Phase 3: Parse hourly + mobility (no geocoding) ────────────
+    // ── Phase 3: Parse hourly + mobility + temporal (no geocoding) ──
     if (state.phase === 'parsing' && state.queries) {
       // Parse hourly
       if (state.queries.hourly) {
@@ -187,7 +213,23 @@ export async function POST(
         }
       }
 
-      state = { ...state, phase: 'geocoding', parsed: { hourly: true, mobility: true } };
+      // Parse temporal
+      if (state.queries.temporal) {
+        try {
+          const result = await fetchQueryResults(state.queries.temporal);
+          const dailyData = result.rows.map((r: any) => ({
+            date: r.date,
+            pings: parseInt(r.pings, 10) || 0,
+            devices: parseInt(r.devices, 10) || 0,
+          }));
+          const report = buildTemporalTrends(datasetName, [dailyData]);
+          await saveReport(datasetName, 'temporal', report);
+        } catch (err: any) {
+          console.error('[DS-REPORT] Error parsing temporal:', err.message);
+        }
+      }
+
+      state = { ...state, phase: 'geocoding', parsed: { hourly: true, mobility: true, temporal: true } };
       await saveState(datasetName, state);
 
       return NextResponse.json({
