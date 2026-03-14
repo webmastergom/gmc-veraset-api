@@ -144,6 +144,40 @@ export const externalCreateJobSchema = z.object({
   )
 
 /**
+ * Mega-job: auto-split creation schema (relaxed date/POI limits)
+ */
+export const createMegaJobAutoSplitSchema = z.object({
+  name: z.string().min(1).max(200),
+  description: z.string().max(1000).optional(),
+  country: z.string().length(2).toUpperCase().optional(),
+  poiCollectionId: z.string().min(1),
+  dateRange: z.object({
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD'),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD'),
+  }).refine(
+    (data) => {
+      const from = new Date(data.from);
+      const to = new Date(data.to);
+      if (isNaN(from.getTime()) || isNaN(to.getTime())) return false;
+      return to >= from;
+    },
+    { message: 'to must be after from', path: ['to'] }
+  ),
+  radius: z.number().min(1).max(1000).optional().default(10),
+  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
+  type: z.enum(['pings', 'devices', 'aggregate', 'cohort', 'pings_by_device']).optional().default('pings'),
+})
+
+/**
+ * Mega-job: manual group creation schema (group existing jobs)
+ */
+export const createMegaJobManualGroupSchema = z.object({
+  name: z.string().min(1).max(200),
+  description: z.string().max(1000).optional(),
+  subJobIds: z.array(z.string().min(1)).min(2, 'Must group at least 2 jobs'),
+})
+
+/**
  * Login schema
  */
 export const loginSchema = z.object({

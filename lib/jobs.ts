@@ -91,6 +91,10 @@ export interface Job {
   };
   /** Whether this dataset is enabled for the Audience Agent */
   audienceAgentEnabled?: boolean;
+  /** If this job belongs to a mega-job, references the parent */
+  megaJobId?: string;
+  /** Position within a mega-job (0-based, for ordering) */
+  megaJobIndex?: number;
   /** Detailed sync progress by day (for professional loader) */
   syncProgress?: {
     currentDay?: string; // Date being copied (YYYY-MM-DD)

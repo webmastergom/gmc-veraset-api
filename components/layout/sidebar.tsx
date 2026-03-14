@@ -16,6 +16,7 @@ import {
   Users,
   MapPinned,
   Settings,
+  Layers,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -25,6 +26,7 @@ const navigation = [
   { name: 'POIs', href: '/pois', icon: MapPin },
   { name: 'Jobs', href: '/jobs', icon: Briefcase },
   { name: 'Datasets', href: '/datasets', icon: Database },
+  { name: 'Mega-Jobs', href: '/mega-jobs', icon: Layers },
   { name: 'Laboratory', href: '/laboratory', icon: FlaskConical },
   { name: 'Roamy', href: '/laboratory/audiences', icon: Users },
   { name: 'Zip Code Signals', href: '/zip-code-signals', icon: MapPinned },

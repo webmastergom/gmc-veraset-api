@@ -104,7 +104,7 @@ export async function getRemaining(): Promise<number> {
  */
 export async function canCreateJob(): Promise<{ allowed: boolean; reason?: string; remaining: number }> {
   const usage = await getUsage();
-  
+
   if (usage.remaining <= 0) {
     return {
       allowed: false,
@@ -112,6 +112,25 @@ export async function canCreateJob(): Promise<{ allowed: boolean; reason?: strin
       remaining: 0,
     };
   }
-  
+
+  return { allowed: true, remaining: usage.remaining };
+}
+
+/**
+ * Check if enough quota exists to create all sub-jobs for a mega-job.
+ */
+export async function canCreateMegaJob(
+  subJobCount: number
+): Promise<{ allowed: boolean; reason?: string; remaining: number }> {
+  const usage = await getUsage();
+
+  if (usage.remaining < subJobCount) {
+    return {
+      allowed: false,
+      reason: `Not enough quota: need ${subJobCount} calls but only ${usage.remaining} remaining this month (limit ${usage.limit}).`,
+      remaining: usage.remaining,
+    };
+  }
+
   return { allowed: true, remaining: usage.remaining };
 }
