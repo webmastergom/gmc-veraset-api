@@ -187,9 +187,13 @@ export default function MegaJobDetailPage() {
     name: v.poiName || v.poiId,
   }))
 
-  // Compute summary stats
-  const totalPings = temporalReport?.daily?.reduce((s: number, d: any) => s + d.pings, 0) || 0
-  const totalDevices = temporalReport?.daily?.reduce((s: number, d: any) => s + d.devices, 0) || 0
+  // Compute summary stats — prefer temporal report, fallback to hourly
+  const totalPings = temporalReport?.daily?.reduce((s: number, d: any) => s + d.pings, 0)
+    || hourlyReport?.hourly?.reduce((s: number, h: any) => s + (h.pings || 0), 0)
+    || 0
+  const totalDevices = temporalReport?.daily?.reduce((s: number, d: any) => s + d.devices, 0)
+    || hourlyReport?.hourly?.reduce((s: number, h: any) => s + (h.devices || 0), 0)
+    || 0
   const dateRange = {
     from: temporalReport?.daily?.[0]?.date || '—',
     to: temporalReport?.daily?.[temporalReport.daily.length - 1]?.date || '—',
