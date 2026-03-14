@@ -191,7 +191,9 @@ export default function MegaJobDetailPage() {
   const totalPings = temporalReport?.daily?.reduce((s: number, d: any) => s + d.pings, 0)
     || hourlyReport?.hourly?.reduce((s: number, h: any) => s + (h.pings || 0), 0)
     || 0
-  const totalDevices = temporalReport?.daily?.reduce((s: number, d: any) => s + d.devices, 0)
+  // Prefer totalUniqueDevices (true unique), fallback to daily sum (device-days)
+  const totalDevices = temporalReport?.totalUniqueDevices
+    || temporalReport?.daily?.reduce((s: number, d: any) => s + d.devices, 0)
     || hourlyReport?.hourly?.reduce((s: number, h: any) => s + (h.devices || 0), 0)
     || 0
   const dateRange = {

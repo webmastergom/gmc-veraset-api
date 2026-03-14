@@ -67,6 +67,13 @@ export async function POST(
     const reset = request.nextUrl.searchParams.get('reset') === 'true';
     let state = reset ? null : await getState(datasetName);
 
+    // Parse optional POI ID filter from request body
+    let poiIds: string[] | undefined;
+    try {
+      const body = await request.json();
+      if (body?.poiIds?.length) poiIds = body.poiIds;
+    } catch { /* no body or invalid JSON */ }
+
     // Reset if done
     if (state?.phase === 'done') state = null;
 
@@ -83,6 +90,21 @@ export async function POST(
           if (matchingJob) {
             poiCoords = extractPoiCoords([matchingJob as any]);
             console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords for ${datasetName}`);
+
+            // Filter to selected POIs if poiIds provided
+            if (poiIds?.length && matchingJob.verasetPayload?.geo_radius) {
+              const selectedSet = new Set(poiIds);
+              const filtered: PoiCoord[] = [];
+              for (const g of matchingJob.verasetPayload.geo_radius) {
+                if (selectedSet.has(g.poi_id)) {
+                  filtered.push({ lat: g.latitude, lng: g.longitude, radiusM: g.distance_in_meters || 200 });
+                }
+              }
+              if (filtered.length > 0) {
+                poiCoords = filtered;
+                console.log(`[DS-REPORT] Filtered to ${poiCoords.length} POI coords (of ${poiIds.length} selected)`);
+              }
+            }
           }
         }
       } catch (e: any) {
@@ -105,8 +127,8 @@ export async function POST(
         startDatasetHourlyQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
         startDatasetCatchmentQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
         startDatasetMobilityQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
-        startDatasetTemporalQuery(datasetName).catch((e) => { console.error('[DS-REPORT] Temporal failed:', e.message); return undefined; }),
-        startDatasetTotalDevicesQuery(datasetName).catch((e) => { console.error('[DS-REPORT] TotalDevices failed:', e.message); return undefined; }),
+        startDatasetTemporalQuery(datasetName, poiIds).catch((e) => { console.error('[DS-REPORT] Temporal failed:', e.message); return undefined; }),
+        startDatasetTotalDevicesQuery(datasetName, poiIds).catch((e) => { console.error('[DS-REPORT] TotalDevices failed:', e.message); return undefined; }),
       ]);
 
       const queries: Record<string, string> = {};

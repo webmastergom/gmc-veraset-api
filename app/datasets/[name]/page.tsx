@@ -57,6 +57,7 @@ import { CatchmentMap } from '@/components/mega-jobs/catchment-map';
 import { ODTables } from '@/components/mega-jobs/od-tables';
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar';
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart';
+import { PoiFilter } from '@/components/mega-jobs/poi-filter';
 
 interface DatasetInfo {
   id: string;
@@ -120,6 +121,7 @@ export default function DatasetAnalysisPage() {
   const [mobilityReport, setMobilityReport] = useState<any>(null);
   const [temporalReport, setTemporalReport] = useState<any>(null);
   const [reportVersion, setReportVersion] = useState(0);
+  const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([]);
 
   useEffect(() => {
     fetch('/api/datasets', { credentials: 'include' })
@@ -201,6 +203,8 @@ export default function DatasetAnalysisPage() {
         const res = await fetch(`/api/datasets/${datasetName}/reports/poll${resetParam}`, {
           method: 'POST',
           credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
         });
         const data = await res.json();
 
@@ -564,6 +568,23 @@ export default function DatasetAnalysisPage() {
       {/* ── FULL REPORTS (from Generate Full Report) ───────────────── */}
       {hasReports && (
         <div className="space-y-4 mt-4">
+          {/* POI Filter */}
+          {(() => {
+            const poiOptions = (analysis?.visitsByPoi || [])
+              .filter((v: VisitByPoi) => v.poiId)
+              .map((v: VisitByPoi) => ({
+                id: v.poiId,
+                name: v.name || v.poiId,
+              }));
+            return poiOptions.length > 1 ? (
+              <PoiFilter
+                pois={poiOptions}
+                selectedIds={selectedPoiIds}
+                onChange={setSelectedPoiIds}
+              />
+            ) : null;
+          })()}
+
           {/* Summary Cards */}
           {temporalReport?.daily && (() => {
             const daily = temporalReport.daily as { date: string; pings: number; devices: number }[];

@@ -467,8 +467,10 @@ export async function startDatasetMobilityQuery(
  */
 export async function startDatasetTemporalQuery(
   datasetName: string,
+  poiIds?: string[],
 ): Promise<string> {
   const table = getTableName(datasetName);
+  const poiFilter = buildPoiIdFilter(poiIds);
 
   const sql = `
     SELECT
@@ -479,11 +481,12 @@ export async function startDatasetTemporalQuery(
     CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
     WHERE poi_id IS NOT NULL AND poi_id != ''
       AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+      ${poiFilter}
     GROUP BY date
     ORDER BY date
   `;
 
-  console.log(`[DATASET-TEMPORAL] Starting temporal query for ${datasetName}`);
+  console.log(`[DATASET-TEMPORAL] Starting temporal query for ${datasetName} (poiFilter=${!!poiIds?.length})`);
   return await startQueryAsync(sql);
 }
 
@@ -495,8 +498,10 @@ export async function startDatasetTemporalQuery(
  */
 export async function startDatasetTotalDevicesQuery(
   datasetName: string,
+  poiIds?: string[],
 ): Promise<string> {
   const table = getTableName(datasetName);
+  const poiFilter = buildPoiIdFilter(poiIds);
 
   const sql = `
     SELECT COUNT(DISTINCT ad_id) as total_unique_devices
@@ -504,10 +509,20 @@ export async function startDatasetTotalDevicesQuery(
     CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
     WHERE poi_id IS NOT NULL AND poi_id != ''
       AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+      ${poiFilter}
   `;
 
-  console.log(`[DATASET-TOTAL] Starting total devices query for ${datasetName}`);
+  console.log(`[DATASET-TOTAL] Starting total devices query for ${datasetName} (poiFilter=${!!poiIds?.length})`);
   return await startQueryAsync(sql);
+}
+
+/**
+ * Build a poi_id IN (...) filter clause for direct poi_id matching.
+ */
+function buildPoiIdFilter(poiIds?: string[]): string {
+  if (!poiIds?.length) return '';
+  const list = poiIds.map((p) => `'${p.replace(/'/g, "''")}'`).join(',');
+  return `AND poi_id IN (${list})`;
 }
 
 // ── POI coordinates temp table (for large POI sets) ─────────────────
