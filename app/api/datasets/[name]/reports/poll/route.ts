@@ -100,16 +100,30 @@ export async function POST(
           try {
             const s = await checkQueryStatus(queryId);
             return { name, state: s.state, error: s.error };
-          } catch {
+          } catch (err: any) {
+            // Query not found in Athena (expired/invalid) → treat as failed
+            const msg = err?.message || '';
+            if (msg.includes('not found') || msg.includes('InvalidRequestException')) {
+              console.warn(`[DS-REPORT] Query ${name} (${queryId}) not found in Athena, treating as FAILED`);
+              return { name, state: 'FAILED' as const, error: 'Query expired or not found' };
+            }
             return { name, state: 'FAILED' as const, error: 'Check failed' };
           }
         })
       );
 
       let doneCount = 0;
-      for (const { state: qState } of statusResults) {
+      let failedCount = 0;
+      for (const { name: qName, state: qState, error: qError } of statusResults) {
         if (qState === 'RUNNING' || qState === 'QUEUED') allDone = false;
         if (qState === 'SUCCEEDED') doneCount++;
+        if (qState === 'FAILED' || qState === 'CANCELLED') {
+          doneCount++; // Count as done (will be skipped in parsing)
+          failedCount++;
+          console.warn(`[DS-REPORT] Query ${qName} failed: ${qError}`);
+          // Remove failed queries so parsing skips them
+          delete state.queries![qName];
+        }
       }
 
       if (!allDone) {
@@ -124,7 +138,7 @@ export async function POST(
         });
       }
 
-      // All done → advance to parsing
+      // All done → advance to parsing (save updated state with removed failed queries)
       state = { ...state, phase: 'parsing' };
       await saveState(datasetName, state);
       // Fall through
