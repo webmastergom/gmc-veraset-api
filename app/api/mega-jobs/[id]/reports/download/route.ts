@@ -9,8 +9,11 @@ import {
   type ConsolidatedCatchmentReport,
   type ConsolidatedMobilityReport,
 } from '@/lib/mega-report-consolidation';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 
 export const dynamic = 'force-dynamic';
+
+const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 
 function csvResponse(csv: string, filename: string): NextResponse {
   return new NextResponse(csv, {
@@ -112,6 +115,46 @@ export async function GET(
         `${escCsv(c.category)},${c.deviceDays},${c.hits}`
       );
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-mobility.csv`);
+    }
+
+    // ── MAIDs (from Athena output CSV in S3) ────────────────────────
+    if (reportType === 'maids') {
+      const maidsKey = megaJob.consolidatedReports?.maids;
+      if (!maidsKey) return NextResponse.json({ error: 'MAIDs report not found. Re-consolidate to generate.' }, { status: 404 });
+
+      try {
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-west-2' });
+        const resp = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: maidsKey }));
+        const raw = await resp.Body?.transformToString() || '';
+
+        // Athena CSV has header "ad_id" + quoted values. Clean it up to just MAIDs.
+        const lines = raw.split('\n').filter((l) => l.trim());
+        const header = 'maid';
+        const rows = lines.slice(1).map((line) => line.replace(/^"|"$/g, '').trim()).filter(Boolean);
+        const csv = [header, ...rows].join('\n');
+
+        return csvResponse(csv, `mega-job-${id}-maids.csv`);
+      } catch (err: any) {
+        console.error('[MEGA-MAIDS DOWNLOAD]', err.message);
+        return NextResponse.json({ error: `Failed to fetch MAIDs: ${err.message}` }, { status: 500 });
+      }
+    }
+
+    // ── Clean postal codes ───────────────────────────────────────────
+    if (reportType === 'postcodes') {
+      const report = await getConsolidatedReport<ConsolidatedCatchmentReport>(id, 'catchment');
+      if (!report) return NextResponse.json({ error: 'Catchment report not found' }, { status: 404 });
+
+      const header = 'postal_code,device_days';
+      const rows = report.byZipCode
+        .filter((z) => z.zipCode && z.zipCode !== 'UNKNOWN' && z.zipCode !== 'FOREIGN')
+        .map((z) => {
+          // Clean postal code: remove any added letters, dashes, or spaces
+          const clean = z.zipCode.replace(/[^0-9]/g, '');
+          return `${clean},${z.deviceDays}`;
+        })
+        .filter((r) => r.split(',')[0]); // skip if empty after cleaning
+      return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-postcodes.csv`);
     }
 
     return NextResponse.json({ error: 'Invalid type' }, { status: 400 });

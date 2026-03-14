@@ -52,6 +52,11 @@ export interface ConsolidatedReports {
   visitsByPoi?: string;     // S3 key: config/mega-reports/{id}/visits.json
   catchment?: string;       // S3 key: config/mega-reports/{id}/catchment.json
   temporalTrends?: string;  // S3 key: config/mega-reports/{id}/temporal.json
+  od?: string;              // S3 key: config/mega-reports/{id}/od.json
+  hourly?: string;          // S3 key: config/mega-reports/{id}/hourly.json
+  mobility?: string;        // S3 key: config/mega-reports/{id}/mobility.json
+  maids?: string;           // S3 key: athena-results/{queryId}.csv
+  [key: string]: string | undefined;
 }
 
 export interface MegaJob {

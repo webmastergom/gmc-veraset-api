@@ -17,6 +17,7 @@ import {
   startConsolidatedHourlyQuery,
   startConsolidatedCatchmentQuery,
   startConsolidatedMobilityQuery,
+  startConsolidatedMAIDsQuery,
 } from '@/lib/mega-consolidation-queries';
 import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
@@ -37,6 +38,7 @@ interface ConsolidationState {
     hourly?: string;
     catchment?: string;
     mobility?: string;
+    maids?: string;
   };
   /** Track which queries have been parsed */
   parsed?: {
@@ -104,8 +106,8 @@ export async function POST(
       state = { phase: 'starting', poiIds };
     }
 
-    // Update mega-job status
-    if (megaJob.status !== 'consolidating' && megaJob.status !== 'completed') {
+    // Update mega-job status — always set to consolidating (even for re-consolidation)
+    if (megaJob.status !== 'consolidating') {
       await updateMegaJob(id, { status: 'consolidating' });
     }
 
@@ -114,13 +116,14 @@ export async function POST(
       try {
         const effectivePoiIds = state.poiIds || poiIds;
 
-        // Start all 5 queries in parallel
-        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId] = await Promise.all([
+        // Start all 6 queries in parallel
+        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, maidsQId] = await Promise.all([
           startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
           startConsolidatedODQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
           startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
           startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
           startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
         ]);
 
         state = {
@@ -132,12 +135,13 @@ export async function POST(
             hourly: hourlyQId,
             catchment: catchmentQId,
             mobility: mobilityQId,
+            maids: maidsQId,
           },
           parsed: {},
         };
         await putConf(CONSOLIDATION_KEY(id), state);
 
-        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId].filter(Boolean).length;
+        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, maidsQId].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
           progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
@@ -388,6 +392,11 @@ export async function POST(
         if (catchmentRows) {
           const catchmentReport = buildCatchmentReport(id, catchmentRows, coordToZip);
           reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
+        }
+
+        // Save MAIDs query output key (CSV served directly from Athena output)
+        if (state.queries?.maids) {
+          reportKeys.maids = `athena-results/${state.queries.maids}.csv`;
         }
 
         // Update mega-job with all report keys

@@ -351,3 +351,38 @@ export async function startConsolidatedMobilityQuery(
   console.log(`[MEGA-MOBILITY] Starting mobility trends query across ${syncedJobs.length} tables`);
   return await startQueryAsync(sql);
 }
+
+// ── Q5: MAIDs (unique device IDs) ──────────────────────────────────────
+
+/**
+ * Build and start a query for all unique MAIDs (ad_id) that visited POIs.
+ * Returns Athena queryId. The output CSV is used directly for export.
+ */
+export async function startConsolidatedMAIDsQuery(
+  subJobs: Job[],
+  poiIds?: string[],
+): Promise<string> {
+  const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
+  if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for MAIDs query');
+
+  const poiFilter = buildPoiFilter(poiIds);
+
+  const unionParts = syncedJobs
+    .map((job) => {
+      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      return `SELECT DISTINCT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+    })
+    .join('\n      UNION\n      ');
+
+  // UNION (not UNION ALL) to deduplicate across sub-jobs
+  const sql = `
+    SELECT DISTINCT ad_id
+    FROM (
+      ${unionParts}
+    )
+    ORDER BY ad_id
+  `;
+
+  console.log(`[MEGA-MAIDS] Starting MAIDs query across ${syncedJobs.length} tables`);
+  return await startQueryAsync(sql);
+}

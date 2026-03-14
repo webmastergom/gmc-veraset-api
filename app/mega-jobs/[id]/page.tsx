@@ -8,7 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
-  Layers, ExternalLink, Loader2, Play,
+  Layers, ExternalLink, Loader2, Play, Download,
   CheckCircle2, XCircle, Clock,
   BarChart3, TrendingUp, MapPin, Navigation,
   Compass, Timer, Activity,
@@ -62,6 +62,8 @@ export default function MegaJobDetailPage() {
 
   // POI filter
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([])
+  // Bump to force report reload after re-consolidation
+  const [reportVersion, setReportVersion] = useState(0)
 
   const loadMegaJob = useCallback(async () => {
     try {
@@ -105,7 +107,7 @@ export default function MegaJobDetailPage() {
         .then((data) => setters[type](data))
         .catch(() => { })
     }
-  }, [megaJob?.status, id])
+  }, [megaJob?.status, id, reportVersion])
 
   // ── Consolidation ───────────────────────────────────────────────
   const handleConsolidate = async () => {
@@ -136,6 +138,7 @@ export default function MegaJobDetailPage() {
         if (data.phase === 'done') {
           done = true
           await loadMegaJob()
+          setReportVersion((v) => v + 1)
         } else {
           await new Promise((r) => setTimeout(r, 3000))
         }
@@ -310,6 +313,23 @@ export default function MegaJobDetailPage() {
                 subJobCount={megaJob.progress.synced}
               />
             )}
+
+            {/* Export buttons */}
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-medium text-muted-foreground">Exports:</span>
+              <a href={`/api/mega-jobs/${id}/reports/download?type=maids`}>
+                <Button variant="outline" size="sm">
+                  <Download className="h-4 w-4 mr-1" /> MAIDs
+                </Button>
+              </a>
+              {catchmentReport && (
+                <a href={`/api/mega-jobs/${id}/reports/download?type=postcodes`}>
+                  <Button variant="outline" size="sm">
+                    <Download className="h-4 w-4 mr-1" /> Postal Codes
+                  </Button>
+                </a>
+              )}
+            </div>
 
             {/* 2. Daily Activity Chart */}
             {temporalReport?.daily && (
