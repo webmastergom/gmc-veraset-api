@@ -87,6 +87,13 @@ export default function MegaJobDetailPage() {
     return () => clearInterval(interval)
   }, [megaJob?.status, loadMegaJob])
 
+  // Auto-resume consolidation if page loads with status 'consolidating'
+  useEffect(() => {
+    if (!megaJob || megaJob.status !== 'consolidating' || consolidating) return
+    handleConsolidate(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [megaJob?.status])
+
   // Load all reports if completed
   useEffect(() => {
     if (megaJob?.status !== 'completed') return
@@ -110,16 +117,16 @@ export default function MegaJobDetailPage() {
   }, [megaJob?.status, id, reportVersion])
 
   // ── Consolidation ───────────────────────────────────────────────
-  const handleConsolidate = async () => {
+  const handleConsolidate = async (resume = false) => {
     setConsolidating(true)
-    setConsolidateProgress('Starting consolidation...')
+    setConsolidateProgress(resume ? 'Resuming consolidation...' : 'Starting consolidation...')
 
     try {
       let done = false
       let attempts = 0
       while (!done && attempts < 60) {
         attempts++
-        const resetParam = attempts === 1 ? '?reset=true' : ''
+        const resetParam = (attempts === 1 && !resume) ? '?reset=true' : ''
         const res = await fetch(`/api/mega-jobs/${id}/consolidate${resetParam}`, {
           method: 'POST',
           credentials: 'include',
@@ -168,7 +175,7 @@ export default function MegaJobDetailPage() {
     )
   }
 
-  const canConsolidate = (megaJob.status === 'running' || megaJob.status === 'partial' || megaJob.status === 'completed') && megaJob.progress.synced > 0
+  const canConsolidate = (megaJob.status === 'running' || megaJob.status === 'partial' || megaJob.status === 'completed' || megaJob.status === 'consolidating') && megaJob.progress.synced > 0
   const isCompleted = megaJob.status === 'completed'
 
   // Build POI list from visits report for filter
@@ -209,13 +216,13 @@ export default function MegaJobDetailPage() {
           </div>
 
           {canConsolidate && (
-            <Button onClick={handleConsolidate} disabled={consolidating}>
+            <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
               {consolidating ? (
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
               ) : (
                 <Play className="h-4 w-4 mr-2" />
               )}
-              {isCompleted ? 'Re-consolidate' : 'Consolidate reports'}
+              {megaJob.status === 'consolidating' ? 'Resume consolidation' : isCompleted ? 'Re-consolidate' : 'Consolidate reports'}
             </Button>
           )}
         </div>
