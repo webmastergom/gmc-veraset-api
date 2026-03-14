@@ -255,34 +255,46 @@ export async function POST(
       }
 
       // Parse temporal (daily pings/devices from Athena query)
-      if (state.queries.temporal && !state.parsed?.temporal) {
-        try {
-          const queryResult = await fetchQueryResults(state.queries.temporal);
-          const dailyData = queryResult.rows.map((row: Record<string, any>) => ({
-            date: String(row.date || ''),
-            pings: parseInt(row.pings, 10) || 0,
-            devices: parseInt(row.devices, 10) || 0,
-          })).sort((a: any, b: any) => a.date.localeCompare(b.date));
-          const temporal = buildTemporalTrends(id, [dailyData]);
-          reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
-        } catch (err: any) {
-          console.error('[MEGA] Error parsing temporal:', err.message);
-          // Fallback: try building from sub-job analysis if available
-          const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
-          for (const job of syncedJobs) {
-            const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
-            if (!datasetName) continue;
-            const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
-            if (analysis?.dailyData) dailyDataByJob.push(analysis.dailyData);
-          }
-          if (dailyDataByJob.length > 0) {
-            const temporal = buildTemporalTrends(id, dailyDataByJob);
+      if (!state.parsed?.temporal) {
+        let temporalSaved = false;
+        // Try Athena query first
+        if (state.queries.temporal) {
+          try {
+            const queryResult = await fetchQueryResults(state.queries.temporal);
+            const dailyData = queryResult.rows.map((row: Record<string, any>) => ({
+              date: String(row.date || ''),
+              pings: parseInt(row.pings, 10) || 0,
+              devices: parseInt(row.devices, 10) || 0,
+            })).sort((a: any, b: any) => a.date.localeCompare(b.date));
+            const temporal = buildTemporalTrends(id, [dailyData]);
             reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
+            temporalSaved = true;
+          } catch (err: any) {
+            console.error('[MEGA] Error parsing temporal Athena query:', err.message);
+          }
+        }
+        // Fallback: build from sub-job dataset analyses
+        if (!temporalSaved) {
+          try {
+            const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
+            for (const job of syncedJobs) {
+              const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
+              if (!datasetName) continue;
+              const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
+              if (analysis?.dailyData) dailyDataByJob.push(analysis.dailyData);
+            }
+            if (dailyDataByJob.length > 0) {
+              console.log(`[MEGA] Building temporal from ${dailyDataByJob.length} sub-job analyses (fallback)`);
+              const temporal = buildTemporalTrends(id, dailyDataByJob);
+              reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
+            }
+          } catch (err: any) {
+            console.error('[MEGA] Error building temporal fallback:', err.message);
           }
         }
       }
 
-      state = { ...state, phase: 'parsing_od', parsed: { visits: true, hourly: true, mobility: true } };
+      state = { ...state, phase: 'parsing_od', parsed: { visits: true, hourly: true, mobility: true, temporal: true } };
       await putConf(CONSOLIDATION_KEY(id), state);
 
       return NextResponse.json({
