@@ -4,6 +4,7 @@ import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { logger } from '@/lib/logger';
 import { analyzeOriginDestination } from '@/lib/dataset-analyzer-od';
 import { getConfig, putConfig, BUCKET } from '@/lib/s3-config';
+import { extractPoiCoords } from '@/lib/mega-consolidation-queries';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -136,8 +137,11 @@ export async function GET(
       console.log(`[OD] Filtering by POIs: ${requestedPoiIds.join(', ')} → Veraset IDs: ${verasetPoiIds.join(', ')}`);
     }
 
+    // 3c. Extract POI coordinates from job metadata for spatial proximity
+    const poiCoords = extractPoiCoords([job]);
+
     // 4. Check for cached result
-    const OD_VERSION = 'v6';
+    const OD_VERSION = 'v7';
     const poiSuffix = verasetPoiIds ? `-pois-${[...verasetPoiIds].sort().join(',')}` : '';
     const cacheKey = `od-${OD_VERSION}-${jobId}${poiSuffix}`;
     try {
@@ -158,8 +162,11 @@ export async function GET(
     }
 
     // 5. Run OD analysis
-    const filters = verasetPoiIds ? { poiIds: verasetPoiIds } : {};
-    console.log(`[OD] Computing OD analysis for job ${jobId}, dataset: ${datasetName}${verasetPoiIds ? `, POI filter: ${verasetPoiIds.join(',')}` : ''}`);
+    const filters = {
+      ...(verasetPoiIds ? { poiIds: verasetPoiIds } : {}),
+      ...(poiCoords.length ? { poiCoords } : {}),
+    };
+    console.log(`[OD] Computing OD analysis for job ${jobId}, dataset: ${datasetName}, spatial=${poiCoords.length}${verasetPoiIds ? `, POI filter: ${verasetPoiIds.join(',')}` : ''}`);
     logger.log(`Computing OD analysis for job ${jobId}, dataset: ${datasetName}`);
 
     let result;

@@ -113,11 +113,97 @@ export async function analyzeOriginDestination(
     poiFilter = `AND poi_id IN (${poiList})`;
   }
 
-  console.log(`[OD] Running Athena OD query for ${datasetName}...`);
+  console.log(`[OD] Running Athena OD query for ${datasetName}... (spatial=${!!filters.poiCoords?.length})`);
 
-  // Main OD query: one CTE that extracts origin + destination per device-day
-  const odQuery = `
+  // Build POI visit identification CTE — uses spatial proximity when POI coords available
+  const poiCoords = filters.poiCoords;
+  let poiVisitsCTE: string;
+  let poiActivityQuery: string;
+
+  if (poiCoords?.length) {
+    // ── Spatial proximity approach (correct) ──
+    // Determines actual at-POI pings using Haversine distance to known POI coordinates
+    const poiValues = poiCoords
+      .map((c) => `(${c.lat}, ${c.lng}, ${c.radiusM}.0)`)
+      .join(', ');
+
+    poiVisitsCTE = `
+    all_pings AS (
+      SELECT
+        t.ad_id,
+        t.date,
+        t.utc_timestamp,
+        TRY_CAST(t.latitude AS DOUBLE) as lat,
+        TRY_CAST(t.longitude AS DOUBLE) as lng
+      FROM ${tableName} t
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+        ${dateWhere}
+    ),
+    target_pois AS (
+      SELECT * FROM (VALUES ${poiValues}) AS t(poi_lat, poi_lng, poi_radius_m)
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp
+      FROM all_pings p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    ),
+    poi_visits AS (
+      SELECT
+        ad_id,
+        date,
+        MIN(utc_timestamp) as first_poi_visit,
+        MAX(utc_timestamp) as last_poi_visit
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    )`;
+
+    poiActivityQuery = `
     WITH
+    all_pings AS (
+      SELECT ad_id, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${tableName}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
+        ${dateWhere}
+    ),
+    target_pois AS (
+      SELECT * FROM (VALUES ${poiValues}) AS t(poi_lat, poi_lng, poi_radius_m)
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.utc_timestamp
+      FROM all_pings p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    )
+    SELECT
+      HOUR(utc_timestamp) as touch_hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM at_poi_pings
+    GROUP BY HOUR(utc_timestamp)
+    ORDER BY touch_hour
+    `;
+  } else {
+    // ── Fallback: poi_ids approach (less accurate for visit timing) ──
+    poiVisitsCTE = `
     poi_visits AS (
       SELECT
         ad_id,
@@ -144,7 +230,26 @@ export async function analyzeOriginDestination(
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
         AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         ${dateWhere}
-    ),
+    )`;
+
+    poiActivityQuery = `
+    SELECT
+      HOUR(utc_timestamp) as touch_hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      ${dateWhere} ${poiFilter}
+    GROUP BY HOUR(utc_timestamp)
+    ORDER BY touch_hour
+    `;
+  }
+
+  // Main OD query: one CTE that extracts origin + destination per device-day
+  const odQuery = `
+    WITH
+    ${poiVisitsCTE},
     device_day_trips AS (
       SELECT
         p.ad_id,
@@ -196,28 +301,13 @@ export async function analyzeOriginDestination(
     LIMIT 100000
   `;
 
-  // Also get total unique devices for coverage calculation
+  // Total unique devices for coverage calculation (poi_ids is correct for counting visitors)
   const totalQuery = `
     SELECT COUNT(DISTINCT ad_id) as total_devices
     FROM ${tableName}
     CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
     WHERE poi_id IS NOT NULL AND poi_id != ''
       ${dateWhere} ${poiFilter}
-  `;
-
-  // POI activity by hour — counts ALL pings at the POI grouped by hour of day
-  // This answers "when is this POI busy?" regardless of where devices came from
-  const poiActivityQuery = `
-    SELECT
-      HOUR(utc_timestamp) as touch_hour,
-      COUNT(*) as pings,
-      COUNT(DISTINCT ad_id) as devices
-    FROM ${tableName}
-    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-    WHERE poi_id IS NOT NULL AND poi_id != ''
-      ${dateWhere} ${poiFilter}
-    GROUP BY HOUR(utc_timestamp)
-    ORDER BY touch_hour
   `;
 
   let odRes, totalRes, activityRes;

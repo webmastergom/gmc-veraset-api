@@ -19,6 +19,8 @@ import {
   startConsolidatedMobilityQuery,
   startConsolidatedTemporalQuery,
   startConsolidatedMAIDsQuery,
+  extractPoiCoords,
+  type PoiCoord,
 } from '@/lib/mega-consolidation-queries';
 import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
@@ -119,13 +121,17 @@ export async function POST(
       try {
         const effectivePoiIds = state.poiIds || poiIds;
 
-        // Start all 7 queries in parallel
+        // Extract POI coordinates from sub-job metadata for spatial proximity queries
+        const poiCoords = extractPoiCoords(syncedJobs);
+        console.log(`[MEGA] Extracted ${poiCoords.length} POI coordinates from ${syncedJobs.length} sub-jobs`);
+
+        // Start all 7 queries in parallel (pass poiCoords for spatial proximity)
         const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, maidsQId] = await Promise.all([
           startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
-          startConsolidatedODQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
-          startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
-          startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
-          startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedODQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
+          startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
+          startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
           startConsolidatedTemporalQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
           startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
         ]);

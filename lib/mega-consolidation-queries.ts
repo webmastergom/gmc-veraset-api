@@ -5,6 +5,11 @@
  * - POI activity by hour
  * - Mobility trends (nearby POI categories visited ±2h)
  * - Catchment origins (first-ping-of-day for reverse geocoding)
+ *
+ * CRITICAL: Veraset assigns poi_ids to ALL pings of a visiting device for the
+ * entire day — not just pings near the POI. To determine actual at-POI pings,
+ * we use spatial proximity to known POI coordinates instead of relying on poi_ids.
+ * POI coords come from job.verasetPayload.geo_radius[] or job.externalPois[].
  */
 
 import { getTableName, startQueryAsync } from './athena';
@@ -16,6 +21,40 @@ const ACCURACY_THRESHOLD = 500;
 const COORDINATE_PRECISION = 4; // ~11m resolution
 const GRID_STEP = 0.01; // ~1.1km geohash grid for spatial join
 const POI_TABLE = 'lab_pois_gmc';
+
+/** POI coordinate with radius for spatial proximity checks. */
+export interface PoiCoord {
+  lat: number;
+  lng: number;
+  radiusM: number;
+}
+
+/**
+ * Extract POI coordinates from job metadata.
+ * Prefers verasetPayload.geo_radius (has distance_in_meters), falls back to externalPois.
+ */
+export function extractPoiCoords(jobs: Job[]): PoiCoord[] {
+  const coords: PoiCoord[] = [];
+  for (const job of jobs) {
+    if (job.verasetPayload?.geo_radius?.length) {
+      for (const g of job.verasetPayload.geo_radius) {
+        coords.push({ lat: g.latitude, lng: g.longitude, radiusM: g.distance_in_meters || 200 });
+      }
+    } else if (job.externalPois?.length) {
+      for (const p of job.externalPois) {
+        coords.push({ lat: p.latitude, lng: p.longitude, radiusM: 200 });
+      }
+    }
+  }
+  // Deduplicate by rounding to 4 decimals
+  const seen = new Set<string>();
+  return coords.filter((c) => {
+    const key = `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 /**
  * Build the UNION ALL across all synced sub-job tables.
@@ -35,12 +74,45 @@ function buildUnionAll(
 }
 
 /**
- * Build optional POI filter clause.
+ * Build optional POI filter clause (for poi_id string matching).
  */
 function buildPoiFilter(poiIds?: string[]): string {
   if (!poiIds?.length) return '';
   const list = poiIds.map((p) => `'${p.replace(/'/g, "''")}'`).join(',');
   return `AND poi_id IN (${list})`;
+}
+
+/**
+ * Build a SQL VALUES clause for target POI coordinates.
+ * Returns a CTE fragment like: (VALUES (lat1, lng1, radius1), ...) AS t(poi_lat, poi_lng, poi_radius_m)
+ */
+function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
+  const rows = poiCoords
+    .map((c) => `(${c.lat}, ${c.lng}, ${c.radiusM}.0)`)
+    .join(', ');
+  return `(VALUES ${rows}) AS t(poi_lat, poi_lng, poi_radius_m)`;
+}
+
+/**
+ * Build the at-POI pings CTE using spatial proximity.
+ * Uses a bounding box pre-filter (~0.01° ≈ 1.1km) before Haversine distance calc.
+ */
+function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[]): string {
+  return `
+    target_pois AS (
+      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM ${allPingsCte} p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    )`;
 }
 
 // ── Q1: Origin-Destination ──────────────────────────────────────────────
@@ -49,34 +121,83 @@ function buildPoiFilter(poiIds?: string[]): string {
  * Build and start the consolidated OD query across all sub-job tables.
  * Returns Athena queryId for polling.
  *
- * Pattern: UNION ALL → poi_visits → all_pings → device_day_trips
- * Uses MIN_BY for origin (first ping) and MAX_BY for destination (last ping).
+ * When poiCoords are provided, uses spatial proximity to determine actual POI visit time.
+ * Falls back to poi_ids-based approach when no coordinates available.
  */
 export async function startConsolidatedODQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for OD query');
 
-  const poiFilter = buildPoiFilter(poiIds);
-
-  // UNION ALL for POI visits (to identify visitors)
-  const poiUnion = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ad_id, date, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION ALL\n      ');
-
-  // UNION ALL for all pings (for origin/dest inference)
+  // All pings with lat/lng (for origin/dest inference)
   const allPingsUnion = buildUnionAll(
     syncedJobs,
     'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
   );
 
-  const sql = `
+  let sql: string;
+
+  if (poiCoords?.length) {
+    // ── Spatial proximity approach (correct) ──
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)},
+    poi_visits AS (
+      SELECT
+        ad_id,
+        date,
+        MIN(utc_timestamp) as first_poi_visit
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    device_day AS (
+      SELECT
+        p.ad_id,
+        p.date,
+        MIN_BY(p.lat, p.utc_timestamp) as origin_lat,
+        MIN_BY(p.lng, p.utc_timestamp) as origin_lng,
+        MAX_BY(p.lat, p.utc_timestamp) as dest_lat,
+        MAX_BY(p.lng, p.utc_timestamp) as dest_lng,
+        HOUR(MIN(p.utc_timestamp)) as departure_hour,
+        HOUR(v.first_poi_visit) as poi_arrival_hour
+      FROM all_pings p
+      INNER JOIN poi_visits v ON p.ad_id = v.ad_id AND p.date = v.date
+      GROUP BY p.ad_id, p.date, v.first_poi_visit
+    )
+    SELECT
+      ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      ROUND(dest_lat, ${COORDINATE_PRECISION}) as dest_lat,
+      ROUND(dest_lng, ${COORDINATE_PRECISION}) as dest_lng,
+      departure_hour,
+      poi_arrival_hour,
+      COUNT(*) as device_days
+    FROM device_day
+    GROUP BY 1, 2, 3, 4, 5, 6
+    ORDER BY device_days DESC
+    LIMIT 100000
+    `;
+  } else {
+    // ── Fallback: poi_ids approach (legacy, less accurate) ──
+    const poiFilter = buildPoiFilter(poiIds);
+    const poiUnion = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT ad_id, date, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    sql = `
     WITH
     poi_visits AS (
       SELECT
@@ -120,9 +241,10 @@ export async function startConsolidatedODQuery(
     GROUP BY 1, 2, 3, 4, 5, 6
     ORDER BY device_days DESC
     LIMIT 100000
-  `;
+    `;
+  }
 
-  console.log(`[MEGA-OD] Starting OD query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-OD] Starting OD query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
@@ -130,25 +252,55 @@ export async function startConsolidatedODQuery(
 
 /**
  * Build and start the consolidated POI activity by hour query.
+ * When poiCoords provided, only counts pings actually near a POI (spatial proximity).
  * Returns Athena queryId for polling.
  */
 export async function startConsolidatedHourlyQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for hourly query');
 
-  const poiFilter = buildPoiFilter(poiIds);
+  let sql: string;
 
-  const unionParts = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ad_id, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION ALL\n      ');
+  if (poiCoords?.length) {
+    // ── Spatial proximity approach (correct) ──
+    const allPingsUnion = buildUnionAll(
+      syncedJobs,
+      'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+      `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    );
 
-  const sql = `
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}
+    SELECT
+      HOUR(utc_timestamp) as touch_hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM at_poi_pings
+    GROUP BY HOUR(utc_timestamp)
+    ORDER BY touch_hour
+    `;
+  } else {
+    // ── Fallback: poi_ids approach ──
+    const poiFilter = buildPoiFilter(poiIds);
+    const unionParts = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT ad_id, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    sql = `
     SELECT
       HOUR(utc_timestamp) as touch_hour,
       COUNT(*) as pings,
@@ -158,9 +310,10 @@ export async function startConsolidatedHourlyQuery(
     )
     GROUP BY HOUR(utc_timestamp)
     ORDER BY touch_hour
-  `;
+    `;
+  }
 
-  console.log(`[MEGA-HOURLY] Starting POI hourly query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-HOURLY] Starting POI hourly query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
@@ -170,23 +323,18 @@ export async function startConsolidatedHourlyQuery(
  * Build and start the catchment origins query (first ping of day per device).
  * Used for reverse geocoding → zip code aggregation.
  * Returns Athena queryId for polling.
+ *
+ * Note: Catchment is ✅ correct with poi_ids — it just identifies visitors
+ * and gets their first ping of day (origin). But when poiCoords are provided,
+ * we use spatial proximity for more accurate visitor identification.
  */
 export async function startConsolidatedCatchmentQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for catchment query');
-
-  const poiFilter = buildPoiFilter(poiIds);
-
-  // POI visitors
-  const poiUnion = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION ALL\n      ');
 
   // All pings with accuracy filter
   const allPingsUnion = buildUnionAll(
@@ -195,8 +343,34 @@ export async function startConsolidatedCatchmentQuery(
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
   );
 
-  const sql = `
-    WITH
+  let visitorsCTE: string;
+  if (poiCoords?.length) {
+    // Use spatial proximity to identify visitors
+    visitorsCTE = `
+    all_pings_raw AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)},
+    poi_visitors AS (
+      SELECT DISTINCT ad_id FROM at_poi_pings
+    ),
+    valid_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+    )`;
+  } else {
+    // Fallback: poi_ids
+    const poiFilter = buildPoiFilter(poiIds);
+    const poiUnion = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    visitorsCTE = `
     poi_visitors AS (
       SELECT DISTINCT ad_id FROM (
         ${poiUnion}
@@ -207,7 +381,12 @@ export async function startConsolidatedCatchmentQuery(
       FROM (
         ${allPingsUnion}
       )
-    ),
+    )`;
+  }
+
+  const sql = `
+    WITH
+    ${visitorsCTE},
     first_pings AS (
       SELECT
         v.ad_id,
@@ -233,7 +412,7 @@ export async function startConsolidatedCatchmentQuery(
     LIMIT 100000
   `;
 
-  console.log(`[MEGA-CATCHMENT] Starting catchment query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-CATCHMENT] Starting catchment query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
@@ -243,24 +422,18 @@ export async function startConsolidatedCatchmentQuery(
  * Build and start the mobility trends query.
  * Spatial join movement pings (within ±2h of POI visit) with Overture POIs.
  * Uses geohash-bucket pattern (0.01° grid, 3×3 expansion) for efficient matching.
+ *
+ * When poiCoords provided, uses spatial proximity for actual visit_time
+ * instead of poi_ids MIN(utc_timestamp) which = first ping of day.
  * Returns Athena queryId for polling.
  */
 export async function startConsolidatedMobilityQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for mobility query');
-
-  const poiFilter = buildPoiFilter(poiIds);
-
-  // POI visits (to get visit times)
-  const poiVisitsUnion = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ad_id, date, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION ALL\n      ');
 
   // All pings (for spatial join with Overture POIs)
   const allPingsUnion = buildUnionAll(
@@ -269,8 +442,39 @@ export async function startConsolidatedMobilityQuery(
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
   );
 
-  const sql = `
-    WITH
+  let visitTimeCTE: string;
+  if (poiCoords?.length) {
+    // Use spatial proximity for actual visit time
+    visitTimeCTE = `
+    all_pings_raw AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)},
+    target_visits AS (
+      SELECT
+        ad_id,
+        date,
+        MIN(utc_timestamp) as visit_time
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+    )`;
+  } else {
+    // Fallback: poi_ids
+    const poiFilter = buildPoiFilter(poiIds);
+    const poiVisitsUnion = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT ad_id, date, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    visitTimeCTE = `
     target_visits AS (
       SELECT
         ad_id,
@@ -286,7 +490,12 @@ export async function startConsolidatedMobilityQuery(
       FROM (
         ${allPingsUnion}
       )
-    ),
+    )`;
+  }
+
+  const sql = `
+    WITH
+    ${visitTimeCTE},
     nearby_pings AS (
       SELECT
         a.ad_id,
@@ -350,7 +559,7 @@ export async function startConsolidatedMobilityQuery(
     ORDER BY timing, device_days DESC
   `;
 
-  console.log(`[MEGA-MOBILITY] Starting mobility trends query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-MOBILITY] Starting mobility trends query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
@@ -359,6 +568,10 @@ export async function startConsolidatedMobilityQuery(
 /**
  * Build and start the consolidated temporal query across all sub-job tables.
  * Returns daily pings, unique devices, and unique POI-visiting devices.
+ *
+ * Note: This counts pings of POI-visiting devices (identified via poi_ids).
+ * This is acceptable even with the poi_ids gotcha since it just counts daily
+ * volume of visitors (not claiming pings are at the POI).
  */
 export async function startConsolidatedTemporalQuery(
   subJobs: Job[],
@@ -398,6 +611,8 @@ export async function startConsolidatedTemporalQuery(
 /**
  * Build and start a query for all unique MAIDs (ad_id) that visited POIs.
  * Returns Athena queryId. The output CSV is used directly for export.
+ *
+ * Note: Uses poi_ids which is ✅ correct for identifying visitors.
  */
 export async function startConsolidatedMAIDsQuery(
   subJobs: Job[],

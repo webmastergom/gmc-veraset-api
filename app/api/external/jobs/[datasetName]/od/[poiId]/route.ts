@@ -4,6 +4,7 @@ import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { logger } from '@/lib/logger';
 import { analyzeOriginDestination } from '@/lib/dataset-analyzer-od';
 import { getConfig, putConfig, BUCKET } from '@/lib/s3-config';
+import { extractPoiCoords } from '@/lib/mega-consolidation-queries';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -103,8 +104,11 @@ export async function GET(
       );
     }
 
+    // 4b. Extract POI coordinates from job metadata for spatial proximity
+    const poiCoords = extractPoiCoords([job]);
+
     // 5. Check cache
-    const OD_VERSION = 'v7';
+    const OD_VERSION = 'v8';
     const cacheKey = `od-${OD_VERSION}-${jobId}-poi-${poiId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
@@ -130,7 +134,10 @@ export async function GET(
 
     let result;
     try {
-      result = await analyzeOriginDestination(datasetName, { poiIds: poiIdsToQuery });
+      result = await analyzeOriginDestination(datasetName, {
+        poiIds: poiIdsToQuery,
+        ...(poiCoords.length ? { poiCoords } : {}),
+      });
     } catch (error: any) {
       console.error(`[OD-POI ERROR] Analysis failed:`, error.message);
       logger.error(`OD-POI analysis failed for job ${jobId}, poi ${poiId}`, { error: error.message });

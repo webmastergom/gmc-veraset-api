@@ -10,6 +10,8 @@ import {
   startDatasetCatchmentQuery,
   startDatasetMobilityQuery,
 } from '@/lib/dataset-report-queries';
+import { extractPoiCoords, type PoiCoord } from '@/lib/mega-consolidation-queries';
+import { getJob } from '@/lib/jobs';
 import {
   parseConsolidatedOD,
   parseConsolidatedHourly,
@@ -68,11 +70,28 @@ export async function POST(
 
     // ── Phase 1: Start queries ─────────────────────────────────────
     if (!state) {
+      // Find the job for this dataset to extract POI coordinates
+      let poiCoords: PoiCoord[] = [];
+      try {
+        const allJobs = await getConfig<Record<string, any>>('jobs');
+        if (allJobs) {
+          const matchingJob = Object.values(allJobs).find(
+            (j: any) => j.s3DestPath && j.s3DestPath.replace(/\/$/, '').split('/').pop() === datasetName
+          );
+          if (matchingJob) {
+            poiCoords = extractPoiCoords([matchingJob as any]);
+            console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords for ${datasetName}`);
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[DS-REPORT] Could not extract POI coords: ${e.message}`);
+      }
+
       const [od, hourly, catchment, mobility] = await Promise.all([
-        startDatasetODQuery(datasetName).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
-        startDatasetHourlyQuery(datasetName).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
-        startDatasetCatchmentQuery(datasetName).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
-        startDatasetMobilityQuery(datasetName).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
+        startDatasetODQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
+        startDatasetHourlyQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
+        startDatasetCatchmentQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
+        startDatasetMobilityQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
       ]);
 
       const queries: Record<string, string> = {};

@@ -7,21 +7,106 @@
  * - POI activity by hour
  * - Catchment origins (first ping of day) + departure hour
  * - Mobility trends (nearby POI categories ±2h, before/after)
+ *
+ * CRITICAL: Veraset assigns poi_ids to ALL pings of a visiting device for the
+ * entire day — not just pings near the POI. When poiCoords are provided, we use
+ * spatial proximity to known POI coordinates for accurate at-POI filtering.
  */
 
 import { getTableName, startQueryAsync } from './athena';
+import { type PoiCoord } from './mega-consolidation-queries';
 
 const ACCURACY_THRESHOLD = 500;
 const COORDINATE_PRECISION = 4; // ~11m
 const GRID_STEP = 0.01;         // ~1.1km geohash grid
 const POI_TABLE = 'lab_pois_gmc';
 
+/**
+ * Build a SQL VALUES clause for target POI coordinates.
+ */
+function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
+  const rows = poiCoords
+    .map((c) => `(${c.lat}, ${c.lng}, ${c.radiusM}.0)`)
+    .join(', ');
+  return `(VALUES ${rows}) AS t(poi_lat, poi_lng, poi_radius_m)`;
+}
+
 // ── Q1: Origin-Destination ───────────────────────────────────────────
 
-export async function startDatasetODQuery(datasetName: string): Promise<string> {
+export async function startDatasetODQuery(
+  datasetName: string,
+  poiCoords?: PoiCoord[],
+): Promise<string> {
   const table = getTableName(datasetName);
 
-  const sql = `
+  let sql: string;
+
+  if (poiCoords?.length) {
+    // ── Spatial proximity approach (correct) ──
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+    ),
+    target_pois AS (
+      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM all_pings p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    ),
+    poi_visits AS (
+      SELECT
+        ad_id,
+        date,
+        MIN(utc_timestamp) as first_poi_visit
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    device_day AS (
+      SELECT
+        p.ad_id,
+        p.date,
+        MIN_BY(p.lat, p.utc_timestamp) as origin_lat,
+        MIN_BY(p.lng, p.utc_timestamp) as origin_lng,
+        MAX_BY(p.lat, p.utc_timestamp) as dest_lat,
+        MAX_BY(p.lng, p.utc_timestamp) as dest_lng,
+        HOUR(MIN(p.utc_timestamp)) as departure_hour,
+        HOUR(v.first_poi_visit) as poi_arrival_hour
+      FROM all_pings p
+      INNER JOIN poi_visits v ON p.ad_id = v.ad_id AND p.date = v.date
+      GROUP BY p.ad_id, p.date, v.first_poi_visit
+    )
+    SELECT
+      ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      ROUND(dest_lat, ${COORDINATE_PRECISION}) as dest_lat,
+      ROUND(dest_lng, ${COORDINATE_PRECISION}) as dest_lng,
+      departure_hour,
+      poi_arrival_hour,
+      COUNT(*) as device_days
+    FROM device_day
+    GROUP BY 1, 2, 3, 4, 5, 6
+    ORDER BY device_days DESC
+    LIMIT 100000
+    `;
+  } else {
+    // ── Fallback: poi_ids approach ──
+    sql = `
     WITH
     poi_visits AS (
       SELECT
@@ -70,18 +155,62 @@ export async function startDatasetODQuery(datasetName: string): Promise<string> 
     GROUP BY 1, 2, 3, 4, 5, 6
     ORDER BY device_days DESC
     LIMIT 100000
-  `;
+    `;
+  }
 
-  console.log(`[DATASET-OD] Starting OD query for ${datasetName}`);
+  console.log(`[DATASET-OD] Starting OD query for ${datasetName} (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
 // ── Q2: POI Activity by Hour ─────────────────────────────────────────
 
-export async function startDatasetHourlyQuery(datasetName: string): Promise<string> {
+export async function startDatasetHourlyQuery(
+  datasetName: string,
+  poiCoords?: PoiCoord[],
+): Promise<string> {
   const table = getTableName(datasetName);
 
-  const sql = `
+  let sql: string;
+
+  if (poiCoords?.length) {
+    // ── Spatial proximity approach (correct) ──
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+    ),
+    target_pois AS (
+      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM all_pings p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    )
+    SELECT
+      HOUR(utc_timestamp) as touch_hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM at_poi_pings
+    GROUP BY HOUR(utc_timestamp)
+    ORDER BY touch_hour
+    `;
+  } else {
+    // ── Fallback: poi_ids approach ──
+    sql = `
     SELECT
       HOUR(utc_timestamp) as touch_hour,
       COUNT(*) as pings,
@@ -92,19 +221,56 @@ export async function startDatasetHourlyQuery(datasetName: string): Promise<stri
       AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
     GROUP BY HOUR(utc_timestamp)
     ORDER BY touch_hour
-  `;
+    `;
+  }
 
-  console.log(`[DATASET-HOURLY] Starting hourly query for ${datasetName}`);
+  console.log(`[DATASET-HOURLY] Starting hourly query for ${datasetName} (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
 // ── Q3: Catchment Origins (first ping of day) ────────────────────────
 
-export async function startDatasetCatchmentQuery(datasetName: string): Promise<string> {
+export async function startDatasetCatchmentQuery(
+  datasetName: string,
+  poiCoords?: PoiCoord[],
+): Promise<string> {
   const table = getTableName(datasetName);
 
-  const sql = `
-    WITH
+  let visitorsCTE: string;
+  if (poiCoords?.length) {
+    visitorsCTE = `
+    all_pings_raw AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+    ),
+    target_pois AS (
+      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM all_pings_raw p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    ),
+    poi_visitors AS (
+      SELECT DISTINCT ad_id FROM at_poi_pings
+    ),
+    valid_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+    )`;
+  } else {
+    visitorsCTE = `
     poi_visitors AS (
       SELECT DISTINCT ad_id
       FROM ${table}
@@ -121,7 +287,12 @@ export async function startDatasetCatchmentQuery(datasetName: string): Promise<s
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
-    ),
+    )`;
+  }
+
+  const sql = `
+    WITH
+    ${visitorsCTE},
     first_pings AS (
       SELECT
         v.ad_id,
@@ -147,17 +318,58 @@ export async function startDatasetCatchmentQuery(datasetName: string): Promise<s
     LIMIT 100000
   `;
 
-  console.log(`[DATASET-CATCHMENT] Starting catchment query for ${datasetName}`);
+  console.log(`[DATASET-CATCHMENT] Starting catchment query for ${datasetName} (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }
 
 // ── Q4: Mobility Trends (±2h nearby POI categories) ──────────────────
 
-export async function startDatasetMobilityQuery(datasetName: string): Promise<string> {
+export async function startDatasetMobilityQuery(
+  datasetName: string,
+  poiCoords?: PoiCoord[],
+): Promise<string> {
   const table = getTableName(datasetName);
 
-  const sql = `
-    WITH
+  let visitTimeCTE: string;
+  if (poiCoords?.length) {
+    visitTimeCTE = `
+    all_pings_raw AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+    ),
+    target_pois AS (
+      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM all_pings_raw p
+      CROSS JOIN target_pois tp
+      WHERE ABS(p.lat - tp.poi_lat) < 0.01
+        AND ABS(p.lng - tp.poi_lng) < 0.02
+        AND 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    ),
+    target_visits AS (
+      SELECT
+        ad_id,
+        date,
+        MIN(utc_timestamp) as visit_time
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+    )`;
+  } else {
+    visitTimeCTE = `
     target_visits AS (
       SELECT
         ad_id,
@@ -178,7 +390,12 @@ export async function startDatasetMobilityQuery(datasetName: string): Promise<st
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
-    ),
+    )`;
+  }
+
+  const sql = `
+    WITH
+    ${visitTimeCTE},
     nearby_pings AS (
       SELECT
         a.ad_id,
@@ -242,6 +459,6 @@ export async function startDatasetMobilityQuery(datasetName: string): Promise<st
     ORDER BY timing, device_days DESC
   `;
 
-  console.log(`[DATASET-MOBILITY] Starting mobility query for ${datasetName}`);
+  console.log(`[DATASET-MOBILITY] Starting mobility query for ${datasetName} (spatial=${!!poiCoords?.length})`);
   return await startQueryAsync(sql);
 }

@@ -11,6 +11,8 @@ export interface ODFilters {
   dateFrom?: string;
   dateTo?: string;
   poiIds?: string[];
+  /** POI coordinates for spatial proximity checks (fixes poi_ids gotcha). */
+  poiCoords?: Array<{ lat: number; lng: number; radiusM: number }>;
   minPings?: number; // Minimum pings per device-day to include (default: 1 = no filter)
 }
 

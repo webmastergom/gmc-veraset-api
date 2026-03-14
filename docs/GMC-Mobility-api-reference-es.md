@@ -615,12 +615,15 @@ Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional 
 Analisis completo de **de donde vienen y a donde van** los visitantes de tus POIs. Para cada dispositivo que visito un POI en un dia dado:
 - **Origen** = primer ping GPS del dia (de donde venia el visitante)
 - **Destino** = ultimo ping GPS del dia (a donde fue despues)
+- **Hora de llegada al POI** = calculada por proximidad espacial a las coordenadas del POI (distancia Haversine)
 
 Ambos se reverse geocodean a codigo postal y se agregan.
 
 Solo disponible para jobs con estado `SUCCESS` y datos sincronizados.
 
 > **Importante:** La primera peticion puede tardar **1-5 minutos** (consultas Athena + reverse geocoding). Los resultados se cachean automaticamente.
+
+> **Nota tecnica (precision de visita):** La hora de llegada al POI (`poi_arrival_patterns`) y la actividad por hora (`poi_activity_by_hour`) se calculan usando **proximidad espacial** a las coordenadas del POI — no se basan en metadatos internos del dataset. Esto garantiza que solo los pings fisicamente cercanos al POI se cuentan como actividad real en el punto de interes.
 
 #### Filtro por POI
 
@@ -695,11 +698,17 @@ curl -H "X-API-Key: TU_API_KEY" \
     { "hour": 0, "deviceDays": 120, "percentOfTotal": 1.2 },
     { "hour": 1, "deviceDays": 85, "percentOfTotal": 0.9 },
     { "hour": 8, "deviceDays": 2500, "percentOfTotal": 8.1 },
-    { "hour": 9, "deviceDays": 3200, "percentOfTotal": 10.4 },
-    { "hour": 12, "deviceDays": 2800, "percentOfTotal": 9.1 },
-    { "hour": 13, "deviceDays": 3100, "percentOfTotal": 10.1 },
-    { "hour": 17, "deviceDays": 2900, "percentOfTotal": 9.4 },
-    { "hour": 18, "deviceDays": 3400, "percentOfTotal": 11.0 }
+    { "hour": 9, "deviceDays": 3200, "percentOfTotal": 10.4 }
+  ],
+  "poi_arrival_patterns": [
+    { "hour": 9, "deviceDays": 1800, "percentOfTotal": 14.6 },
+    { "hour": 10, "deviceDays": 2100, "percentOfTotal": 17.0 },
+    { "hour": 13, "deviceDays": 1500, "percentOfTotal": 12.2 }
+  ],
+  "poi_activity_by_hour": [
+    { "hour": 9, "deviceDays": 450, "percentOfTotal": 8.3 },
+    { "hour": 10, "deviceDays": 680, "percentOfTotal": 12.5 },
+    { "hour": 13, "deviceDays": 520, "percentOfTotal": 9.6 }
   ]
 }
 ```
