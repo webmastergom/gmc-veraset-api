@@ -36,6 +36,7 @@ function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
 export async function startDatasetODQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
+  poiTableName?: string,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -55,9 +56,7 @@ export async function startDatasetODQuery(
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
-    target_pois AS (
-      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
-    ),
+    ${buildTargetPoisCTE(poiCoords, poiTableName)},
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
       FROM all_pings p
@@ -167,6 +166,7 @@ export async function startDatasetODQuery(
 export async function startDatasetHourlyQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
+  poiTableName?: string,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -186,9 +186,7 @@ export async function startDatasetHourlyQuery(
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
-    target_pois AS (
-      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
-    ),
+    ${buildTargetPoisCTE(poiCoords, poiTableName)},
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
       FROM all_pings p
@@ -233,6 +231,7 @@ export async function startDatasetHourlyQuery(
 export async function startDatasetCatchmentQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
+  poiTableName?: string,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -249,9 +248,7 @@ export async function startDatasetCatchmentQuery(
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
-    target_pois AS (
-      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
-    ),
+    ${buildTargetPoisCTE(poiCoords, poiTableName)},
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
       FROM all_pings_raw p
@@ -327,6 +324,7 @@ export async function startDatasetCatchmentQuery(
 export async function startDatasetMobilityQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
+  poiTableName?: string,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -343,9 +341,7 @@ export async function startDatasetMobilityQuery(
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
-    target_pois AS (
-      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
-    ),
+    ${buildTargetPoisCTE(poiCoords, poiTableName)},
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
       FROM all_pings_raw p
@@ -489,4 +485,95 @@ export async function startDatasetTemporalQuery(
 
   console.log(`[DATASET-TEMPORAL] Starting temporal query for ${datasetName}`);
   return await startQueryAsync(sql);
+}
+
+// ── Total unique devices (global COUNT DISTINCT) ────────────────────
+
+/**
+ * Single-row query: total unique devices that visited any POI.
+ * Needed because summing daily COUNT(DISTINCT) gives device-days, not unique devices.
+ */
+export async function startDatasetTotalDevicesQuery(
+  datasetName: string,
+): Promise<string> {
+  const table = getTableName(datasetName);
+
+  const sql = `
+    SELECT COUNT(DISTINCT ad_id) as total_unique_devices
+    FROM ${table}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+  `;
+
+  console.log(`[DATASET-TOTAL] Starting total devices query for ${datasetName}`);
+  return await startQueryAsync(sql);
+}
+
+// ── POI coordinates temp table (for large POI sets) ─────────────────
+
+const MAX_VALUES_POI_COUNT = 500;
+
+/**
+ * For datasets with many POIs (>500), a VALUES clause exceeds Athena's 256KB
+ * query limit. Instead, write coords to S3 as CSV and create an external table.
+ * Returns the table name to use in queries.
+ */
+export async function ensurePoiCoordsTable(
+  datasetName: string,
+  poiCoords: PoiCoord[],
+): Promise<string> {
+  const { runQuery } = await import('./athena');
+  const { s3Client, BUCKET } = await import('./s3-config');
+  const { PutObjectCommand } = await import('@aws-sdk/client-s3');
+
+  const tableName = `poi_coords_${getTableName(datasetName)}`;
+  const s3Prefix = `config/poi-coords/${datasetName}`;
+
+  // Write CSV
+  const csv = poiCoords
+    .map((c) => `${c.lat},${c.lng},${c.radiusM}`)
+    .join('\n');
+
+  await s3Client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: `${s3Prefix}/coords.csv`,
+    Body: csv,
+    ContentType: 'text/csv',
+  }));
+
+  // Create external table (idempotent)
+  const createSql = `
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${tableName} (
+      poi_lat DOUBLE,
+      poi_lng DOUBLE,
+      poi_radius_m DOUBLE
+    )
+    ROW FORMAT DELIMITED
+    FIELDS TERMINATED BY ','
+    STORED AS TEXTFILE
+    LOCATION 's3://${BUCKET}/${s3Prefix}/'
+  `;
+  await runQuery(createSql);
+  console.log(`[POI-TABLE] Created/verified ${tableName} with ${poiCoords.length} POIs`);
+
+  return tableName;
+}
+
+/**
+ * Decide whether to use VALUES clause or temp table based on POI count.
+ * Returns either a VALUES string or a table reference for use in queries.
+ */
+export function shouldUsePoiTable(poiCoords: PoiCoord[]): boolean {
+  return poiCoords.length > MAX_VALUES_POI_COUNT;
+}
+
+/**
+ * Build the target_pois CTE fragment — either from VALUES or from a table.
+ */
+export function buildTargetPoisCTE(poiCoords: PoiCoord[], poiTableName?: string): string {
+  if (poiTableName) {
+    return `target_pois AS (SELECT poi_lat, poi_lng, poi_radius_m FROM ${poiTableName})`;
+  }
+  return `target_pois AS (SELECT * FROM ${buildTargetPoisValues(poiCoords)})`;
 }

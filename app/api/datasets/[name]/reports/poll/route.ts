@@ -8,6 +8,9 @@ import {
   startDatasetCatchmentQuery,
   startDatasetMobilityQuery,
   startDatasetTemporalQuery,
+  startDatasetTotalDevicesQuery,
+  ensurePoiCoordsTable,
+  shouldUsePoiTable,
 } from '@/lib/dataset-report-queries';
 import { extractPoiCoords, type PoiCoord } from '@/lib/mega-consolidation-queries';
 import {
@@ -86,12 +89,24 @@ export async function POST(
         console.warn(`[DS-REPORT] Could not extract POI coords: ${e.message}`);
       }
 
-      const [od, hourly, catchment, mobility, temporal] = await Promise.all([
-        startDatasetODQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
-        startDatasetHourlyQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
-        startDatasetCatchmentQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
-        startDatasetMobilityQuery(datasetName, poiCoords).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
+      // For large POI sets, create an Athena table instead of VALUES clause
+      let poiTableName: string | undefined;
+      if (poiCoords.length > 0 && shouldUsePoiTable(poiCoords)) {
+        try {
+          poiTableName = await ensurePoiCoordsTable(datasetName, poiCoords);
+          console.log(`[DS-REPORT] Using POI table ${poiTableName} for ${poiCoords.length} coords`);
+        } catch (e: any) {
+          console.error(`[DS-REPORT] Failed to create POI table, falling back to VALUES: ${e.message}`);
+        }
+      }
+
+      const [od, hourly, catchment, mobility, temporal, totalDevices] = await Promise.all([
+        startDatasetODQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
+        startDatasetHourlyQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
+        startDatasetCatchmentQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
+        startDatasetMobilityQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
         startDatasetTemporalQuery(datasetName).catch((e) => { console.error('[DS-REPORT] Temporal failed:', e.message); return undefined; }),
+        startDatasetTotalDevicesQuery(datasetName).catch((e) => { console.error('[DS-REPORT] TotalDevices failed:', e.message); return undefined; }),
       ]);
 
       const queries: Record<string, string> = {};
@@ -100,6 +115,7 @@ export async function POST(
       if (catchment) queries.catchment = catchment;
       if (mobility) queries.mobility = mobility;
       if (temporal) queries.temporal = temporal;
+      if (totalDevices) queries.totalDevices = totalDevices;
 
       state = { phase: 'polling', queries };
       await saveState(datasetName, state);
@@ -213,7 +229,7 @@ export async function POST(
         }
       }
 
-      // Parse temporal
+      // Parse temporal + totalDevices
       if (state.queries.temporal) {
         try {
           const result = await fetchQueryResults(state.queries.temporal);
@@ -223,6 +239,19 @@ export async function POST(
             devices: parseInt(r.devices, 10) || 0,
           }));
           const report = buildTemporalTrends(datasetName, [dailyData]);
+
+          // Add total unique devices from dedicated query
+          if (state.queries.totalDevices) {
+            try {
+              const totalResult = await fetchQueryResults(state.queries.totalDevices);
+              const totalUniqueDevices = parseInt(totalResult.rows[0]?.total_unique_devices, 10) || 0;
+              (report as any).totalUniqueDevices = totalUniqueDevices;
+              console.log(`[DS-REPORT] Total unique devices for ${datasetName}: ${totalUniqueDevices}`);
+            } catch (err: any) {
+              console.error('[DS-REPORT] Error parsing totalDevices:', err.message);
+            }
+          }
+
           await saveReport(datasetName, 'temporal', report);
         } catch (err: any) {
           console.error('[DS-REPORT] Error parsing temporal:', err.message);

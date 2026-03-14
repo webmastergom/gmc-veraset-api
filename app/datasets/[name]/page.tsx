@@ -568,7 +568,11 @@ export default function DatasetAnalysisPage() {
           {temporalReport?.daily && (() => {
             const daily = temporalReport.daily as { date: string; pings: number; devices: number }[];
             const totalPings = daily.reduce((s: number, d: any) => s + d.pings, 0);
-            const totalDevices = daily.reduce((s: number, d: any) => s + d.devices, 0);
+            // Use dedicated total unique devices query (not sum of daily counts which gives device-days)
+            const totalDevices = temporalReport.totalUniqueDevices
+              || analysis?.summary?.uniqueDevices
+              || daily.reduce((s: number, d: any) => s + d.devices, 0);
+            const totalDeviceDays = daily.reduce((s: number, d: any) => s + d.devices, 0);
             const dates = daily.map((d: any) => d.date).sort();
             const dateFrom = dates[0] || '—';
             const dateTo = dates[dates.length - 1] || '—';
@@ -576,7 +580,7 @@ export default function DatasetAnalysisPage() {
               { label: 'Total Pings', value: totalPings.toLocaleString(), icon: <Activity className="h-4 w-4 text-blue-400" /> },
               { label: 'Unique Devices', value: totalDevices.toLocaleString(), icon: <Users className="h-4 w-4 text-cyan-400" /> },
               { label: 'Date Range', value: `${dateFrom} — ${dateTo}`, icon: <Calendar className="h-4 w-4 text-green-400" /> },
-              { label: 'Days', value: daily.length.toString(), icon: <TrendingUp className="h-4 w-4 text-orange-400" /> },
+              { label: 'Device-Days', value: totalDeviceDays.toLocaleString(), icon: <TrendingUp className="h-4 w-4 text-orange-400" /> },
             ];
             return (
               <div className="grid grid-cols-4 gap-4">
