@@ -117,7 +117,8 @@ export default function MegaJobDetailPage() {
       let attempts = 0
       while (!done && attempts < 60) {
         attempts++
-        const res = await fetch(`/api/mega-jobs/${id}/consolidate`, {
+        const resetParam = attempts === 1 ? '?reset=true' : ''
+        const res = await fetch(`/api/mega-jobs/${id}/consolidate${resetParam}`, {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
@@ -164,7 +165,7 @@ export default function MegaJobDetailPage() {
     )
   }
 
-  const canConsolidate = (megaJob.status === 'running' || megaJob.status === 'partial') && megaJob.progress.synced > 0
+  const canConsolidate = (megaJob.status === 'running' || megaJob.status === 'partial' || megaJob.status === 'completed') && megaJob.progress.synced > 0
   const isCompleted = megaJob.status === 'completed'
 
   // Build POI list from visits report for filter
@@ -211,7 +212,7 @@ export default function MegaJobDetailPage() {
               ) : (
                 <Play className="h-4 w-4 mr-2" />
               )}
-              Consolidate reports
+              {isCompleted ? 'Re-consolidate' : 'Consolidate reports'}
             </Button>
           )}
         </div>
