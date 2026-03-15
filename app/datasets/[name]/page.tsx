@@ -674,29 +674,20 @@ export default function DatasetAnalysisPage() {
               title="Mobility Trends (±2h of visit)"
               icon={<Activity className="h-4 w-4" />}
             >
-              {(mobilityReport.before?.length > 0 || mobilityReport.after?.length > 0) ? (
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                  <div>
-                    <p className="text-sm text-muted-foreground mb-3">
-                      🕐 Places visited <span className="font-semibold text-foreground">before</span> arriving at target POIs
-                    </p>
-                    <MobilityBar data={mobilityReport.before || []} />
-                  </div>
-                  <div>
-                    <p className="text-sm text-muted-foreground mb-3">
-                      🕐 Places visited <span className="font-semibold text-foreground">after</span> leaving target POIs
-                    </p>
-                    <MobilityBar data={mobilityReport.after || []} />
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    Top POI categories visited within 2 hours of visiting target POIs
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                  <p className="text-sm text-muted-foreground mb-3">
+                    🕐 Places visited <span className="font-semibold text-foreground">before</span> arriving at target POIs
                   </p>
-                  <MobilityBar data={mobilityReport.categories} />
-                </>
-              )}
+                  <MobilityBar data={mobilityReport.before || mobilityReport.categories} />
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground mb-3">
+                    🕐 Places visited <span className="font-semibold text-foreground">after</span> leaving target POIs
+                  </p>
+                  <MobilityBar data={mobilityReport.after || mobilityReport.categories} />
+                </div>
+              </div>
             </CollapsibleCard>
           )}
 
