@@ -234,6 +234,12 @@ Alternativamente, puedes pasarla como parametro de query: `?api_key=TU_API_KEY`
   - `X-RateLimit-Reset`: Timestamp Unix cuando se resetea el limite
 - Al exceder el limite, recibes HTTP 429 con header `Retry-After` indicando segundos hasta el reset
 
+### Limite Mensual de Jobs
+
+- **200 jobs por mes** por cuenta (default, configurable por administrador)
+- Al exceder el limite, recibes HTTP 429 con `{ "error": "Limit reached", "remaining": 0 }`
+- El contador se resetea el primer dia de cada mes
+
 ---
 
 ## CORS
@@ -267,8 +273,10 @@ La API esta disenada para proteger la privacidad de los usuarios moviles. Todos 
 Para casos de uso especificos (activacion de audiencias, enriquecimiento de datos, integracion con DSPs), existen endpoints dedicados que permiten exportar identificadores de dispositivo (MAIDs/Ad IDs). Estos endpoints:
 
 - **Requieren autorizacion explicita** — no estan disponibles con una API key estandar
-- **Solo devuelven ad_ids anonimizados** asociados a un job especifico
+- **Solo devuelven ad_ids anonimizados** asociados a un job o pais especifico
 - **Estan sujetos a los terminos contractuales** con el proveedor de datos
+
+Ver seccion **"Exportacion de MAIDs por Codigo Postal"** mas abajo para detalles completos de los endpoints.
 
 > **Importante:** Si necesitas acceso a MAIDs, contacta al administrador para activar los permisos de exportacion en tu API key.
 
@@ -287,8 +295,9 @@ Envia un job de analisis de movilidad proporcionando POIs, rango de fechas y con
 | Campo | Tipo | Requerido | Descripcion |
 |-------|------|-----------|-------------|
 | `name` | string | Si | Nombre del job (1-200 caracteres) |
-| `country` | string | Si | Codigo de pais ISO 2 letras (ej: `"ES"`, `"MX"`, `"US"`) |
+| `country` | string | Si | Codigo de pais ISO 2 letras (ej: `"ES"`, `"MX"`, `"US"`). Se convierte a mayusculas automaticamente. |
 | `type` | string | No | Tipo de job (ver tabla abajo). Default: `"pings"` |
+| `schema` | string | No | Nivel de detalle del dataset: `"BASIC"`, `"ENHANCED"` o `"FULL"`. Default: `"BASIC"` |
 | `date_range.from` | string | Si | Fecha inicio `YYYY-MM-DD` |
 | `date_range.to` | string | Si | Fecha fin `YYYY-MM-DD`. Maximo 31 dias desde inicio (ambas fechas inclusivas). |
 | `radius` | number | No | Radio de busqueda en metros alrededor de cada POI (1-1000). Default: `10` |
@@ -308,6 +317,14 @@ Envia un job de analisis de movilidad proporcionando POIs, rango de fechas y con
 | `aggregate` | Conteos agregados por POI y periodo. Util para volumenes sin datos granulares. |
 | `cohort` | Agrupa dispositivos en cohortes basadas en patrones de visita. |
 | `pings_by_device` | Pings organizados por dispositivo en vez de por tiempo. Util para analizar trayectorias individuales. |
+
+#### Niveles de Schema
+
+| Schema | Descripcion |
+|--------|-------------|
+| `BASIC` | Campos esenciales: coordenadas, timestamps, POI IDs. Suficiente para la mayoria de analisis. |
+| `ENHANCED` | Campos adicionales de metadata del dispositivo. |
+| `FULL` | Todos los campos disponibles incluyendo datos de precision y contexto. |
 
 #### Ejemplo de Peticion
 
@@ -390,12 +407,11 @@ curl -H "X-API-Key: TU_API_KEY" \
   "synced": false,
   "created_at": "2026-02-07T10:00:00.000Z",
   "updated_at": "2026-02-07T10:00:00.000Z",
-  "pois": [
-    { "id": "estanco_001", "name": "Estanco Sol", "latitude": 40.4168, "longitude": -3.7038 },
-    { "id": "estanco_002", "name": "Estanco Gran Via", "latitude": 40.4200, "longitude": -3.7050 }
-  ]
+  "pois": []
 }
 ```
+
+> **Nota:** El campo `pois` devuelve un array vacio mientras el job no ha completado. Los POIs con sus coordenadas se incluyen en la respuesta una vez que el status es `SUCCESS` y los datos estan sincronizados.
 
 #### Respuesta - Completado (SUCCESS)
 
@@ -444,7 +460,7 @@ curl -H "X-API-Key: TU_API_KEY" \
   "synced": false,
   "created_at": "2026-02-07T10:00:00.000Z",
   "error": "Descripcion del error de procesamiento",
-  "pois": [...]
+  "pois": []
 }
 ```
 
@@ -453,13 +469,58 @@ curl -H "X-API-Key: TU_API_KEY" \
 | Estado | Descripcion | Accion recomendada |
 |--------|-------------|-------------------|
 | `QUEUED` | Job enviado, esperando ser procesado | Seguir consultando cada 5 min |
+| `SCHEDULED` | Job programado, pendiente de entrar en cola | Seguir consultando cada 5 min |
 | `RUNNING` | Job en proceso activo | Seguir consultando cada 5 min |
 | `SUCCESS` | Job completado, resultados disponibles | Leer `results`, pedir catchment/OD |
 | `FAILED` | Job fallo, revisar campo `error` | Diagnosticar y re-enviar si es necesario |
 
 ---
 
-### 3. Obtener Analisis de Catchment (Origenes Residenciales)
+### 3. Verificar Estado de Multiples Jobs (Batch Poll)
+
+**`POST /api/external/jobs/poll`**
+
+Verifica el estado de **todos los jobs pendientes** (`QUEUED`, `RUNNING`, `SCHEDULED`) en una sola peticion. Util cuando tienes multiples jobs en proceso y quieres verificar todos a la vez sin hacer polling individual.
+
+Este endpoint consulta la API de Veraset para cada job pendiente, actualiza los estados, y sincroniza automaticamente los datos de los jobs que hayan completado.
+
+#### Ejemplo de Peticion
+
+```bash
+curl -X POST https://tu-dominio.com/api/external/jobs/poll \
+  -H "X-API-Key: TU_API_KEY"
+```
+
+#### Respuesta (200 OK)
+
+```json
+{
+  "updated": [
+    {
+      "job_id": "abc123xyz",
+      "name": "Estancos Espana - Enero 2026",
+      "old_status": "RUNNING",
+      "new_status": "SUCCESS",
+      "synced": true
+    }
+  ],
+  "pending": 3
+}
+```
+
+| Campo | Descripcion |
+|-------|-------------|
+| `updated[]` | Jobs cuyo estado cambio en esta verificacion |
+| `updated[].old_status` | Estado anterior del job |
+| `updated[].new_status` | Nuevo estado detectado |
+| `updated[].synced` | Si los datos ya se sincronizaron (solo relevante para `SUCCESS`) |
+| `pending` | Numero de jobs que siguen en proceso |
+
+> **Nota:** Este endpoint puede tardar hasta 5 minutos (maxDuration: 300s) ya que verifica cada job secuencialmente contra Veraset. Los webhooks configurados se disparan automaticamente para cada job que cambie de estado.
+
+---
+
+### 4. Obtener Analisis de Catchment (Origenes Residenciales)
 
 **`GET /api/external/jobs/:jobId/catchment`**
 **`GET /api/external/jobs/:jobId/catchment/:poiId`**
@@ -468,7 +529,7 @@ Determina **donde viven los visitantes** de tus POIs. Para cada dispositivo que 
 
 Solo disponible para jobs con estado `SUCCESS` y datos sincronizados.
 
-> **Importante:** La primera peticion ejecuta consultas Athena y reverse geocoding, lo cual puede tardar **1-5 minutos**. Los resultados se cachean automaticamente — las peticiones posteriores son instantaneas.
+> **Importante:** La primera peticion ejecuta consultas Athena y reverse geocoding, lo cual puede tardar **1-5 minutos**. Los resultados se cachean automaticamente — las peticiones posteriores son instantaneas. El header `X-Cache` indica `HIT` (cacheado) o `MISS` (calculado en tiempo real).
 
 #### Filtro por POI
 
@@ -576,6 +637,8 @@ Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional 
 }
 ```
 
+> **Nota:** En la respuesta per-POI, el campo de coverage usa `totalDevicesVisitedPoi` (singular) en vez de `totalDevicesVisitedPois` (plural).
+
 #### Campos Adicionales (cuando se filtra por POI)
 
 | Campo | Presente cuando | Descripcion |
@@ -607,7 +670,7 @@ Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional 
 
 ---
 
-### 4. Obtener Analisis Origen-Destino
+### 5. Obtener Analisis Origen-Destino
 
 **`GET /api/external/jobs/:jobId/od`**
 **`GET /api/external/jobs/:jobId/od/:poiId`**
@@ -621,7 +684,7 @@ Ambos se reverse geocodean a codigo postal y se agregan.
 
 Solo disponible para jobs con estado `SUCCESS` y datos sincronizados.
 
-> **Importante:** La primera peticion puede tardar **1-5 minutos** (consultas Athena + reverse geocoding). Los resultados se cachean automaticamente.
+> **Importante:** La primera peticion puede tardar **1-5 minutos** (consultas Athena + reverse geocoding). Los resultados se cachean automaticamente. El header `X-Cache` indica `HIT` o `MISS`.
 
 > **Nota tecnica (precision de visita):** La hora de llegada al POI (`poi_arrival_patterns`) y la actividad por hora (`poi_activity_by_hour`) se calculan usando **proximidad espacial** a las coordenadas del POI — no se basan en metadatos internos del dataset. Esto garantiza que solo los pings fisicamente cercanos al POI se cuentan como actividad real en el punto de interes.
 
@@ -735,7 +798,9 @@ Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional:
   },
   "origins": [...],
   "destinations": [...],
-  "temporal_patterns": [...]
+  "temporal_patterns": [...],
+  "poi_arrival_patterns": [...],
+  "poi_activity_by_hour": [...]
 }
 ```
 
@@ -757,25 +822,29 @@ Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional:
 | `summary.top_destination_city` | Ciudad de destino mas frecuente |
 | `origins[]` | Array de origenes ordenados por frecuencia (misma estructura que catchment zipcodes) |
 | `destinations[]` | Array de destinos ordenados por frecuencia |
-| `temporal_patterns[]` | Patrones de llegada por hora UTC (ver tabla abajo) |
+| `temporal_patterns[]` | Distribucion de primeros pings del dia por hora UTC |
+| `poi_arrival_patterns[]` | Patron de llegadas al POI por hora UTC (basado en proximidad espacial) |
+| `poi_activity_by_hour[]` | Actividad total en el POI por hora UTC (todos los pings cercanos al POI) |
 
-#### Campos de `temporal_patterns[]`
+#### Campos de `temporal_patterns[]`, `poi_arrival_patterns[]` y `poi_activity_by_hour[]`
 
 | Campo | Tipo | Descripcion |
 |-------|------|-------------|
 | `hour` | number | Hora del dia UTC (0-23) |
-| `deviceDays` | number | Numero de pares dispositivo-dia con primera visita al POI en esta hora |
+| `deviceDays` | number | Numero de pares dispositivo-dia con actividad en esta hora |
 | `percentOfTotal` | number | Porcentaje sobre el total de device-days |
 
 ---
 
-### 5. Obtener Analisis del Dataset
+### 6. Obtener Analisis del Dataset
 
 **`GET /api/external/jobs/:datasetName/analysis`**
 
 Obtiene metricas diarias del dataset: pings por dia, dispositivos por dia, y la lista de POIs activos con coordenadas.
 
-> **Nota:** Este endpoint usa el `datasetName` (no el `jobId`). Puedes obtener el `datasetName` del endpoint "Listar Jobs" (seccion 6).
+> **Nota:** Este endpoint usa el `datasetName` (no el `jobId`). Puedes obtener el `datasetName` del endpoint "Listar Jobs" (seccion 7).
+
+> **Nota sobre POI IDs:** Los POIs en este endpoint usan los IDs internos de Veraset (formato `geo_radius_X`), no los IDs originales del cliente. Usa el `poiMapping` del job o la respuesta del endpoint de status para correlacionar IDs internos con los tuyos.
 
 #### Ejemplo de Peticion
 
@@ -813,7 +882,7 @@ curl -H "X-API-Key: TU_API_KEY" \
 
 ---
 
-### 6. Listar Jobs Disponibles
+### 7. Listar Jobs Disponibles
 
 **`GET /api/external/jobs`**
 
@@ -844,6 +913,139 @@ curl -H "X-API-Key: TU_API_KEY" \
 ```
 
 > **Nota:** Solo aparecen jobs con status `SUCCESS` y datos sincronizados. Los jobs en proceso no se listan aqui — usa el endpoint de status con el `job_id` para monitorearlos.
+
+---
+
+### 8. Exportacion de MAIDs por Codigo Postal
+
+Estos endpoints permiten exportar identificadores de dispositivo (MAIDs/Ad IDs) filtrados por codigos postales. **Requieren autorizacion explicita** — no estan disponibles con una API key estandar.
+
+#### 8a. MAIDs por Codigo Postal (con Job)
+
+**`POST /api/external/jobs/:jobId/postal-maid`**
+
+Exporta MAIDs de dispositivos que visitaron los POIs del job y cuyo origen residencial coincide con los codigos postales especificados. Devuelve un desglose detallado por codigo postal en formato JSON.
+
+##### Cuerpo de la Peticion
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| `postal_codes` | string[] | Si | Array de codigos postales (no vacio) |
+| `country` | string | Si | Codigo de pais ISO 2 letras |
+| `date_from` | string | No | Fecha inicio `YYYY-MM-DD` (filtra pings dentro del rango) |
+| `date_to` | string | No | Fecha fin `YYYY-MM-DD` |
+
+##### Ejemplo de Peticion
+
+```bash
+curl -X POST https://tu-dominio.com/api/external/jobs/abc123xyz/postal-maid \
+  -H "X-API-Key: TU_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "postal_codes": ["28001", "28002"],
+    "country": "ES",
+    "date_from": "2026-01-01",
+    "date_to": "2026-01-31"
+  }'
+```
+
+##### Respuesta (200 OK — JSON)
+
+```json
+{
+  "job_id": "abc123xyz",
+  "analyzed_at": "2026-02-07T15:00:00.000Z",
+  "filters": {
+    "postal_codes": ["28001", "28002"],
+    "country": "ES",
+    "date_from": "2026-01-01",
+    "date_to": "2026-01-31"
+  },
+  "methodology": { "approach": "...", "description": "..." },
+  "coverage": {
+    "totalDevicesInDataset": 50000,
+    "totalDeviceDays": 200000,
+    "devicesMatchedToPostalCodes": 1234,
+    "matchedDeviceDays": 4500,
+    "postalCodesRequested": 2,
+    "postalCodesWithDevices": 2
+  },
+  "summary": {
+    "totalMaids": 1234,
+    "topPostalCode": "28001",
+    "topPostalCodeDevices": 800
+  },
+  "postal_code_breakdown": [
+    { "postalCode": "28001", "devices": 800, "deviceDays": 3000 },
+    { "postalCode": "28002", "devices": 434, "deviceDays": 1500 }
+  ],
+  "devices": [
+    { "ad_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", "device_days": 3, "postal_codes": ["28001"] }
+  ]
+}
+```
+
+> **Nota:** El header `X-Cache` indica `HIT` o `MISS`. Los codigos postales se normalizan (trim, uppercase) y se ordenan para generar la cache key.
+
+---
+
+#### 8b. MAIDs por Codigo Postal (sin Job — por Pais)
+
+**`POST /api/external/postal-maid`**
+
+Exporta MAIDs de un pais completo filtrados por codigos postales, **sin necesidad de un job previo**. Usa un dataset pre-configurado por pais. La respuesta es un archivo **gzip comprimido** con un MAID por linea.
+
+##### Cuerpo de la Peticion
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| `postal_codes` | string[] | Si | Array de codigos postales (no vacio) |
+| `country` | string | Si | Codigo de pais ISO 2 letras |
+| `date_from` | string | No | Fecha inicio `YYYY-MM-DD` |
+| `date_to` | string | No | Fecha fin `YYYY-MM-DD` |
+
+##### Ejemplo de Peticion
+
+```bash
+curl -X POST https://tu-dominio.com/api/external/postal-maid \
+  -H "X-API-Key: TU_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "postal_codes": ["28001", "28002", "28003"],
+    "country": "ES"
+  }' \
+  --output maids.txt.gz
+```
+
+##### Respuesta (200 OK — gzip)
+
+La respuesta es un archivo gzip con los headers:
+
+| Header | Descripcion |
+|--------|-------------|
+| `Content-Type` | `application/gzip` |
+| `Content-Disposition` | `attachment; filename="postal-maid-ES-28001_28002_28003-20260207.txt.gz"` |
+| `X-Total-Maids` | Numero total de MAIDs en el archivo |
+| `X-Cache` | `HIT` o `MISS` |
+
+El contenido descomprimido es texto plano con un MAID por linea:
+
+```
+xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
+```
+
+##### Paises Disponibles
+
+La lista de paises con datasets configurados puede consultarse intentando un pais no disponible. La respuesta 404 incluye:
+
+```json
+{
+  "error": "No dataset configured for country: XX",
+  "available_countries": ["ES", "MX", "US", "CO"]
+}
+```
 
 ---
 
@@ -915,7 +1117,7 @@ def webhook():
 | 409 | Not Synced | Job completado pero datos aun transfiriendose | Reintentar en 1-2 minutos. La sincronizacion es automatica. |
 | 409 | Dataset not accessible | Datos del job aun no sincronizados en S3 | Reintentar en unos minutos. Puede indicar problemas de permisos AWS. |
 | 429 | Rate Limited | Demasiadas peticiones en la ventana de 1 minuto | Esperar segun header `Retry-After`. Limite: 100 req/min por ruta. |
-| 429 | Limit Reached | Limite mensual de creacion de jobs alcanzado | Contactar al administrador para aumentar el limite. |
+| 429 | Limit Reached | Limite mensual de creacion de jobs alcanzado (200/mes default) | Contactar al administrador para aumentar el limite. |
 | 502 | Upstream Error | La llamada a la API de Veraset fallo | Error transitorio. Reintentar despues de unos segundos. |
 | 503 | Configuration Error | Credenciales AWS no configuradas en el servidor | Contactar al administrador. |
 | 500 | Internal Error | Error inesperado del servidor | Reportar al administrador con el `job_id` si es posible. |
@@ -953,19 +1155,21 @@ Crear                Monitorear               Analizar
 POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/catchment          (global)
   |                    |        |        ├──> GET /jobs/:id/catchment/:poiId   (por POI)
   |  job_id            | QUEUED |        ├──> GET /jobs/:id/od                 (global)
-  |<───────            | RUNNING|        ├──> GET /jobs/:id/od/:poiId          (por POI)
-  |                    | (auto- |        └──> GET /jobs/:name/analysis         (metricas diarias)
-  |  webhook?          |  check)|
-  |  ─ ─ ─ ─ ─ ─ ─ ─> |        |
-  |                    v        |
-  |               SUCCESS ──────┘
-  |               (auto-sync)
+  |<───────            | SCHEDULED       ├──> GET /jobs/:id/od/:poiId          (por POI)
+  |                    | RUNNING|        ├──> GET /jobs/:name/analysis         (metricas diarias)
+  |  webhook?          | (auto- |        └──> POST /jobs/:id/postal-maid      (MAIDs por CP)
+  |  ─ ─ ─ ─ ─ ─ ─ ─> |  check)|
+  |                    v        |          Standalone
+  |               SUCCESS ──────┘          ─────────
+  |               (auto-sync)              POST /postal-maid                   (MAIDs por pais)
+  |
+  └─── POST /jobs/poll ───────────────> (batch: verifica todos los pendientes)
 ```
 
 ### Paso a Paso
 
 1. **`POST /api/external/jobs`** — Crear job, recibir `job_id`
-2. **`GET /api/external/jobs/:jobId/status`** — Consultar periodicamente (cada 5 min) hasta que `status = "SUCCESS"`. Alternativamente, registrar un `webhook_url` y esperar la notificacion.
+2. **`GET /api/external/jobs/:jobId/status`** — Consultar periodicamente (cada 5 min) hasta que `status = "SUCCESS"`. Alternativamente, registrar un `webhook_url` y esperar la notificacion. Opcionalmente, usar **`POST /api/external/jobs/poll`** para verificar multiples jobs de una sola vez.
 3. Cuando `status = "SUCCESS"` y `synced = true`:
    - Los **resultados basicos** (pings, dispositivos, resumen por POI) ya estan en la respuesta de status.
    - **`GET /api/external/jobs/:jobId/catchment`** — Origenes residenciales de todos los POIs.
@@ -973,6 +1177,8 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
    - **`GET /api/external/jobs/:jobId/od`** — Origen-destino de todos los POIs.
    - **`GET /api/external/jobs/:jobId/od/:poiId`** — Origen-destino de un POI especifico.
    - **`GET /api/external/jobs/:datasetName/analysis`** — Metricas diarias y POIs activos.
+   - **`POST /api/external/jobs/:jobId/postal-maid`** — Exportar MAIDs por codigos postales (acceso restringido).
+4. **`POST /api/external/postal-maid`** — Exportar MAIDs por pais sin necesidad de un job (acceso restringido).
 
 ### Tiempos Tipicos
 
@@ -988,6 +1194,9 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
 | OD cacheado (peticiones posteriores) | < 1 segundo |
 | Analisis diario (primera peticion) | 30-90 segundos |
 | Analisis diario cacheado | < 1 segundo |
+| Postal-MAID (primera peticion) | 1-5 minutos |
+| Postal-MAID cacheado | < 1 segundo |
+| Batch poll (todos los jobs pendientes) | 10-300 segundos (depende de cantidad) |
 
 ### Intervalo de Polling Recomendado
 

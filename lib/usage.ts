@@ -1,4 +1,4 @@
-import { getConfig, putConfig, initConfigIfNeeded } from './s3-config';
+import { getConfig, putConfig, initConfigIfNeeded, invalidateCache } from './s3-config';
 
 export interface MonthUsage {
   used: number;
@@ -50,28 +50,39 @@ export async function getUsageForMonth(month: string): Promise<MonthUsage> {
 }
 
 /**
- * Increment usage counter for current month (atomic operation)
+ * Increment usage counter for current month.
+ *
+ * IMPORTANT: Bypasses the in-memory cache before reading to minimise the
+ * read-modify-write race window.  On Vercel each serverless instance has
+ * its own cache, so two concurrent requests on different instances could
+ * still read the same S3 object.  At the current volume (~200 jobs/month)
+ * this is an acceptable risk — the worst case is exceeding the limit by 1.
+ * If we need true atomicity, migrate the counter to DynamoDB or Vercel KV
+ * with a conditional write.
  */
 export async function incrementUsage(jobId: string): Promise<MonthUsage> {
+  // Bypass the 60s in-memory cache so we read the freshest value from S3
+  invalidateCache('usage');
+
   const data = await initConfigIfNeeded<UsageData>('usage', DEFAULT_USAGE);
   const month = getCurrentMonth();
-  
+
   const current = data[month] || { used: 0, limit: 200 };
-  
+
   // Check limit BEFORE incrementing
   if (current.used >= current.limit) {
     throw new Error(`Monthly limit reached: ${current.used}/${current.limit}`);
   }
-  
+
   const updated: MonthUsage = {
     used: current.used + 1,
     limit: current.limit,
     lastJobId: jobId,
     lastJobAt: new Date().toISOString(),
   };
-  
+
   data[month] = updated;
-  
+
   try {
     await putConfig('usage', data);
     console.log(`✅ Usage incremented: ${updated.used}/${updated.limit} for ${month}`);
@@ -79,7 +90,7 @@ export async function incrementUsage(jobId: string): Promise<MonthUsage> {
     console.error(`❌ Failed to save usage increment:`, error);
     throw error;
   }
-  
+
   return updated;
 }
 

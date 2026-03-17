@@ -151,7 +151,7 @@ export async function GET(
         // Only include POIs with valid coordinates
         if (latitude !== null && longitude !== null) {
           pois.push({
-            poiId: verasetPoiId,
+            poiId: originalPoiId,
             name: poiName,
             latitude,
             longitude,
