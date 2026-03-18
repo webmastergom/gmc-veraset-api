@@ -206,6 +206,21 @@ export default function DatasetAnalysisPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
         });
+
+        if (!res.ok && res.status >= 500) {
+          const text = await res.text();
+          let errMsg: string;
+          try {
+            const parsed = JSON.parse(text);
+            errMsg = parsed.error || `Server error ${res.status}`;
+          } catch {
+            errMsg = `Server error ${res.status}: ${text.substring(0, 200)}`;
+          }
+          console.error(`[REPORT-POLL] ${res.status}:`, errMsg);
+          setReportProgress({ step: 'error', percent: 0, message: `Error: ${errMsg}` });
+          break;
+        }
+
         const data = await res.json();
 
         if (data.error) {

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
+import { getJob } from '@/lib/jobs';
 import {
   startDatasetODQuery,
   startDatasetHourlyQuery,
@@ -79,33 +80,45 @@ export async function POST(
 
     // ── Phase 1: Start queries ─────────────────────────────────────
     if (!state) {
-      // Find the job for this dataset to extract POI coordinates
+      console.log(`[DS-REPORT] Phase 1: Starting queries for ${datasetName} (reset=${reset}, poiIds=${poiIds?.length || 0})`);
+      // Find the job for this dataset to extract POI coordinates.
+      // Use lightweight index to find job ID, then read individual job file.
+      // (The monolithic config/jobs.json is 258MB+ and causes Vercel timeouts.)
       let poiCoords: PoiCoord[] = [];
       try {
-        const allJobs = await getConfig<Record<string, any>>('jobs');
-        if (allJobs) {
-          const matchingJob = Object.values(allJobs).find(
-            (j: any) => j.s3DestPath && j.s3DestPath.replace(/\/$/, '').split('/').pop() === datasetName
+        const index = await getConfig<Record<string, any>>('jobs-index');
+        if (index) {
+          const matchingEntry = Object.entries(index).find(
+            ([_, j]: [string, any]) => j.s3DestPath && j.s3DestPath.replace(/\/$/, '').split('/').pop() === datasetName
           );
-          if (matchingJob) {
-            poiCoords = extractPoiCoords([matchingJob as any]);
-            console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords for ${datasetName}`);
+          if (matchingEntry) {
+            const [matchingJobId] = matchingEntry;
+            // Read full job data (has verasetPayload with POI coords)
+            const matchingJob = await getJob(matchingJobId);
+            if (matchingJob) {
+              poiCoords = extractPoiCoords([matchingJob]);
+              console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords for ${datasetName} (job ${matchingJobId})`);
 
-            // Filter to selected POIs if poiIds provided
-            if (poiIds?.length && matchingJob.verasetPayload?.geo_radius) {
-              const selectedSet = new Set(poiIds);
-              const filtered: PoiCoord[] = [];
-              for (const g of matchingJob.verasetPayload.geo_radius) {
-                if (selectedSet.has(g.poi_id)) {
-                  filtered.push({ lat: g.latitude, lng: g.longitude, radiusM: g.distance_in_meters || 200 });
+              // Filter to selected POIs if poiIds provided
+              if (poiIds?.length && matchingJob.verasetPayload?.geo_radius) {
+                const selectedSet = new Set(poiIds);
+                const filtered: PoiCoord[] = [];
+                for (const g of matchingJob.verasetPayload.geo_radius) {
+                  if (selectedSet.has(g.poi_id)) {
+                    filtered.push({ lat: g.latitude, lng: g.longitude, radiusM: g.distance_in_meters || 200 });
+                  }
+                }
+                if (filtered.length > 0) {
+                  poiCoords = filtered;
+                  console.log(`[DS-REPORT] Filtered to ${poiCoords.length} POI coords (of ${poiIds.length} selected)`);
                 }
               }
-              if (filtered.length > 0) {
-                poiCoords = filtered;
-                console.log(`[DS-REPORT] Filtered to ${poiCoords.length} POI coords (of ${poiIds.length} selected)`);
-              }
             }
+          } else {
+            console.warn(`[DS-REPORT] No matching job found in index for dataset ${datasetName}`);
           }
+        } else {
+          console.warn(`[DS-REPORT] No jobs-index found`);
         }
       } catch (e: any) {
         console.warn(`[DS-REPORT] Could not extract POI coords: ${e.message}`);
@@ -140,7 +153,11 @@ export async function POST(
       if (totalDevices) queries.totalDevices = totalDevices;
 
       state = { phase: 'polling', queries };
-      await saveState(datasetName, state);
+      try {
+        await saveState(datasetName, state);
+      } catch (saveErr: any) {
+        console.error(`[DS-REPORT] Failed to save state for ${datasetName}, continuing anyway:`, saveErr.message);
+      }
 
       return NextResponse.json({
         phase: 'polling',
@@ -412,7 +429,7 @@ export async function POST(
       progress: { step: 'complete', percent: 100, message: 'Reports already generated' },
     });
   } catch (error: any) {
-    console.error('[DS-REPORT-POLL]', error.message);
+    console.error('[DS-REPORT-POLL] Error for', datasetName, ':', error.message, error.stack?.split('\n').slice(0, 3).join(' | '));
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
