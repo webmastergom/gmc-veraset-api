@@ -238,10 +238,13 @@ export async function POST(
         });
       }
 
-      // All done → advance to parsing (save updated state with removed failed queries)
+      // All done → advance to parsing on NEXT call (avoid doing too much in one call → Vercel timeout)
       state = { ...state, phase: 'parsing' };
       await saveState(datasetName, state);
-      // Fall through
+      return NextResponse.json({
+        phase: 'parsing',
+        progress: { step: 'queries_done', percent: 45, message: 'All queries done, parsing results...' },
+      });
     }
 
     // ── Phase 3: Parse hourly + mobility + temporal (no geocoding) ──

@@ -197,15 +197,23 @@ export default function DatasetAnalysisPage() {
     try {
       let done = false;
       let attempts = 0;
-      while (!done && attempts < 60) {
+      while (!done && attempts < 200) {
         attempts++;
         const resetParam = attempts === 1 ? '?reset=true' : '';
-        const res = await fetch(`/api/datasets/${datasetName}/reports/poll${resetParam}`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
-        });
+        let res: Response;
+        try {
+          res = await fetch(`/api/datasets/${datasetName}/reports/poll${resetParam}`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
+          });
+        } catch (fetchErr: any) {
+          // Network error or timeout — retry
+          console.warn(`[REPORT-POLL] Fetch failed (attempt ${attempts}):`, fetchErr.message);
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
 
         if (!res.ok && res.status >= 500) {
           const text = await res.text();
@@ -217,6 +225,11 @@ export default function DatasetAnalysisPage() {
             errMsg = `Server error ${res.status}: ${text.substring(0, 200)}`;
           }
           console.error(`[REPORT-POLL] ${res.status}:`, errMsg);
+          // Retry on server errors (Vercel timeouts, transient failures)
+          if (attempts < 5) {
+            await new Promise((r) => setTimeout(r, 5000));
+            continue;
+          }
           setReportProgress({ step: 'error', percent: 0, message: `Error: ${errMsg}` });
           break;
         }
