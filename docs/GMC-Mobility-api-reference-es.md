@@ -836,6 +836,75 @@ Cuando se filtra por un solo POI, la respuesta incluye un campo `poi` adicional:
 
 ---
 
+### 5b. Analisis de Movilidad por POI (Categorias Antes/Despues)
+
+**`GET /api/external/jobs/:jobId/mobility/:poiId`**
+
+Analiza las categorias de POIs (del catalogo Overture) que los visitantes de un POI especifico visitaron **antes y despues** de su visita al POI medido. Utiliza una ventana temporal de ±2 horas.
+
+> **Importante:** Este endpoint solo esta disponible a nivel per-POI (no global). Requiere el `poiId` original enviado al crear el job.
+
+> **Nota tecnica (precision):** La deteccion de visitas al POI objetivo se realiza por **proximidad espacial** (distancia Haversine) a las coordenadas exactas del POI — no se basan en metadatos del dataset. El matching de categorias usa la base de datos Overture con un grid geohash de 9 celdas y un umbral de 200m.
+
+#### Ejemplo
+
+```bash
+curl -s "https://tu-dominio.com/api/external/jobs/abc123xyz/mobility/poi_001" \
+  -H "X-API-Key: TU_API_KEY" | jq '.'
+```
+
+#### Respuesta
+
+```json
+{
+  "job_id": "abc123xyz",
+  "poi": { "id": "poi_001", "name": "Mi Tienda" },
+  "analyzed_at": "2026-03-18T10:30:00.000Z",
+  "before": [
+    { "category": "restaurant", "deviceDays": 45, "hits": 89 },
+    { "category": "cafe", "deviceDays": 32, "hits": 51 }
+  ],
+  "after": [
+    { "category": "shopping_mall", "deviceDays": 38, "hits": 65 },
+    { "category": "parking", "deviceDays": 25, "hits": 42 }
+  ],
+  "categories": [
+    { "category": "restaurant", "deviceDays": 78, "hits": 142 },
+    { "category": "shopping_mall", "deviceDays": 55, "hits": 98 }
+  ]
+}
+```
+
+#### Campos de la Respuesta
+
+| Campo | Tipo | Descripcion |
+|-------|------|-------------|
+| `job_id` | string | ID del job |
+| `poi` | object | `{ id, name }` del POI consultado |
+| `analyzed_at` | string | Timestamp ISO del analisis |
+| `before` | array | Categorias visitadas 0-2 horas **antes** de llegar al POI |
+| `after` | array | Categorias visitadas 0-2 horas **despues** de salir del POI |
+| `categories` | array | Todas las categorias combinadas (before + after, sumados) |
+
+#### Campos de Cada Categoria
+
+| Campo | Tipo | Descripcion |
+|-------|------|-------------|
+| `category` | string | Categoria del POI visitado (del catalogo Overture, ej: `restaurant`, `cafe`, `parking`) |
+| `deviceDays` | number | Numero de pares dispositivo-dia que visitaron esta categoria |
+| `hits` | number | Numero total de pings/visitas a esta categoria |
+
+#### Tiempos
+
+| Escenario | Tiempo |
+|-----------|--------|
+| Primera peticion | 1-3 minutos |
+| Peticion cacheada | < 1 segundo |
+
+> **Cache:** Los resultados se cachean automaticamente en S3. El header `X-Cache` indica `HIT` o `MISS`.
+
+---
+
 ### 6. Obtener Analisis del Dataset
 
 **`GET /api/external/jobs/:datasetName/analysis`**
@@ -1156,8 +1225,9 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
   |                    |        |        ├──> GET /jobs/:id/catchment/:poiId   (por POI)
   |  job_id            | QUEUED |        ├──> GET /jobs/:id/od                 (global)
   |<───────            | SCHEDULED       ├──> GET /jobs/:id/od/:poiId          (por POI)
-  |                    | RUNNING|        ├──> GET /jobs/:name/analysis         (metricas diarias)
-  |  webhook?          | (auto- |        └──> POST /jobs/:id/postal-maid      (MAIDs por CP)
+  |                    | RUNNING|        ├──> GET /jobs/:id/mobility/:poiId    (categorias antes/despues)
+  |  webhook?          | (auto- |        ├──> GET /jobs/:name/analysis         (metricas diarias)
+  |                    |  check)|        └──> POST /jobs/:id/postal-maid      (MAIDs por CP)
   |  ─ ─ ─ ─ ─ ─ ─ ─> |  check)|
   |                    v        |          Standalone
   |               SUCCESS ──────┘          ─────────
@@ -1176,6 +1246,7 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
    - **`GET /api/external/jobs/:jobId/catchment/:poiId`** — Origenes residenciales de un POI especifico.
    - **`GET /api/external/jobs/:jobId/od`** — Origen-destino de todos los POIs.
    - **`GET /api/external/jobs/:jobId/od/:poiId`** — Origen-destino de un POI especifico.
+   - **`GET /api/external/jobs/:jobId/mobility/:poiId`** — Categorias de POIs visitados antes/despues de un POI especifico.
    - **`GET /api/external/jobs/:datasetName/analysis`** — Metricas diarias y POIs activos.
    - **`POST /api/external/jobs/:jobId/postal-maid`** — Exportar MAIDs por codigos postales (acceso restringido).
 4. **`POST /api/external/postal-maid`** — Exportar MAIDs por pais sin necesidad de un job (acceso restringido).
@@ -1192,6 +1263,8 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
 | Primera peticion de OD (global) | 1-5 minutos |
 | Primera peticion de OD (por POI) | 1-3 minutos |
 | OD cacheado (peticiones posteriores) | < 1 segundo |
+| Primera peticion de mobility/categorias (por POI) | 1-3 minutos |
+| Mobility cacheado (peticiones posteriores) | < 1 segundo |
 | Analisis diario (primera peticion) | 30-90 segundos |
 | Analisis diario cacheado | < 1 segundo |
 | Postal-MAID (primera peticion) | 1-5 minutos |

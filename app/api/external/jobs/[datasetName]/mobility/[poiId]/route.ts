@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getJob } from '@/lib/jobs';
 import { validateApiKeyFromRequest } from '@/lib/api-auth';
 import { logger } from '@/lib/logger';
-import { analyzeOriginDestination } from '@/lib/dataset-analyzer-od';
+import { analyzeMobility } from '@/lib/dataset-analyzer-mobility';
 import { getConfig, putConfig, BUCKET } from '@/lib/s3-config';
 // extractPoiCoords is NOT used here — per-POI endpoints extract only the requested POI's coords
 
@@ -20,10 +20,20 @@ function reversePoiMapping(poiMapping: Record<string, string>): Record<string, s
 }
 
 /**
- * GET /api/external/jobs/[datasetName]/od/[poiId]
- * Origin-destination analysis for a single POI.
+ * GET /api/external/jobs/[datasetName]/mobility/[poiId]
+ * Mobility analysis (POI categories visited before/after) for a single POI.
  *
  * datasetName = jobId, poiId = the original POI ID the client sent when creating the job.
+ *
+ * Response:
+ * {
+ *   job_id: string,
+ *   poi: { id: string, name: string },
+ *   analyzed_at: string,
+ *   before: [{ category, deviceDays, hits }],
+ *   after: [{ category, deviceDays, hits }],
+ *   categories: [{ category, deviceDays, hits }]   // combined
+ * }
  */
 export async function GET(
   request: NextRequest,
@@ -36,7 +46,7 @@ export async function GET(
     jobId = params.datasetName;
     const poiId = decodeURIComponent(params.poiId);
 
-    console.log(`[OD-POI] GET /api/external/jobs/${jobId}/od/${poiId}`);
+    console.log(`[MOBILITY-POI] GET /api/external/jobs/${jobId}/mobility/${poiId}`);
 
     // 1. Validate API key
     const auth = await validateApiKeyFromRequest(request);
@@ -69,7 +79,7 @@ export async function GET(
       return NextResponse.json(
         {
           error: 'Job Not Ready',
-          message: `Job status is '${job.status}'. OD analysis is only available for completed jobs.`,
+          message: `Job status is '${job.status}'. Mobility analysis is only available for completed jobs.`,
           status: job.status,
         },
         { status: 409 }
@@ -117,14 +127,17 @@ export async function GET(
         poiCoords = [{ lat: p.latitude, lng: p.longitude, radiusM: 200 }];
       }
     }
+    const poiIdsToQuery = verasetPoiId !== poiId
+      ? [verasetPoiId, poiId]
+      : [verasetPoiId];
 
     // 5. Check cache — bump version to invalidate stale study-level results
-    const OD_VERSION = 'v9';
-    const cacheKey = `od-${OD_VERSION}-${jobId}-poi-${poiId}`;
+    const MOBILITY_VERSION = 'v2';
+    const cacheKey = `mobility-${MOBILITY_VERSION}-${jobId}-poi-${poiId}`;
     try {
       const cached = await getConfig<any>(cacheKey);
       if (cached) {
-        console.log(`[OD-POI] Serving cached result for job ${jobId}, poi ${poiId}`);
+        console.log(`[MOBILITY-POI] Serving cached result for job ${jobId}, poi ${poiId}`);
         return NextResponse.json(cached, {
           status: 200,
           headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' },
@@ -134,24 +147,19 @@ export async function GET(
       // No cache, continue
     }
 
-    // 6. Run OD analysis filtered to this POI
-    // Query with BOTH the Veraset ID (geo_radius_X) and the original client ID (poi_123)
-    // because Parquet data may contain either format in the poi_ids array.
-    const poiIdsToQuery = verasetPoiId !== poiId
-      ? [verasetPoiId, poiId]
-      : [verasetPoiId];
-    console.log(`[OD-POI] Computing for job ${jobId}, dataset: ${datasetName}, poi: ${poiId} (veraset: ${verasetPoiId}), querying: [${poiIdsToQuery.join(', ')}]`);
-    logger.log(`Computing OD for job ${jobId}, poi ${poiId}`);
+    // 6. Run mobility analysis
+    console.log(`[MOBILITY-POI] Computing for job ${jobId}, dataset: ${datasetName}, poi: ${poiId} (veraset: ${verasetPoiId})`);
+    logger.log(`Computing mobility for job ${jobId}, poi ${poiId}`);
 
     let result;
     try {
-      result = await analyzeOriginDestination(datasetName, {
+      result = await analyzeMobility(datasetName, {
         poiIds: poiIdsToQuery,
         ...(poiCoords.length ? { poiCoords } : {}),
       });
     } catch (error: any) {
-      console.error(`[OD-POI ERROR] Analysis failed:`, error.message);
-      logger.error(`OD-POI analysis failed for job ${jobId}, poi ${poiId}`, { error: error.message });
+      console.error(`[MOBILITY-POI ERROR] Analysis failed:`, error.message);
+      logger.error(`Mobility-POI analysis failed for job ${jobId}, poi ${poiId}`, { error: error.message });
 
       if (error.message?.includes('Access Denied') ||
           error.message?.includes('AccessDeniedException') ||
@@ -173,7 +181,7 @@ export async function GET(
       }
 
       return NextResponse.json(
-        { error: 'Internal Server Error', message: 'Failed to compute OD analysis' },
+        { error: 'Internal Server Error', message: 'Failed to compute mobility analysis' },
         { status: 500 }
       );
     }
@@ -186,34 +194,23 @@ export async function GET(
       job_id: jobId,
       poi: { id: poiId, name: poiName },
       analyzed_at: result.analyzedAt,
-      methodology: result.methodology,
-      coverage: result.coverage,
-      summary: {
-        total_device_days: result.summary.totalDeviceDays,
-        top_origin_zipcode: result.summary.topOriginZipcode,
-        top_origin_city: result.summary.topOriginCity,
-        top_destination_zipcode: result.summary.topDestinationZipcode,
-        top_destination_city: result.summary.topDestinationCity,
-      },
-      origins: result.origins,
-      destinations: result.destinations,
-      temporal_patterns: result.temporalPatterns,
-      poi_arrival_patterns: result.poiArrivalPatterns || [],
-      poi_activity_by_hour: result.poiActivityByHour || [],
+      before: result.before,
+      after: result.after,
+      categories: result.categories,
     };
 
-    console.log(`[OD-POI] Analysis completed for poi ${poiId}`, {
-      totalDeviceDays: response.summary.total_device_days,
-      originZipcodes: response.origins.length,
-      destinationZipcodes: response.destinations.length,
+    console.log(`[MOBILITY-POI] Analysis completed for poi ${poiId}`, {
+      categoriesBefore: response.before.length,
+      categoriesAfter: response.after.length,
+      totalCategories: response.categories.length,
     });
 
     // 8. Cache result
     try {
       await putConfig(cacheKey, response);
-      logger.log(`Cached OD for job ${jobId}, poi ${poiId}`);
+      logger.log(`Cached mobility for job ${jobId}, poi ${poiId}`);
     } catch (err: any) {
-      logger.warn(`Failed to cache OD for job ${jobId}, poi ${poiId}`, { error: err.message });
+      logger.warn(`Failed to cache mobility for job ${jobId}, poi ${poiId}`, { error: err.message });
     }
 
     return NextResponse.json(response, {
@@ -223,8 +220,8 @@ export async function GET(
 
   } catch (error: any) {
     const errorJobId = jobId || 'unknown';
-    console.error(`[OD-POI ERROR] GET /api/external/jobs/${errorJobId}/od/:poiId:`, error.message);
-    logger.error(`GET /api/external/jobs/${errorJobId}/od/:poiId error:`, error);
+    console.error(`[MOBILITY-POI ERROR] GET /api/external/jobs/${errorJobId}/mobility/:poiId:`, error.message);
+    logger.error(`GET /api/external/jobs/${errorJobId}/mobility/:poiId error:`, error);
 
     return NextResponse.json(
       { error: 'Internal Server Error', message: error.message || 'An unexpected error occurred' },
