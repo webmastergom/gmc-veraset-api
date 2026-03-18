@@ -661,10 +661,37 @@ export default function DatasetAnalysisPage() {
               title="Catchment by Zip Code"
               icon={<MapPin className="h-4 w-4" />}
             >
-              <p className="text-sm text-muted-foreground mb-4">
-                {catchmentReport.totalDeviceDays?.toLocaleString()} total device-days across{' '}
-                {catchmentReport.byZipCode.length} zip codes
-              </p>
+              <div className="flex items-center justify-between mb-4">
+                <p className="text-sm text-muted-foreground">
+                  {catchmentReport.totalDeviceDays?.toLocaleString()} total device-days across{' '}
+                  {catchmentReport.byZipCode.length} zip codes
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const total = catchmentReport.totalDeviceDays || 1;
+                    const sorted = [...catchmentReport.byZipCode].sort((a, b) => b.deviceDays - a.deviceDays);
+                    const cleanZip = (z: string) => z.replace(/^["']+|["']+$/g, '').replace(/^[A-Z]{2}[-\s]/, '');
+                    downloadCsv(
+                      `${datasetName}-catchment-zipcodes.csv`,
+                      ['zip_code', 'city', 'country', 'device_days', 'share_pct', 'lat', 'lng'],
+                      sorted.map((z) => [
+                        cleanZip(z.zipCode),
+                        z.city,
+                        z.country,
+                        z.deviceDays,
+                        ((z.deviceDays / total) * 100).toFixed(2),
+                        z.lat,
+                        z.lng,
+                      ])
+                    );
+                  }}
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  Download Zipcodes
+                </Button>
+              </div>
               <CatchmentPie data={catchmentReport.byZipCode} />
             </CollapsibleCard>
           )}
