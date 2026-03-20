@@ -191,7 +191,7 @@ export default function NewJobPage() {
       return
     }
 
-    // Validate date range (max 31 days) - use consistent inclusive calculation
+    // Validate date range — >31 days auto-routes to mega-job
     const from = new Date(formData.dateRange.from)
     const to = new Date(formData.dateRange.to)
     const diffMs = to.getTime() - from.getTime()
@@ -207,15 +207,6 @@ export default function NewJobPage() {
       return
     }
     
-    if (daysDiff > 31) {
-      toast({
-        title: "Validation Error",
-        description: `Date range cannot exceed 31 days. You selected ${daysDiff} days.`,
-        variant: "destructive",
-      })
-      return
-    }
-
     if (daysDiff < 1) {
       toast({
         title: "Validation Error",
@@ -557,6 +548,70 @@ export default function NewJobPage() {
         return
       }
 
+      // ── Auto-detect mega-job: >31 days → route to /api/mega-jobs ──
+      const fromDate = new Date(formData.dateRange!.from)
+      const toDate = new Date(formData.dateRange!.to)
+      const daysDiffCheck = Math.floor((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24)) + 1
+      const isMegaJob = daysDiffCheck > 31
+
+      if (isMegaJob) {
+        // First ensure the POI collection exists (upload if from file)
+        let collectionId = formData.poiCollection || ''
+        if (poiSource === "upload" && uploadedGeojson) {
+          // Create a temporary collection from uploaded file
+          const collectionName = `upload-${formData.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') || 'job'}-${Date.now()}`
+          const uploadRes = await fetch('/api/pois/collections', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+              id: collectionName,
+              name: `Upload: ${formData.name}`,
+              poiCount: pois.length,
+              geojson: uploadedGeojson,
+            }),
+          })
+          if (!uploadRes.ok) {
+            throw new Error('Failed to upload POI collection for mega-job')
+          }
+          const uploadedCollection = await uploadRes.json()
+          collectionId = uploadedCollection.id
+        }
+
+        // Create mega-job via auto-split
+        const megaResponse = await fetch('/api/mega-jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            mode: 'auto-split',
+            name: formData.name,
+            description: `Auto-split job: ${daysDiffCheck} days, ${pois.length} POIs`,
+            poiCollectionId: collectionId,
+            dateRange: { from: formData.dateRange!.from, to: formData.dateRange!.to },
+            radius: formData.radius || 10,
+            schema: formData.schema || 'BASIC',
+            type: formData.type || 'pings',
+          }),
+        })
+
+        if (!megaResponse.ok) {
+          const error = await megaResponse.json()
+          throw new Error(error.error || 'Failed to create mega-job')
+        }
+
+        const megaResult = await megaResponse.json()
+        const megaJobId = megaResult.megaJob?.megaJobId
+
+        toast({
+          title: "Mega-Job Created",
+          description: `Job "${formData.name}" will be split into ${megaResult.splitPreview?.totalSubJobs || '?'} sub-jobs (${daysDiffCheck} days)`,
+        })
+
+        router.push(`/mega-jobs/${megaJobId}`)
+        return
+      }
+
       // Create job via API route (which handles Veraset API call and S3 storage)
       const createResponse = await fetch("/api/jobs", {
         method: "POST",
@@ -694,7 +749,7 @@ export default function NewJobPage() {
         <CardHeader>
           <CardTitle>Job Configuration</CardTitle>
           <CardDescription>
-            Fill in the details to create a new Veraset job. Maximum 25,000 POIs and 31 days date range.
+            Fill in the details to create a new Veraset job. Maximum 25,000 POIs. Ranges over 31 days auto-split into mega-jobs.
           </CardDescription>
         </CardHeader>
         <CardContent>
