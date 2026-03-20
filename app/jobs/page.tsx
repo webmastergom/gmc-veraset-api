@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import Link from "next/link"
 import { Plus, LayoutGrid, List, Search, Calendar, MapPin, Database, ExternalLink, Clock, Users } from "lucide-react"
 import { ExternalBadge } from "@/components/ui/external-badge"
+import { MegaJobBadge } from "@/components/ui/mega-job-badge"
 
 type ViewMode = 'modern' | 'classic';
 
@@ -27,6 +28,8 @@ interface Job {
   external?: boolean;
   apiKeyName?: string;
   audienceAgentEnabled?: boolean;
+  megaJobId?: string;
+  megaJobIndex?: number;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -69,6 +72,8 @@ export default function JobsPage() {
           external: job.external || false,
           apiKeyName: job.apiKeyName,
           audienceAgentEnabled: job.audienceAgentEnabled || false,
+          megaJobId: job.megaJobId,
+          megaJobIndex: job.megaJobIndex,
         }));
         setJobs(normalizedJobs);
       })
@@ -186,6 +191,9 @@ export default function JobsPage() {
                   {job.external && (
                     <ExternalBadge apiKeyName={job.apiKeyName} />
                   )}
+                  {job.megaJobId && (
+                    <MegaJobBadge megaJobId={job.megaJobId} megaJobIndex={job.megaJobIndex} />
+                  )}
                   {job.audienceAgentEnabled && (
                     <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">
                       <Users className="h-3 w-3" />
@@ -273,6 +281,9 @@ export default function JobsPage() {
                           </Link>
                           {job.external && (
                             <ExternalBadge apiKeyName={job.apiKeyName} />
+                          )}
+                          {job.megaJobId && (
+                            <MegaJobBadge megaJobId={job.megaJobId} megaJobIndex={job.megaJobIndex} />
                           )}
                           {job.audienceAgentEnabled && (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-gmc-primary/10 text-gmc-primary border border-gmc-primary/20 flex items-center gap-1">
