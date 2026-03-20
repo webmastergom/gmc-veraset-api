@@ -40,8 +40,23 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const body = await request.json();
     const mode = body.mode as string;
 
+    // Resolve API key name for origin tracking on sub-jobs
+    let apiKeyName: string | undefined;
+    const headerKey = request.headers.get('X-API-Key');
+    if (headerKey) {
+      try {
+        const { validateApiKey } = await import('@/lib/api-keys');
+        const keyResult = await validateApiKey(headerKey);
+        if (keyResult.valid && keyResult.keyId) {
+          const { getApiKeyById } = await import('@/lib/api-keys');
+          const keyInfo = await getApiKeyById(keyResult.keyId);
+          apiKeyName = keyInfo?.name;
+        }
+      } catch { /* non-critical */ }
+    }
+
     if (mode === 'auto-split') {
-      return await handleAutoSplit(body);
+      return await handleAutoSplit(body, apiKeyName);
     }
     if (mode === 'manual-group') {
       return await handleManualGroup(body);
@@ -59,7 +74,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
 // ── Auto-split ────────────────────────────────────────────────────────
 
-async function handleAutoSplit(body: any): Promise<NextResponse> {
+async function handleAutoSplit(body: any, apiKeyName?: string): Promise<NextResponse> {
   // Validate
   let data: z.infer<typeof createMegaJobAutoSplitSchema>;
   try {
@@ -110,6 +125,7 @@ async function handleAutoSplit(body: any): Promise<NextResponse> {
     subJobIds: [],
     status: 'planning',
     progress: { created: 0, synced: 0, failed: 0, total: splitPlan.totalSubJobs },
+    ...(apiKeyName ? { apiKeyName } : {}),
   });
 
   return NextResponse.json({

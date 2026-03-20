@@ -91,6 +91,9 @@ export interface MegaJob {
   // Error info
   error?: string;
 
+  // Origin tracking — propagated to sub-jobs for badge display
+  apiKeyName?: string;
+
   createdAt: string;
   updatedAt: string;
 }
