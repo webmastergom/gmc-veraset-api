@@ -1174,6 +1174,930 @@ def webhook():
 
 ---
 
+## Mega-Jobs (Rangos de Fechas Extendidos)
+
+Los mega-jobs permiten analizar rangos de fechas superiores a 31 dias dividiendo automaticamente el trabajo en sub-jobs de 31 dias maximo. El sistema maneja la creacion, monitoreo y consolidacion de todos los sub-jobs de forma transparente.
+
+### Quickstart: Tu primer mega-job
+
+Este ejemplo crea un mega-job para un trimestre completo (90 dias), espera a que termine y descarga los reportes consolidados.
+
+#### Bash (curl + jq)
+
+```bash
+# 1. Configura tu API key
+API_KEY="TU_API_KEY"
+BASE_URL="https://tu-dominio.com"
+
+# 2. Sube tu coleccion de POIs (GeoJSON FeatureCollection)
+COLLECTION_RESPONSE=$(curl -s -X POST "$BASE_URL/api/pois/collections" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "estancos-espana",
+    "name": "Estancos Espana",
+    "geojson": {
+      "type": "FeatureCollection",
+      "features": [
+        {
+          "type": "Feature",
+          "geometry": { "type": "Point", "coordinates": [-3.7038, 40.4168] },
+          "properties": { "id": "estanco_001", "name": "Estanco Sol" }
+        },
+        {
+          "type": "Feature",
+          "geometry": { "type": "Point", "coordinates": [-3.7050, 40.4200] },
+          "properties": { "id": "estanco_002", "name": "Estanco Gran Via" }
+        }
+      ]
+    }
+  }')
+
+echo "Coleccion creada: $(echo "$COLLECTION_RESPONSE" | jq -r '.id')"
+
+# 3. Crea el mega-job (auto-split: divide 90 dias en sub-jobs de 31 dias)
+MEGA_RESPONSE=$(curl -s -X POST "$BASE_URL/api/mega-jobs" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "auto-split",
+    "name": "Estancos Espana Q1 2026",
+    "country": "ES",
+    "poiCollectionId": "estancos-espana",
+    "dateRange": { "from": "2026-01-01", "to": "2026-03-31" },
+    "radius": 10,
+    "schema": "BASIC",
+    "type": "pings"
+  }')
+
+MEGA_ID=$(echo "$MEGA_RESPONSE" | jq -r '.megaJob.id')
+TOTAL=$(echo "$MEGA_RESPONSE" | jq -r '.splitPreview.totalSubJobs')
+echo "Mega-job creado: $MEGA_ID ($TOTAL sub-jobs)"
+
+# 4. Crea sub-jobs via polling (1 por llamada, ~30s entre llamadas)
+while true; do
+  POLL_RESPONSE=$(curl -s -X POST "$BASE_URL/api/mega-jobs/$MEGA_ID/create-poll" \
+    -H "X-API-Key: $API_KEY")
+  DONE=$(echo "$POLL_RESPONSE" | jq -r '.done')
+  CREATED=$(echo "$POLL_RESPONSE" | jq -r '.megaJob.progress.created')
+  echo "Sub-jobs creados: $CREATED/$TOTAL"
+
+  if [ "$DONE" = "true" ]; then
+    echo "Todos los sub-jobs creados"
+    break
+  fi
+
+  sleep 30
+done
+
+# 5. Espera a que todos los sub-jobs terminen (consulta cada 5 min)
+while true; do
+  DETAIL=$(curl -s "$BASE_URL/api/mega-jobs/$MEGA_ID" \
+    -H "X-API-Key: $API_KEY")
+  STATUS=$(echo "$DETAIL" | jq -r '.status')
+  SYNCED=$(echo "$DETAIL" | jq -r '.progress.synced')
+  echo "Estado: $STATUS (sincronizados: $SYNCED/$TOTAL)"
+
+  if [ "$SYNCED" = "$TOTAL" ]; then
+    echo "Todos los sub-jobs sincronizados"
+    break
+  fi
+
+  sleep 300  # 5 minutos
+done
+
+# 6. Consolida reportes (polling hasta phase = "done")
+while true; do
+  CONSOL=$(curl -s -X POST "$BASE_URL/api/mega-jobs/$MEGA_ID/consolidate" \
+    -H "X-API-Key: $API_KEY")
+  PHASE=$(echo "$CONSOL" | jq -r '.phase')
+  MSG=$(echo "$CONSOL" | jq -r '.progress.message')
+  echo "Consolidacion: $PHASE - $MSG"
+
+  if [ "$PHASE" = "done" ]; then
+    echo "Consolidacion completa"
+    break
+  fi
+
+  sleep 30
+done
+
+# 7. Obtener reportes consolidados (JSON)
+curl -s "$BASE_URL/api/mega-jobs/$MEGA_ID/reports?type=visits" \
+  -H "X-API-Key: $API_KEY" | jq '.visitsByPoi[:3]'
+
+# 8. Descargar reportes (CSV)
+curl -s "$BASE_URL/api/mega-jobs/$MEGA_ID/reports/download?type=temporal" \
+  -H "X-API-Key: $API_KEY" --output "temporal.csv"
+
+curl -s "$BASE_URL/api/mega-jobs/$MEGA_ID/reports/download?type=catchment" \
+  -H "X-API-Key: $API_KEY" --output "catchment.csv"
+
+echo "Reportes descargados: temporal.csv, catchment.csv"
+```
+
+#### Python (requests)
+
+```python
+import requests, time
+
+API_KEY = "TU_API_KEY"
+BASE_URL = "https://tu-dominio.com"
+HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+
+# 1. Subir coleccion de POIs
+collection = requests.post(f"{BASE_URL}/api/pois/collections", headers=HEADERS, json={
+    "id": "estancos-espana",
+    "name": "Estancos Espana",
+    "geojson": {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-3.7038, 40.4168]},
+                "properties": {"id": "estanco_001", "name": "Estanco Sol"}
+            }
+        ]
+    }
+}).json()
+print(f"Coleccion: {collection['id']} ({collection['poiCount']} POIs)")
+
+# 2. Crear mega-job
+mega = requests.post(f"{BASE_URL}/api/mega-jobs", headers=HEADERS, json={
+    "mode": "auto-split",
+    "name": "Estancos Q1 2026",
+    "country": "ES",
+    "poiCollectionId": "estancos-espana",
+    "dateRange": {"from": "2026-01-01", "to": "2026-03-31"},
+    "radius": 10,
+    "schema": "BASIC",
+    "type": "pings"
+}).json()
+
+mega_id = mega["megaJob"]["id"]
+total = mega["splitPreview"]["totalSubJobs"]
+print(f"Mega-job: {mega_id} ({total} sub-jobs)")
+
+# 3. Crear sub-jobs (polling)
+while True:
+    poll = requests.post(f"{BASE_URL}/api/mega-jobs/{mega_id}/create-poll", headers=HEADERS).json()
+    created = poll["megaJob"]["progress"]["created"]
+    print(f"  Sub-jobs creados: {created}/{total}")
+    if poll.get("done"):
+        break
+    time.sleep(30)
+
+# 4. Esperar sincronizacion
+while True:
+    detail = requests.get(f"{BASE_URL}/api/mega-jobs/{mega_id}", headers=HEADERS).json()
+    synced = detail["progress"]["synced"]
+    print(f"  Sincronizados: {synced}/{total}")
+    if synced >= total:
+        break
+    time.sleep(300)
+
+# 5. Consolidar
+while True:
+    consol = requests.post(f"{BASE_URL}/api/mega-jobs/{mega_id}/consolidate", headers=HEADERS).json()
+    print(f"  Consolidacion: {consol['phase']} - {consol['progress']['message']}")
+    if consol["phase"] == "done":
+        break
+    time.sleep(30)
+
+# 6. Obtener reportes
+visits = requests.get(f"{BASE_URL}/api/mega-jobs/{mega_id}/reports?type=visits", headers=HEADERS).json()
+for v in visits["visitsByPoi"][:5]:
+    print(f"  {v['poiName']}: {v['visits']} visitas, {v['devices']} dispositivos")
+
+# 7. Descargar CSV
+for report_type in ["temporal", "catchment", "od", "hourly"]:
+    resp = requests.get(f"{BASE_URL}/api/mega-jobs/{mega_id}/reports/download?type={report_type}", headers=HEADERS)
+    with open(f"{report_type}.csv", "w") as f:
+        f.write(resp.text)
+    print(f"  Descargado: {report_type}.csv")
+```
+
+---
+
+### 9. Subir Coleccion de POIs
+
+**`POST /api/pois/collections`**
+
+Sube una coleccion GeoJSON FeatureCollection para usar con mega-jobs. Cada POI debe ser un Feature con geometria de tipo Point. Las features invalidas (coordenadas fuera de rango, geometrias no-Point) se filtran automaticamente.
+
+> **Nota:** Las colecciones se almacenan en S3. El sistema valida las coordenadas y reporta cuantas features fueron validas vs invalidas.
+
+#### Cuerpo de la Peticion
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| `id` | string | No | Identificador unico de la coleccion. Si no se provee, se genera automaticamente desde `name` (kebab-case). |
+| `name` | string | Si | Nombre legible de la coleccion |
+| `description` | string | No | Descripcion opcional |
+| `geojson` | object | Si | GeoJSON FeatureCollection con POIs de tipo Point |
+| `geojson.features[].properties.id` | string | Recomendado | Identificador unico del POI. Si no se provee, se genera como `poi_N`. |
+| `geojson.features[].properties.name` | string | No | Nombre legible del POI |
+
+#### Ejemplo de Peticion
+
+```bash
+curl -X POST https://tu-dominio.com/api/pois/collections \
+  -H "X-API-Key: TU_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "estancos-espana",
+    "name": "Estancos Espana",
+    "geojson": {
+      "type": "FeatureCollection",
+      "features": [
+        {
+          "type": "Feature",
+          "geometry": { "type": "Point", "coordinates": [-3.7038, 40.4168] },
+          "properties": { "id": "estanco_001", "name": "Estanco Sol" }
+        },
+        {
+          "type": "Feature",
+          "geometry": { "type": "Point", "coordinates": [-3.7050, 40.4200] },
+          "properties": { "id": "estanco_002", "name": "Estanco Gran Via" }
+        }
+      ]
+    }
+  }'
+```
+
+#### Respuesta (200 OK)
+
+```json
+{
+  "id": "estancos-espana",
+  "name": "Estancos Espana",
+  "description": "",
+  "poiCount": 2,
+  "totalFeatures": 2,
+  "invalidFeatures": 0,
+  "geojsonPath": "pois/estancos-espana.geojson",
+  "createdAt": "2026-03-20T10:00:00.000Z"
+}
+```
+
+> **Nota:** El campo `poiCount` refleja el numero de features **validas** (Point con coordenadas correctas). Si `invalidFeatures > 0`, algunas features fueron filtradas. El campo `totalFeatures` muestra el total original.
+
+---
+
+### 10. Listar Colecciones de POIs
+
+**`GET /api/pois/collections`**
+
+Lista todas las colecciones de POIs disponibles, ordenadas por fecha de creacion (mas recientes primero).
+
+#### Ejemplo de Peticion
+
+```bash
+curl -H "X-API-Key: TU_API_KEY" \
+  https://tu-dominio.com/api/pois/collections
+```
+
+#### Respuesta (200 OK)
+
+```json
+[
+  {
+    "id": "estancos-espana",
+    "name": "Estancos Espana",
+    "poiCount": 150,
+    "totalFeatures": 152,
+    "invalidFeatures": 2,
+    "geojsonPath": "pois/estancos-espana.geojson",
+    "createdAt": "2026-03-20T10:00:00.000Z"
+  }
+]
+```
+
+---
+
+### 11. Crear Mega-Job (Auto-Split)
+
+**`POST /api/mega-jobs`**
+
+Crea un mega-job que divide automaticamente un rango de fechas en sub-jobs de maximo 31 dias. Si el rango total es menor a 31 dias, se crea un unico sub-job. El sistema tambien divide por lotes de POIs si la coleccion es grande.
+
+#### Modos de Creacion
+
+| Modo | Descripcion |
+|------|-------------|
+| `auto-split` | Division automatica del rango de fechas y POIs. Requiere `poiCollectionId`. |
+| `manual-group` | Agrupa sub-jobs existentes (ya completados). Requiere `subJobIds`. |
+
+#### Cuerpo de la Peticion (modo `auto-split`)
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| `mode` | string | Si | Debe ser `"auto-split"` |
+| `name` | string | Si | Nombre del mega-job (1-200 caracteres) |
+| `description` | string | No | Descripcion opcional (max 1000 caracteres) |
+| `country` | string | No | Codigo ISO 2 letras del pais (ej: `"ES"`, `"MX"`) |
+| `poiCollectionId` | string | Si | ID de la coleccion POI subida previamente |
+| `dateRange.from` | string | Si | Fecha inicio `YYYY-MM-DD` |
+| `dateRange.to` | string | Si | Fecha fin `YYYY-MM-DD` (sin limite maximo) |
+| `radius` | number | No | Radio en metros (1-1000). Default: `10` |
+| `schema` | string | No | `"BASIC"`, `"ENHANCED"` o `"FULL"`. Default: `"BASIC"` |
+| `type` | string | No | `"pings"`, `"devices"`, `"aggregate"`, `"cohort"` o `"pings_by_device"`. Default: `"pings"` |
+
+#### Ejemplo de Peticion
+
+```bash
+curl -X POST https://tu-dominio.com/api/mega-jobs \
+  -H "X-API-Key: TU_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "auto-split",
+    "name": "Tabaco Espana Q1 2026",
+    "country": "ES",
+    "poiCollectionId": "estancos-espana",
+    "dateRange": { "from": "2026-01-01", "to": "2026-03-31" },
+    "radius": 10,
+    "schema": "BASIC",
+    "type": "pings"
+  }'
+```
+
+#### Respuesta (201 Created)
+
+```json
+{
+  "megaJob": {
+    "id": "mj_abc123",
+    "name": "Tabaco Espana Q1 2026",
+    "mode": "auto-split",
+    "status": "planning",
+    "country": "ES",
+    "sourceScope": {
+      "poiCollectionId": "estancos-espana",
+      "dateRange": { "from": "2026-01-01", "to": "2026-03-31" },
+      "radius": 10,
+      "schema": "BASIC",
+      "type": "pings"
+    },
+    "progress": { "created": 0, "synced": 0, "failed": 0, "total": 3 },
+    "subJobIds": [],
+    "createdAt": "2026-03-20T10:05:00.000Z"
+  },
+  "splitPreview": {
+    "dateChunks": [
+      { "from": "2026-01-01", "to": "2026-01-31" },
+      { "from": "2026-02-01", "to": "2026-03-03" },
+      { "from": "2026-03-04", "to": "2026-03-31" }
+    ],
+    "poiChunks": [
+      { "startIndex": 0, "endIndex": 150, "label": "POIs 1-150" }
+    ],
+    "totalSubJobs": 3,
+    "poiCollectionName": "Estancos Espana",
+    "totalPois": 150,
+    "quotaRemaining": 197
+  }
+}
+```
+
+> **Nota:** El `splitPreview` muestra como el sistema dividira el rango de fechas. Cada `dateChunk` sera un sub-job independiente enviado a Veraset. Si la coleccion tiene muchos POIs, tambien se dividira en `poiChunks`, resultando en `dateChunks x poiChunks` sub-jobs totales.
+
+#### Respuestas de Error
+
+```json
+// 400 - Modo invalido
+{
+  "error": "Invalid mode. Must be \"auto-split\" or \"manual-group\"."
+}
+
+// 404 - Coleccion no encontrada
+{
+  "error": "POI collection \"mi-coleccion\" not found"
+}
+
+// 429 - Limite de cuota alcanzado
+{
+  "error": "Monthly job creation limit exceeded",
+  "remaining": 0
+}
+```
+
+---
+
+### 12. Crear Sub-Jobs (Polling)
+
+**`POST /api/mega-jobs/:megaJobId/create-poll`**
+
+Crea **un sub-job por llamada** a traves de la API de Veraset. El frontend o script debe llamar repetidamente a este endpoint hasta que la respuesta contenga `done: true`.
+
+En la primera llamada, el mega-job transiciona de `planning` a `creating`. Cuando se crea el ultimo sub-job, transiciona a `running`.
+
+> **Importante:** Solo funciona para mega-jobs en modo `auto-split`. Los mega-jobs `manual-group` no necesitan este paso ya que los sub-jobs ya existen.
+
+#### Ejemplo de Peticion
+
+```bash
+curl -X POST https://tu-dominio.com/api/mega-jobs/mj_abc123/create-poll \
+  -H "X-API-Key: TU_API_KEY"
+```
+
+#### Respuesta - Sub-Job Creado
+
+```json
+{
+  "megaJob": {
+    "id": "mj_abc123",
+    "status": "creating",
+    "progress": { "created": 1, "synced": 0, "failed": 0, "total": 3 }
+  },
+  "createdJobId": "veraset_job_456",
+  "subJobName": "Tabaco Espana Q1 2026 [2026-01-01→2026-01-31]",
+  "done": false
+}
+```
+
+#### Respuesta - Todos los Sub-Jobs Creados
+
+```json
+{
+  "megaJob": {
+    "id": "mj_abc123",
+    "status": "running",
+    "progress": { "created": 3, "synced": 0, "failed": 0, "total": 3 }
+  },
+  "createdJobId": "veraset_job_789",
+  "subJobName": "Tabaco Espana Q1 2026 [2026-03-04→2026-03-31]",
+  "done": true
+}
+```
+
+#### Respuesta - Sub-Job Ya Existente (todos creados)
+
+```json
+{
+  "megaJob": {
+    "id": "mj_abc123",
+    "status": "running",
+    "progress": { "created": 3, "synced": 0, "failed": 0, "total": 3 }
+  },
+  "message": "All sub-jobs already created",
+  "done": true
+}
+```
+
+#### Respuesta - Error en un Sub-Job (no detiene el mega-job)
+
+```json
+{
+  "megaJob": {
+    "id": "mj_abc123",
+    "status": "creating",
+    "progress": { "created": 2, "synced": 0, "failed": 1, "total": 3 }
+  },
+  "subJobError": "Veraset 400: Invalid date range",
+  "done": false
+}
+```
+
+> **Nota:** Si un sub-job individual falla al crearse en Veraset, el mega-job **no se detiene**. El error se registra en `progress.failed` y el sistema avanza al siguiente sub-job. Puedes verificar cuantos fallaron en el detalle del mega-job.
+
+---
+
+### 13. Detalle de Mega-Job
+
+**`GET /api/mega-jobs/:megaJobId`**
+
+Obtiene el detalle completo del mega-job, incluyendo el estado actualizado de cada sub-job. Este endpoint **actualiza automaticamente** el progreso del mega-job basandose en el estado actual de los sub-jobs en Veraset.
+
+#### Ejemplo de Peticion
+
+```bash
+curl -H "X-API-Key: TU_API_KEY" \
+  https://tu-dominio.com/api/mega-jobs/mj_abc123
+```
+
+#### Respuesta
+
+```json
+{
+  "id": "mj_abc123",
+  "name": "Tabaco Espana Q1 2026",
+  "mode": "auto-split",
+  "status": "running",
+  "country": "ES",
+  "sourceScope": {
+    "poiCollectionId": "estancos-espana",
+    "dateRange": { "from": "2026-01-01", "to": "2026-03-31" },
+    "radius": 10,
+    "schema": "BASIC",
+    "type": "pings"
+  },
+  "progress": { "created": 3, "synced": 2, "failed": 0, "total": 3 },
+  "subJobIds": ["veraset_job_456", "veraset_job_567", "veraset_job_789"],
+  "subJobs": [
+    {
+      "jobId": "veraset_job_456",
+      "name": "Tabaco Espana Q1 2026 [2026-01-01→2026-01-31]",
+      "status": "SUCCESS",
+      "dateRange": { "from": "2026-01-01", "to": "2026-01-31" },
+      "poiCount": 150,
+      "syncedAt": "2026-03-20T14:00:00.000Z",
+      "megaJobIndex": 0
+    },
+    {
+      "jobId": "veraset_job_567",
+      "name": "Tabaco Espana Q1 2026 [2026-02-01→2026-03-03]",
+      "status": "SUCCESS",
+      "dateRange": { "from": "2026-02-01", "to": "2026-03-03" },
+      "poiCount": 150,
+      "syncedAt": "2026-03-20T14:15:00.000Z",
+      "megaJobIndex": 1
+    },
+    {
+      "jobId": "veraset_job_789",
+      "name": "Tabaco Espana Q1 2026 [2026-03-04→2026-03-31]",
+      "status": "RUNNING",
+      "dateRange": { "from": "2026-03-04", "to": "2026-03-31" },
+      "poiCount": 150,
+      "syncedAt": null,
+      "megaJobIndex": 2
+    }
+  ],
+  "createdAt": "2026-03-20T10:05:00.000Z"
+}
+```
+
+#### Estados del Mega-Job
+
+| Estado | Descripcion | Accion recomendada |
+|--------|-------------|-------------------|
+| `planning` | Mega-job creado, sub-jobs aun no enviados | Llamar a `create-poll` para empezar |
+| `creating` | Sub-jobs enviandose a Veraset (en progreso) | Seguir llamando a `create-poll` cada 30s |
+| `running` | Todos los sub-jobs creados, esperando resultados | Consultar detalle cada 5 min |
+| `consolidating` | Consolidacion de reportes en progreso | Esperar a que `consolidate` retorne `phase: "done"` |
+| `completed` | Todos los reportes consolidados disponibles | Consultar reportes via `reports` |
+| `partial` | Algunos sub-jobs fallaron, pero hay resultados parciales | Consolidar los sub-jobs exitosos |
+| `error` | Todos los sub-jobs fallaron | Diagnosticar y recrear |
+
+---
+
+### 14. Listar Mega-Jobs
+
+**`GET /api/mega-jobs`**
+
+Lista todos los mega-jobs con un resumen ligero (sin detalle de sub-jobs).
+
+#### Ejemplo de Peticion
+
+```bash
+curl -H "X-API-Key: TU_API_KEY" \
+  https://tu-dominio.com/api/mega-jobs
+```
+
+#### Respuesta (200 OK)
+
+```json
+[
+  {
+    "id": "mj_abc123",
+    "name": "Tabaco Espana Q1 2026",
+    "mode": "auto-split",
+    "status": "completed",
+    "country": "ES",
+    "progress": { "created": 3, "synced": 3, "failed": 0, "total": 3 },
+    "createdAt": "2026-03-20T10:05:00.000Z"
+  }
+]
+```
+
+---
+
+### 15. Consolidar Reportes
+
+**`POST /api/mega-jobs/:megaJobId/consolidate`**
+
+Consolida los datos de todos los sub-jobs completados en reportes unificados. El proceso es multi-fase con queries Athena paralelos. Este endpoint es **idempotente**: puedes llamarlo repetidamente hasta que `phase` sea `"done"`.
+
+#### Cuerpo de la Peticion (opcional)
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| `poiIds` | string[] | No | Array de POI IDs para filtrar. Si se omite, se incluyen todos los POIs. |
+
+#### Query Params
+
+| Param | Descripcion |
+|-------|-------------|
+| `reset=true` | Reinicia la consolidacion desde cero (util si una fase fallo). |
+
+#### Ejemplo de Peticion
+
+```bash
+# Consolidar todos los POIs
+curl -X POST https://tu-dominio.com/api/mega-jobs/mj_abc123/consolidate \
+  -H "X-API-Key: TU_API_KEY"
+
+# Consolidar solo POIs especificos
+curl -X POST https://tu-dominio.com/api/mega-jobs/mj_abc123/consolidate \
+  -H "X-API-Key: TU_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "poiIds": ["estanco_001", "estanco_002"] }'
+
+# Reiniciar consolidacion
+curl -X POST "https://tu-dominio.com/api/mega-jobs/mj_abc123/consolidate?reset=true" \
+  -H "X-API-Key: $API_KEY"
+```
+
+#### Fases de Consolidacion
+
+La consolidacion se ejecuta en 5 fases. Cada llamada al endpoint avanza una fase (o espera si la fase actual no ha terminado):
+
+| Fase | Nombre | Descripcion |
+|------|--------|-------------|
+| 1 | `starting` | Inicia 7 queries Athena en paralelo (visits, OD, hourly, catchment, mobility, temporal, MAIDs) |
+| 2 | `polling` | Espera a que todos los queries completen en Athena |
+| 3 | `parsing_visits` | Parsea los resultados de visits, hourly, mobility y temporal (sin geocodificacion) |
+| 4 | `parsing_od` | Parsea OD y catchment con reverse geocodificacion (puede tardar mas) |
+| 5 | `done` | Todos los reportes guardados y disponibles |
+
+#### Respuesta - Fase `starting`
+
+```json
+{
+  "phase": "polling",
+  "progress": {
+    "step": "queries_started",
+    "percent": 10,
+    "message": "Started 7 Athena queries..."
+  }
+}
+```
+
+#### Respuesta - Fase `polling`
+
+```json
+{
+  "phase": "polling",
+  "progress": {
+    "step": "polling_queries",
+    "percent": 25,
+    "message": "Queries: 3 done, 4 running..."
+  },
+  "statuses": {
+    "visits": "SUCCEEDED",
+    "od": "RUNNING",
+    "hourly": "SUCCEEDED",
+    "catchment": "RUNNING",
+    "mobility": "RUNNING",
+    "temporal": "SUCCEEDED",
+    "maids": "RUNNING"
+  }
+}
+```
+
+#### Respuesta - Fase `parsing_od`
+
+```json
+{
+  "phase": "parsing_od",
+  "progress": {
+    "step": "parsing_geocode",
+    "percent": 60,
+    "message": "Geocoding origins and destinations..."
+  }
+}
+```
+
+#### Respuesta - Fase `done`
+
+```json
+{
+  "phase": "done",
+  "progress": {
+    "step": "complete",
+    "percent": 100,
+    "message": "Consolidation complete"
+  }
+}
+```
+
+---
+
+### 16. Obtener Reportes Consolidados (JSON)
+
+**`GET /api/mega-jobs/:megaJobId/reports?type={tipo}`**
+
+Obtiene un reporte consolidado en formato JSON. Requiere que la consolidacion haya completado (`phase: "done"`).
+
+#### Tipos de Reporte
+
+| Tipo | Descripcion |
+|------|-------------|
+| `visits` | Visitas y dispositivos por POI |
+| `temporal` | Tendencia diaria (pings y dispositivos por dia) |
+| `catchment` | Origenes residenciales por codigo postal |
+| `od` | Analisis origen-destino |
+| `hourly` | Distribucion horaria de actividad |
+| `mobility` | Categorias de POIs visitados antes/despues |
+
+#### Ejemplo de Peticion
+
+```bash
+curl -H "X-API-Key: TU_API_KEY" \
+  "https://tu-dominio.com/api/mega-jobs/mj_abc123/reports?type=visits"
+```
+
+#### Respuesta - Reporte `visits`
+
+```json
+{
+  "megaJobId": "mj_abc123",
+  "analyzedAt": "2026-03-20T15:00:00.000Z",
+  "totalPois": 150,
+  "visitsByPoi": [
+    { "poiId": "estanco_001", "poiName": "Estanco Sol", "visits": 15432, "devices": 3456 },
+    { "poiId": "estanco_002", "poiName": "Estanco Gran Via", "visits": 12100, "devices": 2890 }
+  ]
+}
+```
+
+#### Respuesta - Reporte `temporal`
+
+```json
+{
+  "megaJobId": "mj_abc123",
+  "analyzedAt": "2026-03-20T15:00:00.000Z",
+  "daily": [
+    { "date": "2026-01-01", "pings": 45000, "devices": 3200 },
+    { "date": "2026-01-02", "pings": 52000, "devices": 3800 }
+  ]
+}
+```
+
+#### Respuesta - Reporte `catchment`
+
+```json
+{
+  "megaJobId": "mj_abc123",
+  "analyzedAt": "2026-03-20T15:00:00.000Z",
+  "byZipCode": [
+    { "zipCode": "28001", "city": "Madrid", "country": "ES", "lat": 40.42, "lng": -3.70, "deviceDays": 1234 },
+    { "zipCode": "08001", "city": "Barcelona", "country": "ES", "lat": 41.38, "lng": 2.17, "deviceDays": 987 }
+  ]
+}
+```
+
+#### Respuesta - Reporte `od`
+
+```json
+{
+  "megaJobId": "mj_abc123",
+  "analyzedAt": "2026-03-20T15:00:00.000Z",
+  "origins": [
+    { "zipCode": "28001", "city": "Madrid", "country": "ES", "lat": 40.42, "lng": -3.70, "deviceDays": 1234 }
+  ],
+  "destinations": [
+    { "zipCode": "28006", "city": "Madrid", "country": "ES", "lat": 40.43, "lng": -3.68, "deviceDays": 1100 }
+  ]
+}
+```
+
+#### Respuesta - Reporte `hourly`
+
+```json
+{
+  "megaJobId": "mj_abc123",
+  "analyzedAt": "2026-03-20T15:00:00.000Z",
+  "hourly": [
+    { "hour": 8, "pings": 12000, "devices": 2500 },
+    { "hour": 9, "pings": 18000, "devices": 3200 },
+    { "hour": 13, "pings": 15000, "devices": 2800 }
+  ]
+}
+```
+
+#### Respuesta - Reporte `mobility`
+
+```json
+{
+  "megaJobId": "mj_abc123",
+  "analyzedAt": "2026-03-20T15:00:00.000Z",
+  "before": [
+    { "category": "restaurant", "deviceDays": 450, "hits": 890 },
+    { "category": "cafe", "deviceDays": 320, "hits": 510 }
+  ],
+  "after": [
+    { "category": "shopping_mall", "deviceDays": 380, "hits": 650 },
+    { "category": "parking", "deviceDays": 250, "hits": 420 }
+  ],
+  "categories": [
+    { "category": "restaurant", "deviceDays": 780, "hits": 1420 },
+    { "category": "shopping_mall", "deviceDays": 550, "hits": 980 }
+  ]
+}
+```
+
+---
+
+### 17. Descargar Reportes Consolidados (CSV)
+
+**`GET /api/mega-jobs/:megaJobId/reports/download?type={tipo}`**
+
+Descarga un reporte consolidado en formato CSV. Util para importar en Excel, Tableau u otras herramientas de analisis.
+
+#### Tipos de Descarga
+
+| Tipo | Columnas CSV | Descripcion |
+|------|-------------|-------------|
+| `visits` | `poi_id,poi_name,visits,devices` | Visitas por POI |
+| `temporal` | `date,pings,devices` | Tendencia diaria |
+| `catchment` | `zip_code,city,country,lat,lng,device_days` | Origenes residenciales |
+| `od` | `type,zip_code,city,country,lat,lng,device_days` | Origen-destino (type = origin/destination) |
+| `hourly` | `hour,pings,devices` | Distribucion horaria |
+| `mobility` | `timing,category,device_days,hits` | Movilidad (timing = before/after/combined) |
+| `maids` | `maid` | Identificadores de dispositivo (acceso restringido) |
+| `postcodes` | `postal_code,device_days` | Codigos postales limpios (solo numericos) |
+
+#### Ejemplo de Peticion
+
+```bash
+# Descargar reporte de visitas
+curl -H "X-API-Key: TU_API_KEY" \
+  "https://tu-dominio.com/api/mega-jobs/mj_abc123/reports/download?type=visits" \
+  --output "visitas.csv"
+
+# Descargar tendencia temporal
+curl -H "X-API-Key: TU_API_KEY" \
+  "https://tu-dominio.com/api/mega-jobs/mj_abc123/reports/download?type=temporal" \
+  --output "temporal.csv"
+
+# Descargar catchment
+curl -H "X-API-Key: TU_API_KEY" \
+  "https://tu-dominio.com/api/mega-jobs/mj_abc123/reports/download?type=catchment" \
+  --output "catchment.csv"
+
+# Descargar MAIDs (acceso restringido)
+curl -H "X-API-Key: TU_API_KEY" \
+  "https://tu-dominio.com/api/mega-jobs/mj_abc123/reports/download?type=maids" \
+  --output "maids.csv"
+```
+
+#### Headers de Respuesta
+
+| Header | Valor |
+|--------|-------|
+| `Content-Type` | `text/csv` |
+| `Content-Disposition` | `attachment; filename="mega-job-{id}-{tipo}.csv"` |
+
+---
+
+### Flujo Tipico de Mega-Job
+
+```
+Subir POIs          Crear             Crear Sub-Jobs      Monitorear          Consolidar         Reportes
+──────────          ─────             ──────────────      ──────────          ──────────         ────────
+
+POST /pois/     POST /mega-jobs   POST /mega-jobs/   GET /mega-jobs/    POST /mega-jobs/   GET /mega-jobs/
+ collections        |               :id/create-poll    :id                :id/consolidate    :id/reports
+    |               |                    |                 |                    |               ?type=visits
+    |  id           |  megaJob.id        | done=false      | synced < total    | phase!=done     |
+    |<──────        |<─────────          |<──── loop ───>  |<──── loop ──────> |<── loop ────>   |
+    |               |                    |                 |                    |               GET /mega-jobs/
+    |               |                    | done=true       | synced == total   | phase=done     :id/reports/
+    |               |                    |─────────────>   |────────────────>  |─────────────>  download
+    |               |                                                                          ?type=temporal
+```
+
+### Paso a Paso
+
+1. **`POST /api/pois/collections`** — Subir coleccion de POIs en formato GeoJSON.
+2. **`POST /api/mega-jobs`** — Crear mega-job con `mode: "auto-split"`, recibir `megaJob.id` y preview de la division.
+3. **`POST /api/mega-jobs/:id/create-poll`** — Llamar en loop (cada 30-60 segundos) hasta `done: true`. Cada llamada crea un sub-job en Veraset.
+4. **`GET /api/mega-jobs/:id`** — Consultar periodicamente (cada 5 minutos) hasta que `progress.synced == progress.total`.
+5. **`POST /api/mega-jobs/:id/consolidate`** — Llamar en loop (cada 30-60 segundos) hasta `phase: "done"`. El sistema ejecuta queries Athena y geocodificacion en paralelo.
+6. **`GET /api/mega-jobs/:id/reports?type=visits`** — Obtener reportes consolidados en JSON.
+7. **`GET /api/mega-jobs/:id/reports/download?type=temporal`** — Descargar reportes en formato CSV.
+
+### Intervalos de Polling Recomendados
+
+| Operacion | Intervalo | Razon |
+|-----------|-----------|-------|
+| `create-poll` | 30-60 segundos | Cada llamada crea un job en Veraset (~5-20s) |
+| Detalle mega-job | 5 minutos | Los sub-jobs tardan horas en completarse |
+| `consolidate` | 30-60 segundos | Los queries Athena tardan 1-5 minutos |
+
+### Tiempos Tipicos de Mega-Jobs
+
+| Operacion | Tiempo tipico |
+|-----------|---------------|
+| Subir coleccion (150 POIs) | < 2 segundos |
+| Crear mega-job | < 2 segundos |
+| Crear todos los sub-jobs (3 sub-jobs) | 1-3 minutos |
+| Procesamiento de sub-jobs (Veraset) | 2-8 horas |
+| Consolidacion completa | 3-15 minutos |
+| Descarga de reportes CSV | < 2 segundos |
+
+---
+
 ## Codigos de Error
 
 | HTTP Status | Error | Descripcion | Que hacer |
@@ -1190,6 +2114,11 @@ def webhook():
 | 502 | Upstream Error | La llamada a la API de Veraset fallo | Error transitorio. Reintentar despues de unos segundos. |
 | 503 | Configuration Error | Credenciales AWS no configuradas en el servidor | Contactar al administrador. |
 | 500 | Internal Error | Error inesperado del servidor | Reportar al administrador con el `job_id` si es posible. |
+| 400 | No synced sub-jobs | Intentaste consolidar sin sub-jobs sincronizados | Esperar a que al menos un sub-job tenga status `SUCCESS` y `syncedAt`. |
+| 400 | Only auto-split | Llamaste `create-poll` en un mega-job `manual-group` | Los mega-jobs `manual-group` no necesitan `create-poll`. |
+| 400 | Invalid type | Tipo de reporte no valido en `reports` o `download` | Usar uno de: visits, temporal, catchment, od, hourly, mobility, maids, postcodes. |
+| 404 | Report not found | Reporte no consolidado aun | Ejecutar consolidacion antes de solicitar reportes. |
+| 504 | Veraset API timeout | La llamada a Veraset excedio 40 segundos al crear sub-job | Reintentar `create-poll` en unos segundos. |
 
 ### Formato de Errores de Validacion (400)
 
@@ -1274,3 +2203,15 @@ POST /jobs ─────> GET /jobs/:id/status ──┬──> GET /jobs/:id/
 ### Intervalo de Polling Recomendado
 
 **Cada 5 minutos.** No hay beneficio en consultar mas frecuentemente ya que los jobs tardan horas. El endpoint de status verifica automaticamente con Veraset en cada llamada, asi que siempre obtienes el estado mas reciente.
+
+### Cuando Usar Mega-Jobs vs Jobs Regulares
+
+| Criterio | Job Regular | Mega-Job |
+|----------|-------------|----------|
+| Rango de fechas | Maximo 31 dias | Sin limite (se divide automaticamente) |
+| POIs | Hasta 25,000 en el body | Coleccion GeoJSON ilimitada (se divide en lotes) |
+| Reportes | Catchment, OD, mobility per-POI | Consolidados: visits, temporal, catchment, OD, hourly, mobility |
+| Descarga CSV | No incluido | Incluido para todos los tipos |
+| Caso de uso | Analisis puntual, rango corto | Analisis trimestral/anual, grandes colecciones |
+
+> **Nota:** Los mega-jobs usan los mismos endpoints de Veraset internamente. La consolidacion agrega los resultados de todos los sub-jobs en reportes unificados usando queries Athena.

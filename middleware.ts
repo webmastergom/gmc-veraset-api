@@ -13,6 +13,8 @@ const PUBLIC_API_ROUTES = [
 // These routes handle their own authentication via API keys
 const EXTERNAL_API_ROUTES = [
   '/api/external',
+  '/api/mega-jobs',
+  '/api/pois/collections',
 ]
 
 // Veraset API routes that should be protected but may be called externally
