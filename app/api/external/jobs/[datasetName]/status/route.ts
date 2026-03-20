@@ -108,7 +108,26 @@ export async function GET(
 
     const synced = !!(job.s3DestPath && job.syncedAt);
 
-    // 5. Build response based on status
+    // 5. Resolve POI list — externalPois for external jobs, reconstruct from verasetPayload for dashboard jobs
+    let resolvedPois: Array<{ id: string; name?: string; latitude: number; longitude: number }> = [];
+    if (job.externalPois?.length) {
+      resolvedPois = job.externalPois;
+    } else if (job.verasetPayload?.geo_radius?.length) {
+      const poiMapping = job.poiMapping || {};
+      const poiNames = job.poiNames || {};
+      resolvedPois = job.verasetPayload.geo_radius.map((g: any) => {
+        const verasetId = g.poi_id || `geo_radius_${job.verasetPayload!.geo_radius!.indexOf(g)}`;
+        const originalId = poiMapping[verasetId] || verasetId;
+        return {
+          id: originalId,
+          name: poiNames[verasetId] || originalId,
+          latitude: g.latitude,
+          longitude: g.longitude,
+        };
+      });
+    }
+
+    // 6. Build response based on status
     if (currentStatus === 'SUCCESS') {
       const results = synced
         ? await getJobResults(jobId, job)
@@ -130,7 +149,7 @@ export async function GET(
         created_at: job.createdAt,
         completed_at: job.updatedAt,
         results,
-        pois: job.externalPois || [],
+        pois: resolvedPois,
       });
     }
 
@@ -142,7 +161,7 @@ export async function GET(
         synced: false,
         created_at: job.createdAt,
         error: job.errorMessage || 'Job processing failed',
-        pois: job.externalPois || [],
+        pois: resolvedPois,
       });
     }
 
@@ -154,7 +173,7 @@ export async function GET(
       synced: false,
       created_at: job.createdAt,
       updated_at: job.updatedAt,
-      pois: job.externalPois || [],
+      pois: resolvedPois,
     });
 
   } catch (error: any) {

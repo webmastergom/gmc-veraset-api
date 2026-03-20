@@ -90,6 +90,40 @@ export default function MegaJobDetailPage() {
     return () => clearInterval(interval)
   }, [megaJob?.status, loadMegaJob])
 
+  // Auto-create sub-jobs while status is 'planning' or 'creating'
+  useEffect(() => {
+    if (!megaJob) return
+    if (megaJob.status !== 'planning' && megaJob.status !== 'creating') return
+    if (megaJob.progress?.created >= megaJob.progress?.total) return
+
+    let cancelled = false
+    const pollCreateSubJobs = async () => {
+      while (!cancelled) {
+        try {
+          const res = await fetch(`/api/mega-jobs/${id}/create-poll`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+          })
+          if (!res.ok) break
+          const data = await res.json()
+          if (data.megaJob) setMegaJob(data.megaJob)
+          if (data.done) break
+        } catch {
+          break
+        }
+        // Brief pause between sub-job creations
+        await new Promise(r => setTimeout(r, 2000))
+      }
+      // Refresh final state
+      if (!cancelled) loadMegaJob()
+    }
+
+    pollCreateSubJobs()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [megaJob?.status, id])
+
   // Auto-resume consolidation if page loads with status 'consolidating'
   useEffect(() => {
     if (!megaJob || megaJob.status !== 'consolidating' || consolidating) return
