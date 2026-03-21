@@ -307,6 +307,8 @@ export async function POST(
             ? `Parsed ${Object.keys(reportKeys).length} reports (${errors.length} errors). Geocoding...`
             : 'Geocoding origins and destinations...',
         },
+        ...(errors.length > 0 ? { errors } : {}),
+        savedReports: Object.keys(reportKeys),
       });
     }
 
