@@ -22,7 +22,7 @@ import {
   extractPoiCoords,
   type PoiCoord,
 } from '@/lib/mega-consolidation-queries';
-import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
+import { checkQueryStatus, fetchQueryResults, ensureTableForDataset } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
@@ -120,6 +120,19 @@ export async function POST(
     if (state.phase === 'starting') {
       try {
         const effectivePoiIds = state.poiIds || poiIds;
+
+        // Ensure Athena tables exist for all sub-jobs (required before querying)
+        console.log(`[MEGA] Ensuring Athena tables for ${syncedJobs.length} sub-jobs...`);
+        await Promise.all(
+          syncedJobs.map(async (job) => {
+            const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
+            if (datasetName) {
+              console.log(`[MEGA] Ensuring table for ${datasetName}...`);
+              await ensureTableForDataset(datasetName);
+            }
+          })
+        );
+        console.log(`[MEGA] All Athena tables ready`);
 
         // Extract POI coordinates from sub-job metadata for spatial proximity queries
         const poiCoords = extractPoiCoords(syncedJobs);
