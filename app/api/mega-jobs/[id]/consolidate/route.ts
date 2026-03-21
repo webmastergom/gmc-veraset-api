@@ -211,95 +211,102 @@ export async function POST(
       // Fall through to parsing
     }
 
-    // ── Phase 3: Parse visits + hourly + mobility (no geocoding) ───────
+    // ── Phase 3: Parse visits + hourly + mobility + temporal (no geocoding) ──
     if (state.phase === 'parsing_visits' && state.queries) {
       const reportKeys: Record<string, string> = {};
+      const errors: string[] = [];
+
+      // Helper: parse one query result and save report
+      const parseAndSave = async (
+        name: string,
+        queryId: string | undefined,
+        parser: (rows: any[]) => any,
+        reportType: string
+      ) => {
+        if (!queryId) return;
+        try {
+          console.log(`[MEGA] Phase 3: fetching ${name} query ${queryId}...`);
+          const queryResult = await fetchQueryResults(queryId);
+          console.log(`[MEGA] Phase 3: ${name} returned ${queryResult.rows?.length ?? 0} rows`);
+          const report = parser(queryResult.rows);
+          const key = await saveConsolidatedReport(id, reportType, report);
+          console.log(`[MEGA] Phase 3: saved ${name} → ${key}`);
+          reportKeys[name] = key;
+        } catch (err: any) {
+          const msg = `${name}: ${err.message}`;
+          console.error(`[MEGA] Phase 3 ERROR ${msg}`);
+          errors.push(msg);
+        }
+      };
 
       // Parse visits
-      if (state.queries.visits && !state.parsed?.visits) {
-        try {
-          const queryResult = await fetchQueryResults(state.queries.visits);
-          const visitsByPoi = parseConsolidatedVisits(queryResult.rows, syncedJobs);
-          const visitsReport = {
-            megaJobId: id,
-            analyzedAt: new Date().toISOString(),
-            totalPois: visitsByPoi.length,
-            visitsByPoi,
-          };
-          reportKeys.visitsByPoi = await saveConsolidatedReport(id, 'visits', visitsReport);
-        } catch (err: any) {
-          console.error('[MEGA] Error parsing visits:', err.message);
-        }
-      }
+      await parseAndSave('visits', state.queries.visits, (rows) => {
+        const visitsByPoi = parseConsolidatedVisits(rows, syncedJobs);
+        return { megaJobId: id, analyzedAt: new Date().toISOString(), totalPois: visitsByPoi.length, visitsByPoi };
+      }, 'visits');
 
       // Parse hourly
-      if (state.queries.hourly && !state.parsed?.hourly) {
-        try {
-          const queryResult = await fetchQueryResults(state.queries.hourly);
-          const hourlyReport = parseConsolidatedHourly(id, queryResult.rows);
-          reportKeys.hourly = await saveConsolidatedReport(id, 'hourly', hourlyReport);
-        } catch (err: any) {
-          console.error('[MEGA] Error parsing hourly:', err.message);
-        }
-      }
+      await parseAndSave('hourly', state.queries.hourly, (rows) => {
+        return parseConsolidatedHourly(id, rows);
+      }, 'hourly');
 
       // Parse mobility
-      if (state.queries.mobility && !state.parsed?.mobility) {
+      await parseAndSave('mobility', state.queries.mobility, (rows) => {
+        return parseConsolidatedMobility(id, rows);
+      }, 'mobility');
+
+      // Parse temporal
+      if (state.queries.temporal) {
+        await parseAndSave('temporal', state.queries.temporal, (rows) => {
+          const dailyData = rows.map((row: Record<string, any>) => ({
+            date: String(row.date || ''),
+            pings: parseInt(row.pings, 10) || 0,
+            devices: parseInt(row.devices, 10) || 0,
+          })).sort((a: any, b: any) => a.date.localeCompare(b.date));
+          return buildTemporalTrends(id, [dailyData]);
+        }, 'temporal');
+      }
+      // Temporal fallback from sub-job analyses
+      if (!reportKeys.temporal) {
         try {
-          const queryResult = await fetchQueryResults(state.queries.mobility);
-          const mobilityReport = parseConsolidatedMobility(id, queryResult.rows);
-          reportKeys.mobility = await saveConsolidatedReport(id, 'mobility', mobilityReport);
+          const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
+          for (const job of syncedJobs) {
+            const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
+            if (!datasetName) continue;
+            const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
+            if (analysis?.dailyData) dailyDataByJob.push(analysis.dailyData);
+          }
+          if (dailyDataByJob.length > 0) {
+            console.log(`[MEGA] Building temporal from ${dailyDataByJob.length} sub-job analyses (fallback)`);
+            const temporal = buildTemporalTrends(id, dailyDataByJob);
+            reportKeys.temporal = await saveConsolidatedReport(id, 'temporal', temporal);
+          }
         } catch (err: any) {
-          console.error('[MEGA] Error parsing mobility:', err.message);
+          console.error('[MEGA] Error building temporal fallback:', err.message);
+          errors.push(`temporal_fallback: ${err.message}`);
         }
       }
 
-      // Parse temporal (daily pings/devices from Athena query)
-      if (!state.parsed?.temporal) {
-        let temporalSaved = false;
-        // Try Athena query first
-        if (state.queries.temporal) {
-          try {
-            const queryResult = await fetchQueryResults(state.queries.temporal);
-            const dailyData = queryResult.rows.map((row: Record<string, any>) => ({
-              date: String(row.date || ''),
-              pings: parseInt(row.pings, 10) || 0,
-              devices: parseInt(row.devices, 10) || 0,
-            })).sort((a: any, b: any) => a.date.localeCompare(b.date));
-            const temporal = buildTemporalTrends(id, [dailyData]);
-            reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
-            temporalSaved = true;
-          } catch (err: any) {
-            console.error('[MEGA] Error parsing temporal Athena query:', err.message);
-          }
-        }
-        // Fallback: build from sub-job dataset analyses
-        if (!temporalSaved) {
-          try {
-            const dailyDataByJob: Array<{ date: string; pings: number; devices: number }[]> = [];
-            for (const job of syncedJobs) {
-              const datasetName = job.s3DestPath?.replace(/\/$/, '').split('/').pop();
-              if (!datasetName) continue;
-              const analysis = await getConf<any>(`dataset-analysis/${datasetName}`);
-              if (analysis?.dailyData) dailyDataByJob.push(analysis.dailyData);
-            }
-            if (dailyDataByJob.length > 0) {
-              console.log(`[MEGA] Building temporal from ${dailyDataByJob.length} sub-job analyses (fallback)`);
-              const temporal = buildTemporalTrends(id, dailyDataByJob);
-              reportKeys.temporalTrends = await saveConsolidatedReport(id, 'temporal', temporal);
-            }
-          } catch (err: any) {
-            console.error('[MEGA] Error building temporal fallback:', err.message);
-          }
-        }
-      }
+      console.log(`[MEGA] Phase 3 complete: saved=${Object.keys(reportKeys).join(',')}, errors=${errors.length}`);
 
-      state = { ...state, phase: 'parsing_od', parsed: { visits: true, hourly: true, mobility: true, temporal: true } };
+      state = {
+        ...state,
+        phase: 'parsing_od',
+        parsed: { visits: true, hourly: true, mobility: true, temporal: true },
+        phase3ReportKeys: reportKeys,
+        phase3Errors: errors,
+      } as ConsolidationState & { phase3ReportKeys?: Record<string, string>; phase3Errors?: string[] };
       await putConf(CONSOLIDATION_KEY(id), state);
 
       return NextResponse.json({
         phase: 'parsing_od',
-        progress: { step: 'parsing_geocode', percent: 60, message: 'Geocoding origins and destinations...' },
+        progress: {
+          step: 'parsing_geocode',
+          percent: 60,
+          message: errors.length > 0
+            ? `Parsed ${Object.keys(reportKeys).length} reports (${errors.length} errors). Geocoding...`
+            : 'Geocoding origins and destinations...',
+        },
       });
     }
 
@@ -435,10 +442,14 @@ export async function POST(
           reportKeys.maids = `athena-results/${state.queries.maids}.csv`;
         }
 
+        // Merge Phase 3 report keys with Phase 4 report keys
+        const phase3Keys = (state as any).phase3ReportKeys || {};
+        const allReportKeys = { ...phase3Keys, ...reportKeys };
+
         // Update mega-job with all report keys
         await updateMegaJob(id, {
           status: 'completed',
-          consolidatedReports: reportKeys,
+          consolidatedReports: allReportKeys,
         });
 
         state = { phase: 'done' };
