@@ -450,14 +450,14 @@ export async function POST(
         });
       } catch (err: any) {
         console.error('[MEGA] Error in OD/catchment parsing:', err.message);
-        // Save partial results and mark as completed anyway
-        state = { phase: 'done', error: err.message };
+        // Keep in parsing_od phase so Re-consolidate can retry
+        state = { ...state, phase: 'parsing_od', error: err.message };
         await putConf(CONSOLIDATION_KEY(id), state);
-        await updateMegaJob(id, { status: 'completed' });
+        await updateMegaJob(id, { status: 'error', error: `Consolidation failed: ${err.message}` });
         return NextResponse.json({
-          phase: 'done',
-          progress: { step: 'complete', percent: 100, message: `Completed with errors: ${err.message}` },
-        });
+          phase: 'error',
+          progress: { step: 'error', percent: 0, message: `Consolidation failed: ${err.message}. Click Re-consolidate to retry.` },
+        }, { status: 500 });
       }
     }
 
