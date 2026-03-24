@@ -20,6 +20,8 @@ const ACCURACY_THRESHOLD = 500;
 const COORDINATE_PRECISION = 4; // ~11m
 const GRID_STEP = 0.01;         // ~1.1km geohash grid
 const POI_TABLE = 'lab_pois_gmc';
+// Buffer around POI bounding box to pre-filter pings (degrees, ~2.2km)
+const BBOX_BUFFER = 0.02;
 
 /**
  * Build a SQL VALUES clause for target POI coordinates.
@@ -29,6 +31,27 @@ function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
     .map((c) => `(${c.lat}, ${c.lng}, ${c.radiusM}.0)`)
     .join(', ');
   return `(VALUES ${rows}) AS t(poi_lat, poi_lng, poi_radius_m)`;
+}
+
+/**
+ * Compute bounding box WHERE clause from POI coordinates.
+ * Pre-filters pings to only those within the POI extent + buffer,
+ * eliminating 90%+ of pings before expensive CROSS JOINs.
+ */
+function buildBboxFilter(poiCoords: PoiCoord[], latCol = 'latitude', lngCol = 'longitude', cast = true): string {
+  if (!poiCoords.length) return '';
+  const lats = poiCoords.map(c => c.lat);
+  const lngs = poiCoords.map(c => c.lng);
+  const minLat = Math.min(...lats) - BBOX_BUFFER;
+  const maxLat = Math.max(...lats) + BBOX_BUFFER;
+  const minLng = Math.min(...lngs) - BBOX_BUFFER;
+  const maxLng = Math.max(...lngs) + BBOX_BUFFER;
+  if (cast) {
+    return `AND TRY_CAST(${latCol} AS DOUBLE) BETWEEN ${minLat} AND ${maxLat}
+        AND TRY_CAST(${lngCol} AS DOUBLE) BETWEEN ${minLng} AND ${maxLng}`;
+  }
+  return `AND ${latCol} BETWEEN ${minLat} AND ${maxLat}
+        AND ${lngCol} BETWEEN ${minLng} AND ${maxLng}`;
 }
 
 // ── Q1: Origin-Destination ───────────────────────────────────────────
@@ -44,6 +67,7 @@ export async function startDatasetODQuery(
 
   if (poiCoords?.length) {
     // ── Spatial proximity approach (correct) ──
+    const bbox = buildBboxFilter(poiCoords);
     sql = `
     WITH
     all_pings AS (
@@ -54,6 +78,7 @@ export async function startDatasetODQuery(
       WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        ${bbox}
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
     ${buildTargetPoisCTE(poiCoords, poiTableName)},
@@ -174,6 +199,7 @@ export async function startDatasetHourlyQuery(
 
   if (poiCoords?.length) {
     // ── Spatial proximity approach (correct) ──
+    const bbox = buildBboxFilter(poiCoords);
     sql = `
     WITH
     all_pings AS (
@@ -184,6 +210,7 @@ export async function startDatasetHourlyQuery(
       WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        ${bbox}
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
     ${buildTargetPoisCTE(poiCoords, poiTableName)},
@@ -237,6 +264,7 @@ export async function startDatasetCatchmentQuery(
 
   let visitorsCTE: string;
   if (poiCoords?.length) {
+    const bbox = buildBboxFilter(poiCoords);
     visitorsCTE = `
     all_pings_raw AS (
       SELECT ad_id, date, utc_timestamp,
@@ -246,6 +274,7 @@ export async function startDatasetCatchmentQuery(
       WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        ${bbox}
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
     ${buildTargetPoisCTE(poiCoords, poiTableName)},
@@ -330,6 +359,7 @@ export async function startDatasetMobilityQuery(
 
   let visitTimeCTE: string;
   if (poiCoords?.length) {
+    const bbox = buildBboxFilter(poiCoords);
     visitTimeCTE = `
     all_pings_raw AS (
       SELECT ad_id, date, utc_timestamp,
@@ -339,6 +369,7 @@ export async function startDatasetMobilityQuery(
       WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        ${bbox}
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
     ),
     ${buildTargetPoisCTE(poiCoords, poiTableName)},

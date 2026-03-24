@@ -98,9 +98,28 @@ export function buildSpatialJoinQueries(
   const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
 
   const GRID_STEP = 0.01;
+  // Buffer around POI bounding box to pre-filter pings (degrees, ~2.2km)
+  const BBOX_BUFFER = 0.02;
 
   const spatialQuery = `
     WITH
+    poi_base AS (
+      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
+        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
+      FROM ${poiTableName} p
+      WHERE p.category IS NOT NULL
+        ${catFilter}
+        ${countryFilter}
+    ),
+    poi_bounds AS (
+      SELECT
+        MIN(poi_lat) - ${BBOX_BUFFER} as min_lat,
+        MAX(poi_lat) + ${BBOX_BUFFER} as max_lat,
+        MIN(poi_lng) - ${BBOX_BUFFER} as min_lng,
+        MAX(poi_lng) + ${BBOX_BUFFER} as max_lng
+      FROM poi_base
+    ),
     pings AS (
       SELECT
         ad_id,
@@ -113,18 +132,11 @@ export function buildSpatialJoinQueries(
       FROM ${tableName}
       WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(latitude AS DOUBLE) BETWEEN (SELECT min_lat FROM poi_bounds) AND (SELECT max_lat FROM poi_bounds)
+        AND TRY_CAST(longitude AS DOUBLE) BETWEEN (SELECT min_lng FROM poi_bounds) AND (SELECT max_lng FROM poi_bounds)
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${dateWhere}
-    ),
-    poi_base AS (
-      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
-        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
-      FROM ${poiTableName} p
-      WHERE p.category IS NOT NULL
-        ${catFilter}
-        ${countryFilter}
     ),
     poi_buckets AS (
       SELECT poi_id, category, poi_lat, poi_lng,
@@ -196,6 +208,23 @@ export function buildSpatialJoinQueries(
   // CTAS-compatible version: no ORDER BY (not supported in CTAS), no NULL origin columns
   const spatialSelectForCTAS = `
     WITH
+    poi_base AS (
+      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
+        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
+      FROM ${poiTableName} p
+      WHERE p.category IS NOT NULL
+        ${catFilter}
+        ${countryFilter}
+    ),
+    poi_bounds AS (
+      SELECT
+        MIN(poi_lat) - ${BBOX_BUFFER} as min_lat,
+        MAX(poi_lat) + ${BBOX_BUFFER} as max_lat,
+        MIN(poi_lng) - ${BBOX_BUFFER} as min_lng,
+        MAX(poi_lng) + ${BBOX_BUFFER} as max_lng
+      FROM poi_base
+    ),
     pings AS (
       SELECT
         ad_id,
@@ -208,18 +237,11 @@ export function buildSpatialJoinQueries(
       FROM ${tableName}
       WHERE TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(latitude AS DOUBLE) BETWEEN (SELECT min_lat FROM poi_bounds) AND (SELECT max_lat FROM poi_bounds)
+        AND TRY_CAST(longitude AS DOUBLE) BETWEEN (SELECT min_lng FROM poi_bounds) AND (SELECT max_lng FROM poi_bounds)
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${dateWhere}
-    ),
-    poi_base AS (
-      SELECT id as poi_id, category, latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
-        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
-      FROM ${poiTableName} p
-      WHERE p.category IS NOT NULL
-        ${catFilter}
-        ${countryFilter}
     ),
     poi_buckets AS (
       SELECT poi_id, category, poi_lat, poi_lng,

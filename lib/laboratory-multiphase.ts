@@ -21,6 +21,7 @@ import {
   runQueryViaS3,
   ensureTableForDataset,
   dropTempTable,
+  cleanupTempS3,
 } from './athena';
 import {
   buildSpatialJoinQueries,
@@ -175,6 +176,15 @@ export async function analyzeLaboratoryMultiPhase(
     return state;
   } catch (error: any) {
     console.error(`[LAB-MP] ${datasetName} error:`, error.message);
+    // Clean up any partial temp data on failure
+    if (state?.spatialTableName) {
+      dropTempTable(state.spatialTableName).catch(() => {});
+      cleanupTempS3(state.spatialTableName).catch(() => {});
+    }
+    if (state?.originsTableName) {
+      dropTempTable(state.originsTableName).catch(() => {});
+      cleanupTempS3(state.originsTableName).catch(() => {});
+    }
     const errorState: LaboratoryState = {
       ...(state || {
         datasetName,
@@ -282,8 +292,12 @@ async function phaseSpatialRunning(state: LaboratoryState): Promise<LaboratorySt
 
   console.log(`[LAB-MP] ${datasetName}: spatial=${spatialStatus.state}, total=${totalStatus.state}`);
 
-  // Check for failures
+  // Check for failures — clean up partial S3 data from failed CTAS
   if (spatialStatus.state === 'FAILED') {
+    if (state.spatialTableName) {
+      dropTempTable(state.spatialTableName).catch(() => {});
+      cleanupTempS3(state.spatialTableName).catch(() => {});
+    }
     throw new Error(`Spatial join query failed: ${spatialStatus.error}`);
   }
   if (totalStatus.state === 'FAILED') {
@@ -349,6 +363,10 @@ async function phaseOriginsRunning(state: LaboratoryState): Promise<LaboratorySt
   console.log(`[LAB-MP] ${datasetName}: origins=${originsStatus.state}`);
 
   if (originsStatus.state === 'FAILED') {
+    if (state.originsTableName) {
+      dropTempTable(state.originsTableName).catch(() => {});
+      cleanupTempS3(state.originsTableName).catch(() => {});
+    }
     throw new Error(`Origins query failed: ${originsStatus.error}`);
   }
 

@@ -25,7 +25,7 @@ import {
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60;
+export const maxDuration = 120; // Phase 1 POI table + 6 queries, Phase 4 geocoding can be slow
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
 const REPORT_KEY = (ds: string, type: string) => `dataset-reports/${ds}/${type}`;
