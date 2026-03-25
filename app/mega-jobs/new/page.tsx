@@ -33,6 +33,9 @@ export default function NewMegaJobPage() {
   const [name, setName] = useState('')
   const [collections, setCollections] = useState<POICollection[]>([])
   const [selectedCollections, setSelectedCollections] = useState<string[]>([])
+  const [jobType, setJobType] = useState('pings')
+  const [radius, setRadius] = useState(1000)
+  const [schema, setSchema] = useState<'BASIC' | 'FULL'>('BASIC')
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [splitPreview, setSplitPreview] = useState<any>(null)
@@ -81,6 +84,9 @@ export default function NewMegaJobPage() {
           name,
           poiCollectionIds: selectedCollections,
           dateRange: { from: dateFrom, to: dateTo },
+          type: jobType,
+          radius,
+          schema,
         }),
       })
       const data = await res.json()
@@ -259,6 +265,44 @@ export default function NewMegaJobPage() {
                   <div>
                     <Label>To</Label>
                     <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-4">
+                  <div>
+                    <Label>Job Type</Label>
+                    <select
+                      className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                      value={jobType}
+                      onChange={(e) => setJobType(e.target.value)}
+                    >
+                      <option value="pings">Pings</option>
+                      <option value="aggregate">Aggregate</option>
+                      <option value="devices">Devices</option>
+                      <option value="cohort">Cohort</option>
+                      <option value="pings_by_device">Pings by Device</option>
+                    </select>
+                  </div>
+                  <div>
+                    <Label>Radius (m)</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={10000}
+                      value={radius}
+                      onChange={(e) => setRadius(Number(e.target.value))}
+                    />
+                  </div>
+                  <div>
+                    <Label>Schema</Label>
+                    <select
+                      className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                      value={schema}
+                      onChange={(e) => setSchema(e.target.value as 'BASIC' | 'FULL')}
+                    >
+                      <option value="BASIC">Basic</option>
+                      <option value="FULL">Full</option>
+                    </select>
                   </div>
                 </div>
 
