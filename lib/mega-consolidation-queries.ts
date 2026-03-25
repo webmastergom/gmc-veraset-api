@@ -606,6 +606,39 @@ export async function startConsolidatedTemporalQuery(
   return await startQueryAsync(sql);
 }
 
+// ── Q5b: Total unique devices (global COUNT DISTINCT) ─────────────────
+
+/**
+ * Single-row query: total unique devices that visited any POI across all sub-jobs.
+ * Needed because summing daily COUNT(DISTINCT) gives device-days, not unique devices.
+ */
+export async function startConsolidatedTotalDevicesQuery(
+  subJobs: Job[],
+  poiIds?: string[],
+): Promise<string> {
+  const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
+  if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for total devices query');
+
+  const poiFilter = buildPoiFilter(poiIds);
+
+  const unionParts = syncedJobs
+    .map((job) => {
+      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      return `SELECT DISTINCT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+    })
+    .join('\n      UNION\n      ');
+
+  const sql = `
+    SELECT COUNT(*) as total_unique_devices
+    FROM (
+      ${unionParts}
+    )
+  `;
+
+  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query across ${syncedJobs.length} tables`);
+  return await startQueryAsync(sql);
+}
+
 // ── Q6: MAIDs (unique device IDs) ──────────────────────────────────────
 
 /**

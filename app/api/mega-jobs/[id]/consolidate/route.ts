@@ -18,6 +18,7 @@ import {
   startConsolidatedCatchmentQuery,
   startConsolidatedMobilityQuery,
   startConsolidatedTemporalQuery,
+  startConsolidatedTotalDevicesQuery,
   startConsolidatedMAIDsQuery,
   extractPoiCoords,
   type PoiCoord,
@@ -42,6 +43,7 @@ interface ConsolidationState {
     catchment?: string;
     mobility?: string;
     temporal?: string;
+    totalDevices?: string;
     maids?: string;
   };
   /** Track which queries have been parsed */
@@ -139,13 +141,14 @@ export async function POST(
         console.log(`[MEGA] Extracted ${poiCoords.length} POI coordinates from ${syncedJobs.length} sub-jobs`);
 
         // Start all 7 queries in parallel (pass poiCoords for spatial proximity)
-        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, maidsQId] = await Promise.all([
+        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId] = await Promise.all([
           startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
           startConsolidatedODQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
           startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
           startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
           startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
           startConsolidatedTemporalQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
+          startConsolidatedTotalDevicesQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
           startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
         ]);
 
@@ -159,13 +162,14 @@ export async function POST(
             catchment: catchmentQId,
             mobility: mobilityQId,
             temporal: temporalQId,
+            totalDevices: totalDevicesQId,
             maids: maidsQId,
           },
           parsed: {},
         };
         await putConf(CONSOLIDATION_KEY(id), state);
 
-        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, maidsQId].filter(Boolean).length;
+        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
           progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
@@ -268,6 +272,19 @@ export async function POST(
         return parseConsolidatedMobility(id, rows);
       }, 'mobility');
 
+      // Parse total unique devices (global COUNT DISTINCT, not sum of daily)
+      let totalUniqueDevices: number | undefined;
+      if (state.queries.totalDevices) {
+        try {
+          const totalResult = await fetchQueryResults(state.queries.totalDevices);
+          totalUniqueDevices = parseInt(totalResult.rows[0]?.total_unique_devices, 10) || 0;
+          console.log(`[MEGA] Total unique devices: ${totalUniqueDevices}`);
+        } catch (err: any) {
+          console.error('[MEGA] Error parsing totalDevices:', err.message);
+          errors.push(`totalDevices: ${err.message}`);
+        }
+      }
+
       // Parse temporal
       if (state.queries.temporal) {
         await parseAndSave('temporal', state.queries.temporal, (rows) => {
@@ -276,7 +293,11 @@ export async function POST(
             pings: parseInt(row.pings, 10) || 0,
             devices: parseInt(row.devices, 10) || 0,
           })).sort((a: any, b: any) => a.date.localeCompare(b.date));
-          return buildTemporalTrends(id, [dailyData]);
+          const report = buildTemporalTrends(id, [dailyData]);
+          if (totalUniqueDevices !== undefined) {
+            (report as any).totalUniqueDevices = totalUniqueDevices;
+          }
+          return report;
         }, 'temporal');
       }
       // Temporal fallback from sub-job analyses
@@ -292,6 +313,9 @@ export async function POST(
           if (dailyDataByJob.length > 0) {
             console.log(`[MEGA] Building temporal from ${dailyDataByJob.length} sub-job analyses (fallback)`);
             const temporal = buildTemporalTrends(id, dailyDataByJob);
+            if (totalUniqueDevices !== undefined) {
+              (temporal as any).totalUniqueDevices = totalUniqueDevices;
+            }
             reportKeys.temporal = await saveConsolidatedReport(id, 'temporal', temporal);
           }
         } catch (err: any) {
