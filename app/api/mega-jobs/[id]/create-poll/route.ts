@@ -67,20 +67,24 @@ export async function POST(
       `dates=${dateChunk.from}→${dateChunk.to} pois=${poiChunk.startIndex}–${poiChunk.endIndex}`
     );
 
-    // Load POI GeoJSON and slice
+    // Load POI GeoJSON from all collections and merge
     const { getPOICollection } = await import('@/lib/poi-storage');
-    const geojson = await getPOICollection(scope.poiCollectionId);
-    if (!geojson?.features) {
-      return NextResponse.json({ error: 'POI collection GeoJSON not found' }, { status: 404 });
-    }
+    const collectionIds = scope.poiCollectionIds || (scope.poiCollectionId ? [scope.poiCollectionId] : []);
 
-    // Filter to valid Point features and slice for this chunk
-    const validFeatures = geojson.features.filter(
-      (f: any) =>
-        f.geometry?.type === 'Point' &&
-        Array.isArray(f.geometry.coordinates) &&
-        f.geometry.coordinates.length >= 2
-    );
+    const validFeatures: any[] = [];
+    for (const colId of collectionIds) {
+      const geojson = await getPOICollection(colId);
+      if (!geojson?.features) {
+        return NextResponse.json({ error: `POI collection "${colId}" GeoJSON not found` }, { status: 404 });
+      }
+      const features = geojson.features.filter(
+        (f: any) =>
+          f.geometry?.type === 'Point' &&
+          Array.isArray(f.geometry.coordinates) &&
+          f.geometry.coordinates.length >= 2
+      );
+      validFeatures.push(...features);
+    }
 
     const chunkFeatures = validFeatures.slice(poiChunk.startIndex, poiChunk.endIndex);
 
@@ -179,7 +183,7 @@ export async function POST(
       name: subJobName,
       type: scope.type,
       poiCount: chunkFeatures.length,
-      poiCollectionId: scope.poiCollectionId,
+      poiCollectionId: collectionIds[0],
       dateRange: { from: dateChunk.from, to: dateChunk.to },
       radius: scope.radius,
       schema: scope.schema as 'BASIC' | 'FULL' | 'ENHANCED' | 'N/A',

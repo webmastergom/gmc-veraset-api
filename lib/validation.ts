@@ -150,7 +150,7 @@ export const createMegaJobAutoSplitSchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().max(1000).optional(),
   country: z.string().length(2).toUpperCase().optional(),
-  poiCollectionId: z.string().min(1),
+  poiCollectionIds: z.array(z.string().min(1)).min(1),
   dateRange: z.object({
     from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD'),
     to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD'),

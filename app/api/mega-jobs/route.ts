@@ -86,21 +86,29 @@ async function handleAutoSplit(body: any, apiKeyName?: string): Promise<NextResp
     return NextResponse.json({ error: msg }, { status: 400 });
   }
 
-  // Fetch POI collection to get count
+  // Fetch POI collections to get combined count
   const { getConfig } = await import('@/lib/s3-config');
-  type Collections = Record<string, { id: string; poiCount: number; geojsonPath: string; name: string }>;
-  const collections = await getConfig<Collections>('poi-collections');
-  const collection = collections?.[data.poiCollectionId];
+  type CollectionRecord = { id: string; poiCount: number; geojsonPath: string; name: string };
+  type Collections = Record<string, CollectionRecord>;
+  const allCollections = await getConfig<Collections>('poi-collections');
 
-  if (!collection) {
-    return NextResponse.json(
-      { error: `POI collection "${data.poiCollectionId}" not found` },
-      { status: 404 }
-    );
+  const resolvedCollections: CollectionRecord[] = [];
+  for (const colId of data.poiCollectionIds) {
+    const col = allCollections?.[colId];
+    if (!col) {
+      return NextResponse.json(
+        { error: `POI collection "${colId}" not found` },
+        { status: 404 }
+      );
+    }
+    resolvedCollections.push(col);
   }
 
+  const totalPois = resolvedCollections.reduce((sum, c) => sum + c.poiCount, 0);
+  const collectionNames = resolvedCollections.map((c) => c.name).join(' + ');
+
   // Compute split plan
-  const splitPlan = computeSplitPlan(data.dateRange, collection.poiCount);
+  const splitPlan = computeSplitPlan(data.dateRange, totalPois);
 
   // Check usage quota
   const quota = await canCreateMegaJob(splitPlan.totalSubJobs);
@@ -115,7 +123,7 @@ async function handleAutoSplit(body: any, apiKeyName?: string): Promise<NextResp
     country: data.country,
     mode: 'auto-split',
     sourceScope: {
-      poiCollectionId: data.poiCollectionId,
+      poiCollectionIds: data.poiCollectionIds,
       dateRange: data.dateRange,
       radius: data.radius,
       schema: data.schema,
@@ -137,8 +145,8 @@ async function handleAutoSplit(body: any, apiKeyName?: string): Promise<NextResp
         label: `POIs ${c.startIndex + 1}–${c.endIndex}`,
       })),
       totalSubJobs: splitPlan.totalSubJobs,
-      poiCollectionName: collection.name,
-      totalPois: collection.poiCount,
+      poiCollectionName: collectionNames,
+      totalPois: totalPois,
       quotaRemaining: quota.remaining,
     },
   }, { status: 201 });

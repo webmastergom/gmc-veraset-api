@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Layers, Wand2, Link2, Calendar, MapPin, Loader2, CheckCircle2 } from 'lucide-react'
+import { Layers, Wand2, Link2, Calendar, MapPin, Loader2, CheckCircle2, X } from 'lucide-react'
 
 interface POICollection {
   id: string
@@ -32,7 +32,7 @@ export default function NewMegaJobPage() {
   // ── Auto-split state ────────────────────────────────────────────
   const [name, setName] = useState('')
   const [collections, setCollections] = useState<POICollection[]>([])
-  const [selectedCollection, setSelectedCollection] = useState('')
+  const [selectedCollections, setSelectedCollections] = useState<string[]>([])
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [splitPreview, setSplitPreview] = useState<any>(null)
@@ -67,7 +67,7 @@ export default function NewMegaJobPage() {
 
   // ── Auto-split: compute preview ─────────────────────────────────
   const handlePreview = async () => {
-    if (!name || !selectedCollection || !dateFrom || !dateTo) return
+    if (!name || selectedCollections.length === 0 || !dateFrom || !dateTo) return
     setCreating(true)
     setSplitPreview(null)
 
@@ -79,7 +79,7 @@ export default function NewMegaJobPage() {
         body: JSON.stringify({
           mode: 'auto-split',
           name,
-          poiCollectionId: selectedCollection,
+          poiCollectionIds: selectedCollections,
           dateRange: { from: dateFrom, to: dateTo },
         }),
       })
@@ -163,7 +163,16 @@ export default function NewMegaJobPage() {
     })
   }
 
-  const selectedPOICount = collections.find((c) => c.id === selectedCollection)?.poiCount || 0
+  const toggleCollection = (id: string) => {
+    setSelectedCollections((prev) =>
+      prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id]
+    )
+  }
+
+  const selectedPOICount = selectedCollections.reduce(
+    (sum, id) => sum + (collections.find((c) => c.id === id)?.poiCount || 0),
+    0
+  )
 
   return (
     <MainLayout>
@@ -199,19 +208,47 @@ export default function NewMegaJobPage() {
                 </div>
 
                 <div>
-                  <Label>POI Collection</Label>
-                  <select
-                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                    value={selectedCollection}
-                    onChange={(e) => setSelectedCollection(e.target.value)}
-                  >
-                    <option value="">Select collection...</option>
-                    {collections.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name} ({c.poiCount.toLocaleString()} POIs)
-                      </option>
-                    ))}
-                  </select>
+                  <Label>POI Collections</Label>
+                  {selectedCollections.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mb-2">
+                      {selectedCollections.map((id) => {
+                        const c = collections.find((col) => col.id === id)
+                        return c ? (
+                          <Badge key={id} variant="secondary" className="gap-1">
+                            {c.name} ({c.poiCount.toLocaleString()})
+                            <X
+                              className="h-3 w-3 cursor-pointer"
+                              onClick={() => toggleCollection(id)}
+                            />
+                          </Badge>
+                        ) : null
+                      })}
+                    </div>
+                  )}
+                  <div className="space-y-1 max-h-48 overflow-y-auto rounded-md border p-2">
+                    {collections.length === 0 ? (
+                      <p className="text-sm text-muted-foreground py-2 text-center">
+                        No collections available
+                      </p>
+                    ) : (
+                      collections.map((c) => (
+                        <div
+                          key={c.id}
+                          onClick={() => toggleCollection(c.id)}
+                          className={`flex items-center justify-between px-3 py-2 rounded cursor-pointer text-sm transition-colors ${
+                            selectedCollections.includes(c.id)
+                              ? 'bg-primary/10 border border-primary/30'
+                              : 'hover:bg-muted'
+                          }`}
+                        >
+                          <span>{c.name} ({c.poiCount.toLocaleString()} POIs)</span>
+                          {selectedCollections.includes(c.id) && (
+                            <CheckCircle2 className="h-4 w-4 text-primary" />
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
@@ -235,7 +272,7 @@ export default function NewMegaJobPage() {
 
                 <Button
                   onClick={handlePreview}
-                  disabled={!name || !selectedCollection || !dateFrom || !dateTo || creating}
+                  disabled={!name || selectedCollections.length === 0 || !dateFrom || !dateTo || creating}
                   className="w-full"
                 >
                   {creating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}

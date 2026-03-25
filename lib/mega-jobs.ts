@@ -68,7 +68,8 @@ export interface MegaJob {
 
   // Auto-split: the "big" scope the user defined
   sourceScope?: {
-    poiCollectionId: string;
+    poiCollectionId?: string;  // legacy single collection
+    poiCollectionIds: string[];
     dateRange: { from: string; to: string };
     radius: number;
     schema: 'BASIC' | 'ENHANCED' | 'FULL';
