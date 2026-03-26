@@ -14,13 +14,38 @@ const s3 = new S3Client({
 });
 
 const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
-
-/** One page per folder (max 1000) so list loads fast; use Audit for exact comparison. */
 const LIST_PAGE_SIZE = 1000;
+const SYSTEM_FOLDERS = new Set(['config', 'exports', 'pois', 'athena-results', 'staging', 'MAIDs']);
+const CONCURRENCY = 25;
+
+// ── Server-side cache (60s TTL) ──────────────────────────────────────
+let cachedDatasets: any[] | null = null;
+let cacheTimestamp = 0;
+const CACHE_TTL_MS = 60_000;
+
+/** Process a batch of promises with concurrency limit */
+async function batchProcess<T>(items: T[], fn: (item: T) => Promise<any>, concurrency: number): Promise<any[]> {
+  const results: any[] = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(fn));
+    results.push(...batchResults);
+  }
+  return results;
+}
 
 export async function GET() {
   try {
-    const jobs = await getAllJobs();
+    // Return cached if fresh
+    if (cachedDatasets && Date.now() - cacheTimestamp < CACHE_TTL_MS) {
+      return NextResponse.json({ datasets: cachedDatasets });
+    }
+
+    const [jobs, listRes] = await Promise.all([
+      getAllJobs(),
+      s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Delimiter: '/' })),
+    ]);
+
     const folderToJob = new Map<string, Job>();
     for (const job of jobs) {
       if (job.s3DestPath) {
@@ -30,20 +55,13 @@ export async function GET() {
       }
     }
 
-    const listRes = await s3.send(new ListObjectsV2Command({
-      Bucket: BUCKET,
-      Delimiter: '/',
-    }));
+    const folders = (listRes.CommonPrefixes || [])
+      .map((p) => p.Prefix?.replace('/', ''))
+      .filter((f): f is string => !!f && !SYSTEM_FOLDERS.has(f));
 
-    const datasets: any[] = [];
-    const systemFolders = ['config', 'exports', 'pois', 'athena-results'];
-
-    for (const prefix of listRes.CommonPrefixes || []) {
-      const folderName = prefix.Prefix?.replace('/', '');
-      if (!folderName || systemFolders.includes(folderName)) continue;
-
+    // Parallel S3 detail calls (25 concurrent)
+    const datasets = (await batchProcess(folders, async (folderName) => {
       const job = folderToJob.get(folderName);
-
       try {
         const detailRes = await s3.send(new ListObjectsV2Command({
           Bucket: BUCKET,
@@ -51,13 +69,13 @@ export async function GET() {
           MaxKeys: LIST_PAGE_SIZE,
         }));
         const objects = detailRes.Contents || [];
-        const parquetFiles = objects.filter((o) => o.Key && o.Key.endsWith('.parquet'));
+        const parquetFiles = objects.filter((o) => o.Key?.endsWith('.parquet'));
         const dates = [...new Set(
           objects.map((o) => o.Key?.match(/date=(\d{4}-\d{2}-\d{2})/)?.[1]).filter(Boolean)
         )].sort() as string[];
         const totalBytes = objects.reduce((sum, o) => sum + (Number(o.Size) || 0), 0);
 
-        datasets.push({
+        return {
           id: folderName,
           name: job?.name || folderName,
           jobId: job?.jobId ?? null,
@@ -74,39 +92,40 @@ export async function GET() {
           dateRangeDiscrepancy: job?.dateRangeDiscrepancy ?? null,
           verasetPayload: job?.verasetPayload ?? null,
           actualDateRange: job?.actualDateRange ?? null,
-        });
-      } catch (error) {
-        console.warn(`Error listing objects for ${folderName}:`, error);
-        if (job) {
-          datasets.push({
-            id: folderName,
-            name: job.name,
-            jobId: job.jobId,
-            type: job.type,
-            poiCount: job.poiCount,
-            external: job.external ?? false,
-            objectCount: job.objectCount ?? 0,
-            totalBytes: job.totalBytes ?? 0,
+        };
+      } catch {
+        if (!job) return null;
+        return {
+          id: folderName,
+          name: job.name,
+          jobId: job.jobId,
+          type: job.type,
+          poiCount: job.poiCount,
+          external: job.external ?? false,
+          objectCount: job.objectCount ?? 0,
+          totalBytes: job.totalBytes ?? 0,
           dateRange: job.dateRange,
           lastModified: job.syncedAt || job.createdAt,
           syncedAt: job.syncedAt ?? null,
           dateRangeDiscrepancy: job.dateRangeDiscrepancy ?? null,
           verasetPayload: job.verasetPayload ?? null,
           actualDateRange: job.actualDateRange ?? null,
-        });
-        }
+        };
       }
-    }
+    }, CONCURRENCY)).filter(Boolean);
 
-    // Sort by sync date descending (most recently synced first)
-    datasets.sort((a, b) => {
+    // Sort by sync date descending
+    datasets.sort((a: any, b: any) => {
       const dateA = a.syncedAt || a.lastModified || '0000';
       const dateB = b.syncedAt || b.lastModified || '0000';
       return dateB.localeCompare(dateA);
     });
 
-    return NextResponse.json({ datasets });
+    // Cache
+    cachedDatasets = datasets;
+    cacheTimestamp = Date.now();
 
+    return NextResponse.json({ datasets });
   } catch (error: any) {
     console.error('GET /api/datasets error:', error);
     return NextResponse.json(

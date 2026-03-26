@@ -49,6 +49,8 @@ export default function JobsPage() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [viewMode, setViewMode] = useState<ViewMode>('modern');
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 20;
 
   useEffect(() => {
     fetch('/api/jobs', {
@@ -96,6 +98,13 @@ export default function JobsPage() {
       job.status.toLowerCase().includes(query)
     );
   }, [jobs, searchQuery]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery]);
+
+  const totalPages = Math.ceil(filteredJobs.length / PAGE_SIZE);
+  const paginatedJobs = filteredJobs.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   if (loading) {
     return (
@@ -168,8 +177,9 @@ export default function JobsPage() {
         </Card>
       ) : viewMode === 'modern' ? (
         /* Modern View - Grid Cards */
+        <>
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {filteredJobs.map((job) => (
+          {paginatedJobs.map((job) => (
             <Card key={job.id} className="bg-[#111] border-[#1a1a1a] hover:border-[#333] transition-colors">
               <CardHeader>
                 <div className="flex items-start justify-between">
@@ -247,8 +257,22 @@ export default function JobsPage() {
             </Card>
           ))}
         </div>
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between mt-4">
+            <p className="text-sm text-muted-foreground">
+              Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredJobs.length)} of {filteredJobs.length}
+            </p>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setCurrentPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</Button>
+              <span className="text-sm text-muted-foreground px-2">Page {currentPage} of {totalPages}</span>
+              <Button variant="outline" size="sm" onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>Next</Button>
+            </div>
+          </div>
+        )}
+        </>
       ) : (
         /* Classic View - Table */
+        <>
         <Card className="bg-[#111] border-[#1a1a1a]">
           <CardHeader>
             <CardTitle className="text-white">All Jobs</CardTitle>
@@ -269,7 +293,7 @@ export default function JobsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredJobs.map((job) => (
+                  {paginatedJobs.map((job) => (
                     <tr key={job.id} className="border-b border-[#1a1a1a] hover:bg-[#151515]">
                       <td className="p-4">
                         <div className="flex items-center gap-2">
@@ -344,6 +368,19 @@ export default function JobsPage() {
             </div>
           </CardContent>
         </Card>
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between mt-4">
+            <p className="text-sm text-muted-foreground">
+              Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredJobs.length)} of {filteredJobs.length}
+            </p>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setCurrentPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</Button>
+              <span className="text-sm text-muted-foreground px-2">Page {currentPage} of {totalPages}</span>
+              <Button variant="outline" size="sm" onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>Next</Button>
+            </div>
+          </div>
+        )}
+        </>
       )}
     </MainLayout>
   )

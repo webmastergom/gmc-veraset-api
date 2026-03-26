@@ -134,6 +134,8 @@ export default function DatasetsPage() {
   } | null>(null);
 
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 20;
 
   useEffect(() => {
     fetch('/api/datasets', { credentials: 'include' })
@@ -191,6 +193,12 @@ export default function DatasetsPage() {
 
     return result;
   }, [datasets, searchQuery, sortField, sortDirection]);
+
+  // Reset page when filters change
+  useEffect(() => { setCurrentPage(1); }, [searchQuery, sortField, sortDirection]);
+
+  const totalPages = Math.ceil(filteredDatasets.length / PAGE_SIZE);
+  const paginatedDatasets = filteredDatasets.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   const toggleSort = (field: SortField) => {
     if (sortField === field) {
@@ -384,7 +392,7 @@ export default function DatasetsPage() {
       ) : viewMode === 'modern' ? (
         /* Modern View - Cards */
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {filteredDatasets.map((ds) => (
+          {paginatedDatasets.map((ds) => (
             <Card key={ds.id} className="bg-[#111] border-[#1a1a1a] hover:border-[#333] transition-colors">
               <CardHeader>
                 <div className="flex items-center justify-between">
@@ -544,7 +552,7 @@ export default function DatasetsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filteredDatasets.map((ds) => (
+              {paginatedDatasets.map((ds) => (
                 <TableRow key={ds.id} className="border-[#222] hover:bg-[#1a1a1a]">
                   <TableCell>
                     <div className="flex items-center gap-2">
@@ -643,6 +651,36 @@ export default function DatasetsPage() {
             </TableBody>
           </Table>
         </Card>
+      )}
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between mt-4">
+          <p className="text-sm text-muted-foreground">
+            Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredDatasets.length)} of {filteredDatasets.length} datasets
+          </p>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+              disabled={currentPage === 1}
+            >
+              Previous
+            </Button>
+            <span className="text-sm text-muted-foreground px-2">
+              Page {currentPage} of {totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+              disabled={currentPage === totalPages}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
       )}
 
       {exportDatasetId && (

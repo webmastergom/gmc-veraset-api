@@ -24,6 +24,8 @@ export default function POIsPage() {
   const { toast } = useToast()
   const [collections, setCollections] = useState<POICollection[]>([])
   const [loading, setLoading] = useState(true)
+  const [currentPage, setCurrentPage] = useState(1)
+  const PAGE_SIZE = 20
 
   const fetchCollections = async () => {
     try {
@@ -103,26 +105,45 @@ export default function POIsPage() {
         </div>
       </div>
 
-      {loading ? (
-        <div className="flex items-center justify-center py-16">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-        </div>
-      ) : collections.length === 0 ? (
-        <div className="text-center py-16 text-muted-foreground">
-          <p className="text-lg">No POI collections yet</p>
-          <p className="text-sm mt-2">Upload or import POIs to get started</p>
-        </div>
-      ) : (
-        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-          {collections.map((collection) => (
-            <CollectionCard
-              key={collection.id}
-              collection={collection}
-              onDelete={handleDelete}
-            />
-          ))}
-        </div>
-      )}
+      {(() => {
+        const totalPages = Math.ceil(collections.length / PAGE_SIZE);
+        const paginatedCollections = collections.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
+        return loading ? (
+          <div className="flex items-center justify-center py-16">
+            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+          </div>
+        ) : collections.length === 0 ? (
+          <div className="text-center py-16 text-muted-foreground">
+            <p className="text-lg">No POI collections yet</p>
+            <p className="text-sm mt-2">Upload or import POIs to get started</p>
+          </div>
+        ) : (
+          <>
+            <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+              {paginatedCollections.map((collection) => (
+                <CollectionCard
+                  key={collection.id}
+                  collection={collection}
+                  onDelete={handleDelete}
+                />
+              ))}
+            </div>
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between mt-4">
+                <p className="text-sm text-muted-foreground">
+                  Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, collections.length)} of {collections.length}
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setCurrentPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</Button>
+                  <span className="text-sm text-muted-foreground px-2">Page {currentPage} of {totalPages}</span>
+                  <Button variant="outline" size="sm" onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>Next</Button>
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
     </MainLayout>
   )
 }
