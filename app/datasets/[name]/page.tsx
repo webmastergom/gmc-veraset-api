@@ -194,21 +194,16 @@ export default function DatasetAnalysisPage() {
   };
 
   // ── Unified "Analyze" button ────────────────────────────────────
-  // Runs basic analysis (cached, no dwell — for visitsByPoi + movement map)
-  // AND full reports (always fresh, with dwell filter applied to all queries).
-  // Summary cards come from full reports (temporal), not basic analysis.
+  // Single flow: only generateReportsOnly (with dwell filter).
+  // Summary stats come from temporal report (totalPings, totalUniqueDevices).
+  // No parallel basic analysis — avoids 429s and inconsistent stats.
   const runFullAnalysis = async () => {
     setLoading(true);
     setGeneratingReports(true);
     setReportProgress({ step: 'starting', percent: 0, message: 'Starting analysis...' });
 
     try {
-      // Fire both: basic analysis uses S3 cache so it's fast,
-      // full reports always regenerate with current dwell filter
-      await Promise.all([
-        runAnalysisOnly().catch(() => {}), // non-fatal, just for visitsByPoi
-        generateReportsOnly(),
-      ]);
+      await generateReportsOnly();
     } finally {
       setLoading(false);
     }
