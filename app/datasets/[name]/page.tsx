@@ -193,18 +193,22 @@ export default function DatasetAnalysisPage() {
     }
   };
 
-  // ── Unified: Run analysis first, then generate full reports ─────
+  // ── Unified "Analyze" button ────────────────────────────────────
+  // Runs basic analysis (cached, no dwell — for visitsByPoi + movement map)
+  // AND full reports (always fresh, with dwell filter applied to all queries).
+  // Summary cards come from full reports (temporal), not basic analysis.
   const runFullAnalysis = async () => {
     setLoading(true);
     setGeneratingReports(true);
-    setReportProgress({ step: 'starting', percent: 0, message: 'Running basic analysis...' });
-    setAnalysis(null);
+    setReportProgress({ step: 'starting', percent: 0, message: 'Starting analysis...' });
 
     try {
-      // Run analysis first (fast), then full reports (slow)
-      await runAnalysisOnly();
-      setReportProgress({ step: 'starting', percent: 10, message: 'Starting full report generation...' });
-      await generateReportsOnly();
+      // Fire both: basic analysis uses S3 cache so it's fast,
+      // full reports always regenerate with current dwell filter
+      await Promise.all([
+        runAnalysisOnly().catch(() => {}), // non-fatal, just for visitsByPoi
+        generateReportsOnly(),
+      ]);
     } finally {
       setLoading(false);
     }
