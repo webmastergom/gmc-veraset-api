@@ -41,10 +41,12 @@ export async function GET() {
       return NextResponse.json({ datasets: cachedDatasets });
     }
 
-    const [jobs, listRes] = await Promise.all([
-      getAllJobs(),
+    let jobs: Job[] = [];
+    const [jobsResult, listRes] = await Promise.all([
+      getAllJobs().catch((e) => { console.error('[DATASETS] getAllJobs failed:', e.message); return [] as Job[]; }),
       s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Delimiter: '/' })),
     ]);
+    jobs = jobsResult;
 
     const folderToJob = new Map<string, Job>();
     for (const job of jobs) {

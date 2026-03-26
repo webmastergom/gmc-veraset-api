@@ -167,11 +167,15 @@ export default function DatasetAnalysisPage() {
   // ── Run analysis (basic stats) ──────────────────────────────────
   const runAnalysisOnly = async () => {
     try {
-      const poll = async (): Promise<AnalysisResult> => {
+      const poll = async (retries = 0): Promise<AnalysisResult> => {
         const res = await fetch(`/api/datasets/${datasetName}/analyze/poll`, {
           method: 'POST',
           credentials: 'include',
         });
+        if (res.status === 429 && retries < 10) {
+          await new Promise(r => setTimeout(r, 3000 + retries * 2000));
+          return poll(retries + 1);
+        }
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.error || err.details || `HTTP ${res.status}`);
@@ -179,7 +183,7 @@ export default function DatasetAnalysisPage() {
         const state = await res.json();
         if (state.status === 'error') throw new Error(state.error || state.progress?.message || 'Analysis failed');
         if (state.status === 'completed' && state.result) return state.result as AnalysisResult;
-        await new Promise(r => setTimeout(r, 2500));
+        await new Promise(r => setTimeout(r, 3000));
         return poll();
       };
       const data = await poll();
@@ -189,18 +193,18 @@ export default function DatasetAnalysisPage() {
     }
   };
 
-  // ── Unified: Run analysis + Generate full reports in parallel ───
+  // ── Unified: Run analysis first, then generate full reports ─────
   const runFullAnalysis = async () => {
     setLoading(true);
     setGeneratingReports(true);
-    setReportProgress({ step: 'starting', percent: 0, message: 'Starting analysis + full report...' });
+    setReportProgress({ step: 'starting', percent: 0, message: 'Running basic analysis...' });
     setAnalysis(null);
 
     try {
-      await Promise.all([
-        runAnalysisOnly(),
-        generateReportsOnly(),
-      ]);
+      // Run analysis first (fast), then full reports (slow)
+      await runAnalysisOnly();
+      setReportProgress({ step: 'starting', percent: 10, message: 'Starting full report generation...' });
+      await generateReportsOnly();
     } finally {
       setLoading(false);
     }
@@ -237,6 +241,12 @@ export default function DatasetAnalysisPage() {
           // Network error or timeout — retry
           console.warn(`[REPORT-POLL] Fetch failed (attempt ${attempts}):`, fetchErr.message);
           await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
+
+        if (res.status === 429) {
+          console.warn(`[REPORT-POLL] Rate limited (attempt ${attempts}), backing off...`);
+          await new Promise((r) => setTimeout(r, 5000 + attempts * 1000));
           continue;
         }
 
