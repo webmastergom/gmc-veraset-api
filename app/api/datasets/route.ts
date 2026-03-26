@@ -4,6 +4,7 @@ import { getAllJobs, Job } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+export const maxDuration = 60;
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || 'us-west-2',
