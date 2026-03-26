@@ -468,8 +468,9 @@ export async function runQueryViaS3(sql: string): Promise<QueryResult> {
  * Athena table names must start with a letter and use only [a-z0-9_].
  */
 export function tempTableName(base: string, runId: string): string {
-  const safe = runId.replace(/-/g, '_');
-  return `temp_${base}_${safe}`;
+  const safeBase = base.replace(/-/g, '_');
+  const safeRun = runId.replace(/-/g, '_');
+  return `temp_${safeBase}_${safeRun}`;
 }
 
 /**
