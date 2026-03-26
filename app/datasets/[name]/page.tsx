@@ -249,7 +249,7 @@ export default function DatasetAnalysisPage() {
           continue;
         }
 
-        if (!res.ok && res.status >= 500) {
+        if (!res.ok) {
           const text = await res.text();
           let errMsg: string;
           try {
@@ -260,11 +260,12 @@ export default function DatasetAnalysisPage() {
           }
           console.error(`[REPORT-POLL] ${res.status}:`, errMsg);
           // Retry on server errors (Vercel timeouts, transient failures)
-          if (attempts < 5) {
+          if (res.status >= 500 && attempts < 5) {
             await new Promise((r) => setTimeout(r, 5000));
             continue;
           }
           setReportProgress({ step: 'error', percent: 0, message: `Error: ${errMsg}` });
+          toast({ title: 'Report generation failed', description: errMsg, variant: 'destructive' });
           break;
         }
 
@@ -513,13 +514,32 @@ export default function DatasetAnalysisPage() {
       {generatingReports && reportProgress && (
         <Card className="mb-6">
           <CardContent className="py-4">
-            <div className="space-y-2">
+            <div className="space-y-3">
               <Progress value={reportProgress.percent} className="h-2" />
               <div className="flex items-center gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                <span className="text-muted-foreground">{reportProgress.message}</span>
-                <span className="ml-auto text-muted-foreground">{reportProgress.percent}%</span>
+                <span className="font-medium">{reportProgress.message}</span>
+                <span className="ml-auto font-mono text-muted-foreground">{reportProgress.percent}%</span>
               </div>
+              {(reportProgress as any).detail && (
+                <div className="text-xs text-muted-foreground">
+                  {(reportProgress as any).detail}
+                </div>
+              )}
+              {(reportProgress as any).completedNames?.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {(reportProgress as any).completedNames.map((n: string) => (
+                    <span key={n} className="inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2 py-0.5 text-xs text-green-400">
+                      ✓ {n}
+                    </span>
+                  ))}
+                  {(reportProgress as any).runningNames?.map((n: string) => (
+                    <span key={n} className="inline-flex items-center gap-1 rounded-full bg-yellow-500/10 px-2 py-0.5 text-xs text-yellow-400 animate-pulse">
+                      ⟳ {n}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>

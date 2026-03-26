@@ -230,12 +230,26 @@ export async function POST(
         // Save state with removed failed queries
         await saveState(datasetName, state);
         const runningCount = queryEntries.length - doneCount;
+        const totalQ = queryEntries.length;
+        // Build detail of which queries finished
+        const completedNames = statusResults
+          .filter(r => r.state === 'SUCCEEDED')
+          .map(r => r.name.charAt(0).toUpperCase() + r.name.slice(1));
+        const runningNames = statusResults
+          .filter(r => r.state === 'RUNNING' || r.state === 'QUEUED')
+          .map(r => r.name.charAt(0).toUpperCase() + r.name.slice(1));
+        const detail = runningNames.length > 0
+          ? `Running: ${runningNames.join(', ')}`
+          : '';
         return NextResponse.json({
           phase: 'polling',
           progress: {
             step: 'polling_queries',
-            percent: 10 + Math.round((doneCount / queryEntries.length) * 30),
-            message: `Queries: ${doneCount} done, ${runningCount} running...`,
+            percent: 10 + Math.round((doneCount / totalQ) * 30),
+            message: `Athena queries: ${doneCount}/${totalQ} complete`,
+            detail,
+            completedNames,
+            runningNames,
           },
         });
       }
