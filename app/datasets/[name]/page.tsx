@@ -81,6 +81,18 @@ interface AnalysisResult {
   visitsByPoi: VisitByPoi[];
 }
 
+const DWELL_BUCKET_OPTIONS = [
+  { value: 0, label: 'All visits' },
+  { value: 2, label: '2+ min' },
+  { value: 5, label: '5+ min' },
+  { value: 10, label: '10+ min' },
+  { value: 15, label: '15+ min' },
+  { value: 30, label: '30+ min' },
+  { value: 60, label: '1+ hour' },
+  { value: 120, label: '2+ hours' },
+  { value: 180, label: '3+ hours' },
+];
+
 function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]) {
   const line = (arr: (string | number)[]) =>
     arr.map((c) => (typeof c === 'string' && (c.includes(',') || c.includes('"')) ? `"${c.replace(/"/g, '""')}"` : c)).join(',');
@@ -117,8 +129,7 @@ export default function DatasetAnalysisPage() {
   const [reportProgress, setReportProgress] = useState<{ step: string; percent: number; message: string } | null>(null);
 
   // Dwell filter
-  const [dwellMin, setDwellMin] = useState<string>('');
-  const [dwellMax, setDwellMax] = useState<string>('');
+  const [selectedBucket, setSelectedBucket] = useState<number>(0);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
@@ -145,8 +156,8 @@ export default function DatasetAnalysisPage() {
       .catch(console.error);
   }, [datasetName]);
 
-  // Load saved reports on mount
-  useEffect(() => {
+  // Load reports for a specific dwell bucket
+  const loadReportsForBucket = (bucket: number) => {
     const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -155,13 +166,17 @@ export default function DatasetAnalysisPage() {
       mobility: setMobilityReport,
       temporal: setTemporalReport,
     };
-
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}&bucket=${bucket}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
     }
+  };
+
+  // Load saved reports on mount
+  useEffect(() => {
+    loadReportsForBucket(selectedBucket);
   }, [datasetName, reportVersion]);
 
   // ── Run analysis (basic stats) ──────────────────────────────────
@@ -228,12 +243,6 @@ export default function DatasetAnalysisPage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
-              ...(dwellMin || dwellMax ? {
-                dwellFilter: {
-                  ...(dwellMin ? { minMinutes: parseFloat(dwellMin) } : {}),
-                  ...(dwellMax ? { maxMinutes: parseFloat(dwellMax) } : {}),
-                }
-              } : {}),
             }),
           });
         } catch (fetchErr: any) {
@@ -467,22 +476,20 @@ export default function DatasetAnalysisPage() {
         <h2 className="text-xl font-semibold">Data analysis</h2>
         <div className="flex flex-wrap gap-2 items-center">
           <div className="flex items-center gap-2 mr-2">
-            <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell (min):</label>
-            <input
-              type="number"
-              placeholder="Min"
-              value={dwellMin}
-              onChange={(e) => setDwellMin(e.target.value)}
-              className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
-            />
-            <span className="text-xs text-muted-foreground">-</span>
-            <input
-              type="number"
-              placeholder="Max"
-              value={dwellMax}
-              onChange={(e) => setDwellMax(e.target.value)}
-              className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
-            />
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell filter:</label>
+            <select
+              value={selectedBucket}
+              onChange={(e) => {
+                const bucket = parseInt(e.target.value, 10);
+                setSelectedBucket(bucket);
+                loadReportsForBucket(bucket);
+              }}
+              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+            >
+              {DWELL_BUCKET_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
           </div>
           <Button onClick={runFullAnalysis} disabled={loading || generatingReports}>
             {loading || generatingReports ? (
@@ -526,16 +533,22 @@ export default function DatasetAnalysisPage() {
                   {(reportProgress as any).detail}
                 </div>
               )}
-              {(reportProgress as any).completedNames?.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {(reportProgress as any).completedNames.map((n: string) => (
-                    <span key={n} className="inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2 py-0.5 text-xs text-green-400">
-                      ✓ {n}
+              {/* Dwell bucket status grid */}
+              {((reportProgress as any).completedBuckets || (reportProgress as any).runningBuckets || (reportProgress as any).pendingBuckets) && (
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {(reportProgress as any).completedBuckets?.map((b: number) => (
+                    <span key={`c-${b}`} className="inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2.5 py-0.5 text-xs text-green-400">
+                      ✓ {DWELL_BUCKET_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
                     </span>
                   ))}
-                  {(reportProgress as any).runningNames?.map((n: string) => (
-                    <span key={n} className="inline-flex items-center gap-1 rounded-full bg-yellow-500/10 px-2 py-0.5 text-xs text-yellow-400 animate-pulse">
-                      ⟳ {n}
+                  {(reportProgress as any).runningBuckets?.map((b: number) => (
+                    <span key={`r-${b}`} className="inline-flex items-center gap-1 rounded-full bg-yellow-500/10 px-2.5 py-0.5 text-xs text-yellow-400 animate-pulse">
+                      ⟳ {DWELL_BUCKET_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
+                    </span>
+                  ))}
+                  {(reportProgress as any).pendingBuckets?.map((b: number) => (
+                    <span key={`p-${b}`} className="inline-flex items-center gap-1 rounded-full bg-zinc-500/10 px-2.5 py-0.5 text-xs text-zinc-500">
+                      ○ {DWELL_BUCKET_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
                     </span>
                   ))}
                 </div>
