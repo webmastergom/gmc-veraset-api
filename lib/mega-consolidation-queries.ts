@@ -29,6 +29,46 @@ export interface PoiCoord {
   radiusM: number;
 }
 
+/** Dwell time filter for reports (min/max minutes at POI). */
+export interface DwellFilter {
+  minMinutes?: number;
+  maxMinutes?: number;
+}
+
+/**
+ * Build dwell time filter CTEs.
+ * Computes dwell = time between first and last ping at POI per (ad_id, date).
+ * Returns SQL fragment with visit_dwell + dwell_filtered CTEs.
+ * If no filter provided, returns empty string (no filtering).
+ */
+function buildDwellFilterCTEs(dwell?: DwellFilter): string {
+  if (!dwell || (dwell.minMinutes == null && dwell.maxMinutes == null)) return '';
+
+  const conditions: string[] = [];
+  if (dwell.minMinutes != null) conditions.push(`dwell_minutes >= ${dwell.minMinutes}`);
+  if (dwell.maxMinutes != null) conditions.push(`dwell_minutes <= ${dwell.maxMinutes}`);
+
+  return `,
+    visit_dwell AS (
+      SELECT ad_id, date,
+        ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    dwell_filtered AS (
+      SELECT ad_id, date FROM visit_dwell
+      WHERE ${conditions.join(' AND ')}
+    )`;
+}
+
+/**
+ * Returns the correct visitor CTE name based on whether dwell filter is active.
+ * When dwell filter is active, queries should JOIN against dwell_filtered.
+ */
+function hasDwellFilter(dwell?: DwellFilter): boolean {
+  return !!(dwell && (dwell.minMinutes != null || dwell.maxMinutes != null));
+}
+
 /**
  * Extract POI coordinates from job metadata.
  * Prefers verasetPayload.geo_radius (has distance_in_meters), falls back to externalPois.
@@ -128,6 +168,7 @@ export async function startConsolidatedODQuery(
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for OD query');
@@ -143,6 +184,12 @@ export async function startConsolidatedODQuery(
 
   if (poiCoords?.length) {
     // ── Spatial proximity approach (correct) ──
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    const useDwell = hasDwellFilter(dwell);
+    const poiVisitSource = useDwell
+      ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
+      : `at_poi_pings`;
+
     sql = `
     WITH
     all_pings AS (
@@ -151,14 +198,14 @@ export async function startConsolidatedODQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)},
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs},
     poi_visits AS (
       SELECT
-        ad_id,
-        date,
-        MIN(utc_timestamp) as first_poi_visit
-      FROM at_poi_pings
-      GROUP BY ad_id, date
+        ${useDwell ? 'a.' : ''}ad_id,
+        ${useDwell ? 'a.' : ''}date,
+        MIN(${useDwell ? 'a.' : ''}utc_timestamp) as first_poi_visit
+      FROM ${poiVisitSource}
+      GROUP BY ${useDwell ? 'a.' : ''}ad_id, ${useDwell ? 'a.' : ''}date
     ),
     device_day AS (
       SELECT
@@ -259,6 +306,7 @@ export async function startConsolidatedHourlyQuery(
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for hourly query');
@@ -273,6 +321,12 @@ export async function startConsolidatedHourlyQuery(
       `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
     );
 
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    const useDwell = hasDwellFilter(dwell);
+    const hourlySource = useDwell
+      ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
+      : `at_poi_pings`;
+
     sql = `
     WITH
     all_pings AS (
@@ -281,13 +335,13 @@ export async function startConsolidatedHourlyQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
     SELECT
-      HOUR(utc_timestamp) as touch_hour,
+      HOUR(${useDwell ? 'a.' : ''}utc_timestamp) as touch_hour,
       COUNT(*) as pings,
-      COUNT(DISTINCT ad_id) as devices
-    FROM at_poi_pings
-    GROUP BY HOUR(utc_timestamp)
+      COUNT(DISTINCT ${useDwell ? 'a.' : ''}ad_id) as devices
+    FROM ${hourlySource}
+    GROUP BY HOUR(${useDwell ? 'a.' : ''}utc_timestamp)
     ORDER BY touch_hour
     `;
   } else {
@@ -332,6 +386,7 @@ export async function startConsolidatedCatchmentQuery(
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for catchment query');
@@ -346,6 +401,9 @@ export async function startConsolidatedCatchmentQuery(
   let visitorsCTE: string;
   if (poiCoords?.length) {
     // Use spatial proximity to identify visitors
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    const useDwell = hasDwellFilter(dwell);
+
     visitorsCTE = `
     all_pings_raw AS (
       SELECT ad_id, date, utc_timestamp, lat, lng
@@ -353,9 +411,11 @@ export async function startConsolidatedCatchmentQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)},
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)}${dwellCTEs},
     poi_visitors AS (
-      SELECT DISTINCT ad_id FROM at_poi_pings
+      ${useDwell
+        ? `SELECT DISTINCT ad_id FROM dwell_filtered`
+        : `SELECT DISTINCT ad_id FROM at_poi_pings`}
     ),
     valid_pings AS (
       SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
@@ -431,6 +491,7 @@ export async function startConsolidatedMobilityQuery(
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for mobility query');
@@ -445,6 +506,12 @@ export async function startConsolidatedMobilityQuery(
   let visitTimeCTE: string;
   if (poiCoords?.length) {
     // Use spatial proximity for actual visit time
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    const useDwell = hasDwellFilter(dwell);
+    const targetVisitSource = useDwell
+      ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
+      : `at_poi_pings`;
+
     visitTimeCTE = `
     all_pings_raw AS (
       SELECT ad_id, date, utc_timestamp, lat, lng
@@ -452,14 +519,14 @@ export async function startConsolidatedMobilityQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)},
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)}${dwellCTEs},
     target_visits AS (
       SELECT
-        ad_id,
-        date,
-        MIN(utc_timestamp) as visit_time
-      FROM at_poi_pings
-      GROUP BY ad_id, date
+        ${useDwell ? 'a.' : ''}ad_id,
+        ${useDwell ? 'a.' : ''}date,
+        MIN(${useDwell ? 'a.' : ''}utc_timestamp) as visit_time
+      FROM ${targetVisitSource}
+      GROUP BY ${useDwell ? 'a.' : ''}ad_id, ${useDwell ? 'a.' : ''}date
     ),
     all_pings AS (
       SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
@@ -576,21 +643,53 @@ export async function startConsolidatedMobilityQuery(
 export async function startConsolidatedTemporalQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for temporal query');
 
-  const poiFilter = buildPoiFilter(poiIds);
+  const useDwell = hasDwellFilter(dwell);
+  let sql: string;
 
-  // All pings with POI visits
-  const poiPingsUnion = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT date, ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION ALL\n      ');
+  if (useDwell && poiCoords?.length) {
+    // Spatial + dwell filter path
+    const allPingsUnion = buildUnionAll(
+      syncedJobs,
+      'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+      `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    );
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
 
-  const sql = `
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    SELECT
+      a.date,
+      COUNT(*) as pings,
+      COUNT(DISTINCT a.ad_id) as devices
+    FROM at_poi_pings a
+    INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date
+    GROUP BY a.date
+    ORDER BY a.date
+    `;
+  } else {
+    // Original poi_ids path (no dwell filter)
+    const poiFilter = buildPoiFilter(poiIds);
+    const poiPingsUnion = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT date, ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    sql = `
     SELECT
       date,
       COUNT(*) as pings,
@@ -600,9 +699,10 @@ export async function startConsolidatedTemporalQuery(
     )
     GROUP BY date
     ORDER BY date
-  `;
+    `;
+  }
 
-  console.log(`[MEGA-TEMPORAL] Starting temporal query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-TEMPORAL] Starting temporal query across ${syncedJobs.length} tables (dwell=${useDwell})`);
   return await startQueryAsync(sql);
 }
 
@@ -615,27 +715,55 @@ export async function startConsolidatedTemporalQuery(
 export async function startConsolidatedTotalDevicesQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for total devices query');
 
-  const poiFilter = buildPoiFilter(poiIds);
+  const useDwell = hasDwellFilter(dwell);
+  let sql: string;
 
-  const unionParts = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT DISTINCT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION\n      ');
+  if (useDwell && poiCoords?.length) {
+    // Spatial + dwell filter path
+    const allPingsUnion = buildUnionAll(
+      syncedJobs,
+      'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+      `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    );
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
 
-  const sql = `
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    SELECT COUNT(DISTINCT ad_id) as total_unique_devices
+    FROM dwell_filtered
+    `;
+  } else {
+    // Original poi_ids path
+    const poiFilter = buildPoiFilter(poiIds);
+    const unionParts = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT DISTINCT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION\n      ');
+
+    sql = `
     SELECT COUNT(*) as total_unique_devices
     FROM (
       ${unionParts}
     )
-  `;
+    `;
+  }
 
-  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query across ${syncedJobs.length} tables (dwell=${useDwell})`);
   return await startQueryAsync(sql);
 }
 
@@ -650,28 +778,132 @@ export async function startConsolidatedTotalDevicesQuery(
 export async function startConsolidatedMAIDsQuery(
   subJobs: Job[],
   poiIds?: string[],
+  poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for MAIDs query');
 
-  const poiFilter = buildPoiFilter(poiIds);
+  const useDwell = hasDwellFilter(dwell);
+  let sql: string;
 
-  const unionParts = syncedJobs
-    .map((job) => {
-      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT DISTINCT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
-    })
-    .join('\n      UNION\n      ');
+  if (useDwell && poiCoords?.length) {
+    // Spatial + dwell filter path
+    const allPingsUnion = buildUnionAll(
+      syncedJobs,
+      'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+      `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    );
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
 
-  // UNION (not UNION ALL) to deduplicate across sub-jobs
-  const sql = `
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    SELECT DISTINCT ad_id
+    FROM dwell_filtered
+    ORDER BY ad_id
+    `;
+  } else {
+    // Original poi_ids path
+    const poiFilter = buildPoiFilter(poiIds);
+    const unionParts = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT DISTINCT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION\n      ');
+
+    sql = `
     SELECT DISTINCT ad_id
     FROM (
       ${unionParts}
     )
     ORDER BY ad_id
+    `;
+  }
+
+  console.log(`[MEGA-MAIDS] Starting MAIDs query across ${syncedJobs.length} tables (dwell=${useDwell})`);
+  return await startQueryAsync(sql);
+}
+
+// ── Q7: Affinity data (per-origin visit metrics) ────────────────────────
+
+/**
+ * Build and start the affinity data query.
+ * Computes per-origin: total visits, unique devices, avg dwell, avg frequency.
+ * Results are geocoded server-side to postal codes, then scored 0-100.
+ * Requires spatial path (poiCoords) since dwell time computation needs at_poi_pings.
+ */
+export async function startConsolidatedAffinityQuery(
+  subJobs: Job[],
+  poiCoords: PoiCoord[],
+  dwell?: DwellFilter,
+): Promise<string> {
+  const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
+  if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for affinity query');
+
+  const allPingsUnion = buildUnionAll(
+    syncedJobs,
+    'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+    `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+  );
+
+  const dwellCTEs = buildDwellFilterCTEs(dwell);
+  const useDwell = hasDwellFilter(dwell);
+
+  // visit_metrics: per (ad_id, date) at the POI — dwell + origin coords
+  const visitMetricsSource = useDwell
+    ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
+    : `at_poi_pings a`;
+  const visitMetricsPrefix = 'a.';
+
+  const sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs},
+    visit_metrics AS (
+      SELECT
+        ${visitMetricsPrefix}ad_id,
+        ${visitMetricsPrefix}date,
+        ROUND(DATE_DIFF('second', MIN(${visitMetricsPrefix}utc_timestamp), MAX(${visitMetricsPrefix}utc_timestamp)) / 60.0, 1) as dwell_minutes
+      FROM ${visitMetricsSource}
+      GROUP BY ${visitMetricsPrefix}ad_id, ${visitMetricsPrefix}date
+    ),
+    device_origins AS (
+      SELECT
+        vm.ad_id,
+        vm.date,
+        vm.dwell_minutes,
+        MIN_BY(ap.lat, ap.utc_timestamp) as origin_lat,
+        MIN_BY(ap.lng, ap.utc_timestamp) as origin_lng
+      FROM visit_metrics vm
+      JOIN all_pings ap ON vm.ad_id = ap.ad_id AND vm.date = ap.date
+      GROUP BY vm.ad_id, vm.date, vm.dwell_minutes
+    )
+    SELECT
+      ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      COUNT(*) as total_visits,
+      COUNT(DISTINCT ad_id) as unique_devices,
+      AVG(dwell_minutes) as avg_dwell,
+      CAST(COUNT(*) AS DOUBLE) / NULLIF(COUNT(DISTINCT ad_id), 0) as avg_frequency
+    FROM device_origins
+    GROUP BY ROUND(origin_lat, ${COORDINATE_PRECISION}), ROUND(origin_lng, ${COORDINATE_PRECISION})
+    ORDER BY total_visits DESC
+    LIMIT 100000
   `;
 
-  console.log(`[MEGA-MAIDS] Starting MAIDs query across ${syncedJobs.length} tables`);
+  console.log(`[MEGA-AFFINITY] Starting affinity query across ${syncedJobs.length} tables (dwell=${useDwell})`);
   return await startQueryAsync(sql);
 }

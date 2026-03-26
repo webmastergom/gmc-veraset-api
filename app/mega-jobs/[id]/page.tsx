@@ -60,6 +60,11 @@ export default function MegaJobDetailPage() {
   const [hourlyReport, setHourlyReport] = useState<any>(null)
   const [catchmentReport, setCatchmentReport] = useState<any>(null)
   const [mobilityReport, setMobilityReport] = useState<any>(null)
+  const [affinityReport, setAffinityReport] = useState<any>(null)
+
+  // Dwell filter
+  const [dwellMin, setDwellMin] = useState<string>('')
+  const [dwellMax, setDwellMax] = useState<string>('')
 
   // POI filter
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([])
@@ -135,7 +140,7 @@ export default function MegaJobDetailPage() {
   useEffect(() => {
     if (megaJob?.status !== 'completed') return
 
-    const reportTypes = ['visits', 'temporal', 'od', 'hourly', 'catchment', 'mobility']
+    const reportTypes = ['visits', 'temporal', 'od', 'hourly', 'catchment', 'mobility', 'affinity']
     const setters: Record<string, (d: any) => void> = {
       visits: setVisitsReport,
       temporal: setTemporalReport,
@@ -143,6 +148,7 @@ export default function MegaJobDetailPage() {
       hourly: setHourlyReport,
       catchment: setCatchmentReport,
       mobility: setMobilityReport,
+      affinity: setAffinityReport,
     }
 
     for (const type of reportTypes) {
@@ -168,7 +174,15 @@ export default function MegaJobDetailPage() {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
+          body: JSON.stringify({
+            ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
+            ...(dwellMin || dwellMax ? {
+              dwellFilter: {
+                ...(dwellMin ? { minMinutes: parseFloat(dwellMin) } : {}),
+                ...(dwellMax ? { maxMinutes: parseFloat(dwellMax) } : {}),
+              }
+            } : {}),
+          }),
         })
         const data = await res.json()
 
@@ -259,14 +273,34 @@ export default function MegaJobDetailPage() {
           </div>
 
           {canConsolidate && (
-            <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
-              {consolidating ? (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              ) : (
-                <Play className="h-4 w-4 mr-2" />
-              )}
-              {megaJob.status === 'consolidating' ? 'Resume consolidation' : isCompleted ? 'Re-consolidate' : 'Consolidate reports'}
-            </Button>
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell (min):</label>
+                <input
+                  type="number"
+                  placeholder="Min"
+                  value={dwellMin}
+                  onChange={(e) => setDwellMin(e.target.value)}
+                  className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
+                />
+                <span className="text-xs text-muted-foreground">-</span>
+                <input
+                  type="number"
+                  placeholder="Max"
+                  value={dwellMax}
+                  onChange={(e) => setDwellMax(e.target.value)}
+                  className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
+                />
+              </div>
+              <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
+                {consolidating ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4 mr-2" />
+                )}
+                {megaJob.status === 'consolidating' ? 'Resume consolidation' : isCompleted ? 'Re-consolidate' : 'Consolidate reports'}
+              </Button>
+            </div>
           )}
         </div>
 
@@ -373,9 +407,23 @@ export default function MegaJobDetailPage() {
                 </Button>
               </a>
               {catchmentReport && (
-                <a href={`/api/mega-jobs/${id}/reports/download?type=postcodes`}>
+                <>
+                  <a href={`/api/mega-jobs/${id}/reports/download?type=catchment`}>
+                    <Button variant="outline" size="sm">
+                      <Download className="h-4 w-4 mr-1" /> Catchment
+                    </Button>
+                  </a>
+                  <a href={`/api/mega-jobs/${id}/reports/download?type=postcodes`}>
+                    <Button variant="outline" size="sm">
+                      <Download className="h-4 w-4 mr-1" /> Postal Codes
+                    </Button>
+                  </a>
+                </>
+              )}
+              {affinityReport && (
+                <a href={`/api/mega-jobs/${id}/reports/download?type=affinity`}>
                   <Button variant="outline" size="sm">
-                    <Download className="h-4 w-4 mr-1" /> Postal Codes
+                    <Download className="h-4 w-4 mr-1" /> Affinity Index
                   </Button>
                 </a>
               )}

@@ -8,6 +8,7 @@ import {
   type ConsolidatedHourlyReport,
   type ConsolidatedCatchmentReport,
   type ConsolidatedMobilityReport,
+  type ConsolidatedAffinityReport,
 } from '@/lib/mega-report-consolidation';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 
@@ -29,7 +30,7 @@ function escCsv(s: string): string {
 }
 
 /**
- * GET /api/mega-jobs/[id]/reports/download?type=visits|temporal|od|hourly|catchment|mobility
+ * GET /api/mega-jobs/[id]/reports/download?type=visits|temporal|od|hourly|catchment|mobility|maids|postcodes|affinity
  * Download consolidated report as CSV.
  */
 export async function GET(
@@ -98,9 +99,9 @@ export async function GET(
       const report = await getConsolidatedReport<ConsolidatedCatchmentReport>(id, 'catchment');
       if (!report) return NextResponse.json({ error: 'Catchment report not found' }, { status: 404 });
 
-      const header = 'zip_code,city,country,lat,lng,device_days';
+      const header = 'postal_code,city,country,devices,share_percentage';
       const rows = report.byZipCode.map((z) =>
-        `${escCsv(z.zipCode)},${escCsv(z.city)},${escCsv(z.country)},${z.lat},${z.lng},${z.deviceDays}`
+        `${escCsv(z.zipCode)},${escCsv(z.city)},${escCsv(z.country)},${z.deviceDays},${z.sharePercentage ?? 0}`
       );
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-catchment.csv`);
     }
@@ -165,6 +166,18 @@ export async function GET(
         })
         .filter((r) => r.split(',')[0]); // skip if empty after cleaning
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-postcodes.csv`);
+    }
+
+    // ── Affinity Index ──────────────────────────────────────────────
+    if (reportType === 'affinity') {
+      const report = await getConsolidatedReport<ConsolidatedAffinityReport>(id, 'affinity');
+      if (!report) return NextResponse.json({ error: 'Affinity report not found. Re-consolidate to generate.' }, { status: 404 });
+
+      const header = 'postal_code,affinity_index,total_visits,unique_devices,avg_dwell_minutes,avg_frequency';
+      const rows = report.byZipCode.map((z) =>
+        `${escCsv(z.postalCode)},${z.affinityIndex},${z.totalVisits},${z.uniqueDevices},${z.avgDwell},${z.avgFrequency}`
+      );
+      return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-affinity.csv`);
     }
 
     return NextResponse.json({ error: 'Invalid type' }, { status: 400 });

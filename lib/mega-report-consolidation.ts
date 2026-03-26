@@ -94,9 +94,25 @@ export interface ConsolidatedCatchmentReport {
     lat: number;
     lng: number;
     deviceDays: number;
+    sharePercentage: number;
   }>;
   /** Departure hour distribution */
   departureByHour: Array<{ hour: number; deviceDays: number }>;
+}
+
+export interface ConsolidatedAffinityReport {
+  megaJobId: string;
+  analyzedAt: string;
+  byZipCode: Array<{
+    postalCode: string;
+    city: string;
+    country: string;
+    affinityIndex: number;
+    totalVisits: number;
+    uniqueDevices: number;
+    avgDwell: number;
+    avgFrequency: number;
+  }>;
 }
 
 export interface ConsolidatedMobilityReport {
@@ -455,7 +471,10 @@ export function buildCatchmentReport(
     analyzedAt: new Date().toISOString(),
     totalDeviceDays,
     byZipCode: Array.from(byZip.values())
-      .map((v) => ({ zipCode: v.zip, city: v.city, country: v.country, lat: v.lat, lng: v.lng, deviceDays: v.deviceDays }))
+      .map((v) => ({
+        zipCode: v.zip, city: v.city, country: v.country, lat: v.lat, lng: v.lng, deviceDays: v.deviceDays,
+        sharePercentage: totalDeviceDays > 0 ? Math.round((v.deviceDays / totalDeviceDays) * 10000) / 100 : 0,
+      }))
       .sort((a, b) => b.deviceDays - a.deviceDays),
     departureByHour: Array.from({ length: 24 }, (_, h) => ({ hour: h, deviceDays: hourMap.get(h) || 0 })),
   };
@@ -519,4 +538,89 @@ export async function getConsolidatedReport<T>(
   reportType: string
 ): Promise<T | null> {
   return await getConfig<T>(megaReportKey(megaJobId, reportType));
+}
+
+// ── Affinity report builder ─────────────────────────────────────────
+
+/**
+ * Build affinity index report from Athena affinity query results.
+ * Geocodes origins to postal codes, then scores each 0-100 based on:
+ * - Visit count (40% weight)
+ * - Average dwell time (30% weight, capped at 60 min)
+ * - Average visit frequency (30% weight, capped at 10)
+ */
+export function buildAffinityReport(
+  megaJobId: string,
+  rows: Record<string, any>[],
+  coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
+): ConsolidatedAffinityReport {
+  // Aggregate by postal code
+  const byZip = new Map<string, {
+    city: string; country: string;
+    totalVisits: number; uniqueDevices: number;
+    dwellSum: number; freqSum: number; rowCount: number;
+  }>();
+
+  for (const row of rows) {
+    const lat = parseFloat(row.origin_lat) || 0;
+    const lng = parseFloat(row.origin_lng) || 0;
+    const key = `${lat},${lng}`;
+    const geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const zipKey = `${geo.zipCode}|${geo.city}|${geo.country}`;
+
+    const totalVisits = parseInt(row.total_visits, 10) || 0;
+    const uniqueDevices = parseInt(row.unique_devices, 10) || 0;
+    const avgDwell = parseFloat(row.avg_dwell) || 0;
+    const avgFreq = parseFloat(row.avg_frequency) || 1;
+
+    const existing = byZip.get(zipKey);
+    if (existing) {
+      existing.totalVisits += totalVisits;
+      existing.uniqueDevices += uniqueDevices;
+      existing.dwellSum += avgDwell * totalVisits;
+      existing.freqSum += avgFreq * totalVisits;
+      existing.rowCount += totalVisits;
+    } else {
+      byZip.set(zipKey, {
+        city: geo.city, country: geo.country,
+        totalVisits, uniqueDevices,
+        dwellSum: avgDwell * totalVisits,
+        freqSum: avgFreq * totalVisits,
+        rowCount: totalVisits,
+      });
+    }
+  }
+
+  // Compute affinity scores
+  const entries = Array.from(byZip.entries()).map(([key, v]) => {
+    const [postalCode] = key.split('|');
+    const avgDwell = v.rowCount > 0 ? v.dwellSum / v.rowCount : 0;
+    const avgFrequency = v.rowCount > 0 ? v.freqSum / v.rowCount : 1;
+    return { postalCode, city: v.city, country: v.country, totalVisits: v.totalVisits, uniqueDevices: v.uniqueDevices, avgDwell, avgFrequency };
+  });
+
+  // Normalize visit count to max
+  const maxVisits = Math.max(...entries.map((e) => e.totalVisits), 1);
+
+  const scored = entries.map((e) => {
+    const visitScore = Math.min(e.totalVisits / maxVisits, 1) * 100;
+    const dwellScore = Math.min(e.avgDwell / 60, 1) * 100;
+    const freqScore = Math.min(Math.log2(Math.max(e.avgFrequency, 1)) / Math.log2(10), 1) * 100;
+    const affinityIndex = Math.round(0.4 * visitScore + 0.3 * dwellScore + 0.3 * freqScore);
+
+    return {
+      postalCode: e.postalCode, city: e.city, country: e.country,
+      affinityIndex,
+      totalVisits: e.totalVisits,
+      uniqueDevices: e.uniqueDevices,
+      avgDwell: Math.round(e.avgDwell * 10) / 10,
+      avgFrequency: Math.round(e.avgFrequency * 100) / 100,
+    };
+  }).sort((a, b) => b.affinityIndex - a.affinityIndex);
+
+  return {
+    megaJobId,
+    analyzedAt: new Date().toISOString(),
+    byZipCode: scored,
+  };
 }

@@ -20,8 +20,10 @@ import {
   startConsolidatedTemporalQuery,
   startConsolidatedTotalDevicesQuery,
   startConsolidatedMAIDsQuery,
+  startConsolidatedAffinityQuery,
   extractPoiCoords,
   type PoiCoord,
+  type DwellFilter,
 } from '@/lib/mega-consolidation-queries';
 import { checkQueryStatus, fetchQueryResults, ensureTableForDataset } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
@@ -45,6 +47,7 @@ interface ConsolidationState {
     temporal?: string;
     totalDevices?: string;
     maids?: string;
+    affinity?: string;
   };
   /** Track which queries have been parsed */
   parsed?: {
@@ -55,6 +58,8 @@ interface ConsolidationState {
   };
   /** Optional POI filter */
   poiIds?: string[];
+  /** Optional dwell time filter */
+  dwellFilter?: DwellFilter;
   error?: string;
 }
 
@@ -82,11 +87,13 @@ export async function POST(
       return NextResponse.json({ error: 'Mega-job not found' }, { status: 404 });
     }
 
-    // Parse optional POI filter from body
+    // Parse optional POI filter and dwell filter from body
     let poiIds: string[] | undefined;
+    let dwellFilter: DwellFilter | undefined;
     try {
       const body = await _request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
+      if (body?.dwellFilter) dwellFilter = body.dwellFilter;
     } catch { }
 
     // Load sub-jobs
@@ -110,7 +117,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting', poiIds };
+      state = { phase: 'starting', poiIds, dwellFilter };
     }
 
     // Update mega-job status — always set to consolidating (even for re-consolidation)
@@ -140,21 +147,26 @@ export async function POST(
         const poiCoords = extractPoiCoords(syncedJobs);
         console.log(`[MEGA] Extracted ${poiCoords.length} POI coordinates from ${syncedJobs.length} sub-jobs`);
 
-        // Start all 7 queries in parallel (pass poiCoords for spatial proximity)
-        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId] = await Promise.all([
+        // Get dwell filter from state (persisted across polls)
+        const dwell = state.dwellFilter || dwellFilter;
+
+        // Start all queries in parallel (pass poiCoords for spatial proximity + dwell filter)
+        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId, affinityQId] = await Promise.all([
           startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
-          startConsolidatedODQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
-          startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
-          startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
-          startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds, poiCoords).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
-          startConsolidatedTemporalQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
-          startConsolidatedTotalDevicesQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
-          startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
+          startConsolidatedODQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
+          startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
+          startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedTemporalQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
+          startConsolidatedTotalDevicesQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
+          startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
+          poiCoords.length > 0 ? startConsolidatedAffinityQuery(syncedJobs, poiCoords, dwell).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
         ]);
 
         state = {
           phase: 'polling',
           poiIds: effectivePoiIds,
+          dwellFilter: dwell,
           queries: {
             visits: visitsQId,
             od: odQId,
@@ -164,12 +176,13 @@ export async function POST(
             temporal: temporalQId,
             totalDevices: totalDevicesQId,
             maids: maidsQId,
+            affinity: affinityQId,
           },
           parsed: {},
         };
         await putConf(CONSOLIDATION_KEY(id), state);
 
-        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId].filter(Boolean).length;
+        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId, affinityQId].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
           progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
@@ -474,6 +487,18 @@ export async function POST(
         if (catchmentRows) {
           const catchmentReport = buildCatchmentReport(id, catchmentRows, coordToZip);
           reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
+        }
+
+        // Build affinity report
+        if (state.queries?.affinity) {
+          try {
+            const affinityResult = await fetchQueryResults(state.queries.affinity);
+            const { buildAffinityReport } = await import('@/lib/mega-report-consolidation');
+            const affinityReport = buildAffinityReport(id, affinityResult.rows, coordToZip);
+            reportKeys.affinity = await saveConsolidatedReport(id, 'affinity', affinityReport);
+          } catch (err: any) {
+            console.error('[MEGA] Error building affinity report:', err.message);
+          }
         }
 
         // Save MAIDs query output key (CSV served directly from Athena output)
