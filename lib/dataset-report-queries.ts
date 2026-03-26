@@ -14,7 +14,7 @@
  */
 
 import { getTableName, startQueryAsync } from './athena';
-import { type PoiCoord } from './mega-consolidation-queries';
+import { type PoiCoord, type DwellFilter } from './mega-consolidation-queries';
 
 const ACCURACY_THRESHOLD = 500;
 const COORDINATE_PRECISION = 4; // ~11m
@@ -22,6 +22,29 @@ const GRID_STEP = 0.01;         // ~1.1km geohash grid
 const POI_TABLE = 'lab_pois_gmc';
 // Buffer around POI bounding box to pre-filter pings (degrees, ~2.2km)
 const BBOX_BUFFER = 0.02;
+
+/** Build dwell filter CTEs for dataset queries (same pattern as mega). */
+function buildDwellCTEs(dwell?: DwellFilter): string {
+  if (!dwell || (dwell.minMinutes == null && dwell.maxMinutes == null)) return '';
+  const conditions: string[] = [];
+  if (dwell.minMinutes != null) conditions.push(`dwell_minutes >= ${dwell.minMinutes}`);
+  if (dwell.maxMinutes != null) conditions.push(`dwell_minutes <= ${dwell.maxMinutes}`);
+  return `,
+    visit_dwell AS (
+      SELECT ad_id, date,
+        ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    dwell_filtered AS (
+      SELECT ad_id, date FROM visit_dwell
+      WHERE ${conditions.join(' AND ')}
+    )`;
+}
+
+function hasDwell(dwell?: DwellFilter): boolean {
+  return !!(dwell && (dwell.minMinutes != null || dwell.maxMinutes != null));
+}
 
 /**
  * Build a SQL VALUES clause for target POI coordinates.
@@ -60,6 +83,7 @@ export async function startDatasetODQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
   poiTableName?: string,
+  dwell?: DwellFilter,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -92,14 +116,14 @@ export async function startDatasetODQuery(
           POW(p.lat - tp.poi_lat, 2) +
           POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
         ) <= tp.poi_radius_m
-    ),
+    )${buildDwellCTEs(dwell)},
     poi_visits AS (
       SELECT
-        ad_id,
-        date,
-        MIN(utc_timestamp) as first_poi_visit
-      FROM at_poi_pings
-      GROUP BY ad_id, date
+        ${hasDwell(dwell) ? 'a.' : ''}ad_id,
+        ${hasDwell(dwell) ? 'a.' : ''}date,
+        MIN(${hasDwell(dwell) ? 'a.' : ''}utc_timestamp) as first_poi_visit
+      FROM ${hasDwell(dwell) ? 'at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date' : 'at_poi_pings'}
+      GROUP BY ${hasDwell(dwell) ? 'a.' : ''}ad_id, ${hasDwell(dwell) ? 'a.' : ''}date
     ),
     device_day AS (
       SELECT
@@ -192,6 +216,7 @@ export async function startDatasetHourlyQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
   poiTableName?: string,
+  dwell?: DwellFilter,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -259,6 +284,7 @@ export async function startDatasetCatchmentQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
   poiTableName?: string,
+  dwell?: DwellFilter,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -354,6 +380,7 @@ export async function startDatasetMobilityQuery(
   datasetName: string,
   poiCoords?: PoiCoord[],
   poiTableName?: string,
+  dwell?: DwellFilter,
 ): Promise<string> {
   const table = getTableName(datasetName);
 
@@ -499,6 +526,7 @@ export async function startDatasetMobilityQuery(
 export async function startDatasetTemporalQuery(
   datasetName: string,
   poiIds?: string[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const table = getTableName(datasetName);
   const poiFilter = buildPoiIdFilter(poiIds);
@@ -530,6 +558,7 @@ export async function startDatasetTemporalQuery(
 export async function startDatasetTotalDevicesQuery(
   datasetName: string,
   poiIds?: string[],
+  dwell?: DwellFilter,
 ): Promise<string> {
   const table = getTableName(datasetName);
   const poiFilter = buildPoiIdFilter(poiIds);

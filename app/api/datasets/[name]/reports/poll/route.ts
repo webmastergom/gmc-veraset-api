@@ -13,7 +13,7 @@ import {
   ensurePoiCoordsTable,
   shouldUsePoiTable,
 } from '@/lib/dataset-report-queries';
-import { extractPoiCoords, type PoiCoord } from '@/lib/mega-consolidation-queries';
+import { extractPoiCoords, type PoiCoord, type DwellFilter } from '@/lib/mega-consolidation-queries';
 import {
   parseConsolidatedOD,
   parseConsolidatedHourly,
@@ -68,11 +68,13 @@ export async function POST(
     const reset = request.nextUrl.searchParams.get('reset') === 'true';
     let state = reset ? null : await getState(datasetName);
 
-    // Parse optional POI ID filter from request body
+    // Parse optional POI ID filter and dwell filter from request body
     let poiIds: string[] | undefined;
+    let dwellFilter: DwellFilter | undefined;
     try {
       const body = await request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
+      if (body?.dwellFilter) dwellFilter = body.dwellFilter;
     } catch { /* no body or invalid JSON */ }
 
     // Reset if done
@@ -136,12 +138,12 @@ export async function POST(
       }
 
       const [od, hourly, catchment, mobility, temporal, totalDevices] = await Promise.all([
-        startDatasetODQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
-        startDatasetHourlyQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
-        startDatasetCatchmentQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
-        startDatasetMobilityQuery(datasetName, poiCoords, poiTableName).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
-        startDatasetTemporalQuery(datasetName, poiIds).catch((e) => { console.error('[DS-REPORT] Temporal failed:', e.message); return undefined; }),
-        startDatasetTotalDevicesQuery(datasetName, poiIds).catch((e) => { console.error('[DS-REPORT] TotalDevices failed:', e.message); return undefined; }),
+        startDatasetODQuery(datasetName, poiCoords, poiTableName, dwellFilter).catch((e) => { console.error('[DS-REPORT] OD failed:', e.message); return undefined; }),
+        startDatasetHourlyQuery(datasetName, poiCoords, poiTableName, dwellFilter).catch((e) => { console.error('[DS-REPORT] Hourly failed:', e.message); return undefined; }),
+        startDatasetCatchmentQuery(datasetName, poiCoords, poiTableName, dwellFilter).catch((e) => { console.error('[DS-REPORT] Catchment failed:', e.message); return undefined; }),
+        startDatasetMobilityQuery(datasetName, poiCoords, poiTableName, dwellFilter).catch((e) => { console.error('[DS-REPORT] Mobility failed:', e.message); return undefined; }),
+        startDatasetTemporalQuery(datasetName, poiIds, dwellFilter).catch((e) => { console.error('[DS-REPORT] Temporal failed:', e.message); return undefined; }),
+        startDatasetTotalDevicesQuery(datasetName, poiIds, dwellFilter).catch((e) => { console.error('[DS-REPORT] TotalDevices failed:', e.message); return undefined; }),
       ]);
 
       const queries: Record<string, string> = {};

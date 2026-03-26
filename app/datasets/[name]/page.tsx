@@ -115,6 +115,10 @@ export default function DatasetAnalysisPage() {
   // Reports (from /api/datasets/[name]/reports/poll)
   const [generatingReports, setGeneratingReports] = useState(false);
   const [reportProgress, setReportProgress] = useState<{ step: string; percent: number; message: string } | null>(null);
+
+  // Dwell filter
+  const [dwellMin, setDwellMin] = useState<string>('');
+  const [dwellMax, setDwellMax] = useState<string>('');
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
@@ -160,10 +164,8 @@ export default function DatasetAnalysisPage() {
     }
   }, [datasetName, reportVersion]);
 
-  // ── Run analysis ────────────────────────────────────────────────
-  const runAnalysis = async () => {
-    setLoading(true);
-    setAnalysis(null);
+  // ── Run analysis (basic stats) ──────────────────────────────────
+  const runAnalysisOnly = async () => {
     try {
       const poll = async (): Promise<AnalysisResult> => {
         const res = await fetch(`/api/datasets/${datasetName}/analyze/poll`, {
@@ -184,15 +186,30 @@ export default function DatasetAnalysisPage() {
       setAnalysis(data);
     } catch (e: any) {
       toast({ title: 'Analysis failed', description: e.message, variant: 'destructive' });
+    }
+  };
+
+  // ── Unified: Run analysis + Generate full reports in parallel ───
+  const runFullAnalysis = async () => {
+    setLoading(true);
+    setGeneratingReports(true);
+    setReportProgress({ step: 'starting', percent: 0, message: 'Starting analysis + full report...' });
+    setAnalysis(null);
+
+    try {
+      await Promise.all([
+        runAnalysisOnly(),
+        generateReportsOnly(),
+      ]);
     } finally {
       setLoading(false);
     }
   };
 
   // ── Generate full reports (OD, hourly, catchment, mobility) ─────
-  const generateReports = async () => {
-    setGeneratingReports(true);
-    setReportProgress({ step: 'starting', percent: 0, message: 'Starting report generation...' });
+  const generateReportsOnly = async () => {
+    if (!generatingReports) setGeneratingReports(true);
+    if (!reportProgress) setReportProgress({ step: 'starting', percent: 0, message: 'Starting report generation...' });
 
     try {
       let done = false;
@@ -206,7 +223,15 @@ export default function DatasetAnalysisPage() {
             method: 'POST',
             credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
+            body: JSON.stringify({
+              ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
+              ...(dwellMin || dwellMax ? {
+                dwellFilter: {
+                  ...(dwellMin ? { minMinutes: parseFloat(dwellMin) } : {}),
+                  ...(dwellMax ? { maxMinutes: parseFloat(dwellMax) } : {}),
+                }
+              } : {}),
+            }),
           });
         } catch (fetchErr: any) {
           // Network error or timeout — retry
@@ -430,15 +455,30 @@ export default function DatasetAnalysisPage() {
       {/* Action buttons */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <h2 className="text-xl font-semibold">Data analysis</h2>
-        <div className="flex flex-wrap gap-2">
-          <Button onClick={runAnalysis} disabled={loading}>
-            {loading ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Analyzing...</> : 'Run analysis'}
-          </Button>
-          <Button variant="outline" onClick={generateReports} disabled={generatingReports}>
-            {generatingReports ? (
-              <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Generating...</>
+        <div className="flex flex-wrap gap-2 items-center">
+          <div className="flex items-center gap-2 mr-2">
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell (min):</label>
+            <input
+              type="number"
+              placeholder="Min"
+              value={dwellMin}
+              onChange={(e) => setDwellMin(e.target.value)}
+              className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
+            />
+            <span className="text-xs text-muted-foreground">-</span>
+            <input
+              type="number"
+              placeholder="Max"
+              value={dwellMax}
+              onChange={(e) => setDwellMax(e.target.value)}
+              className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
+            />
+          </div>
+          <Button onClick={runFullAnalysis} disabled={loading || generatingReports}>
+            {loading || generatingReports ? (
+              <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Analyzing...</>
             ) : (
-              <><Play className="mr-2 h-4 w-4" />Generate Full Report</>
+              <><Play className="mr-2 h-4 w-4" />Analyze</>
             )}
           </Button>
           <Button variant="outline" onClick={handleDownloadFull} disabled={downloadingFull}>
@@ -790,7 +830,7 @@ export default function DatasetAnalysisPage() {
         <Card>
           <CardContent className="py-12 text-center">
             <p className="text-muted-foreground">
-              Click &quot;Run analysis&quot; for basic stats, or &quot;Generate Full Report&quot; for the complete dashboard.
+              Click &quot;Analyze&quot; to run basic stats and generate the full report dashboard.
             </p>
           </CardContent>
         </Card>
