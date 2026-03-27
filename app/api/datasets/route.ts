@@ -50,6 +50,7 @@ export async function GET() {
             : job.dateRange ?? null,
           lastModified: job.syncedAt || job.createdAt,
           syncedAt: job.syncedAt ?? null,
+          country: job.country ?? null,
           dateRangeDiscrepancy: job.dateRangeDiscrepancy ?? null,
           verasetPayload: job.verasetPayload ?? null,
           actualDateRange: job.actualDateRange ?? null,

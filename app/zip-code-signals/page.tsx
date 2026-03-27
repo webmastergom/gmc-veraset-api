@@ -60,6 +60,7 @@ interface DatasetInfo {
   totalBytes: number;
   dateRange: { from: string; to: string } | null;
   syncedAt: string | null;
+  country: string | null;
 }
 
 type Phase = 'setup' | 'running' | 'results';
@@ -129,19 +130,28 @@ export default function ZipCodeSignalsPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedAll, setCopiedAll] = useState(false);
 
-  // ── Fetch datasets ────────────────────────────────────────────────
+  // ── Fetch datasets (only when country is selected) ───────────────
   useEffect(() => {
+    if (!selectedCountry) {
+      setDatasets([]);
+      setSelectedDatasetId('');
+      setLoadingDatasets(false);
+      return;
+    }
+    setLoadingDatasets(true);
+    setSelectedDatasetId('');
     fetch('/api/datasets', { credentials: 'include' })
       .then(r => r.json())
       .then(data => {
         const ds = (data.datasets || []).filter((d: any) =>
-          d.jobId && d.objectCount > 0 && d.totalBytes > 0
+          d.jobId && d.objectCount > 0 && d.totalBytes > 0 &&
+          d.country === selectedCountry
         );
         setDatasets(ds);
         setLoadingDatasets(false);
       })
       .catch(() => setLoadingDatasets(false));
-  }, []);
+  }, [selectedCountry]);
 
   // ── Derived ───────────────────────────────────────────────────────
   const selectedDataset = datasets.find(d => d.id === selectedDatasetId);
@@ -381,12 +391,37 @@ export default function ZipCodeSignalsPage() {
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="grid gap-4 sm:grid-cols-2">
-                    {/* Dataset selector */}
+                    {/* Country selector (step 1) */}
                     <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground uppercase tracking-wider">Dataset</Label>
-                      {loadingDatasets ? (
+                      <Label className="text-xs text-muted-foreground uppercase tracking-wider">1. Country</Label>
+                      <Select value={selectedCountry} onValueChange={setSelectedCountry}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select country" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {COUNTRIES.map(code => (
+                            <SelectItem key={code} value={code}>
+                              {COUNTRY_FLAGS[code]} {code}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    {/* Dataset selector (step 2, filtered by country) */}
+                    <div className="space-y-2">
+                      <Label className="text-xs text-muted-foreground uppercase tracking-wider">2. Dataset</Label>
+                      {!selectedCountry ? (
+                        <div className="text-sm text-muted-foreground py-2">
+                          Select a country first
+                        </div>
+                      ) : loadingDatasets ? (
                         <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
                           <Loader2 className="w-4 h-4 animate-spin" /> Loading datasets...
+                        </div>
+                      ) : datasets.length === 0 ? (
+                        <div className="text-sm text-muted-foreground py-2">
+                          No datasets for {COUNTRY_FLAGS[selectedCountry]} {selectedCountry}
                         </div>
                       ) : (
                         <Select value={selectedDatasetId} onValueChange={setSelectedDatasetId}>
@@ -405,23 +440,6 @@ export default function ZipCodeSignalsPage() {
                           </SelectContent>
                         </Select>
                       )}
-                    </div>
-
-                    {/* Country selector */}
-                    <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground uppercase tracking-wider">Country</Label>
-                      <Select value={selectedCountry} onValueChange={setSelectedCountry}>
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select country" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {COUNTRIES.map(code => (
-                            <SelectItem key={code} value={code}>
-                              {COUNTRY_FLAGS[code]} {code}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
                     </div>
                   </div>
 
