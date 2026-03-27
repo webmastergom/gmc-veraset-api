@@ -1,4 +1,5 @@
 import { getConfig, putConfig, initConfigIfNeeded, invalidateCache } from './s3-config';
+import { inferCountryFromName } from './country-inference';
 
 export interface Job {
   jobId: string;
@@ -265,6 +266,7 @@ export async function getJob(jobId: string): Promise<Job | null> {
 export async function createJob(job: Omit<Job, 'createdAt' | 'updatedAt'>): Promise<Job> {
   const newJob: Job = {
     ...job,
+    country: job.country || inferCountryFromName(job.name) || undefined,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
