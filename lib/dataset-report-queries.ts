@@ -13,7 +13,7 @@
  * spatial proximity to known POI coordinates for accurate at-POI filtering.
  */
 
-import { getTableName, startQueryAsync, startCTASAsync, tempTableName } from './athena';
+import { getTableName, startQueryAsync, startCTASAsync, tempTableName, ensureTableForDataset } from './athena';
 import { type PoiCoord, type DwellFilter } from './mega-consolidation-queries';
 
 const ACCURACY_THRESHOLD = 500;
@@ -673,6 +673,7 @@ export async function startDwellCTASQuery(
   poiCoords: PoiCoord[],
   poiTableName?: string,
 ): Promise<{ queryId: string; tableName: string }> {
+  await ensureTableForDataset(datasetName);
   const table = getTableName(datasetName);
   const runId = Date.now().toString(36);
   const tblName = tempTableName(datasetName, `dwell_${runId}`);
