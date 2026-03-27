@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getAllJobs, Job } from '@/lib/jobs';
+import { inferCountryFromName } from '@/lib/country-inference';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -50,7 +51,7 @@ export async function GET() {
             : job.dateRange ?? null,
           lastModified: job.syncedAt || job.createdAt,
           syncedAt: job.syncedAt ?? null,
-          country: job.country ?? null,
+          country: job.country || inferCountryFromName(job.name) || null,
           dateRangeDiscrepancy: job.dateRangeDiscrepancy ?? null,
           verasetPayload: job.verasetPayload ?? null,
           actualDateRange: job.actualDateRange ?? null,

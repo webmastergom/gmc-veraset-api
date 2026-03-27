@@ -234,10 +234,9 @@ export default function DatasetAnalysisPage() {
       let attempts = 0;
       while (!done && attempts < 200) {
         attempts++;
-        const resetParam = attempts === 1 ? '?reset=true' : '';
         let res: Response;
         try {
-          res = await fetch(`/api/datasets/${datasetName}/reports/poll${resetParam}`, {
+          res = await fetch(`/api/datasets/${datasetName}/reports/poll`, {
             method: 'POST',
             credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
