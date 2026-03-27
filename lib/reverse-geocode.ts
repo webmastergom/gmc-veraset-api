@@ -546,11 +546,12 @@ function getZipcodeFromCache(lat: number, lng: number): { country: string; postc
  * No external geocoding API calls.
  */
 export async function batchReverseGeocode(
-  points: Array<{ lat: number; lng: number; deviceCount: number }>
+  points: Array<{ lat: number; lng: number; deviceCount: number }>,
+  options?: { skipCache?: boolean }
 ): Promise<GeocodeClassification[]> {
   // Try to load pre-computed cache for the country filter (if set)
   let hasCache = false;
-  if (countryFilter) {
+  if (countryFilter && !options?.skipCache) {
     for (const cc of countryFilter) {
       if (await loadGeocodeCache(cc)) hasCache = true;
     }

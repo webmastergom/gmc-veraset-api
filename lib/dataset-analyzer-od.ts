@@ -555,7 +555,8 @@ export type OriginsProgressCallback = (progress: {
 export async function analyzeOrigins(
   datasetName: string,
   filters: ODFilters = {},
-  onProgress?: OriginsProgressCallback
+  onProgress?: OriginsProgressCallback,
+  options?: { skipCache?: boolean }
 ): Promise<OriginsResult> {
   const tableName = getTableName(datasetName);
   const report = onProgress || (() => {});
@@ -689,7 +690,7 @@ export async function analyzeOrigins(
 
   report({ step: 'geocoding', percent: 65, message: 'Reverse geocoding origins...', detail: `${originPoints.length} coordinate clusters → postal codes` });
   console.log(`[ORIGINS] Reverse geocoding ${originPoints.length} origin clusters...`);
-  const classified = await batchReverseGeocode(originPoints);
+  const classified = await batchReverseGeocode(originPoints, { skipCache: options?.skipCache });
   report({ step: 'geocoding', percent: 85, message: 'Geocoding complete' });
 
   report({ step: 'aggregating', percent: 90, message: 'Aggregating by postal code...' });

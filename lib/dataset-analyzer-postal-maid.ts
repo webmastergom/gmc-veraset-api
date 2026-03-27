@@ -81,7 +81,7 @@ export async function analyzePostalMaid(
       message: p.message,
       detail: p.detail,
     });
-  });
+  }, { skipCache: true });
 
   console.log(`[POSTAL-MAID] Catchment done: ${catchment.origins.length} postal codes, ${catchment.totalDevicesVisitedPois} devices`);
 
@@ -202,7 +202,7 @@ export async function analyzePostalMaid(
     deviceCount: p.deviceCount,
   }));
 
-  const classified = await batchReverseGeocode(coordPoints);
+  const classified = await batchReverseGeocode(coordPoints, { skipCache: true });
   report({ step: 'geocoding', percent: 90, message: 'Geocoding complete' });
 
   // Build coordKey → postalCode map (accept any classification with a postcode)
