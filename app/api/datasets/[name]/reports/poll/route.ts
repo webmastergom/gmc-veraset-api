@@ -45,7 +45,7 @@ const BUCKET_BATCHES: number[][] = [
 const QUERY_TYPES = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'totalDevices'] as const;
 
 interface DwellReportState {
-  phase: 'materialize' | 'poll_ctas' | 'start_batch' | 'poll_batch' | 'parse_batch' | 'cleanup' | 'done';
+  phase: 'materialize' | 'poll_ctas' | 'start_batch' | 'poll_batch' | 'parse_batch' | 'cleanup' | 'done' | 'error';
   ctasQueryId?: string;
   tempTableName?: string;
   currentBatchIndex: number;
@@ -103,8 +103,8 @@ export async function POST(
       if (body?.poiIds?.length) poiIds = body.poiIds;
     } catch { /* no body or invalid JSON */ }
 
-    // Reset if done
-    if (state?.phase === 'done') state = null;
+    // Reset if done or error — allow retry
+    if (state?.phase === 'done' || state?.phase === 'error') state = null;
 
     // ── Phase: materialize ─────────────────────────────────────────
     if (!state) {
@@ -212,10 +212,11 @@ export async function POST(
     // ── Phase: poll_ctas ───────────────────────────────────────────
     if (state.phase === 'poll_ctas') {
       if (!state.ctasQueryId) {
-        state = { ...state, phase: 'done', error: 'Missing CTAS query ID' };
+        state = { ...state, phase: 'error', error: 'Missing CTAS query ID' };
         await saveState(datasetName, state);
         return NextResponse.json({
-          phase: 'done',
+          phase: 'error',
+          error: 'Missing CTAS query ID',
           progress: { step: 'error', percent: 0, message: 'Missing CTAS query ID' },
         });
       }
@@ -226,21 +227,23 @@ export async function POST(
       } catch (err: any) {
         const msg = err?.message || '';
         if (msg.includes('not found') || msg.includes('InvalidRequestException')) {
-          state = { ...state, phase: 'done', error: 'CTAS query expired or not found' };
+          state = { ...state, phase: 'error', error: 'CTAS query expired or not found' };
           await saveState(datasetName, state);
           return NextResponse.json({
-            phase: 'done',
-            progress: { step: 'error', percent: 0, message: 'CTAS query expired. Click Generate again to retry.' },
+            phase: 'error',
+            error: 'CTAS query expired. Click Analyze again to retry.',
+            progress: { step: 'error', percent: 0, message: 'CTAS query expired. Click Analyze again to retry.' },
           });
         }
         throw err;
       }
 
       if (qStatus.state === 'FAILED' || qStatus.state === 'CANCELLED') {
-        state = { ...state, phase: 'done', error: qStatus.error || 'CTAS query failed' };
+        state = { ...state, phase: 'error', error: qStatus.error || 'CTAS query failed' };
         await saveState(datasetName, state);
         return NextResponse.json({
-          phase: 'done',
+          phase: 'error',
+          error: `CTAS failed: ${qStatus.error || 'unknown error'}`,
           progress: { step: 'error', percent: 0, message: `CTAS failed: ${qStatus.error || 'unknown error'}` },
         });
       }
