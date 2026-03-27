@@ -679,7 +679,63 @@ export async function startDwellCTASQuery(
   const tblName = tempTableName(datasetName, `dwell_${runId}`);
   const bbox = buildBboxFilter(poiCoords);
 
-  const selectSql = `
+  // Use geohash-bucket JOIN for large POI sets, CROSS JOIN for small ones
+  const useBucketJoin = poiCoords.length > 50 || !!poiTableName;
+
+  let selectSql: string;
+  if (useBucketJoin) {
+    // Geohash-bucket approach: assign each ping and POI to ~1km grid cells,
+    // then JOIN on matching buckets. This reduces N×M to only nearby comparisons.
+    selectSql = `
+    WITH
+    ${buildTargetPoisCTE(poiCoords, poiTableName)},
+    poi_buckets AS (
+      SELECT poi_lat, poi_lng, poi_radius_m,
+        CAST(FLOOR(poi_lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(poi_lng / ${GRID_STEP}) AS BIGINT) as lng_bucket
+      FROM target_pois
+    ),
+    poi_expanded AS (
+      SELECT poi_lat, poi_lng, poi_radius_m, lat_bucket + dlat as lat_bucket, lng_bucket + dlng as lng_bucket
+      FROM poi_buckets
+      CROSS JOIN (VALUES (-1), (0), (1)) AS d1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS d2(dlng)
+    ),
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(TRY_CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_bucket
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        ${bbox}
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM all_pings p
+      INNER JOIN poi_expanded tp ON p.lat_bucket = tp.lat_bucket AND p.lng_bucket = tp.lng_bucket
+      WHERE 111320 * SQRT(
+          POW(p.lat - tp.poi_lat, 2) +
+          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+        ) <= tp.poi_radius_m
+    ),
+    visit_dwell AS (
+      SELECT ad_id, date,
+        ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    )
+    SELECT a.ad_id, a.date, a.utc_timestamp, a.lat, a.lng, d.dwell_minutes
+    FROM at_poi_pings a
+    JOIN visit_dwell d ON a.ad_id = d.ad_id AND a.date = d.date
+  `;
+  } else {
+    // Small POI sets: simple CROSS JOIN is fine
+    selectSql = `
     WITH
     all_pings AS (
       SELECT ad_id, date, utc_timestamp,
@@ -714,6 +770,7 @@ export async function startDwellCTASQuery(
     FROM at_poi_pings a
     JOIN visit_dwell d ON a.ad_id = d.ad_id AND a.date = d.date
   `;
+  }
 
   console.log(`[DWELL-CTAS] Starting dwell materialization for ${datasetName} → ${tblName}`);
   const queryId = await startCTASAsync(selectSql, tblName);

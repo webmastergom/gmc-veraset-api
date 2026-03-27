@@ -26,6 +26,7 @@ import {
 } from '@/lib/mega-report-consolidation';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { dropTempTable, cleanupTempS3 } from '@/lib/athena';
+import { getPOICollection } from '@/lib/poi-storage';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -122,7 +123,30 @@ export async function POST(
             const matchingJob = await getJob(matchingJobId);
             if (matchingJob) {
               poiCoords = extractPoiCoords([matchingJob]);
-              console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords for ${datasetName} (job ${matchingJobId})`);
+              console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords from job metadata for ${datasetName}`);
+
+              // Fallback: for cohort jobs without geo_radius, load from POI collection
+              if (poiCoords.length === 0 && matchingJob.poiCollectionId) {
+                console.log(`[DS-REPORT] No coords in job metadata, loading from POI collection: ${matchingJob.poiCollectionId}`);
+                const geojson = await getPOICollection(matchingJob.poiCollectionId);
+                if (geojson?.features?.length) {
+                  for (const f of geojson.features) {
+                    const [lng, lat] = f.geometry?.coordinates || [];
+                    if (lat != null && lng != null) {
+                      poiCoords.push({ lat, lng, radiusM: matchingJob.radius || 200 });
+                    }
+                  }
+                  // Deduplicate
+                  const seen = new Set<string>();
+                  poiCoords = poiCoords.filter((c) => {
+                    const key = `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                  });
+                  console.log(`[DS-REPORT] Loaded ${poiCoords.length} POI coords from collection ${matchingJob.poiCollectionId}`);
+                }
+              }
 
               // Filter to selected POIs if poiIds provided
               if (poiIds?.length && matchingJob.verasetPayload?.geo_radius) {
