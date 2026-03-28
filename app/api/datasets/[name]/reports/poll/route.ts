@@ -273,27 +273,36 @@ export async function POST(
         entries.map(async ([name, queryId]) => {
           try {
             const s = await checkQueryStatus(queryId);
-            return { name, state: s.state, error: s.error };
+            return { name, state: s.state, error: s.error, stats: s.statistics };
           } catch (err: any) {
             if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
-              return { name, state: 'FAILED' as const, error: 'Query expired' };
+              return { name, state: 'FAILED' as const, error: 'Query expired', stats: undefined };
             }
-            return { name, state: 'FAILED' as const, error: err.message };
+            return { name, state: 'FAILED' as const, error: err.message, stats: undefined };
           }
         })
       );
 
       let allDone = true;
       let doneCount = 0;
-      const running: string[] = [];
+      let totalScannedGB = 0;
+      const queryDetails: string[] = [];
 
       for (const s of statuses) {
+        const scannedGB = s.stats?.dataScannedBytes ? (s.stats.dataScannedBytes / 1e9) : 0;
+        totalScannedGB += scannedGB;
+
         if (s.state === 'RUNNING' || s.state === 'QUEUED') {
           allDone = false;
-          running.push(s.name);
+          const runtimeSec = s.stats?.engineExecutionTimeMs ? Math.round(s.stats.engineExecutionTimeMs / 1000) : 0;
+          queryDetails.push(`⏳ ${s.name}: ${scannedGB.toFixed(0)} GB scanned (${runtimeSec}s)`);
         } else {
           doneCount++;
-          if (s.state === 'FAILED' || s.state === 'CANCELLED') {
+          if (s.state === 'SUCCEEDED') {
+            const runtimeSec = s.stats?.engineExecutionTimeMs ? Math.round(s.stats.engineExecutionTimeMs / 1000) : 0;
+            queryDetails.push(`✅ ${s.name}: done in ${runtimeSec}s`);
+          } else {
+            queryDetails.push(`❌ ${s.name}: ${s.error || 'failed'}`);
             console.warn(`[DS-REPORT] ${s.name} failed: ${s.error}`);
           }
         }
@@ -305,8 +314,8 @@ export async function POST(
           progress: {
             step: 'polling',
             percent: 10 + Math.round((doneCount / entries.length) * 50),
-            message: `Athena queries: ${doneCount}/${entries.length} complete`,
-            detail: `Running: ${running.join(', ')}`,
+            message: `Athena queries: ${doneCount}/${entries.length} complete · ${totalScannedGB.toFixed(0)} GB scanned`,
+            detail: queryDetails.join('\n'),
           },
         });
       }

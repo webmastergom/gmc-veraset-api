@@ -528,8 +528,10 @@ export default function DatasetAnalysisPage() {
                 <span className="ml-auto font-mono text-muted-foreground">{reportProgress.percent}%</span>
               </div>
               {(reportProgress as any).detail && (
-                <div className="text-xs text-muted-foreground">
-                  {(reportProgress as any).detail}
+                <div className="mt-2 rounded-md bg-muted/50 p-3 font-mono text-xs leading-relaxed text-muted-foreground">
+                  {(reportProgress as any).detail.split('\n').map((line: string, i: number) => (
+                    <div key={i} className={line.startsWith('✅') ? 'text-green-400' : line.startsWith('❌') ? 'text-red-400' : ''}>{line}</div>
+                  ))}
                 </div>
               )}
               {/* Dwell bucket status grid */}
