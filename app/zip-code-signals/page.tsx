@@ -257,6 +257,10 @@ export default function ZipCodeSignalsPage() {
   const handleRun = async () => {
     if (!canRun || !selectedDataset) return;
 
+    /** Empty date fields default to dataset catalog range so Athena does not scan 100+ GB unpartitioned. */
+    const effDateFrom = (dateFrom || selectedDataset.dateRange?.from || '').trim();
+    const effDateTo = (dateTo || selectedDataset.dateRange?.to || '').trim();
+
     setPhase('running');
     setError(null);
     setResult(null);
@@ -268,8 +272,8 @@ export default function ZipCodeSignalsPage() {
       dataset: selectedDataset.id,
       country: selectedCountry,
       postalCount: postalCodes.length,
-      dateFrom: dateFrom || null,
-      dateTo: dateTo || null,
+      dateFrom: effDateFrom || null,
+      dateTo: effDateTo || null,
     };
     setProgress({ step: 'initializing', percent: 0, message: 'Starting...' });
     appendProgressLog({
@@ -278,13 +282,36 @@ export default function ZipCodeSignalsPage() {
       message: 'Run started (client)',
       detail: `${runMeta.dataset} · ${runMeta.country} · ${runMeta.postalCount} postal code(s)${
         runMeta.dateFrom || runMeta.dateTo
-          ? ` · dates ${runMeta.dateFrom ?? '…'} → ${runMeta.dateTo ?? '…'}`
-          : ''
+          ? ` · Athena dates ${runMeta.dateFrom ?? '…'} → ${runMeta.dateTo ?? '…'}`
+          : ' · Athena dates: full table (all partitions)'
       }`,
     });
 
     const abort = new AbortController();
     abortRef.current = abort;
+
+    const resolveSpillIfNeeded = async (data: PostalMaidResult): Promise<PostalMaidResult> => {
+      if (!data.devicesSpillKey) return data;
+      appendProgressLog({
+        step: 'running_queries',
+        percent: 99,
+        message: 'Fetching full device list from storage…',
+        detail: `${data.devicesSpillTotal?.toLocaleString?.() ?? '?'} MAIDs (spilled payload)`,
+      });
+      const r = await fetch(
+        `/api/zip-code-signals/spill?key=${encodeURIComponent(data.devicesSpillKey)}`,
+        { credentials: 'include' },
+      );
+      if (!r.ok) {
+        let msg = `Spill download HTTP ${r.status}`;
+        try {
+          const j = await r.json() as { error?: string };
+          if (j?.error) msg = j.error;
+        } catch { /* ignore */ }
+        throw new Error(msg);
+      }
+      return r.json() as Promise<PostalMaidResult>;
+    };
 
     try {
       const response = await fetch('/api/zip-code-signals/analyze/stream', {
@@ -294,8 +321,8 @@ export default function ZipCodeSignalsPage() {
           datasetName: selectedDataset.id,
           postalCodes,
           country: selectedCountry,
-          dateFrom: dateFrom || undefined,
-          dateTo: dateTo || undefined,
+          dateFrom: effDateFrom || undefined,
+          dateTo: effDateTo || undefined,
         }),
         credentials: 'include',
         signal: abort.signal,
@@ -353,14 +380,40 @@ export default function ZipCodeSignalsPage() {
               appendProgressLog({
                 step: 'completed',
                 percent: 100,
-                message: 'Result received from server',
-                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s) in payload`,
+                message: 'Result packet received',
+                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s) in SSE${data?.devicesSpillKey ? ' (preview — loading spill…)' : ''}`,
               });
-              setResult(data);
+              const merged = await resolveSpillIfNeeded(data as PostalMaidResult);
+              appendProgressLog({
+                step: 'completed',
+                percent: 100,
+                message: 'Result ready',
+                detail: `${merged.devices?.length?.toLocaleString?.() ?? 0} MAID row(s)`,
+              });
+              setResult(merged);
               setPhase('results');
               setProgress(null);
             }
-          } catch { /* ignore parse errors */ }
+          } catch (parseErr: unknown) {
+            const pe = parseErr instanceof Error ? parseErr.message : String(parseErr);
+            if (eventType === 'result') {
+              const hint = `Could not parse result JSON (${dataStr.length} chars). The response may be truncated, or the browser ran out of memory.`;
+              backendError = hint;
+              appendProgressLog({
+                step: 'error',
+                percent: 0,
+                message: hint,
+                detail: pe.slice(0, 400),
+              });
+            } else {
+              appendProgressLog({
+                step: 'error',
+                percent: 0,
+                message: `Could not parse ${eventType} event`,
+                detail: pe.slice(0, 400),
+              });
+            }
+          }
         }
       }
 
@@ -389,14 +442,21 @@ export default function ZipCodeSignalsPage() {
               appendProgressLog({
                 step: 'completed',
                 percent: 100,
-                message: 'Result received from server',
-                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s) in payload`,
+                message: 'Result packet received (tail buffer)',
+                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s)${data?.devicesSpillKey ? ' — loading spill…' : ''}`,
               });
-              setResult(data);
+              const merged = await resolveSpillIfNeeded(data as PostalMaidResult);
+              setResult(merged);
               setPhase('results');
               setProgress(null);
             }
-          } catch { /* ignore */ }
+          } catch (parseErr: unknown) {
+            const pe = parseErr instanceof Error ? parseErr.message : String(parseErr);
+            if (eventType === 'result') {
+              backendError = `Tail buffer: could not parse result (${dataStr.length} chars): ${pe.slice(0, 200)}`;
+              appendProgressLog({ step: 'error', percent: 0, message: backendError, detail: pe.slice(0, 400) });
+            }
+          }
         }
       }
 
@@ -404,7 +464,9 @@ export default function ZipCodeSignalsPage() {
         throw new Error(backendError);
       }
       if (!gotResult) {
-        throw new Error('Analysis completed without returning results');
+        throw new Error(
+          'The server closed the stream without a result. Typical causes: (1) Vercel/server time limit — use the date range (defaults now match the dataset catalog); (2) network timeout; (3) server error — check the activity log for the last step. This is not the same as "zero postal matches."',
+        );
       }
     } catch (err: any) {
       const last = lastProgressRef.current;
@@ -591,6 +653,10 @@ export default function ZipCodeSignalsPage() {
                       />
                     </div>
                   </div>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    If you leave dates blank, the run uses this dataset&apos;s catalog range above (recommended).
+                    Omitting that filter forces Athena over all partitions and often hits server time limits on large jobs.
+                  </p>
 
                   {/* Dataset info */}
                   {selectedDataset && (

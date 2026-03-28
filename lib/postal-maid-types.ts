@@ -44,6 +44,13 @@ export interface PostalMaidResult {
   };
   /** Matched MAIDs — all devices whose first-ping origin fell in the requested postal codes */
   devices: PostalMaidDevice[];
+  /**
+   * When the SSE payload would exceed safe size, full result is stored in S3 config.
+   * Client should GET /api/zip-code-signals/spill?key=… (after merge, devices holds a preview only).
+   */
+  devicesSpillKey?: string;
+  /** Total MAIDs when devicesSpillKey is set (devices array may be shorter) */
+  devicesSpillTotal?: number;
   /** Breakdown by postal code: how many devices per requested postal code */
   postalCodeBreakdown: Array<{
     postalCode: string;

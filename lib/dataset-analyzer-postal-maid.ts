@@ -18,6 +18,18 @@ export type { PostalMaidFilters, PostalMaidResult } from './postal-maid-types';
 const ACCURACY_THRESHOLD_METERS = 500;
 const COORDINATE_PRECISION = 4; // ~11m resolution
 
+/** Align user input with GeoJSON (e.g. MX 5-digit CP: "5900" → "05900") */
+function normalizePostalForCountry(country: string, raw: string): string {
+  const cc = country.toUpperCase();
+  let s = raw.trim().toUpperCase().replace(/\s+/g, '');
+  if (/^[A-Z]{2}-/.test(s)) s = s.slice(3);
+  if (cc === 'MX') {
+    const digits = s.replace(/\D/g, '');
+    if (digits.length >= 1 && digits.length <= 5) return digits.padStart(5, '0');
+  }
+  return s;
+}
+
 /** Progress callback for streaming updates */
 export type PostalMaidProgressCallback = (progress: {
   step:
@@ -61,15 +73,8 @@ export async function analyzePostalMaid(
   try {
     setCountryFilter([filters.country.toUpperCase()]);
 
-  // Normalize postal codes (trim, uppercase, strip country prefix like "ES-" or "CO-")
   const requestedPostalCodes = new Set(
-    filters.postalCodes.map(pc => {
-      let code = pc.trim().toUpperCase();
-      if (/^[A-Z]{2}-/.test(code)) {
-        code = code.slice(3);
-      }
-      return code;
-    })
+    filters.postalCodes.map(pc => normalizePostalForCountry(filters.country, pc)),
   );
 
   const tableName = getTableName(datasetName);
@@ -216,7 +221,7 @@ export async function analyzePostalMaid(
     const c = classified[i];
     if (c.type === 'geojson_local' || c.type === 'nominatim_match') {
       const [coordKey] = coordEntries[i];
-      coordToPostal.set(coordKey, c.postcode.toUpperCase());
+      coordToPostal.set(coordKey, normalizePostalForCountry(filters.country, c.postcode));
     }
   }
 
@@ -335,7 +340,7 @@ function buildEmptyResult(
     },
     devices: [],
     postalCodeBreakdown: filters.postalCodes.map(pc => ({
-      postalCode: pc.trim().toUpperCase(),
+      postalCode: normalizePostalForCountry(filters.country, pc),
       devices: 0,
       deviceDays: 0,
     })),

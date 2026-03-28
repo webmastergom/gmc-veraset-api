@@ -1,10 +1,18 @@
+import { randomBytes } from 'crypto';
 import { NextRequest } from 'next/server';
+import { isAuthenticated } from '@/lib/auth';
 import { analyzePostalMaid } from '@/lib/dataset-analyzer-postal-maid';
-import type { PostalMaidFilters } from '@/lib/postal-maid-types';
+import type { PostalMaidFilters, PostalMaidResult } from '@/lib/postal-maid-types';
+import { putConfig } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-export const maxDuration = 300;
+/** Pro / Enterprise — large Athena jobs need headroom beyond 300s */
+export const maxDuration = 800;
+
+const MAX_SSE_PAYLOAD_CHARS = 2_000_000;
+const MAX_DEVICES_INLINE = 60_000;
+const SPILL_PREVIEW_DEVICES = 5_000;
 
 /**
  * POST /api/zip-code-signals/analyze/stream
@@ -21,6 +29,10 @@ export const maxDuration = 300;
  * }
  */
 export async function POST(request: NextRequest): Promise<Response> {
+  if (!isAuthenticated(request)) {
+    return new Response('Unauthorized cookie auth required', { status: 401 });
+  }
+
   let body: {
     datasetName: string;
     postalCodes: string[];
@@ -89,10 +101,45 @@ export async function POST(request: NextRequest): Promise<Response> {
 
         if (aborted) return;
 
-        // Send result directly (NOT via send()) so serialization errors propagate
-        const payload = JSON.stringify(result);
-        console.log(`[ZIP-SIGNALS-STREAM] Result payload size: ${payload.length} chars, devices: ${result.devices?.length ?? 0}, matched: ${result.coverage?.postalCodesWithDevices ?? 0}/${result.coverage?.postalCodesRequested ?? 0}`);
-        controller.enqueue(encoder.encode(`event: result\ndata: ${payload}\n\n`));
+        let outbound: PostalMaidResult = result;
+        const needsSpill =
+          result.devices.length > MAX_DEVICES_INLINE ||
+          // avoid double stringify on huge arrays: rough lower bound (~35 chars / device)
+          result.devices.length * 40 > MAX_SSE_PAYLOAD_CHARS;
+
+        if (needsSpill) {
+          const safeDs = body.datasetName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 72);
+          const spillKey = `postal-maid-spill/${safeDs}/${Date.now()}-${randomBytes(6).toString('hex')}`;
+          await putConfig(spillKey, result, { compact: true });
+          outbound = {
+            ...result,
+            devices: result.devices.slice(0, SPILL_PREVIEW_DEVICES),
+            devicesSpillKey: spillKey,
+            devicesSpillTotal: result.devices.length,
+          };
+          console.log(
+            `[ZIP-SIGNALS-STREAM] Spilled ${result.devices.length} devices to ${spillKey}; SSE preview ${outbound.devices.length}`,
+          );
+        }
+
+        const payload = JSON.stringify(outbound);
+        if (!needsSpill && payload.length > MAX_SSE_PAYLOAD_CHARS) {
+          const safeDs = body.datasetName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 72);
+          const spillKey = `postal-maid-spill/${safeDs}/${Date.now()}-${randomBytes(6).toString('hex')}`;
+          await putConfig(spillKey, result, { compact: true });
+          outbound = {
+            ...result,
+            devices: result.devices.slice(0, SPILL_PREVIEW_DEVICES),
+            devicesSpillKey: spillKey,
+            devicesSpillTotal: result.devices.length,
+          };
+          console.log(`[ZIP-SIGNALS-STREAM] Spilled after size check (${payload.length} chars) → ${spillKey}`);
+        }
+        const payloadFinal = JSON.stringify(outbound);
+        console.log(
+          `[ZIP-SIGNALS-STREAM] SSE payload: ${payloadFinal.length} chars, devices in packet: ${outbound.devices?.length ?? 0}, matched CPs: ${result.coverage?.postalCodesWithDevices ?? 0}/${result.coverage?.postalCodesRequested ?? 0}`,
+        );
+        controller.enqueue(encoder.encode(`event: result\ndata: ${payloadFinal}\n\n`));
       } catch (error: any) {
         console.error(`[ZIP-SIGNALS-STREAM] Error:`, error.message);
         if (!aborted) {
