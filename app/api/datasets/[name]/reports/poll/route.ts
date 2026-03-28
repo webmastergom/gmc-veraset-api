@@ -270,8 +270,8 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
 
 function buildMobilitySQL(table: string, minDwell = 0): string {
   // Find POI categories visited before/after target POI visit.
-  // Uses Veraset's native poi_ids (assigned to ALL nearby POIs, not just job's)
-  // then looks up categories from lab_pois_gmc. No spatial join needed.
+  // Veraset poi_ids are internal IDs (not GMC UUIDs), so we use geohash
+  // spatial join against lab_pois_gmc — but ONLY for visitor pings (small subset).
   return `WITH ${atPoiCTE(table, minDwell)},
     visit_times AS (
       SELECT ad_id, date,
@@ -279,29 +279,42 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
         MAX(utc_timestamp) as last_visit
       FROM at_poi GROUP BY ad_id, date
     ),
-    other_pois AS (
-      SELECT t.ad_id, t.date, t.utc_timestamp, other_poi
+    nearby_pings AS (
+      SELECT t.ad_id, t.date,
+        CASE WHEN t.utc_timestamp < v.first_visit THEN 'before' ELSE 'after' END as timing,
+        TRY_CAST(t.latitude AS DOUBLE) as lat,
+        TRY_CAST(t.longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(t.latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(TRY_CAST(t.longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_bucket
       FROM ${table} t
       INNER JOIN visit_times v ON t.ad_id = v.ad_id AND t.date = v.date
-      CROSS JOIN UNNEST(t.poi_ids) AS x(other_poi)
       WHERE t.ad_id IS NOT NULL AND TRIM(t.ad_id) != ''
-        AND x.other_poi IS NOT NULL AND x.other_poi != ''
-        AND ABS(DATE_DIFF('hour', t.utc_timestamp, v.first_visit)) <= 3
-        AND (t.utc_timestamp < v.first_visit OR t.utc_timestamp > v.last_visit)
+        AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        AND ABS(DATE_DIFF('hour', t.utc_timestamp, v.first_visit)) <= 2
+        AND t.utc_timestamp != v.first_visit
     ),
-    categorized AS (
-      SELECT o.ad_id, o.date,
-        CASE WHEN o.utc_timestamp < v.first_visit THEN 'before' ELSE 'after' END as timing,
-        g.category
-      FROM other_pois o
-      INNER JOIN visit_times v ON o.ad_id = v.ad_id AND o.date = v.date
-      INNER JOIN ${POI_GMC_TABLE} g ON o.other_poi = g.id
-      WHERE g.category IS NOT NULL
+    gmc_buckets AS (
+      SELECT category, latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) as lng_bucket
+      FROM ${POI_GMC_TABLE}
+      WHERE category IS NOT NULL
+    ),
+    matched AS (
+      SELECT n.ad_id, n.date, n.timing, g.category
+      FROM nearby_pings n
+      INNER JOIN gmc_buckets g ON n.lat_bucket = g.lat_bucket AND n.lng_bucket = g.lng_bucket
+      WHERE 111320 * SQRT(
+          POW(n.lat - g.poi_lat, 2) +
+          POW((n.lng - g.poi_lng) * COS(RADIANS((n.lat + g.poi_lat) / 2)), 2)
+        ) <= 200
     )
     SELECT category, timing,
       COUNT(DISTINCT ad_id || '|' || date) as device_days,
       COUNT(DISTINCT ad_id) as unique_devices
-    FROM categorized
+    FROM matched
     GROUP BY category, timing
     ORDER BY device_days DESC
     LIMIT 500`;
