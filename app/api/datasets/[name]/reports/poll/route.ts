@@ -239,56 +239,39 @@ function buildAffinitySQL(table: string): string {
 }
 
 function buildMobilitySQL(table: string): string {
+  // Uses poi_ids from the job itself: pings before/after POI visit on the same day.
+  // "before" = pings within 2h before first POI ping; "after" = within 2h after last POI ping.
+  // Groups non-POI pings by hour bucket relative to visit for temporal distribution.
   return `WITH ${atPoiCTE(table)},
-    target_visits AS (
-      SELECT ad_id, date, MIN(utc_timestamp) as visit_time
+    visit_times AS (
+      SELECT ad_id, date,
+        MIN(utc_timestamp) as first_visit,
+        MAX(utc_timestamp) as last_visit
       FROM at_poi GROUP BY ad_id, date
     ),
-    all_pings AS (
-      SELECT ad_id, date, utc_timestamp,
-        TRY_CAST(latitude AS DOUBLE) as lat,
-        TRY_CAST(longitude AS DOUBLE) as lng,
-        CAST(FLOOR(TRY_CAST(latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_bucket,
-        CAST(FLOOR(TRY_CAST(longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_bucket
-      FROM ${table}
-      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-    ),
-    nearby_pings AS (
-      SELECT
-        ap.ad_id, ap.date,
-        CASE WHEN ap.utc_timestamp < tv.visit_time THEN 'before' ELSE 'after' END as timing,
-        ap.lat, ap.lng, ap.lat_bucket, ap.lng_bucket
-      FROM all_pings ap
-      INNER JOIN target_visits tv ON ap.ad_id = tv.ad_id AND ap.date = tv.date
-      WHERE ABS(DATE_DIFF('hour', ap.utc_timestamp, tv.visit_time)) <= 2
-        AND ap.utc_timestamp != tv.visit_time
-    ),
-    gmc_buckets AS (
-      SELECT category, latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) as lat_bucket,
-        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) as lng_bucket
-      FROM ${POI_GMC_TABLE}
-      WHERE category IS NOT NULL
-    ),
-    matched AS (
-      SELECT n.ad_id, n.date, n.timing, g.category
-      FROM nearby_pings n
-      INNER JOIN gmc_buckets g ON n.lat_bucket = g.lat_bucket AND n.lng_bucket = g.lng_bucket
-      WHERE 111320 * SQRT(
-          POW(n.lat - g.poi_lat, 2) +
-          POW((n.lng - g.poi_lng) * COS(RADIANS((n.lat + g.poi_lat) / 2)), 2)
-        ) <= 200
+    non_poi_pings AS (
+      SELECT t.ad_id, t.date, t.utc_timestamp,
+        CASE
+          WHEN t.utc_timestamp < v.first_visit THEN 'before'
+          WHEN t.utc_timestamp > v.last_visit THEN 'after'
+          ELSE 'during'
+        END as timing,
+        HOUR(t.utc_timestamp) as ping_hour
+      FROM ${table} t
+      INNER JOIN visit_times v ON t.ad_id = v.ad_id AND t.date = v.date
+      WHERE t.ad_id IS NOT NULL AND TRIM(t.ad_id) != ''
+        AND (t.poi_ids IS NULL OR CARDINALITY(t.poi_ids) = 0
+             OR NOT EXISTS (SELECT 1 FROM UNNEST(t.poi_ids) AS x(id) WHERE x.id IS NOT NULL AND x.id != ''))
+        AND ABS(DATE_DIFF('hour', t.utc_timestamp, v.first_visit)) <= 3
     )
-    SELECT category, timing,
-      COUNT(DISTINCT ad_id || '|' || date) as device_days,
-      COUNT(DISTINCT ad_id) as unique_devices
-    FROM matched
-    GROUP BY category, timing
-    ORDER BY device_days DESC
-    LIMIT 500`;
+    SELECT timing, ping_hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as unique_devices,
+      COUNT(DISTINCT ad_id || '|' || date) as device_days
+    FROM non_poi_pings
+    WHERE timing != 'during'
+    GROUP BY timing, ping_hour
+    ORDER BY timing, ping_hour`;
 }
 
 // ── Affinity index computation ────────────────────────────────────────
@@ -564,11 +547,32 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] temporal parse:', e.message); }
       }
 
-      // Parse mobility
+      // Parse mobility (before/after POI visit by hour)
       if (queries.mobility) {
         try {
           const r = await fetchQueryResults(queries.mobility);
-          await putConfig(`${pfx}/mobility`, parseConsolidatedMobility(datasetName, r.rows), { compact: true });
+          const before: any[] = [];
+          const after: any[] = [];
+          for (const row of r.rows) {
+            const entry = {
+              hour: parseInt(row.ping_hour, 10) || 0,
+              pings: parseInt(row.pings, 10) || 0,
+              devices: parseInt(row.unique_devices, 10) || 0,
+              deviceDays: parseInt(row.device_days, 10) || 0,
+            };
+            if (row.timing === 'before') before.push(entry);
+            else if (row.timing === 'after') after.push(entry);
+          }
+          before.sort((a, b) => a.hour - b.hour);
+          after.sort((a, b) => a.hour - b.hour);
+          await putConfig(`${pfx}/mobility`, {
+            analyzedAt: new Date().toISOString(),
+            datasetName,
+            before,
+            after,
+            totalBeforeDeviceDays: before.reduce((s, e) => s + e.deviceDays, 0),
+            totalAfterDeviceDays: after.reduce((s, e) => s + e.deviceDays, 0),
+          }, { compact: true });
         } catch (e: any) { console.error('[DS-REPORT] mobility parse:', e.message); }
       }
 
