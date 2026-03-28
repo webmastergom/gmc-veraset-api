@@ -49,9 +49,37 @@ const GRID = 0.01;
 const POI_GMC_TABLE = 'lab_pois_gmc';
 
 /**
- * Common CTE: filter pings that have poi_ids assigned by Veraset.
- * This is O(N) scan — no spatial join needed.
+ * Common CTE: filter pings at POIs with dwell calculation.
+ * Dwell = time span (minutes) between first and last ping per device-day at POI.
+ * Returns per-device-day aggregated rows with dwell_minutes.
  */
+function atPoiWithDwellCTE(table: string): string {
+  return `raw_poi_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    ),
+    at_poi AS (
+      SELECT ad_id, date,
+        MIN(utc_timestamp) as first_ping,
+        MAX(utc_timestamp) as last_ping,
+        ROUND(MIN_BY(lat, utc_timestamp), ${PREC}) as lat,
+        ROUND(MIN_BY(lng, utc_timestamp), ${PREC}) as lng,
+        DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_minutes,
+        COUNT(*) as ping_count
+      FROM raw_poi_pings
+      GROUP BY ad_id, date
+    )`;
+}
+
+/** Simple CTE for queries that just need the raw pings (hourly, temporal) */
 function atPoiCTE(table: string): string {
   return `at_poi AS (
       SELECT DISTINCT ad_id, date, utc_timestamp,
@@ -86,10 +114,10 @@ function buildTotalDevicesSQL(table: string): string {
 }
 
 function buildODSQL(table: string): string {
-  return `WITH ${atPoiCTE(table)},
+  return `WITH ${atPoiWithDwellCTE(table)},
     poi_visits AS (
-      SELECT ad_id, date, MIN(utc_timestamp) as first_poi_visit
-      FROM at_poi GROUP BY ad_id, date
+      SELECT ad_id, date, first_ping as first_poi_visit
+      FROM at_poi
     ),
     all_pings AS (
       SELECT ad_id, date, utc_timestamp,
@@ -127,7 +155,7 @@ function buildODSQL(table: string): string {
 }
 
 function buildCatchmentSQL(table: string): string {
-  return `WITH ${atPoiCTE(table)},
+  return `WITH ${atPoiWithDwellCTE(table)},
     poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
     valid_pings AS (
       SELECT t.ad_id, t.date, t.utc_timestamp,
@@ -159,6 +187,57 @@ function buildCatchmentSQL(table: string): string {
     LIMIT 100000`;
 }
 
+/**
+ * Affinity query: per-origin-cluster, compute total visits, unique devices,
+ * avg dwell, and visit frequency. These feed the affinity index calculation
+ * after reverse geocoding groups them by postal code.
+ */
+function buildAffinitySQL(table: string): string {
+  return `WITH ${atPoiWithDwellCTE(table)},
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    ),
+    first_pings AS (
+      SELECT p.ad_id, p.date,
+        MIN_BY(p.lat, p.utc_timestamp) as origin_lat,
+        MIN_BY(p.lng, p.utc_timestamp) as origin_lng
+      FROM all_pings p
+      INNER JOIN (SELECT DISTINCT ad_id FROM at_poi) v ON p.ad_id = v.ad_id
+      GROUP BY p.ad_id, p.date
+    ),
+    device_stats AS (
+      SELECT
+        a.ad_id,
+        fp.origin_lat,
+        fp.origin_lng,
+        COUNT(DISTINCT a.date) as visit_days,
+        AVG(a.dwell_minutes) as avg_dwell,
+        SUM(a.ping_count) as total_pings
+      FROM at_poi a
+      INNER JOIN first_pings fp ON a.ad_id = fp.ad_id AND a.date = fp.date
+      GROUP BY a.ad_id, fp.origin_lat, fp.origin_lng
+    )
+    SELECT
+      ROUND(origin_lat, ${PREC}) as origin_lat,
+      ROUND(origin_lng, ${PREC}) as origin_lng,
+      COUNT(DISTINCT ad_id) as unique_devices,
+      SUM(visit_days) as total_visit_days,
+      AVG(avg_dwell) as avg_dwell_minutes,
+      AVG(visit_days) as avg_frequency
+    FROM device_stats
+    WHERE origin_lat IS NOT NULL
+    GROUP BY 1, 2
+    ORDER BY unique_devices DESC
+    LIMIT 50000`;
+}
+
 function buildMobilitySQL(table: string): string {
   return `WITH ${atPoiCTE(table)},
     target_visits AS (
@@ -178,22 +257,20 @@ function buildMobilitySQL(table: string): string {
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
     ),
     nearby_pings AS (
-      SELECT a.ad_id, a.date, a.lat, a.lng,
-        a.lat_bucket, a.lng_bucket,
-        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing
-      FROM all_pings a
-      INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
-      WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
-        AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
+      SELECT
+        ap.ad_id, ap.date,
+        CASE WHEN ap.utc_timestamp < tv.visit_time THEN 'before' ELSE 'after' END as timing,
+        ap.lat, ap.lng, ap.lat_bucket, ap.lng_bucket
+      FROM all_pings ap
+      INNER JOIN target_visits tv ON ap.ad_id = tv.ad_id AND ap.date = tv.date
+      WHERE ABS(DATE_DIFF('hour', ap.utc_timestamp, tv.visit_time)) <= 2
+        AND ap.utc_timestamp != tv.visit_time
     ),
     gmc_buckets AS (
-      SELECT id as poi_id, name as poi_name, category,
-        latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) + dlat as lat_bucket,
-        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) + dlng as lng_bucket
+      SELECT category, latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) as lng_bucket
       FROM ${POI_GMC_TABLE}
-      CROSS JOIN (VALUES (-1),(0),(1)) AS t1(dlat)
-      CROSS JOIN (VALUES (-1),(0),(1)) AS t2(dlng)
       WHERE category IS NOT NULL
     ),
     matched AS (
@@ -212,6 +289,105 @@ function buildMobilitySQL(table: string): string {
     GROUP BY category, timing
     ORDER BY device_days DESC
     LIMIT 500`;
+}
+
+// ── Affinity index computation ────────────────────────────────────────
+
+interface AffinityByZip {
+  zipCode: string;
+  city: string;
+  country: string;
+  lat: number;
+  lng: number;
+  uniqueDevices: number;
+  totalVisitDays: number;
+  avgDwellMinutes: number;
+  avgFrequency: number;
+  affinityIndex: number;  // 0-100
+}
+
+function computeAffinityReport(
+  datasetName: string,
+  rows: any[],
+  coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
+): { analyzedAt: string; datasetName: string; byZipCode: AffinityByZip[] } {
+  // Aggregate by postal code
+  const zipMap = new Map<string, {
+    zipCode: string; city: string; country: string;
+    lat: number; lng: number;
+    uniqueDevices: number; totalVisitDays: number;
+    dwellSum: number; dwellCount: number;
+    freqSum: number; freqCount: number;
+  }>();
+
+  for (const row of rows) {
+    const lat = parseFloat(row.origin_lat) || 0;
+    const lng = parseFloat(row.origin_lng) || 0;
+    const key = `${lat},${lng}`;
+    const geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const zk = geo.zipCode;
+
+    const devices = parseInt(row.unique_devices, 10) || 0;
+    const visitDays = parseInt(row.total_visit_days, 10) || 0;
+    const avgDwell = parseFloat(row.avg_dwell_minutes) || 0;
+    const avgFreq = parseFloat(row.avg_frequency) || 1;
+
+    const existing = zipMap.get(zk);
+    if (existing) {
+      existing.uniqueDevices += devices;
+      existing.totalVisitDays += visitDays;
+      existing.dwellSum += avgDwell * devices;
+      existing.dwellCount += devices;
+      existing.freqSum += avgFreq * devices;
+      existing.freqCount += devices;
+    } else {
+      zipMap.set(zk, {
+        zipCode: zk, city: geo.city, country: geo.country,
+        lat, lng,
+        uniqueDevices: devices, totalVisitDays: visitDays,
+        dwellSum: avgDwell * devices, dwellCount: devices,
+        freqSum: avgFreq * devices, freqCount: devices,
+      });
+    }
+  }
+
+  // Compute affinity index per zip
+  const zips = Array.from(zipMap.values());
+
+  // Find max dwell and max frequency for normalization
+  const maxDwell = Math.max(1, ...zips.map(z => z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0));
+  const maxFreq = Math.max(1, ...zips.map(z => z.freqCount > 0 ? z.freqSum / z.freqCount : 0));
+
+  const result: AffinityByZip[] = zips.map(z => {
+    const avgDwell = z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0;
+    const avgFreq = z.freqCount > 0 ? z.freqSum / z.freqCount : 1;
+
+    // Normalize to 0-100: dwell (50%) + frequency (50%)
+    const dwellScore = Math.min(100, (avgDwell / maxDwell) * 100);
+    const freqScore = Math.min(100, (avgFreq / maxFreq) * 100);
+    const affinityIndex = Math.round(dwellScore * 0.5 + freqScore * 0.5);
+
+    return {
+      zipCode: z.zipCode,
+      city: z.city,
+      country: z.country,
+      lat: z.lat,
+      lng: z.lng,
+      uniqueDevices: z.uniqueDevices,
+      totalVisitDays: z.totalVisitDays,
+      avgDwellMinutes: Math.round(avgDwell * 10) / 10,
+      avgFrequency: Math.round(avgFreq * 100) / 100,
+      affinityIndex,
+    };
+  });
+
+  result.sort((a, b) => b.affinityIndex - a.affinityIndex);
+
+  return {
+    analyzedAt: new Date().toISOString(),
+    datasetName,
+    byZipCode: result.filter(z => z.zipCode !== 'UNKNOWN'),
+  };
 }
 
 // ── Main handler ──────────────────────────────────────────────────────
@@ -239,7 +415,7 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      // Launch all 6 queries in parallel using poi_ids (no spatial join)
+      // Launch all 7 queries in parallel using poi_ids (no spatial join)
       const queries: Record<string, string> = {};
       await Promise.all([
         startQueryAsync(buildODSQL(table)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
@@ -248,6 +424,7 @@ export async function POST(
         startQueryAsync(buildTemporalSQL(table)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
         startQueryAsync(buildTotalDevicesSQL(table)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
         startQueryAsync(buildMobilitySQL(table)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildAffinitySQL(table)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
       // Get dataset size for progress estimation
@@ -422,7 +599,21 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] catchment parse:', e.message); }
       }
 
-      // Geocode OD + catchment coords
+      // Parse affinity rows (geocoded later)
+      let affinityRows: any[] | null = null;
+      if (queries.affinity) {
+        try {
+          const r = await fetchQueryResults(queries.affinity);
+          affinityRows = r.rows;
+          for (const row of r.rows) {
+            const lat = parseFloat(row.origin_lat) || 0;
+            const lng = parseFloat(row.origin_lng) || 0;
+            coordsToGeocode.set(`${lat},${lng}`, { lat, lng, deviceCount: parseInt(row.unique_devices, 10) || 0 });
+          }
+        } catch (e: any) { console.error('[DS-REPORT] affinity parse:', e.message); }
+      }
+
+      // Geocode OD + catchment + affinity coords
       const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
       if (coordsToGeocode.size > 0) {
         try {
@@ -466,6 +657,13 @@ export async function POST(
       }
       if (catchmentRows) {
         await putConfig(`${pfx}/catchment`, buildCatchmentReport(datasetName, catchmentRows, coordToZip), { compact: true });
+      }
+
+      // Save affinity report
+      if (affinityRows) {
+        const affinityReport = computeAffinityReport(datasetName, affinityRows, coordToZip);
+        await putConfig(`${pfx}/affinity`, affinityReport, { compact: true });
+        console.log(`[DS-REPORT] Affinity report: ${affinityReport.byZipCode.length} postal codes`);
       }
 
       state = { ...state, phase: 'done' };

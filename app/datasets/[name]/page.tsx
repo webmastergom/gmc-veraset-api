@@ -35,6 +35,7 @@ import {
   Compass,
   Timer,
   Play,
+  Target,
 } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -135,6 +136,7 @@ export default function DatasetAnalysisPage() {
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
   const [mobilityReport, setMobilityReport] = useState<any>(null);
   const [temporalReport, setTemporalReport] = useState<any>(null);
+  const [affinityReport, setAffinityReport] = useState<any>(null);
   const [reportVersion, setReportVersion] = useState(0);
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([]);
 
@@ -158,13 +160,14 @@ export default function DatasetAnalysisPage() {
 
   // Load reports for a specific dwell bucket
   const loadReportsForBucket = (bucket: number) => {
-    const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal'];
+    const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
       hourly: setHourlyReport,
       catchment: setCatchmentReport,
       mobility: setMobilityReport,
       temporal: setTemporalReport,
+      affinity: setAffinityReport,
     };
     for (const type of types) {
       fetch(`/api/datasets/${datasetName}/reports?type=${type}&bucket=${bucket}`, { credentials: 'include' })
@@ -449,7 +452,7 @@ export default function DatasetAnalysisPage() {
     devices: d.devices,
   })) || [];
 
-  const hasReports = odReport || hourlyReport || catchmentReport || mobilityReport || temporalReport;
+  const hasReports = odReport || hourlyReport || catchmentReport || mobilityReport || temporalReport || affinityReport;
 
   return (
     <MainLayout>
@@ -847,6 +850,99 @@ export default function DatasetAnalysisPage() {
                 label="Device-Days"
                 color="#f59e0b"
               />
+            </CollapsibleCard>
+          )}
+
+          {/* Affinity Heatmap */}
+          {affinityReport?.byZipCode?.length > 0 && (
+            <CollapsibleCard
+              title="Affinity Heatmap"
+              icon={<Target className="h-4 w-4" />}
+            >
+              <CatchmentMap
+                data={affinityReport.byZipCode.map((z: any) => ({
+                  zipCode: z.zipCode,
+                  city: z.city,
+                  country: z.country,
+                  lat: z.lat,
+                  lng: z.lng,
+                  deviceDays: z.affinityIndex,
+                }))}
+              />
+            </CollapsibleCard>
+          )}
+
+          {/* Affinity Index by Postal Code */}
+          {affinityReport?.byZipCode?.length > 0 && (
+            <CollapsibleCard
+              title="Affinity Index by Postal Code"
+              icon={<Target className="h-4 w-4" />}
+            >
+              <p className="text-sm text-muted-foreground mb-4">
+                Affinity = 50% dwell time + 50% visit frequency. Scale 0-100.
+                {' '}{affinityReport.byZipCode.length} postal codes analyzed.
+              </p>
+              <div className="flex justify-end mb-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const sorted = [...affinityReport.byZipCode].sort((a: any, b: any) => b.affinityIndex - a.affinityIndex);
+                    const csv = 'zip_code,city,country,affinity_index,avg_dwell_min,avg_frequency,unique_devices,total_visit_days\n' +
+                      sorted.map((z: any) => `${z.zipCode},${z.city},${z.country},${z.affinityIndex},${z.avgDwellMinutes},${z.avgFrequency},${z.uniqueDevices},${z.totalVisitDays}`).join('\n');
+                    const blob = new Blob([csv], { type: 'text/csv' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = `${datasetName}-affinity-index.csv`; a.click();
+                  }}
+                >
+                  <Download className="h-3 w-3 mr-1" /> Download CSV
+                </Button>
+              </div>
+              <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-background border-b">
+                    <tr>
+                      <th className="text-left py-2 px-3">Postal Code</th>
+                      <th className="text-left py-2 px-3">City</th>
+                      <th className="text-right py-2 px-3">Affinity</th>
+                      <th className="text-right py-2 px-3">Avg Dwell (min)</th>
+                      <th className="text-right py-2 px-3">Avg Frequency</th>
+                      <th className="text-right py-2 px-3">Devices</th>
+                      <th className="text-right py-2 px-3">Visit-Days</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...affinityReport.byZipCode]
+                      .sort((a: any, b: any) => b.affinityIndex - a.affinityIndex)
+                      .slice(0, 100)
+                      .map((z: any, i: number) => (
+                        <tr key={z.zipCode} className="border-b border-border/50 hover:bg-muted/30">
+                          <td className="py-2 px-3 font-mono">{z.zipCode}</td>
+                          <td className="py-2 px-3 text-muted-foreground">{z.city}</td>
+                          <td className="py-2 px-3 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <div className="w-16 h-2 bg-muted rounded-full overflow-hidden">
+                                <div
+                                  className="h-full rounded-full"
+                                  style={{
+                                    width: `${z.affinityIndex}%`,
+                                    backgroundColor: z.affinityIndex >= 70 ? '#22c55e' : z.affinityIndex >= 40 ? '#eab308' : '#ef4444',
+                                  }}
+                                />
+                              </div>
+                              <span className="font-semibold w-8 text-right">{z.affinityIndex}</span>
+                            </div>
+                          </td>
+                          <td className="py-2 px-3 text-right text-muted-foreground">{z.avgDwellMinutes}</td>
+                          <td className="py-2 px-3 text-right text-muted-foreground">{z.avgFrequency}</td>
+                          <td className="py-2 px-3 text-right">{z.uniqueDevices?.toLocaleString()}</td>
+                          <td className="py-2 px-3 text-right text-muted-foreground">{z.totalVisitDays?.toLocaleString()}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
             </CollapsibleCard>
           )}
 
