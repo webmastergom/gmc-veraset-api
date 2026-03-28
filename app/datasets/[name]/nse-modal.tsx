@@ -204,6 +204,7 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
   // Load data when modal opens
   const handleOpenChange = (isOpen: boolean) => {
     if (isOpen) {
+      setLoading(true);
       loadNseData();
     } else {
       onClose();
@@ -219,7 +220,8 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Users className="h-5 w-5" />
-            MAIDs by NSE — {country || '...'}
+            MAIDs by NSE {country ? `— ${country}` : ''}
+            {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           </DialogTitle>
         </DialogHeader>
 
