@@ -7,8 +7,12 @@ import { putConfig } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-/** Pro / Enterprise — large Athena jobs need headroom beyond 300s */
-export const maxDuration = 800;
+/**
+ * Vercel Pro: default hard cap is often 300s unless you raise it in
+ * Project → Settings → Functions (max 800 on some accounts).
+ * Heavy Athena + geocode regularly exceeds a single invocation — see UI note + long-term async job.
+ */
+export const maxDuration = 300;
 
 const MAX_SSE_PAYLOAD_CHARS = 2_000_000;
 const MAX_DEVICES_INLINE = 60_000;

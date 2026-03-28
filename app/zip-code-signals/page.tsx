@@ -771,6 +771,20 @@ export default function ZipCodeSignalsPage() {
 
                   <Separator />
 
+                  {selectedDataset && selectedDataset.totalBytes >= 40 * 1024 ** 3 && (
+                    <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-100/90 leading-relaxed space-y-1.5">
+                      <p className="font-medium text-amber-100">Very large dataset (~{formatBytes(selectedDataset.totalBytes)})</p>
+                      <p>
+                        Zip Code Signals runs in a <strong>single serverless request</strong> (on Vercel Pro often capped around <strong>5 minutes</strong>).
+                        Athena + geocoding can exceed that even with the default catalog date window — you may see a dropped connection, not “zero matches.”
+                      </p>
+                      <p className="text-amber-100/80">
+                        Mitigations: shorten the date range in the form; set env <code className="text-[10px] px-1 rounded bg-black/30">POSTAL_MAID_SQL_ROW_LIMIT</code> for a capped (biased) sample;
+                        run <code className="text-[10px] px-1 rounded bg-black/30">analyzePostalMaid</code> from a long-lived worker; or add an <strong>async job + poll</strong> flow (same idea as dataset reports).
+                      </p>
+                    </div>
+                  )}
+
                   <p className="text-xs text-muted-foreground leading-relaxed">
                     The analysis will find all mobile devices (MAIDs) whose daily residential
                     origin falls within your target postal codes, using first-ping-of-day
