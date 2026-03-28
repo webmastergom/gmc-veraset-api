@@ -22,7 +22,8 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
-const REPORT_PREFIX = (ds: string) => `dataset-reports/${ds}`;
+const REPORT_KEY = (ds: string, type: string, minDwell = 0) =>
+  minDwell > 0 ? `dataset-reports/${ds}/${type}-dwell-${minDwell}` : `dataset-reports/${ds}/${type}`;
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -30,6 +31,7 @@ interface ReportState {
   phase: 'start' | 'polling' | 'parsing' | 'done' | 'error';
   queries: Record<string, string>;  // name → queryId
   datasetSizeGB?: number;
+  minDwell?: number;
   error?: string;
 }
 
@@ -427,8 +429,12 @@ export async function POST(
       if (body?.minDwell) minDwell = parseInt(body.minDwell, 10) || 0;
     } catch { /* no body */ }
 
-    // Reset if done or error
+    // Reset if done, error, or dwell filter changed
     if (state?.phase === 'done' || state?.phase === 'error') state = null;
+    if (state && minDwell > 0 && state.minDwell !== minDwell) {
+      console.log(`[DS-REPORT] Dwell filter changed (${state.minDwell} → ${minDwell}), resetting`);
+      state = null;
+    }
 
     // ── Phase: start ────────────────────────────────────────────
     if (!state) {
@@ -465,7 +471,7 @@ export async function POST(
 
       console.log(`[DS-REPORT] Launched ${Object.keys(queries).length} queries for ${datasetName} (${datasetSizeGB} GB)`);
 
-      state = { phase: 'polling', queries, datasetSizeGB };
+      state = { phase: 'polling', queries, datasetSizeGB, minDwell: minDwell || undefined };
       await saveState(datasetName, state);
 
       return NextResponse.json({
@@ -555,14 +561,15 @@ export async function POST(
     // ── Phase: parsing ──────────────────────────────────────────
     if (state.phase === 'parsing') {
       const queries = state.queries;
-      const pfx = REPORT_PREFIX(datasetName);
+      const dwell = state.minDwell || 0;
+      const rk = (type: string) => REPORT_KEY(datasetName, type, dwell);
       const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
 
       // Parse hourly
       if (queries.hourly) {
         try {
           const r = await fetchQueryResults(queries.hourly);
-          await putConfig(`${pfx}/hourly`, parseConsolidatedHourly(datasetName, r.rows), { compact: true });
+          await putConfig(`${rk('hourly')}`, parseConsolidatedHourly(datasetName, r.rows), { compact: true });
         } catch (e: any) { console.error('[DS-REPORT] hourly parse:', e.message); }
       }
 
@@ -582,7 +589,7 @@ export async function POST(
               report.totalUniqueDevices = parseInt(tr.rows[0]?.total_unique_devices, 10) || 0;
             } catch {}
           }
-          await putConfig(`${pfx}/temporal`, report, { compact: true });
+          await putConfig(`${rk('temporal')}`, report, { compact: true });
         } catch (e: any) { console.error('[DS-REPORT] temporal parse:', e.message); }
       }
 
@@ -604,7 +611,7 @@ export async function POST(
           }
           before.sort((a, b) => a.hour - b.hour);
           after.sort((a, b) => a.hour - b.hour);
-          await putConfig(`${pfx}/mobility`, {
+          await putConfig(`${rk('mobility')}`, {
             analyzedAt: new Date().toISOString(),
             datasetName,
             before,
@@ -678,8 +685,8 @@ export async function POST(
           const rKeys = Array.from(roundedMap.keys());
 
           for (const [key, p] of coordsToGeocode.entries()) {
-            const rk = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
-            const idx = rKeys.indexOf(rk);
+            const roundKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            const idx = rKeys.indexOf(roundKey);
             if (idx >= 0 && idx < geocoded.length) {
               const g = geocoded[idx];
               if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
@@ -696,16 +703,16 @@ export async function POST(
 
       // Save OD + catchment reports
       if (odClusters) {
-        await putConfig(`${pfx}/od`, buildODReport(datasetName, odClusters.clusters, coordToZip), { compact: true });
+        await putConfig(`${rk('od')}`, buildODReport(datasetName, odClusters.clusters, coordToZip), { compact: true });
       }
       if (catchmentRows) {
-        await putConfig(`${pfx}/catchment`, buildCatchmentReport(datasetName, catchmentRows, coordToZip), { compact: true });
+        await putConfig(`${rk('catchment')}`, buildCatchmentReport(datasetName, catchmentRows, coordToZip), { compact: true });
       }
 
       // Save affinity report
       if (affinityRows) {
         const affinityReport = computeAffinityReport(datasetName, affinityRows, coordToZip);
-        await putConfig(`${pfx}/affinity`, affinityReport, { compact: true });
+        await putConfig(`${rk('affinity')}`, affinityReport, { compact: true });
         console.log(`[DS-REPORT] Affinity report: ${affinityReport.byZipCode.length} postal codes`);
       }
 
