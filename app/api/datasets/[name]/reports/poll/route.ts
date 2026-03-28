@@ -29,6 +29,7 @@ const REPORT_PREFIX = (ds: string) => `dataset-reports/${ds}`;
 interface ReportState {
   phase: 'start' | 'polling' | 'parsing' | 'done' | 'error';
   queries: Record<string, string>;  // name → queryId
+  datasetSizeGB?: number;
   error?: string;
 }
 
@@ -249,9 +250,23 @@ export async function POST(
         startQueryAsync(buildMobilitySQL(table)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
       ]);
 
-      console.log(`[DS-REPORT] Launched ${Object.keys(queries).length} queries for ${datasetName}`);
+      // Get dataset size for progress estimation
+      let datasetSizeGB = 0;
+      try {
+        const index = await getConfig<Record<string, any>>('jobs-index');
+        if (index) {
+          const entry = Object.entries(index).find(
+            ([_, j]: [string, any]) => j.s3DestPath?.replace(/\/$/, '').split('/').pop() === datasetName
+          );
+          if (entry) {
+            datasetSizeGB = Math.round(((entry[1] as any).totalBytes || 0) / 1e9);
+          }
+        }
+      } catch {}
 
-      state = { phase: 'polling', queries };
+      console.log(`[DS-REPORT] Launched ${Object.keys(queries).length} queries for ${datasetName} (${datasetSizeGB} GB)`);
+
+      state = { phase: 'polling', queries, datasetSizeGB };
       await saveState(datasetName, state);
 
       return NextResponse.json({
@@ -286,21 +301,22 @@ export async function POST(
       let allDone = true;
       let doneCount = 0;
       let totalScannedGB = 0;
+      const dsGB = state.datasetSizeGB || 0;
       const queryDetails: string[] = [];
 
       for (const s of statuses) {
         const scannedGB = s.stats?.dataScannedBytes ? (s.stats.dataScannedBytes / 1e9) : 0;
         totalScannedGB += scannedGB;
+        const runtimeSec = s.stats?.engineExecutionTimeMs ? Math.round(s.stats.engineExecutionTimeMs / 1000) : 0;
 
         if (s.state === 'RUNNING' || s.state === 'QUEUED') {
           allDone = false;
-          const runtimeSec = s.stats?.engineExecutionTimeMs ? Math.round(s.stats.engineExecutionTimeMs / 1000) : 0;
-          queryDetails.push(`⏳ ${s.name}: ${scannedGB.toFixed(0)} GB scanned (${runtimeSec}s)`);
+          const pct = dsGB > 0 ? Math.min(99, Math.round((scannedGB / dsGB) * 100)) : 0;
+          queryDetails.push(`⏳ ${s.name}: ${scannedGB.toFixed(0)}/${dsGB} GB (${pct}%) · ${runtimeSec}s`);
         } else {
           doneCount++;
           if (s.state === 'SUCCEEDED') {
-            const runtimeSec = s.stats?.engineExecutionTimeMs ? Math.round(s.stats.engineExecutionTimeMs / 1000) : 0;
-            queryDetails.push(`✅ ${s.name}: done in ${runtimeSec}s`);
+            queryDetails.push(`✅ ${s.name}: ${scannedGB.toFixed(0)} GB in ${runtimeSec}s`);
           } else {
             queryDetails.push(`❌ ${s.name}: ${s.error || 'failed'}`);
             console.warn(`[DS-REPORT] ${s.name} failed: ${s.error}`);
@@ -308,12 +324,20 @@ export async function POST(
         }
       }
 
+      // Overall percent: scan phase (10-60%) + completion phase (60-65%)
+      let overallPercent = 10;
+      if (dsGB > 0 && entries.length > 0) {
+        const avgScanPct = Math.min(100, (totalScannedGB / (dsGB * entries.length)) * 100);
+        overallPercent = 10 + Math.round(avgScanPct * 0.5);
+      }
+      overallPercent = Math.max(overallPercent, 10 + Math.round((doneCount / entries.length) * 50));
+
       if (!allDone) {
         return NextResponse.json({
           phase: 'polling',
           progress: {
             step: 'polling',
-            percent: 10 + Math.round((doneCount / entries.length) * 50),
+            percent: overallPercent,
             message: `Athena queries: ${doneCount}/${entries.length} complete · ${totalScannedGB.toFixed(0)} GB scanned`,
             detail: queryDetails.join('\n'),
           },
