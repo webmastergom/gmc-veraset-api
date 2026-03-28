@@ -1,21 +1,16 @@
 /**
- * Postal Code → MAID lookup.
+ * Postal Code → MAID lookup (catchment = first GPS ping of each device-day).
  *
- * Two-phase approach leveraging the proven catchment (analyzeOrigins) flow:
+ * 1. Ensure Athena table + count distinct POI visitors (coverage).
+ * 2. Run one Athena query: first ping per day per device, grouped by device + rounded origin.
+ * 3. Reverse-geocode those origins and keep ad_ids whose postcode is in the requested set.
  *
- * Phase 1: Run catchment analysis (analyzeOrigins) — identical to Dataset Analysis.
- *          This validates the data exists and tells us which postal codes have devices.
- *
- * Phase 2: For postal codes that match, run a second query identical to catchment
- *          but keeping ad_id to extract individual MAIDs.
- *
- * This guarantees consistency with the Dataset Analysis catchment report.
+ * Optional: set POSTAL_MAID_SQL_ROW_LIMIT (positive int) to cap rows with
+ * ORDER BY device_days DESC LIMIT n — biases toward heavy users; omit for full coverage.
  */
 
-import { analyzeOrigins } from './dataset-analyzer-od';
-import type { OriginsResult } from './dataset-analyzer-od';
-import { runQuery, getTableName } from './athena';
-import { batchReverseGeocode } from './reverse-geocode';
+import { ensureTableForDataset, runQuery, getTableName } from './athena';
+import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
 import type { PostalMaidFilters, PostalMaidDevice, PostalMaidResult } from './postal-maid-types';
 
 export type { PostalMaidFilters, PostalMaidResult } from './postal-maid-types';
@@ -25,7 +20,15 @@ const COORDINATE_PRECISION = 4; // ~11m resolution
 
 /** Progress callback for streaming updates */
 export type PostalMaidProgressCallback = (progress: {
-  step: 'initializing' | 'preparing_table' | 'running_queries' | 'geocoding' | 'matching' | 'completed' | 'error';
+  step:
+    | 'initializing'
+    | 'preparing_table'
+    | 'running_queries'
+    | 'geocoding'
+    | 'matching'
+    | 'aggregating'
+    | 'completed'
+    | 'error';
   percent: number;
   message: string;
   detail?: string;
@@ -55,6 +58,9 @@ export async function analyzePostalMaid(
     throw new Error('Country code is required for reverse geocoding.');
   }
 
+  try {
+    setCountryFilter([filters.country.toUpperCase()]);
+
   // Normalize postal codes (trim, uppercase, strip country prefix like "ES-" or "CO-")
   const requestedPostalCodes = new Set(
     filters.postalCodes.map(pc => {
@@ -66,59 +72,34 @@ export async function analyzePostalMaid(
     })
   );
 
-  // ── Phase 1: Run catchment analysis (same as Dataset Analysis) ──────────
-  report({ step: 'initializing', percent: 2, message: 'Running catchment analysis (same as Dataset Analysis)...' });
-  console.log(`[POSTAL-MAID] Phase 1: Running analyzeOrigins for dataset: ${datasetName}`);
-
-  const catchment = await analyzeOrigins(datasetName, {
-    dateFrom: filters.dateFrom,
-    dateTo: filters.dateTo,
-  }, (p) => {
-    // Scale catchment progress to 0–60%
-    report({
-      step: p.step as any,
-      percent: Math.round(p.percent * 0.6),
-      message: p.message,
-      detail: p.detail,
-    });
-  }, { skipCache: true });
-
-  console.log(`[POSTAL-MAID] Catchment done: ${catchment.origins.length} postal codes, ${catchment.totalDevicesVisitedPois} devices`);
-
-  // ── Phase 2: Match postal codes from catchment ──────────────────────────
-  report({ step: 'matching', percent: 62, message: 'Matching postal codes from catchment...', detail: `${requestedPostalCodes.size} codes` });
-
-  const matchedOrigins = new Map<string, { devices: number; city: string; province: string }>();
-  for (const origin of catchment.origins) {
-    // Catchment returns zipcodes like "ES-28001" — strip country prefix
-    const rawCode = origin.zipcode.includes('-')
-      ? origin.zipcode.split('-').slice(1).join('-').toUpperCase()
-      : origin.zipcode.toUpperCase();
-    if (requestedPostalCodes.has(rawCode)) {
-      matchedOrigins.set(rawCode, {
-        devices: origin.devices,
-        city: origin.city,
-        province: origin.province,
-      });
-    }
-  }
-
-  console.log(`[POSTAL-MAID] Phase 2: ${matchedOrigins.size}/${requestedPostalCodes.size} postal codes found in catchment`);
-
-  if (matchedOrigins.size === 0) {
-    report({ step: 'completed', percent: 100, message: 'No matching postal codes found in catchment' });
-    return buildEmptyResult(datasetName, filters, catchment.totalDevicesVisitedPois);
-  }
-
-  // ── Phase 3: Extract individual MAIDs ───────────────────────────────────
-  // Same Athena CTEs as catchment, but final SELECT keeps ad_id
-  report({ step: 'running_queries', percent: 65, message: 'Extracting individual MAIDs...', detail: `${matchedOrigins.size} matching postal codes` });
-
   const tableName = getTableName(datasetName);
   const dateConditions: string[] = [];
   if (filters.dateFrom) dateConditions.push(`date >= '${filters.dateFrom}'`);
   if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+  const totalQuery = `
+    SELECT COUNT(DISTINCT ad_id) as total_devices
+    FROM ${tableName}
+    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+    WHERE poi_id IS NOT NULL AND poi_id != ''
+      AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+      ${dateWhere}
+  `;
+
+  const sqlRowCap = parseInt(process.env.POSTAL_MAID_SQL_ROW_LIMIT || '', 10);
+  const applyRowCap = Number.isFinite(sqlRowCap) && sqlRowCap > 0;
+  if (applyRowCap) {
+    console.warn(`[POSTAL-MAID] POSTAL_MAID_SQL_ROW_LIMIT=${sqlRowCap}: results biased toward highest device_days rows`);
+  }
+
+  report({ step: 'preparing_table', percent: 5, message: 'Preparing Athena table...', detail: tableName });
+  await ensureTableForDataset(datasetName);
+  report({ step: 'running_queries', percent: 15, message: 'Counting POI visitors & extracting origins...' });
+
+  const rowOrderingSql = applyRowCap
+    ? `ORDER BY device_days DESC LIMIT ${sqlRowCap}`
+    : '';
 
   const maidsQuery = `
     WITH
@@ -161,17 +142,25 @@ export async function analyzePostalMaid(
     FROM first_pings
     WHERE origin_lat IS NOT NULL AND origin_lng IS NOT NULL
     GROUP BY ad_id, ROUND(origin_lat, ${COORDINATE_PRECISION}), ROUND(origin_lng, ${COORDINATE_PRECISION})
-    ORDER BY device_days DESC
-    LIMIT 500000
+    ${rowOrderingSql}
   `;
 
-  console.log(`[POSTAL-MAID] Phase 3: Running MAID extraction query...`);
-  const maidsRes = await runQuery(maidsQuery);
-  console.log(`[POSTAL-MAID] Got ${maidsRes.rows.length} device-origin rows`);
-  report({ step: 'running_queries', percent: 78, message: 'Query complete', detail: `${maidsRes.rows.length} device rows` });
+  console.log(`[POSTAL-MAID] Running device coverage + MAID extraction...`);
+  const [totalRes, maidsRes] = await Promise.all([
+    runQuery(totalQuery),
+    runQuery(maidsQuery),
+  ]);
 
-  // ── Phase 4: Geocode and match devices to postal codes ──────────────────
-  // Same geocoding as catchment (batchReverseGeocode)
+  const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
+  console.log(`[POSTAL-MAID] POI visitors: ${totalDevicesInDataset}, device-origin rows: ${maidsRes.rows.length}`);
+  report({ step: 'running_queries', percent: 60, message: 'Query complete', detail: `${maidsRes.rows.length} device rows` });
+
+  if (totalDevicesInDataset === 0) {
+    report({ step: 'completed', percent: 100, message: 'No POI visitors in dataset for these filters' });
+    return buildEmptyResult(datasetName, filters, 0);
+  }
+
+  // ── Geocode origins and match to requested postal codes ──────────────────
   const coordMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
   const deviceOrigins: Array<{ adId: string; coordKey: string; deviceDays: number }> = [];
   let totalDeviceDays = 0;
@@ -194,7 +183,7 @@ export async function analyzePostalMaid(
   }
 
   report({ step: 'geocoding', percent: 80, message: 'Reverse geocoding device origins...', detail: `${coordMap.size} unique coordinates` });
-  console.log(`[POSTAL-MAID] Phase 4: Geocoding ${coordMap.size} coordinate clusters...`);
+  console.log(`[POSTAL-MAID] Geocoding ${coordMap.size} unique origin coordinates...`);
 
   const coordPoints = Array.from(coordMap.values()).map(p => ({
     lat: p.lat,
@@ -202,7 +191,7 @@ export async function analyzePostalMaid(
     deviceCount: p.deviceCount,
   }));
 
-  const classified = await batchReverseGeocode(coordPoints, { skipCache: true });
+  const classified = await batchReverseGeocode(coordPoints);
   report({ step: 'geocoding', percent: 90, message: 'Geocoding complete' });
 
   // Build coordKey → postalCode map (accept any classification with a postcode)
@@ -281,7 +270,7 @@ export async function analyzePostalMaid(
       coordinatePrecision: COORDINATE_PRECISION,
     },
     coverage: {
-      totalDevicesInDataset: catchment.totalDevicesVisitedPois,
+      totalDevicesInDataset: totalDevicesInDataset,
       totalDeviceDays,
       devicesMatchedToPostalCodes: devices.length,
       matchedDeviceDays,
@@ -296,6 +285,9 @@ export async function analyzePostalMaid(
     devices,
     postalCodeBreakdown,
   };
+  } finally {
+    setCountryFilter(null);
+  }
 }
 
 function buildEmptyResult(
