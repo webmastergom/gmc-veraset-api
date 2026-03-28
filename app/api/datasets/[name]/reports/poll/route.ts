@@ -1,21 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
-import { checkQueryStatus, fetchQueryResults } from '@/lib/athena';
-import { getConfig, putConfig } from '@/lib/s3-config';
-import { getJob } from '@/lib/jobs';
 import {
-  DWELL_BUCKETS,
-  startDwellCTASQuery,
-  startBucketODQuery,
-  startBucketHourlyQuery,
-  startBucketCatchmentQuery,
-  startBucketMobilityQuery,
-  startBucketTemporalQuery,
-  startBucketTotalDevicesQuery,
-  ensurePoiCoordsTable,
-  shouldUsePoiTable,
-} from '@/lib/dataset-report-queries';
-import { extractPoiCoords, type PoiCoord } from '@/lib/mega-consolidation-queries';
+  startQueryAsync,
+  checkQueryStatus,
+  fetchQueryResults,
+  ensureTableForDataset,
+  getTableName,
+} from '@/lib/athena';
+import { getConfig, putConfig } from '@/lib/s3-config';
 import {
   parseConsolidatedOD,
   parseConsolidatedHourly,
@@ -25,63 +17,204 @@ import {
   buildTemporalTrends,
 } from '@/lib/mega-report-consolidation';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
-import { dropTempTable, cleanupTempS3 } from '@/lib/athena';
-import { getPOICollection } from '@/lib/poi-storage';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
-const REPORT_KEY = (ds: string, type: string, bucket: number) =>
-  `dataset-reports/${ds}/${type}-dwell-${bucket}`;
+const REPORT_PREFIX = (ds: string) => `dataset-reports/${ds}`;
 
-// 3 batches of 3 buckets each
-const BUCKET_BATCHES: number[][] = [
-  [0, 2, 5],
-  [10, 15, 30],
-  [60, 120, 180],
-];
+// ── Types ─────────────────────────────────────────────────────────────
 
-const QUERY_TYPES = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'totalDevices'] as const;
-
-interface DwellReportState {
-  phase: 'materialize' | 'poll_ctas' | 'start_batch' | 'poll_batch' | 'parse_batch' | 'cleanup' | 'done' | 'error';
-  ctasQueryId?: string;
-  tempTableName?: string;
-  currentBatchIndex: number;
-  bucketBatches: number[][];
-  queries?: Record<string, string>; // "0-od" -> queryId
-  completedBuckets: number[];
-  coordToZip?: Record<string, string>; // "lat,lng" -> "zip|city|country"
+interface ReportState {
+  phase: 'start' | 'polling' | 'parsing' | 'done' | 'error';
+  queries: Record<string, string>;  // name → queryId
   error?: string;
 }
 
-async function getState(ds: string): Promise<DwellReportState | null> {
-  return await getConfig<DwellReportState>(STATE_KEY(ds));
+async function getState(ds: string): Promise<ReportState | null> {
+  return await getConfig<ReportState>(STATE_KEY(ds));
 }
 
-async function saveState(ds: string, state: DwellReportState): Promise<void> {
+async function saveState(ds: string, state: ReportState): Promise<void> {
   await putConfig(STATE_KEY(ds), state, { compact: true });
 }
 
-async function saveReport(ds: string, type: string, bucket: number, data: any): Promise<void> {
-  await putConfig(REPORT_KEY(ds, type, bucket), data, { compact: true });
-}
+// ── Query builders using poi_ids (no spatial join) ────────────────────
 
-function batchPercent(batchIndex: number, intraPercent: number): number {
-  // 0-10%: materialize + poll_ctas
-  // 10-40%: batch 0 (start_batch + poll_batch + parse_batch)
-  // 40-70%: batch 1
-  // 70-100%: batch 2
-  const batchStart = 10 + batchIndex * 30;
-  return Math.min(100, batchStart + Math.round(intraPercent * 0.3));
-}
+const ACCURACY = 500;
+const PREC = 4;
+const GRID = 0.01;
+const POI_GMC_TABLE = 'lab_pois_gmc';
 
 /**
- * POST /api/datasets/[name]/reports/poll
- * Multi-phase polling for pre-computed dwell-bucketed reports.
- * Call repeatedly until phase === 'done'.
+ * Common CTE: filter pings that have poi_ids assigned by Veraset.
+ * This is O(N) scan — no spatial join needed.
  */
+function atPoiCTE(table: string): string {
+  return `at_poi AS (
+      SELECT DISTINCT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    )`;
+}
+
+function buildHourlySQL(table: string): string {
+  return `WITH ${atPoiCTE(table)}
+    SELECT HOUR(utc_timestamp) as touch_hour,
+      COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
+    FROM at_poi GROUP BY 1 ORDER BY 1`;
+}
+
+function buildTemporalSQL(table: string): string {
+  return `WITH ${atPoiCTE(table)}
+    SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
+    FROM at_poi GROUP BY date ORDER BY date`;
+}
+
+function buildTotalDevicesSQL(table: string): string {
+  return `WITH ${atPoiCTE(table)}
+    SELECT COUNT(DISTINCT ad_id) as total_unique_devices FROM at_poi`;
+}
+
+function buildODSQL(table: string): string {
+  return `WITH ${atPoiCTE(table)},
+    poi_visits AS (
+      SELECT ad_id, date, MIN(utc_timestamp) as first_poi_visit
+      FROM at_poi GROUP BY ad_id, date
+    ),
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    ),
+    device_day AS (
+      SELECT p.ad_id, p.date,
+        MIN_BY(p.lat, p.utc_timestamp) as origin_lat,
+        MIN_BY(p.lng, p.utc_timestamp) as origin_lng,
+        MAX_BY(p.lat, p.utc_timestamp) as dest_lat,
+        MAX_BY(p.lng, p.utc_timestamp) as dest_lng,
+        HOUR(MIN(p.utc_timestamp)) as departure_hour,
+        HOUR(v.first_poi_visit) as poi_arrival_hour
+      FROM all_pings p
+      INNER JOIN poi_visits v ON p.ad_id = v.ad_id AND p.date = v.date
+      GROUP BY p.ad_id, p.date, v.first_poi_visit
+    )
+    SELECT
+      ROUND(origin_lat, ${PREC}) as origin_lat,
+      ROUND(origin_lng, ${PREC}) as origin_lng,
+      ROUND(dest_lat, ${PREC}) as dest_lat,
+      ROUND(dest_lng, ${PREC}) as dest_lng,
+      departure_hour, poi_arrival_hour,
+      COUNT(*) as device_days
+    FROM device_day
+    GROUP BY 1,2,3,4,5,6
+    ORDER BY device_days DESC
+    LIMIT 100000`;
+}
+
+function buildCatchmentSQL(table: string): string {
+  return `WITH ${atPoiCTE(table)},
+    poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
+    valid_pings AS (
+      SELECT t.ad_id, t.date, t.utc_timestamp,
+        TRY_CAST(t.latitude AS DOUBLE) as lat,
+        TRY_CAST(t.longitude AS DOUBLE) as lng
+      FROM ${table} t
+      INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
+      WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    ),
+    first_pings AS (
+      SELECT ad_id, date,
+        MIN_BY(lat, utc_timestamp) as origin_lat,
+        MIN_BY(lng, utc_timestamp) as origin_lng,
+        HOUR(MIN(utc_timestamp)) as departure_hour
+      FROM valid_pings
+      GROUP BY ad_id, date
+    )
+    SELECT
+      ROUND(origin_lat, ${PREC}) as origin_lat,
+      ROUND(origin_lng, ${PREC}) as origin_lng,
+      departure_hour,
+      COUNT(*) as device_days
+    FROM first_pings
+    WHERE origin_lat IS NOT NULL
+    GROUP BY 1,2,3
+    ORDER BY device_days DESC
+    LIMIT 100000`;
+}
+
+function buildMobilitySQL(table: string): string {
+  return `WITH ${atPoiCTE(table)},
+    target_visits AS (
+      SELECT ad_id, date, MIN(utc_timestamp) as visit_time
+      FROM at_poi GROUP BY ad_id, date
+    ),
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(TRY_CAST(longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_bucket
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    ),
+    nearby_pings AS (
+      SELECT a.ad_id, a.date, a.lat, a.lng,
+        a.lat_bucket, a.lng_bucket,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing
+      FROM all_pings a
+      INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
+      WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
+        AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
+    ),
+    gmc_buckets AS (
+      SELECT id as poi_id, name as poi_name, category,
+        latitude as poi_lat, longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) + dlat as lat_bucket,
+        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) + dlng as lng_bucket
+      FROM ${POI_GMC_TABLE}
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t2(dlng)
+      WHERE category IS NOT NULL
+    ),
+    matched AS (
+      SELECT n.ad_id, n.date, n.timing, g.category
+      FROM nearby_pings n
+      INNER JOIN gmc_buckets g ON n.lat_bucket = g.lat_bucket AND n.lng_bucket = g.lng_bucket
+      WHERE 111320 * SQRT(
+          POW(n.lat - g.poi_lat, 2) +
+          POW((n.lng - g.poi_lng) * COS(RADIANS((n.lat + g.poi_lat) / 2)), 2)
+        ) <= 200
+    )
+    SELECT category, timing,
+      COUNT(DISTINCT ad_id || '|' || date) as device_days,
+      COUNT(DISTINCT ad_id) as unique_devices
+    FROM matched
+    GROUP BY category, timing
+    ORDER BY device_days DESC
+    LIMIT 500`;
+}
+
+// ── Main handler ──────────────────────────────────────────────────────
+
 export async function POST(
   request: NextRequest,
   context: { params: Promise<{ name: string }> }
@@ -93,608 +226,227 @@ export async function POST(
   const { name: datasetName } = await context.params;
 
   try {
-    const reset = request.nextUrl.searchParams.get('reset') === 'true';
-    let state = reset ? null : await getState(datasetName);
+    let state = await getState(datasetName);
 
-    // Parse optional POI ID filter from request body
-    let poiIds: string[] | undefined;
-    try {
-      const body = await request.json();
-      if (body?.poiIds?.length) poiIds = body.poiIds;
-    } catch { /* no body or invalid JSON */ }
-
-    // Reset if done or error — allow retry
+    // Reset if done or error
     if (state?.phase === 'done' || state?.phase === 'error') state = null;
 
-    // ── Phase: materialize ─────────────────────────────────────────
+    // ── Phase: start ────────────────────────────────────────────
     if (!state) {
-      console.log(`[DS-REPORT] Phase materialize: Starting CTAS for ${datasetName} (reset=${reset}, poiIds=${poiIds?.length || 0})`);
+      console.log(`[DS-REPORT] Starting reports for ${datasetName}`);
 
-      // Find the job for this dataset to extract POI coordinates
-      let poiCoords: PoiCoord[] = [];
-      try {
-        const index = await getConfig<Record<string, any>>('jobs-index');
-        if (index) {
-          const matchingEntry = Object.entries(index).find(
-            ([_, j]: [string, any]) => j.s3DestPath && j.s3DestPath.replace(/\/$/, '').split('/').pop() === datasetName
-          );
-          if (matchingEntry) {
-            const [matchingJobId] = matchingEntry;
-            const matchingJob = await getJob(matchingJobId);
-            if (matchingJob) {
-              poiCoords = extractPoiCoords([matchingJob]);
-              console.log(`[DS-REPORT] Extracted ${poiCoords.length} POI coords from job metadata for ${datasetName}`);
+      await ensureTableForDataset(datasetName);
+      const table = getTableName(datasetName);
 
-              // Fallback: for cohort jobs without geo_radius, load from POI collection
-              if (poiCoords.length === 0 && matchingJob.poiCollectionId) {
-                console.log(`[DS-REPORT] No coords in job metadata, loading from POI collection: ${matchingJob.poiCollectionId}`);
-                const geojson = await getPOICollection(matchingJob.poiCollectionId);
-                if (geojson?.features?.length) {
-                  for (const f of geojson.features) {
-                    const [lng, lat] = f.geometry?.coordinates || [];
-                    if (lat != null && lng != null) {
-                      poiCoords.push({ lat, lng, radiusM: matchingJob.radius || 200 });
-                    }
-                  }
-                  // Deduplicate
-                  const seen = new Set<string>();
-                  poiCoords = poiCoords.filter((c) => {
-                    const key = `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
-                    if (seen.has(key)) return false;
-                    seen.add(key);
-                    return true;
-                  });
-                  console.log(`[DS-REPORT] Loaded ${poiCoords.length} POI coords from collection ${matchingJob.poiCollectionId}`);
-                }
-              }
+      // Launch all 6 queries in parallel using poi_ids (no spatial join)
+      const queries: Record<string, string> = {};
+      await Promise.all([
+        startQueryAsync(buildODSQL(table)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
+        startQueryAsync(buildHourlySQL(table)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
+        startQueryAsync(buildCatchmentSQL(table)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
+        startQueryAsync(buildTemporalSQL(table)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
+        startQueryAsync(buildTotalDevicesSQL(table)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
+        startQueryAsync(buildMobilitySQL(table)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+      ]);
 
-              // Filter to selected POIs if poiIds provided
-              if (poiIds?.length && matchingJob.verasetPayload?.geo_radius) {
-                const selectedSet = new Set(poiIds);
-                const filtered: PoiCoord[] = [];
-                for (const g of matchingJob.verasetPayload.geo_radius) {
-                  if (selectedSet.has(g.poi_id)) {
-                    filtered.push({ lat: g.latitude, lng: g.longitude, radiusM: g.distance_in_meters || 200 });
-                  }
-                }
-                if (filtered.length > 0) {
-                  poiCoords = filtered;
-                  console.log(`[DS-REPORT] Filtered to ${poiCoords.length} POI coords (of ${poiIds.length} selected)`);
-                }
-              }
+      console.log(`[DS-REPORT] Launched ${Object.keys(queries).length} queries for ${datasetName}`);
+
+      state = { phase: 'polling', queries };
+      await saveState(datasetName, state);
+
+      return NextResponse.json({
+        phase: 'polling',
+        progress: { step: 'queries_started', percent: 10, message: `Running ${Object.keys(queries).length} Athena queries...` },
+      });
+    }
+
+    // ── Phase: polling ──────────────────────────────────────────
+    if (state.phase === 'polling') {
+      const entries = Object.entries(state.queries);
+      if (entries.length === 0) {
+        state = { ...state, phase: 'error', error: 'No queries started' };
+        await saveState(datasetName, state);
+        return NextResponse.json({ phase: 'error', error: 'No queries started' });
+      }
+
+      const statuses = await Promise.all(
+        entries.map(async ([name, queryId]) => {
+          try {
+            const s = await checkQueryStatus(queryId);
+            return { name, state: s.state, error: s.error };
+          } catch (err: any) {
+            if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
+              return { name, state: 'FAILED' as const, error: 'Query expired' };
             }
-          } else {
-            console.warn(`[DS-REPORT] No matching job found in index for dataset ${datasetName}`);
+            return { name, state: 'FAILED' as const, error: err.message };
           }
+        })
+      );
+
+      let allDone = true;
+      let doneCount = 0;
+      const running: string[] = [];
+
+      for (const s of statuses) {
+        if (s.state === 'RUNNING' || s.state === 'QUEUED') {
+          allDone = false;
+          running.push(s.name);
         } else {
-          console.warn(`[DS-REPORT] No jobs-index found`);
-        }
-      } catch (e: any) {
-        console.warn(`[DS-REPORT] Could not extract POI coords: ${e.message}`);
-      }
-
-      // For large POI sets, create an Athena table instead of VALUES clause
-      let poiTableName: string | undefined;
-      if (poiCoords.length > 0 && shouldUsePoiTable(poiCoords)) {
-        try {
-          poiTableName = await ensurePoiCoordsTable(datasetName, poiCoords);
-          console.log(`[DS-REPORT] Using POI table ${poiTableName} for ${poiCoords.length} coords`);
-        } catch (e: any) {
-          console.error(`[DS-REPORT] Failed to create POI table, falling back to VALUES: ${e.message}`);
+          doneCount++;
+          if (s.state === 'FAILED' || s.state === 'CANCELLED') {
+            console.warn(`[DS-REPORT] ${s.name} failed: ${s.error}`);
+          }
         }
       }
 
-      // Start CTAS query to materialize at-POI pings with dwell
-      const { queryId, tableName } = await startDwellCTASQuery(datasetName, poiCoords, poiTableName);
-      console.log(`[DS-REPORT] CTAS started: queryId=${queryId}, tempTable=${tableName}`);
+      if (!allDone) {
+        return NextResponse.json({
+          phase: 'polling',
+          progress: {
+            step: 'polling',
+            percent: 10 + Math.round((doneCount / entries.length) * 50),
+            message: `Athena queries: ${doneCount}/${entries.length} complete`,
+            detail: `Running: ${running.join(', ')}`,
+          },
+        });
+      }
 
-      state = {
-        phase: 'poll_ctas',
-        ctasQueryId: queryId,
-        tempTableName: tableName,
-        currentBatchIndex: 0,
-        bucketBatches: BUCKET_BATCHES,
-        completedBuckets: [],
-      };
+      // All done → parse
+      state = { ...state, phase: 'parsing' };
       await saveState(datasetName, state);
-
       return NextResponse.json({
-        phase: 'materialize',
-        progress: {
-          step: 'materialize',
-          percent: 5,
-          message: 'Materializing visits with dwell calculation...',
-          totalBuckets: DWELL_BUCKETS.length,
-        },
+        phase: 'parsing',
+        progress: { step: 'parsing', percent: 65, message: 'Queries done, parsing results...' },
       });
     }
 
-    // ── Phase: poll_ctas ───────────────────────────────────────────
-    if (state.phase === 'poll_ctas') {
-      if (!state.ctasQueryId) {
-        state = { ...state, phase: 'error', error: 'Missing CTAS query ID' };
-        await saveState(datasetName, state);
-        return NextResponse.json({
-          phase: 'error',
-          error: 'Missing CTAS query ID',
-          progress: { step: 'error', percent: 0, message: 'Missing CTAS query ID' },
-        });
-      }
-
-      let qStatus: { state: string; error?: string };
-      try {
-        qStatus = await checkQueryStatus(state.ctasQueryId);
-      } catch (err: any) {
-        const msg = err?.message || '';
-        if (msg.includes('not found') || msg.includes('InvalidRequestException')) {
-          state = { ...state, phase: 'error', error: 'CTAS query expired or not found' };
-          await saveState(datasetName, state);
-          return NextResponse.json({
-            phase: 'error',
-            error: 'CTAS query expired. Click Analyze again to retry.',
-            progress: { step: 'error', percent: 0, message: 'CTAS query expired. Click Analyze again to retry.' },
-          });
-        }
-        throw err;
-      }
-
-      if (qStatus.state === 'FAILED' || qStatus.state === 'CANCELLED') {
-        state = { ...state, phase: 'error', error: qStatus.error || 'CTAS query failed' };
-        await saveState(datasetName, state);
-        return NextResponse.json({
-          phase: 'error',
-          error: `CTAS failed: ${qStatus.error || 'unknown error'}`,
-          progress: { step: 'error', percent: 0, message: `CTAS failed: ${qStatus.error || 'unknown error'}` },
-        });
-      }
-
-      if (qStatus.state === 'RUNNING' || qStatus.state === 'QUEUED') {
-        return NextResponse.json({
-          phase: 'poll_ctas',
-          progress: {
-            step: 'poll_ctas',
-            percent: 10,
-            message: 'Computing spatial join + dwell times...',
-            detail: 'This is the most expensive step — only happens once',
-            totalBuckets: DWELL_BUCKETS.length,
-          },
-        });
-      }
-
-      // SUCCEEDED → advance to start_batch
-      state = { ...state, phase: 'start_batch' };
-      await saveState(datasetName, state);
-      // Fall through to start_batch
-    }
-
-    // ── Phase: start_batch ─────────────────────────────────────────
-    if (state.phase === 'start_batch') {
-      const batch = state.bucketBatches[state.currentBatchIndex];
-      if (!batch) {
-        // No more batches → cleanup
-        state = { ...state, phase: 'cleanup' };
-        await saveState(datasetName, state);
-        // Fall through to cleanup
-      } else {
-        console.log(`[DS-REPORT] Starting batch ${state.currentBatchIndex}: buckets [${batch.join(', ')}]`);
-
-        const queries: Record<string, string> = {};
-        const tempTable = state.tempTableName!;
-
-        // Start 6 queries per bucket = 18 queries total for 3 buckets
-        const startPromises: Promise<void>[] = [];
-        for (const bucket of batch) {
-          startPromises.push(
-            startBucketODQuery(datasetName, tempTable, bucket)
-              .then(id => { queries[`${bucket}-od`] = id; })
-              .catch(e => { console.error(`[DS-REPORT] ${bucket}-od failed to start:`, e.message); }),
-            startBucketHourlyQuery(datasetName, tempTable, bucket)
-              .then(id => { queries[`${bucket}-hourly`] = id; })
-              .catch(e => { console.error(`[DS-REPORT] ${bucket}-hourly failed to start:`, e.message); }),
-            startBucketCatchmentQuery(datasetName, tempTable, bucket)
-              .then(id => { queries[`${bucket}-catchment`] = id; })
-              .catch(e => { console.error(`[DS-REPORT] ${bucket}-catchment failed to start:`, e.message); }),
-            startBucketMobilityQuery(datasetName, tempTable, bucket)
-              .then(id => { queries[`${bucket}-mobility`] = id; })
-              .catch(e => { console.error(`[DS-REPORT] ${bucket}-mobility failed to start:`, e.message); }),
-            startBucketTemporalQuery(datasetName, tempTable, bucket)
-              .then(id => { queries[`${bucket}-temporal`] = id; })
-              .catch(e => { console.error(`[DS-REPORT] ${bucket}-temporal failed to start:`, e.message); }),
-            startBucketTotalDevicesQuery(datasetName, tempTable, bucket)
-              .then(id => { queries[`${bucket}-totalDevices`] = id; })
-              .catch(e => { console.error(`[DS-REPORT] ${bucket}-totalDevices failed to start:`, e.message); }),
-          );
-        }
-
-        await Promise.all(startPromises);
-
-        state = { ...state, phase: 'poll_batch', queries };
-        await saveState(datasetName, state);
-
-        const pendingBuckets = DWELL_BUCKETS.filter(
-          b => !state!.completedBuckets.includes(b) && !batch.includes(b)
-        );
-
-        return NextResponse.json({
-          phase: 'start_batch',
-          progress: {
-            step: 'start_batch',
-            percent: batchPercent(state.currentBatchIndex, 0),
-            message: `Started ${Object.keys(queries).length} queries for buckets [${batch.join(', ')}] min`,
-            completedBuckets: state.completedBuckets,
-            runningBuckets: batch,
-            pendingBuckets,
-            totalBuckets: DWELL_BUCKETS.length,
-          },
-        });
-      }
-    }
-
-    // ── Phase: poll_batch ──────────────────────────────────────────
-    if (state.phase === 'poll_batch' && state.queries) {
-      const queryEntries = Object.entries(state.queries);
-
-      if (queryEntries.length === 0) {
-        // All queries failed → advance to parse anyway (will skip everything)
-        state = { ...state, phase: 'parse_batch' };
-        await saveState(datasetName, state);
-        // Fall through
-      } else {
-        const statusResults = await Promise.all(
-          queryEntries.map(async ([name, queryId]) => {
-            try {
-              const s = await checkQueryStatus(queryId);
-              return { name, state: s.state, error: s.error };
-            } catch (err: any) {
-              const msg = err?.message || '';
-              if (msg.includes('not found') || msg.includes('InvalidRequestException')) {
-                console.warn(`[DS-REPORT] Query ${name} (${queryId}) not found, treating as FAILED`);
-                return { name, state: 'FAILED' as const, error: 'Query expired or not found' };
-              }
-              return { name, state: 'FAILED' as const, error: 'Check failed' };
-            }
-          })
-        );
-
-        let allDone = true;
-        let doneCount = 0;
-        const totalQ = queryEntries.length;
-
-        for (const { name: qName, state: qState, error: qError } of statusResults) {
-          if (qState === 'RUNNING' || qState === 'QUEUED') {
-            allDone = false;
-          } else {
-            doneCount++;
-            if (qState === 'FAILED' || qState === 'CANCELLED') {
-              console.warn(`[DS-REPORT] Query ${qName} failed: ${qError}`);
-              delete state.queries![qName];
-            }
-          }
-        }
-
-        if (!allDone) {
-          await saveState(datasetName, state);
-
-          const batch = state.bucketBatches[state.currentBatchIndex];
-          const runningNames = statusResults
-            .filter(r => r.state === 'RUNNING' || r.state === 'QUEUED')
-            .map(r => r.name);
-          const pendingBuckets = DWELL_BUCKETS.filter(
-            b => !state!.completedBuckets.includes(b) && !batch.includes(b)
-          );
-
-          return NextResponse.json({
-            phase: 'poll_batch',
-            progress: {
-              step: 'poll_batch',
-              percent: batchPercent(state.currentBatchIndex, Math.round((doneCount / totalQ) * 33)),
-              message: `Athena queries: ${doneCount}/${totalQ} complete`,
-              detail: `Running: ${runningNames.join(', ')}`,
-              completedBuckets: state.completedBuckets,
-              runningBuckets: batch,
-              pendingBuckets,
-              totalBuckets: DWELL_BUCKETS.length,
-            },
-          });
-        }
-
-        // All done → advance to parse_batch
-        state = { ...state, phase: 'parse_batch' };
-        await saveState(datasetName, state);
-
-        return NextResponse.json({
-          phase: 'parse_batch',
-          progress: {
-            step: 'queries_done',
-            percent: batchPercent(state.currentBatchIndex, 33),
-            message: 'All queries done, parsing results...',
-            completedBuckets: state.completedBuckets,
-            totalBuckets: DWELL_BUCKETS.length,
-          },
-        });
-      }
-    }
-
-    // ── Phase: parse_batch ─────────────────────────────────────────
-    if (state.phase === 'parse_batch') {
-      const batch = state.bucketBatches[state.currentBatchIndex];
-      const queries = state.queries || {};
-
-      // Collect all coords needing geocoding across this batch
+    // ── Phase: parsing ──────────────────────────────────────────
+    if (state.phase === 'parsing') {
+      const queries = state.queries;
+      const pfx = REPORT_PREFIX(datasetName);
       const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-      const bucketODData = new Map<number, ReturnType<typeof parseConsolidatedOD>>();
-      const bucketCatchmentRows = new Map<number, Record<string, any>[]>();
 
-      for (const bucket of batch) {
-        // Parse hourly
-        if (queries[`${bucket}-hourly`]) {
-          try {
-            const result = await fetchQueryResults(queries[`${bucket}-hourly`]);
-            const report = parseConsolidatedHourly(datasetName, result.rows);
-            await saveReport(datasetName, 'hourly', bucket, report);
-          } catch (err: any) {
-            console.error(`[DS-REPORT] Error parsing ${bucket}-hourly:`, err.message);
-          }
-        }
-
-        // Parse mobility
-        if (queries[`${bucket}-mobility`]) {
-          try {
-            const result = await fetchQueryResults(queries[`${bucket}-mobility`]);
-            const report = parseConsolidatedMobility(datasetName, result.rows);
-            await saveReport(datasetName, 'mobility', bucket, report);
-          } catch (err: any) {
-            console.error(`[DS-REPORT] Error parsing ${bucket}-mobility:`, err.message);
-          }
-        }
-
-        // Parse temporal + totalDevices
-        if (queries[`${bucket}-temporal`]) {
-          try {
-            const result = await fetchQueryResults(queries[`${bucket}-temporal`]);
-            const dailyData = result.rows.map((r: any) => ({
-              date: r.date,
-              pings: parseInt(r.pings, 10) || 0,
-              devices: parseInt(r.devices, 10) || 0,
-            }));
-            const report = buildTemporalTrends(datasetName, [dailyData]);
-
-            if (queries[`${bucket}-totalDevices`]) {
-              try {
-                const totalResult = await fetchQueryResults(queries[`${bucket}-totalDevices`]);
-                const totalUniqueDevices = parseInt(totalResult.rows[0]?.total_unique_devices, 10) || 0;
-                (report as any).totalUniqueDevices = totalUniqueDevices;
-                console.log(`[DS-REPORT] Bucket ${bucket} total unique devices: ${totalUniqueDevices}`);
-              } catch (err: any) {
-                console.error(`[DS-REPORT] Error parsing ${bucket}-totalDevices:`, err.message);
-              }
-            }
-
-            await saveReport(datasetName, 'temporal', bucket, report);
-          } catch (err: any) {
-            console.error(`[DS-REPORT] Error parsing ${bucket}-temporal:`, err.message);
-          }
-        }
-
-        // Parse OD → collect coords for geocoding
-        if (queries[`${bucket}-od`]) {
-          try {
-            const result = await fetchQueryResults(queries[`${bucket}-od`]);
-            const odClusters = parseConsolidatedOD(result.rows);
-            bucketODData.set(bucket, odClusters);
-            for (const c of odClusters.clusters) {
-              const oKey = `${c.originLat},${c.originLng}`;
-              const ex = coordsToGeocode.get(oKey);
-              coordsToGeocode.set(oKey, { lat: c.originLat, lng: c.originLng, deviceCount: (ex?.deviceCount || 0) + c.deviceDays });
-              const dKey = `${c.destLat},${c.destLng}`;
-              const dEx = coordsToGeocode.get(dKey);
-              coordsToGeocode.set(dKey, { lat: c.destLat, lng: c.destLng, deviceCount: (dEx?.deviceCount || 0) + c.deviceDays });
-            }
-          } catch (err: any) {
-            console.error(`[DS-REPORT] Error parsing ${bucket}-od:`, err.message);
-          }
-        }
-
-        // Parse catchment → collect coords for geocoding
-        if (queries[`${bucket}-catchment`]) {
-          try {
-            const result = await fetchQueryResults(queries[`${bucket}-catchment`]);
-            bucketCatchmentRows.set(bucket, result.rows);
-            for (const row of result.rows) {
-              const lat = parseFloat(row.origin_lat) || 0;
-              const lng = parseFloat(row.origin_lng) || 0;
-              const dd = parseInt(row.device_days, 10) || 0;
-              const key = `${lat},${lng}`;
-              const ex = coordsToGeocode.get(key);
-              coordsToGeocode.set(key, { lat, lng, deviceCount: (ex?.deviceCount || 0) + dd });
-            }
-          } catch (err: any) {
-            console.error(`[DS-REPORT] Error parsing ${bucket}-catchment:`, err.message);
-          }
-        }
+      // Parse hourly
+      if (queries.hourly) {
+        try {
+          const r = await fetchQueryResults(queries.hourly);
+          await putConfig(`${pfx}/hourly`, parseConsolidatedHourly(datasetName, r.rows), { compact: true });
+        } catch (e: any) { console.error('[DS-REPORT] hourly parse:', e.message); }
       }
 
-      // Geocode: reuse from state if already computed, otherwise compute once
-      let coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
-
-      if (state.coordToZip) {
-        // Deserialize from saved state
-        for (const [key, packed] of Object.entries(state.coordToZip)) {
-          const [zipCode, city, country] = (packed as string).split('|');
-          coordToZip.set(key, { zipCode, city, country });
-        }
+      // Parse temporal + totalDevices
+      if (queries.temporal) {
+        try {
+          const r = await fetchQueryResults(queries.temporal);
+          const daily = r.rows.map((row: any) => ({
+            date: row.date,
+            pings: parseInt(row.pings, 10) || 0,
+            devices: parseInt(row.devices, 10) || 0,
+          }));
+          const report: any = buildTemporalTrends(datasetName, [daily]);
+          if (queries.totalDevices) {
+            try {
+              const tr = await fetchQueryResults(queries.totalDevices);
+              report.totalUniqueDevices = parseInt(tr.rows[0]?.total_unique_devices, 10) || 0;
+            } catch {}
+          }
+          await putConfig(`${pfx}/temporal`, report, { compact: true });
+        } catch (e: any) { console.error('[DS-REPORT] temporal parse:', e.message); }
       }
 
-      // Always geocode new coords not yet in the map
+      // Parse mobility
+      if (queries.mobility) {
+        try {
+          const r = await fetchQueryResults(queries.mobility);
+          await putConfig(`${pfx}/mobility`, parseConsolidatedMobility(datasetName, r.rows), { compact: true });
+        } catch (e: any) { console.error('[DS-REPORT] mobility parse:', e.message); }
+      }
+
+      // Parse OD
+      let odClusters: any = null;
+      if (queries.od) {
+        try {
+          const r = await fetchQueryResults(queries.od);
+          odClusters = parseConsolidatedOD(r.rows);
+          for (const c of odClusters.clusters) {
+            coordsToGeocode.set(`${c.originLat},${c.originLng}`, { lat: c.originLat, lng: c.originLng, deviceCount: c.deviceDays });
+            coordsToGeocode.set(`${c.destLat},${c.destLng}`, { lat: c.destLat, lng: c.destLng, deviceCount: c.deviceDays });
+          }
+        } catch (e: any) { console.error('[DS-REPORT] od parse:', e.message); }
+      }
+
+      // Parse catchment
+      let catchmentRows: any[] | null = null;
+      if (queries.catchment) {
+        try {
+          const r = await fetchQueryResults(queries.catchment);
+          catchmentRows = r.rows;
+          for (const row of r.rows) {
+            const lat = parseFloat(row.origin_lat) || 0;
+            const lng = parseFloat(row.origin_lng) || 0;
+            coordsToGeocode.set(`${lat},${lng}`, { lat, lng, deviceCount: parseInt(row.device_days, 10) || 0 });
+          }
+        } catch (e: any) { console.error('[DS-REPORT] catchment parse:', e.message); }
+      }
+
+      // Geocode OD + catchment coords
+      const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
       if (coordsToGeocode.size > 0) {
-        const newCoords = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-        for (const [key, val] of coordsToGeocode.entries()) {
-          if (!coordToZip.has(key)) {
-            newCoords.set(key, val);
+        try {
+          const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
+          if (analysis?.country) setCountryFilter([analysis.country]);
+
+          // Round to 1 decimal for geocoding efficiency
+          const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+          for (const p of coordsToGeocode.values()) {
+            const rl = Math.round(p.lat * 10) / 10;
+            const rn = Math.round(p.lng * 10) / 10;
+            const key = `${rl},${rn}`;
+            const ex = roundedMap.get(key);
+            if (ex) ex.deviceCount += p.deviceCount;
+            else roundedMap.set(key, { lat: rl, lng: rn, deviceCount: p.deviceCount });
           }
-        }
 
-        if (newCoords.size > 0) {
-          try {
-            // Detect country from existing analysis
-            const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
-            if (analysis?.country) {
-              setCountryFilter([analysis.country]);
-            }
+          const geocoded = await batchReverseGeocode(Array.from(roundedMap.values()));
+          const rKeys = Array.from(roundedMap.keys());
 
-            const points = Array.from(newCoords.values());
-            const roundedPoints = points.map(p => ({
-              lat: Math.round(p.lat * 10) / 10,
-              lng: Math.round(p.lng * 10) / 10,
-              deviceCount: p.deviceCount,
-            }));
-
-            // Deduplicate rounded
-            const uniqueRounded = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-            for (const p of roundedPoints) {
-              const key = `${p.lat},${p.lng}`;
-              const ex = uniqueRounded.get(key);
-              if (ex) ex.deviceCount += p.deviceCount;
-              else uniqueRounded.set(key, { ...p });
-            }
-
-            const geocoded = await batchReverseGeocode(Array.from(uniqueRounded.values()));
-            const uniqueKeys = Array.from(uniqueRounded.keys());
-
-            // Map original coords → geocode results
-            for (const [key, p] of newCoords.entries()) {
-              const roundedKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
-              const idx = uniqueKeys.indexOf(roundedKey);
-              if (idx >= 0 && idx < geocoded.length) {
-                const g = geocoded[idx];
-                if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
-                  coordToZip.set(key, { zipCode: g.postcode, city: g.city, country: g.country });
-                } else if (g.type === 'foreign') {
-                  coordToZip.set(key, { zipCode: 'FOREIGN', city: 'FOREIGN', country: g.country });
-                }
+          for (const [key, p] of coordsToGeocode.entries()) {
+            const rk = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            const idx = rKeys.indexOf(rk);
+            if (idx >= 0 && idx < geocoded.length) {
+              const g = geocoded[idx];
+              if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
+                coordToZip.set(key, { zipCode: g.postcode, city: g.city, country: g.country });
               }
             }
-
-            setCountryFilter(null);
-          } catch (err: any) {
-            console.error(`[DS-REPORT] Geocoding error:`, err.message);
-            setCountryFilter(null);
           }
+          setCountryFilter(null);
+        } catch (e: any) {
+          console.error('[DS-REPORT] geocoding:', e.message);
+          setCountryFilter(null);
         }
       }
 
-      // Build + save OD and catchment reports per bucket
-      for (const bucket of batch) {
-        const odClusters = bucketODData.get(bucket);
-        if (odClusters) {
-          const odReport = buildODReport(datasetName, odClusters.clusters, coordToZip);
-          await saveReport(datasetName, 'od', bucket, odReport);
-        }
-
-        const catchmentRows = bucketCatchmentRows.get(bucket);
-        if (catchmentRows) {
-          const catchmentReport = buildCatchmentReport(datasetName, catchmentRows, coordToZip);
-          await saveReport(datasetName, 'catchment', bucket, catchmentReport);
-        }
+      // Save OD + catchment reports
+      if (odClusters) {
+        await putConfig(`${pfx}/od`, buildODReport(datasetName, odClusters.clusters, coordToZip), { compact: true });
+      }
+      if (catchmentRows) {
+        await putConfig(`${pfx}/catchment`, buildCatchmentReport(datasetName, catchmentRows, coordToZip), { compact: true });
       }
 
-      // Serialize coordToZip to state for reuse by subsequent batches
-      const serializedCoordToZip: Record<string, string> = {};
-      for (const [key, val] of coordToZip.entries()) {
-        serializedCoordToZip[key] = `${val.zipCode}|${val.city}|${val.country}`;
-      }
-
-      // Mark buckets as completed
-      const newCompleted = [...state.completedBuckets, ...batch];
-
-      if (state.currentBatchIndex + 1 < state.bucketBatches.length) {
-        // More batches → advance to start_batch
-        state = {
-          ...state,
-          phase: 'start_batch',
-          currentBatchIndex: state.currentBatchIndex + 1,
-          completedBuckets: newCompleted,
-          coordToZip: serializedCoordToZip,
-          queries: undefined,
-        };
-        await saveState(datasetName, state);
-
-        const pendingBuckets = DWELL_BUCKETS.filter(b => !newCompleted.includes(b));
-        return NextResponse.json({
-          phase: 'parse_batch',
-          progress: {
-            step: 'batch_done',
-            percent: batchPercent(state.currentBatchIndex - 1, 100),
-            message: `Batch ${state.currentBatchIndex} of ${state.bucketBatches.length} complete`,
-            completedBuckets: newCompleted,
-            pendingBuckets,
-            totalBuckets: DWELL_BUCKETS.length,
-          },
-        });
-      }
-
-      // All batches done → advance to cleanup
-      state = {
-        ...state,
-        phase: 'cleanup',
-        completedBuckets: newCompleted,
-        coordToZip: serializedCoordToZip,
-        queries: undefined,
-      };
-      await saveState(datasetName, state);
-      // Fall through to cleanup
-    }
-
-    // ── Phase: cleanup ─────────────────────────────────────────────
-    if (state.phase === 'cleanup') {
-      if (state.tempTableName) {
-        try {
-          await dropTempTable(state.tempTableName);
-          console.log(`[DS-REPORT] Dropped temp table ${state.tempTableName}`);
-        } catch (err: any) {
-          console.error(`[DS-REPORT] Error dropping temp table:`, err.message);
-        }
-
-        try {
-          await cleanupTempS3(state.tempTableName);
-          console.log(`[DS-REPORT] Cleaned up temp S3 for ${state.tempTableName}`);
-        } catch (err: any) {
-          console.error(`[DS-REPORT] Error cleaning up temp S3:`, err.message);
-        }
-      }
-
-      state = {
-        ...state,
-        phase: 'done',
-        coordToZip: undefined, // don't persist large geocode map in final state
-      };
+      state = { ...state, phase: 'done' };
       await saveState(datasetName, state);
 
       return NextResponse.json({
         phase: 'done',
-        progress: {
-          step: 'done',
-          percent: 100,
-          message: 'All dwell buckets computed!',
-          completedBuckets: DWELL_BUCKETS,
-          totalBuckets: DWELL_BUCKETS.length,
-        },
+        progress: { step: 'done', percent: 100, message: 'Reports generated successfully' },
       });
     }
 
-    // Already done
-    return NextResponse.json({
-      phase: 'done',
-      progress: {
-        step: 'done',
-        percent: 100,
-        message: 'All dwell buckets computed!',
-        completedBuckets: DWELL_BUCKETS,
-        totalBuckets: DWELL_BUCKETS.length,
-      },
-    });
-  } catch (error: any) {
-    console.error('[DS-REPORT-POLL] Error for', datasetName, ':', error.message, error.stack?.split('\n').slice(0, 3).join(' | '));
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ phase: state?.phase || 'unknown' });
+  } catch (err: any) {
+    console.error(`[DS-REPORT] ${datasetName}:`, err.message);
+    return NextResponse.json({ error: err.message, phase: 'error' }, { status: 500 });
   }
 }
