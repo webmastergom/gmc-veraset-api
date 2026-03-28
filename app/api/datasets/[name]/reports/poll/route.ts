@@ -52,8 +52,10 @@ const POI_GMC_TABLE = 'lab_pois_gmc';
  * Common CTE: filter pings at POIs with dwell calculation.
  * Dwell = time span (minutes) between first and last ping per device-day at POI.
  * Returns per-device-day aggregated rows with dwell_minutes.
+ * @param minDwell - minimum dwell time in minutes (0 = no filter)
  */
-function atPoiWithDwellCTE(table: string): string {
+function atPoiWithDwellCTE(table: string, minDwell = 0): string {
+  const dwellFilter = minDwell > 0 ? `\n    HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}` : '';
   return `raw_poi_pings AS (
       SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
@@ -75,12 +77,38 @@ function atPoiWithDwellCTE(table: string): string {
         DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_minutes,
         COUNT(*) as ping_count
       FROM raw_poi_pings
-      GROUP BY ad_id, date
+      GROUP BY ad_id, date${dwellFilter}
     )`;
 }
 
-/** Simple CTE for queries that just need the raw pings (hourly, temporal) */
-function atPoiCTE(table: string): string {
+/** Simple CTE for queries that just need the raw pings (hourly, temporal).
+ * When minDwell > 0, only includes device-days with sufficient dwell time. */
+function atPoiCTE(table: string, minDwell = 0): string {
+  if (minDwell > 0) {
+    // Need to compute dwell first, then filter, then expand back to individual pings
+    return `poi_device_days AS (
+      SELECT ad_id, date
+      FROM ${table}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+      GROUP BY ad_id, date
+      HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}
+    ),
+    at_poi AS (
+      SELECT DISTINCT t.ad_id, t.date, t.utc_timestamp,
+        TRY_CAST(t.latitude AS DOUBLE) as lat,
+        TRY_CAST(t.longitude AS DOUBLE) as lng
+      FROM ${table} t
+      INNER JOIN poi_device_days dd ON t.ad_id = dd.ad_id AND t.date = dd.date
+      CROSS JOIN UNNEST(t.poi_ids) AS x(poi_id)
+      WHERE x.poi_id IS NOT NULL AND x.poi_id != ''
+        AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    )`;
+  }
   return `at_poi AS (
       SELECT DISTINCT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
@@ -95,26 +123,26 @@ function atPoiCTE(table: string): string {
     )`;
 }
 
-function buildHourlySQL(table: string): string {
-  return `WITH ${atPoiCTE(table)}
+function buildHourlySQL(table: string, minDwell = 0): string {
+  return `WITH ${atPoiCTE(table, minDwell)}
     SELECT HOUR(utc_timestamp) as touch_hour,
       COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY 1 ORDER BY 1`;
 }
 
-function buildTemporalSQL(table: string): string {
-  return `WITH ${atPoiCTE(table)}
+function buildTemporalSQL(table: string, minDwell = 0): string {
+  return `WITH ${atPoiCTE(table, minDwell)}
     SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY date ORDER BY date`;
 }
 
-function buildTotalDevicesSQL(table: string): string {
-  return `WITH ${atPoiCTE(table)}
+function buildTotalDevicesSQL(table: string, minDwell = 0): string {
+  return `WITH ${atPoiCTE(table, minDwell)}
     SELECT COUNT(DISTINCT ad_id) as total_unique_devices FROM at_poi`;
 }
 
-function buildODSQL(table: string): string {
-  return `WITH ${atPoiWithDwellCTE(table)},
+function buildODSQL(table: string, minDwell = 0): string {
+  return `WITH ${atPoiWithDwellCTE(table, minDwell)},
     poi_visits AS (
       SELECT ad_id, date, first_ping as first_poi_visit
       FROM at_poi
@@ -154,8 +182,8 @@ function buildODSQL(table: string): string {
     LIMIT 100000`;
 }
 
-function buildCatchmentSQL(table: string): string {
-  return `WITH ${atPoiWithDwellCTE(table)},
+function buildCatchmentSQL(table: string, minDwell = 0): string {
+  return `WITH ${atPoiWithDwellCTE(table, minDwell)},
     poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
     valid_pings AS (
       SELECT t.ad_id, t.date, t.utc_timestamp,
@@ -192,8 +220,8 @@ function buildCatchmentSQL(table: string): string {
  * avg dwell, and visit frequency. These feed the affinity index calculation
  * after reverse geocoding groups them by postal code.
  */
-function buildAffinitySQL(table: string): string {
-  return `WITH ${atPoiWithDwellCTE(table)},
+function buildAffinitySQL(table: string, minDwell = 0): string {
+  return `WITH ${atPoiWithDwellCTE(table, minDwell)},
     all_pings AS (
       SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
@@ -238,38 +266,42 @@ function buildAffinitySQL(table: string): string {
     LIMIT 50000`;
 }
 
-function buildMobilitySQL(table: string): string {
+function buildMobilitySQL(table: string, minDwell = 0): string {
   // Uses poi_ids from the job itself: pings before/after POI visit on the same day.
-  // "before" = pings within 2h before first POI ping; "after" = within 2h after last POI ping.
-  // Groups non-POI pings by hour bucket relative to visit for temporal distribution.
-  return `WITH ${atPoiCTE(table)},
+  // Identifies all pings from POI visitors, classifies as before/during/after visit.
+  return `WITH ${atPoiCTE(table, minDwell)},
     visit_times AS (
       SELECT ad_id, date,
         MIN(utc_timestamp) as first_visit,
         MAX(utc_timestamp) as last_visit
       FROM at_poi GROUP BY ad_id, date
     ),
-    non_poi_pings AS (
+    poi_device_pings AS (
       SELECT t.ad_id, t.date, t.utc_timestamp,
-        CASE
-          WHEN t.utc_timestamp < v.first_visit THEN 'before'
-          WHEN t.utc_timestamp > v.last_visit THEN 'after'
-          ELSE 'during'
-        END as timing,
-        HOUR(t.utc_timestamp) as ping_hour
+        HOUR(t.utc_timestamp) as ping_hour,
+        COALESCE(TRY(CARDINALITY(FILTER(t.poi_ids, x -> x IS NOT NULL AND x != ''))), 0) as active_poi_count
       FROM ${table} t
       INNER JOIN visit_times v ON t.ad_id = v.ad_id AND t.date = v.date
       WHERE t.ad_id IS NOT NULL AND TRIM(t.ad_id) != ''
-        AND (t.poi_ids IS NULL OR CARDINALITY(t.poi_ids) = 0
-             OR NOT EXISTS (SELECT 1 FROM UNNEST(t.poi_ids) AS x(id) WHERE x.id IS NOT NULL AND x.id != ''))
+        AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND ABS(DATE_DIFF('hour', t.utc_timestamp, v.first_visit)) <= 3
+    ),
+    classified AS (
+      SELECT p.ad_id, p.date, p.ping_hour, p.utc_timestamp,
+        CASE
+          WHEN p.utc_timestamp < v.first_visit AND p.active_poi_count = 0 THEN 'before'
+          WHEN p.utc_timestamp > v.last_visit AND p.active_poi_count = 0 THEN 'after'
+          ELSE 'during'
+        END as timing
+      FROM poi_device_pings p
+      INNER JOIN visit_times v ON p.ad_id = v.ad_id AND p.date = v.date
     )
     SELECT timing, ping_hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ad_id) as unique_devices,
       COUNT(DISTINCT ad_id || '|' || date) as device_days
-    FROM non_poi_pings
-    WHERE timing != 'during'
+    FROM classified
+    WHERE timing IN ('before', 'after')
     GROUP BY timing, ping_hour
     ORDER BY timing, ping_hour`;
 }
@@ -388,12 +420,19 @@ export async function POST(
   try {
     let state = await getState(datasetName);
 
+    // Parse request body for minDwell filter
+    let minDwell = 0;
+    try {
+      const body = await request.json();
+      if (body?.minDwell) minDwell = parseInt(body.minDwell, 10) || 0;
+    } catch { /* no body */ }
+
     // Reset if done or error
     if (state?.phase === 'done' || state?.phase === 'error') state = null;
 
     // ── Phase: start ────────────────────────────────────────────
     if (!state) {
-      console.log(`[DS-REPORT] Starting reports for ${datasetName}`);
+      console.log(`[DS-REPORT] Starting reports for ${datasetName} (minDwell=${minDwell})`);
 
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
@@ -401,13 +440,13 @@ export async function POST(
       // Launch all 7 queries in parallel using poi_ids (no spatial join)
       const queries: Record<string, string> = {};
       await Promise.all([
-        startQueryAsync(buildODSQL(table)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
-        startQueryAsync(buildHourlySQL(table)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
-        startQueryAsync(buildCatchmentSQL(table)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
-        startQueryAsync(buildTemporalSQL(table)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
-        startQueryAsync(buildTotalDevicesSQL(table)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
-        startQueryAsync(buildAffinitySQL(table)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
+        startQueryAsync(buildODSQL(table, minDwell)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
+        startQueryAsync(buildHourlySQL(table, minDwell)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
+        startQueryAsync(buildCatchmentSQL(table, minDwell)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
+        startQueryAsync(buildTemporalSQL(table, minDwell)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
+        startQueryAsync(buildTotalDevicesSQL(table, minDwell)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildAffinitySQL(table, minDwell)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
       // Get dataset size for progress estimation

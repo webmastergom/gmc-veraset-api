@@ -244,6 +244,7 @@ export default function DatasetAnalysisPage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
+              ...(selectedBucket > 0 ? { minDwell: selectedBucket } : {}),
             }),
           });
           consecutiveErrors = 0;
