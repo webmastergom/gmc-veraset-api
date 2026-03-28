@@ -269,8 +269,9 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
 }
 
 function buildMobilitySQL(table: string, minDwell = 0): string {
-  // Uses poi_ids from the job itself: pings before/after POI visit on the same day.
-  // Identifies all pings from POI visitors, classifies as before/during/after visit.
+  // Find POI categories visited before/after target POI visit.
+  // Uses Veraset's native poi_ids (assigned to ALL nearby POIs, not just job's)
+  // then looks up categories from lab_pois_gmc. No spatial join needed.
   return `WITH ${atPoiCTE(table, minDwell)},
     visit_times AS (
       SELECT ad_id, date,
@@ -278,34 +279,32 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
         MAX(utc_timestamp) as last_visit
       FROM at_poi GROUP BY ad_id, date
     ),
-    poi_device_pings AS (
-      SELECT t.ad_id, t.date, t.utc_timestamp,
-        HOUR(t.utc_timestamp) as ping_hour,
-        COALESCE(TRY(CARDINALITY(FILTER(t.poi_ids, x -> x IS NOT NULL AND x != ''))), 0) as active_poi_count
+    other_pois AS (
+      SELECT t.ad_id, t.date, t.utc_timestamp, other_poi
       FROM ${table} t
       INNER JOIN visit_times v ON t.ad_id = v.ad_id AND t.date = v.date
+      CROSS JOIN UNNEST(t.poi_ids) AS x(other_poi)
       WHERE t.ad_id IS NOT NULL AND TRIM(t.ad_id) != ''
-        AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+        AND x.other_poi IS NOT NULL AND x.other_poi != ''
         AND ABS(DATE_DIFF('hour', t.utc_timestamp, v.first_visit)) <= 3
+        AND (t.utc_timestamp < v.first_visit OR t.utc_timestamp > v.last_visit)
     ),
-    classified AS (
-      SELECT p.ad_id, p.date, p.ping_hour, p.utc_timestamp,
-        CASE
-          WHEN p.utc_timestamp < v.first_visit AND p.active_poi_count = 0 THEN 'before'
-          WHEN p.utc_timestamp > v.last_visit AND p.active_poi_count = 0 THEN 'after'
-          ELSE 'during'
-        END as timing
-      FROM poi_device_pings p
-      INNER JOIN visit_times v ON p.ad_id = v.ad_id AND p.date = v.date
+    categorized AS (
+      SELECT o.ad_id, o.date,
+        CASE WHEN o.utc_timestamp < v.first_visit THEN 'before' ELSE 'after' END as timing,
+        g.category
+      FROM other_pois o
+      INNER JOIN visit_times v ON o.ad_id = v.ad_id AND o.date = v.date
+      INNER JOIN ${POI_GMC_TABLE} g ON o.other_poi = g.id
+      WHERE g.category IS NOT NULL
     )
-    SELECT timing, ping_hour,
-      COUNT(*) as pings,
-      COUNT(DISTINCT ad_id) as unique_devices,
-      COUNT(DISTINCT ad_id || '|' || date) as device_days
-    FROM classified
-    WHERE timing IN ('before', 'after')
-    GROUP BY timing, ping_hour
-    ORDER BY timing, ping_hour`;
+    SELECT category, timing,
+      COUNT(DISTINCT ad_id || '|' || date) as device_days,
+      COUNT(DISTINCT ad_id) as unique_devices
+    FROM categorized
+    GROUP BY category, timing
+    ORDER BY device_days DESC
+    LIMIT 500`;
 }
 
 // ── Affinity index computation ────────────────────────────────────────
@@ -593,31 +592,31 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] temporal parse:', e.message); }
       }
 
-      // Parse mobility (before/after POI visit by hour)
+      // Parse mobility (POI categories before/after visit)
       if (queries.mobility) {
         try {
           const r = await fetchQueryResults(queries.mobility);
-          const before: any[] = [];
-          const after: any[] = [];
+          const beforeMap = new Map<string, { deviceDays: number; uniqueDevices: number }>();
+          const afterMap = new Map<string, { deviceDays: number; uniqueDevices: number }>();
           for (const row of r.rows) {
-            const entry = {
-              hour: parseInt(row.ping_hour, 10) || 0,
-              pings: parseInt(row.pings, 10) || 0,
-              devices: parseInt(row.unique_devices, 10) || 0,
-              deviceDays: parseInt(row.device_days, 10) || 0,
-            };
-            if (row.timing === 'before') before.push(entry);
-            else if (row.timing === 'after') after.push(entry);
+            const cat = row.category;
+            const dd = parseInt(row.device_days, 10) || 0;
+            const ud = parseInt(row.unique_devices, 10) || 0;
+            const map = row.timing === 'before' ? beforeMap : afterMap;
+            const ex = map.get(cat);
+            if (ex) { ex.deviceDays += dd; ex.uniqueDevices += ud; }
+            else map.set(cat, { deviceDays: dd, uniqueDevices: ud });
           }
-          before.sort((a, b) => a.hour - b.hour);
-          after.sort((a, b) => a.hour - b.hour);
+          const toArr = (m: Map<string, any>) =>
+            Array.from(m.entries())
+              .map(([category, v]) => ({ category, ...v }))
+              .sort((a, b) => b.deviceDays - a.deviceDays);
           await putConfig(`${rk('mobility')}`, {
             analyzedAt: new Date().toISOString(),
             datasetName,
-            before,
-            after,
-            totalBeforeDeviceDays: before.reduce((s, e) => s + e.deviceDays, 0),
-            totalAfterDeviceDays: after.reduce((s, e) => s + e.deviceDays, 0),
+            before: toArr(beforeMap),
+            after: toArr(afterMap),
+            categories: toArr(beforeMap), // legacy compat
           }, { compact: true });
         } catch (e: any) { console.error('[DS-REPORT] mobility parse:', e.message); }
       }
