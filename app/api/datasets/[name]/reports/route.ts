@@ -8,7 +8,7 @@ const REPORT_KEY_DWELL = (ds: string, type: string, bucket: number) =>
   `dataset-reports/${ds}/${type}-dwell-${bucket}`;
 const REPORT_KEY_LEGACY = (ds: string, type: string) =>
   `dataset-reports/${ds}/${type}`;
-const VALID_TYPES = ['od', 'hourly', 'catchment', 'mobility', 'temporal'];
+const VALID_TYPES = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
 
 /**
  * GET /api/datasets/[name]/reports?type=od&bucket=5
