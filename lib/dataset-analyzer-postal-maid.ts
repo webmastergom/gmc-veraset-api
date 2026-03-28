@@ -95,7 +95,6 @@ export async function analyzePostalMaid(
 
   report({ step: 'preparing_table', percent: 5, message: 'Preparing Athena table...', detail: tableName });
   await ensureTableForDataset(datasetName);
-  report({ step: 'running_queries', percent: 15, message: 'Counting POI visitors & extracting origins...' });
 
   const rowOrderingSql = applyRowCap
     ? `ORDER BY device_days DESC LIMIT ${sqlRowCap}`
@@ -145,20 +144,36 @@ export async function analyzePostalMaid(
     ${rowOrderingSql}
   `;
 
-  console.log(`[POSTAL-MAID] Running device coverage + MAID extraction...`);
-  const [totalRes, maidsRes] = await Promise.all([
-    runQuery(totalQuery),
-    runQuery(maidsQuery),
-  ]);
-
+  // Run queries sequentially — parallel doubles Athena scan cost on large datasets and freezes UI progress at 15%.
+  report({
+    step: 'running_queries',
+    percent: 12,
+    message: 'Counting POI visitors (Athena)...',
+    detail: 'Single table scan; next step is slower',
+  });
+  const totalRes = await runQuery(totalQuery);
   const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
-  console.log(`[POSTAL-MAID] POI visitors: ${totalDevicesInDataset}, device-origin rows: ${maidsRes.rows.length}`);
-  report({ step: 'running_queries', percent: 60, message: 'Query complete', detail: `${maidsRes.rows.length} device rows` });
+  console.log(`[POSTAL-MAID] POI visitors: ${totalDevicesInDataset}`);
 
   if (totalDevicesInDataset === 0) {
     report({ step: 'completed', percent: 100, message: 'No POI visitors in dataset for these filters' });
     return buildEmptyResult(datasetName, filters, 0);
   }
+
+  report({
+    step: 'running_queries',
+    percent: 18,
+    message: 'Extracting first-ping origins (Athena)...',
+    detail: 'Often several minutes on large jobs — query still running',
+  });
+  const maidsRes = await runQuery(maidsQuery);
+  console.log(`[POSTAL-MAID] device-origin rows: ${maidsRes.rows.length}`);
+  report({
+    step: 'running_queries',
+    percent: 60,
+    message: 'Athena queries complete',
+    detail: `${maidsRes.rows.length} device-origin rows`,
+  });
 
   // ── Geocode origins and match to requested postal codes ──────────────────
   const coordMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();

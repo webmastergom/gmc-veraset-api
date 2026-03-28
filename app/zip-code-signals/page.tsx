@@ -48,6 +48,7 @@ import {
   Copy,
   FileDown,
   RotateCcw,
+  ScrollText,
 } from 'lucide-react';
 import type { PostalMaidResult, PostalMaidDevice } from '@/lib/postal-maid-types';
 
@@ -99,6 +100,22 @@ const PROGRESS_STEPS = [
   { key: 'matching', label: 'Match' },
 ];
 
+interface ProgressLogEntry {
+  elapsedMs: number;
+  step: string;
+  percent: number;
+  message: string;
+  detail?: string;
+}
+
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m <= 0) return `${r}s`;
+  return `${m}m ${r.toString().padStart(2, '0')}s`;
+}
+
 // ── Main page ─────────────────────────────────────────────────────────
 export default function ZipCodeSignalsPage() {
   // Phase
@@ -122,6 +139,11 @@ export default function ZipCodeSignalsPage() {
   const [progress, setProgress] = useState<{
     step: string; percent: number; message: string; detail?: string;
   } | null>(null);
+  const [progressLog, setProgressLog] = useState<ProgressLogEntry[]>([]);
+  const [logCopied, setLogCopied] = useState(false);
+  const runStartedAtRef = useRef<number>(0);
+  const lastProgressRef = useRef<{ percent: number; message: string } | null>(null);
+  const logEndRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -173,6 +195,27 @@ export default function ZipCodeSignalsPage() {
     );
   }, [result, searchQuery]);
 
+  useEffect(() => {
+    if (phase === 'running' && progressLog.length > 0) {
+      logEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [phase, progressLog]);
+
+  const appendProgressLog = (data: { step: string; percent: number; message: string; detail?: string }) => {
+    const t0 = runStartedAtRef.current || Date.now();
+    const elapsedMs = Date.now() - t0;
+    setProgressLog(prev => [
+      ...prev,
+      {
+        elapsedMs,
+        step: data.step,
+        percent: data.percent,
+        message: data.message,
+        detail: data.detail,
+      },
+    ]);
+  };
+
   // ── Postal code chip management ───────────────────────────────────
   const addPostalCodes = (input: string) => {
     // Support comma, space, newline, semicolon as delimiters
@@ -217,7 +260,28 @@ export default function ZipCodeSignalsPage() {
     setPhase('running');
     setError(null);
     setResult(null);
+    setProgressLog([]);
+    setLogCopied(false);
+    runStartedAtRef.current = Date.now();
+    lastProgressRef.current = { percent: 0, message: 'Starting...' };
+    const runMeta = {
+      dataset: selectedDataset.id,
+      country: selectedCountry,
+      postalCount: postalCodes.length,
+      dateFrom: dateFrom || null,
+      dateTo: dateTo || null,
+    };
     setProgress({ step: 'initializing', percent: 0, message: 'Starting...' });
+    appendProgressLog({
+      step: 'initializing',
+      percent: 0,
+      message: 'Run started (client)',
+      detail: `${runMeta.dataset} · ${runMeta.country} · ${runMeta.postalCount} postal code(s)${
+        runMeta.dateFrom || runMeta.dateTo
+          ? ` · dates ${runMeta.dateFrom ?? '…'} → ${runMeta.dateTo ?? '…'}`
+          : ''
+      }`,
+    });
 
     const abort = new AbortController();
     abortRef.current = abort;
@@ -269,11 +333,29 @@ export default function ZipCodeSignalsPage() {
             if (eventType === 'progress') {
               if (data.step === 'error') {
                 backendError = data.message || 'Analysis failed';
+                lastProgressRef.current = { percent: 0, message: data.message || 'error' };
+                appendProgressLog({
+                  step: 'error',
+                  percent: 0,
+                  message: data.message || 'Analysis failed',
+                  detail: data.detail,
+                });
               } else {
+                lastProgressRef.current = {
+                  percent: data.percent,
+                  message: data.message,
+                };
                 setProgress(data);
+                appendProgressLog(data);
               }
             } else if (eventType === 'result') {
               gotResult = true;
+              appendProgressLog({
+                step: 'completed',
+                percent: 100,
+                message: 'Result received from server',
+                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s) in payload`,
+              });
               setResult(data);
               setPhase('results');
               setProgress(null);
@@ -296,8 +378,20 @@ export default function ZipCodeSignalsPage() {
             const data = JSON.parse(dataStr);
             if (eventType === 'progress' && data.step === 'error') {
               backendError = data.message || 'Analysis failed';
+              appendProgressLog({
+                step: 'error',
+                percent: 0,
+                message: data.message || 'Analysis failed',
+                detail: data.detail,
+              });
             } else if (eventType === 'result') {
               gotResult = true;
+              appendProgressLog({
+                step: 'completed',
+                percent: 100,
+                message: 'Result received from server',
+                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s) in payload`,
+              });
               setResult(data);
               setPhase('results');
               setProgress(null);
@@ -313,7 +407,22 @@ export default function ZipCodeSignalsPage() {
         throw new Error('Analysis completed without returning results');
       }
     } catch (err: any) {
-      if (err.name === 'AbortError') return;
+      const last = lastProgressRef.current;
+      if (err.name === 'AbortError') {
+        appendProgressLog({
+          step: 'cancelled',
+          percent: last?.percent ?? 0,
+          message: 'Request aborted (cancel button, timeout, or closed connection)',
+          detail: last?.message,
+        });
+        return;
+      }
+      appendProgressLog({
+        step: 'error',
+        percent: last?.percent ?? 0,
+        message: err.message || 'An unexpected error occurred',
+        detail: 'Client-side failure after last server update',
+      });
       setError(err.message || 'An unexpected error occurred');
       setPhase('setup');
       setProgress(null);
@@ -330,8 +439,26 @@ export default function ZipCodeSignalsPage() {
     setPhase('setup');
     setResult(null);
     setProgress(null);
+    setProgressLog([]);
+    setLogCopied(false);
     setError(null);
     setSearchQuery('');
+  };
+
+  const copyProgressLog = async () => {
+    const lines = progressLog.map(
+      e =>
+        `[+${formatElapsed(e.elapsedMs)}] ${e.percent}% · ${e.step} · ${e.message}${
+          e.detail ? ` — ${e.detail}` : ''
+        }`,
+    );
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      setLogCopied(true);
+      setTimeout(() => setLogCopied(false), 2000);
+    } catch {
+      setLogCopied(false);
+    }
   };
 
   // ── Export CSV ────────────────────────────────────────────────────
@@ -657,6 +784,57 @@ export default function ZipCodeSignalsPage() {
                 })}
               </div>
 
+              {/* Chronological activity log (every SSE progress + client milestones) */}
+              <div className="rounded-xl border border-border/60 bg-muted/20 overflow-hidden text-left">
+                <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border/50 bg-muted/40">
+                  <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                    <ScrollText className="w-3.5 h-3.5 shrink-0 opacity-80" />
+                    <span>Activity log</span>
+                    <span className="font-normal opacity-70 hidden sm:inline">
+                      — elapsed time · % · step · message
+                    </span>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs shrink-0"
+                    disabled={progressLog.length === 0}
+                    onClick={copyProgressLog}
+                  >
+                    {logCopied ? 'Copied' : 'Copy log'}
+                  </Button>
+                </div>
+                <div className="max-h-56 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-snug space-y-2.5">
+                  {progressLog.length === 0 ? (
+                    <p className="text-muted-foreground italic">Waiting for first event…</p>
+                  ) : (
+                    progressLog.map((e, i) => (
+                      <div
+                        key={`${e.elapsedMs}-${i}-${e.step}`}
+                        className="border-l-2 border-border/70 pl-2.5 -ml-px"
+                      >
+                        <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+                          <span className="text-theme-accent tabular-nums shrink-0">
+                            +{formatElapsed(e.elapsedMs)}
+                          </span>
+                          <span className="text-muted-foreground/80">{e.percent}%</span>
+                          <span className="text-muted-foreground">·</span>
+                          <span className="font-medium text-foreground/95">{e.step}</span>
+                        </div>
+                        <p className="text-foreground/90 mt-0.5">{e.message}</p>
+                        {e.detail ? (
+                          <p className="text-muted-foreground text-[10px] mt-0.5 break-words">
+                            {e.detail}
+                          </p>
+                        ) : null}
+                      </div>
+                    ))
+                  )}
+                  <div ref={logEndRef} className="h-px" aria-hidden />
+                </div>
+              </div>
+
               <div className="text-center">
                 <Button variant="outline" size="sm" onClick={handleCancel} className="gap-2">
                   <X className="w-3 h-3" /> Cancel
@@ -729,6 +907,43 @@ export default function ZipCodeSignalsPage() {
                 </CardContent>
               </Card>
             </div>
+
+            {progressLog.length > 0 && (
+              <Card>
+                <CardHeader className="pb-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <CardTitle className="text-base flex items-center gap-2">
+                      <ScrollText className="w-4 h-4 text-muted-foreground" />
+                      Run activity log
+                    </CardTitle>
+                    <Button type="button" variant="outline" size="sm" className="h-8 text-xs" onClick={copyProgressLog}>
+                      {logCopied ? 'Copied' : 'Copy log'}
+                    </Button>
+                  </div>
+                  <CardDescription>
+                    Timeline of server progress events for this run (same as during loading).
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="max-h-48 overflow-y-auto rounded-lg border border-border/60 bg-muted/20 px-3 py-2 font-mono text-[11px] leading-snug space-y-2">
+                    {progressLog.map((e, i) => (
+                      <div key={`${e.elapsedMs}-${i}-res-${e.step}`} className="border-l-2 border-border/70 pl-2.5">
+                        <div className="flex flex-wrap items-baseline gap-x-1.5">
+                          <span className="text-theme-accent tabular-nums">+{formatElapsed(e.elapsedMs)}</span>
+                          <span className="text-muted-foreground/80">{e.percent}%</span>
+                          <span className="text-muted-foreground">·</span>
+                          <span className="font-medium">{e.step}</span>
+                        </div>
+                        <p className="text-foreground/90 mt-0.5">{e.message}</p>
+                        {e.detail ? (
+                          <p className="text-muted-foreground text-[10px] mt-0.5 break-words">{e.detail}</p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             {/* Tabs: Devices / Postal Breakdown */}
             <Card>
