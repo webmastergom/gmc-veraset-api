@@ -9,7 +9,7 @@
  * ORDER BY device_days DESC LIMIT n — biases toward heavy users; omit for full coverage.
  */
 
-import { ensureTableForDataset, runQuery, getTableName } from './athena';
+import { ensureTableForDataset, runQuery, getTableName, startQueryAsync, checkQueryStatus, fetchQueryResults } from './athena';
 import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
 import type { PostalMaidFilters, PostalMaidDevice, PostalMaidResult } from './postal-maid-types';
 
@@ -149,14 +149,50 @@ export async function analyzePostalMaid(
     ${rowOrderingSql}
   `;
 
-  // Run queries sequentially — parallel doubles Athena scan cost on large datasets and freezes UI progress at 15%.
+  // Launch both queries in parallel, poll with progress updates
   report({
     step: 'running_queries',
-    percent: 12,
-    message: 'Counting POI visitors (Athena)...',
-    detail: 'Single table scan; next step is slower',
+    percent: 10,
+    message: 'Launching Athena queries...',
+    detail: 'Starting total count + origin extraction in parallel',
   });
-  const totalRes = await runQuery(totalQuery);
+
+  const [totalQId, maidsQId] = await Promise.all([
+    startQueryAsync(totalQuery),
+    startQueryAsync(maidsQuery),
+  ]);
+
+  // Poll both queries until done, reporting progress
+  let totalDone = false, maidsDone = false;
+  let totalRes: { rows: Record<string, string>[] } = { rows: [] };
+  let maidsRes: { rows: Record<string, string>[] } = { rows: [] };
+  const t0 = Date.now();
+
+  while (!totalDone || !maidsDone) {
+    await new Promise(r => setTimeout(r, 3000));
+    const elapsed = Math.round((Date.now() - t0) / 1000);
+
+    if (!totalDone) {
+      const s = await checkQueryStatus(totalQId);
+      if (s.state === 'SUCCEEDED') { totalDone = true; totalRes = await fetchQueryResults(totalQId); }
+      else if (s.state === 'FAILED') throw new Error(`Total devices query failed: ${s.error}`);
+    }
+    if (!maidsDone) {
+      const s = await checkQueryStatus(maidsQId);
+      if (s.state === 'SUCCEEDED') { maidsDone = true; maidsRes = await fetchQueryResults(maidsQId); }
+      else if (s.state === 'FAILED') throw new Error(`Origins query failed: ${s.error}`);
+    }
+
+    const done = (totalDone ? 1 : 0) + (maidsDone ? 1 : 0);
+    const pct = 10 + Math.round((done / 2) * 50);
+    report({
+      step: 'running_queries',
+      percent: pct,
+      message: `Athena queries: ${done}/2 complete · ${elapsed}s`,
+      detail: `${totalDone ? '✅' : '⏳'} totalDevices  ${maidsDone ? '✅' : '⏳'} origins`,
+    });
+  }
+
   const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
   console.log(`[POSTAL-MAID] POI visitors: ${totalDevicesInDataset}`);
 
@@ -164,14 +200,6 @@ export async function analyzePostalMaid(
     report({ step: 'completed', percent: 100, message: 'No POI visitors in dataset for these filters' });
     return buildEmptyResult(datasetName, filters, 0);
   }
-
-  report({
-    step: 'running_queries',
-    percent: 18,
-    message: 'Extracting first-ping origins (Athena)...',
-    detail: 'Often several minutes on large jobs — query still running',
-  });
-  const maidsRes = await runQuery(maidsQuery);
   console.log(`[POSTAL-MAID] device-origin rows: ${maidsRes.rows.length}`);
   report({
     step: 'running_queries',
