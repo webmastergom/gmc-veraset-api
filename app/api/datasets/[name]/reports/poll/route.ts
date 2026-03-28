@@ -270,18 +270,28 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
 
 function buildMobilitySQL(table: string, minDwell = 0): string {
   // Find POI categories visited before/after target POI visit.
-  // Veraset poi_ids are internal IDs (not GMC UUIDs), so we use geohash
-  // spatial join against lab_pois_gmc — but ONLY for visitor pings (small subset).
-  return `WITH ${atPoiCTE(table, minDwell)},
+  // Uses MEDIAN timestamp of poi_id pings as visit_time proxy
+  // (MIN = first ping of day due to Veraset gotcha, MEDIAN ≈ actual visit).
+  // Then spatial joins visitor pings (±2h) against lab_pois_gmc for category lookup.
+
+  const dwellHaving = minDwell > 0
+    ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
+    : '';
+
+  return `WITH
     visit_times AS (
       SELECT ad_id, date,
-        MIN(utc_timestamp) as first_visit,
-        MAX(utc_timestamp) as last_visit
-      FROM at_poi GROUP BY ad_id, date
+        APPROX_PERCENTILE(TO_UNIXTIME(utc_timestamp), 0.5) as median_ts
+      FROM ${table}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+      GROUP BY ad_id, date
+      ${dwellHaving}
     ),
     nearby_pings AS (
       SELECT t.ad_id, t.date,
-        CASE WHEN t.utc_timestamp < v.first_visit THEN 'before' ELSE 'after' END as timing,
+        CASE WHEN TO_UNIXTIME(t.utc_timestamp) < v.median_ts THEN 'before' ELSE 'after' END as timing,
         TRY_CAST(t.latitude AS DOUBLE) as lat,
         TRY_CAST(t.longitude AS DOUBLE) as lng,
         CAST(FLOOR(TRY_CAST(t.latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_bucket,
@@ -292,14 +302,16 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
         AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
         AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        AND ABS(DATE_DIFF('hour', t.utc_timestamp, v.first_visit)) <= 2
-        AND t.utc_timestamp != v.first_visit
+        AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) <= 7200
+        AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) > 0
     ),
     gmc_buckets AS (
       SELECT category, latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) as lat_bucket,
-        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) as lng_bucket
+        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) + dlat as lat_bucket,
+        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) + dlng as lng_bucket
       FROM ${POI_GMC_TABLE}
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
       WHERE category IS NOT NULL
     ),
     matched AS (
