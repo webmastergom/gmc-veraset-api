@@ -322,12 +322,24 @@ interface AffinityByZip {
   affinityIndex: number;  // 0-100
 }
 
-function computeAffinityReport(
+/** Haversine distance in km between two points */
+function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function computeAffinityReport(
   datasetName: string,
   rows: any[],
   coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
-): { analyzedAt: string; datasetName: string; byZipCode: AffinityByZip[] } {
-  // Aggregate by postal code
+  country?: string,
+): Promise<{ analyzedAt: string; datasetName: string; byZipCode: AffinityByZip[] }> {
+  // ── Step 1: Aggregate raw data by postal code ──────────────────
   const zipMap = new Map<string, {
     zipCode: string; city: string; country: string;
     lat: number; lng: number;
@@ -367,42 +379,114 @@ function computeAffinityReport(
     }
   }
 
-  // Compute affinity index per zip
-  const zips = Array.from(zipMap.values());
-
-  // Find max dwell and max frequency for normalization
+  // ── Step 2: Score "hot" CPs at 85-100 ──────────────────────────
+  const zips = Array.from(zipMap.values()).filter(z => z.zipCode !== 'UNKNOWN');
   const maxDwell = Math.max(1, ...zips.map(z => z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0));
   const maxFreq = Math.max(1, ...zips.map(z => z.freqCount > 0 ? z.freqSum / z.freqCount : 0));
 
-  const result: AffinityByZip[] = zips.map(z => {
+  const hotCps: AffinityByZip[] = zips.map(z => {
     const avgDwell = z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0;
     const avgFreq = z.freqCount > 0 ? z.freqSum / z.freqCount : 1;
-
-    // Normalize to 0-100: dwell (50%) + frequency (50%)
-    const dwellScore = Math.min(100, (avgDwell / maxDwell) * 100);
-    const freqScore = Math.min(100, (avgFreq / maxFreq) * 100);
-    const affinityIndex = Math.round(dwellScore * 0.5 + freqScore * 0.5);
+    const rawScore = (avgDwell / maxDwell) * 0.5 + (avgFreq / maxFreq) * 0.5;
+    // Scale to 85-100
+    const affinityIndex = Math.round(85 + rawScore * 15);
 
     return {
-      zipCode: z.zipCode,
-      city: z.city,
-      country: z.country,
-      lat: z.lat,
-      lng: z.lng,
-      uniqueDevices: z.uniqueDevices,
-      totalVisitDays: z.totalVisitDays,
+      zipCode: z.zipCode, city: z.city, country: z.country,
+      lat: z.lat, lng: z.lng,
+      uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
       avgDwellMinutes: Math.round(avgDwell * 10) / 10,
       avgFrequency: Math.round(avgFreq * 100) / 100,
       affinityIndex,
     };
   });
 
-  result.sort((a, b) => b.affinityIndex - a.affinityIndex);
+  // ── Step 3: Geographic decay — adjacent CPs scored progressively lower ──
+  const adjacentCps: AffinityByZip[] = [];
+
+  if (country && hotCps.length > 0) {
+    try {
+      const fs = await import('fs');
+      const path = await import('path');
+      const geojsonPath = path.join(process.cwd(), 'data', 'geojson', `${country}.geojson`);
+
+      if (fs.existsSync(geojsonPath)) {
+        const geojson = JSON.parse(fs.readFileSync(geojsonPath, 'utf-8'));
+        const hotSet = new Set(hotCps.map(h => h.zipCode));
+
+        // Compute centroid for each GeoJSON feature
+        for (const feature of geojson.features) {
+          const cp = feature.properties?.postal_code || feature.properties?.postcode || '';
+          if (!cp || hotSet.has(cp)) continue;
+
+          // Quick centroid from bbox or first coordinate
+          let cLat = 0, cLng = 0;
+          if (feature.properties?.latitude && feature.properties?.longitude) {
+            cLat = parseFloat(feature.properties.latitude);
+            cLng = parseFloat(feature.properties.longitude);
+          } else if (feature.bbox) {
+            cLat = (feature.bbox[1] + feature.bbox[3]) / 2;
+            cLng = (feature.bbox[0] + feature.bbox[2]) / 2;
+          } else {
+            // Extract from geometry
+            const coords = feature.geometry?.coordinates;
+            if (!coords) continue;
+            const flat = feature.geometry.type === 'MultiPolygon'
+              ? coords[0][0] : coords[0];
+            if (!flat?.length) continue;
+            const sumLat = flat.reduce((s: number, c: number[]) => s + c[1], 0);
+            const sumLng = flat.reduce((s: number, c: number[]) => s + c[0], 0);
+            cLat = sumLat / flat.length;
+            cLng = sumLng / flat.length;
+          }
+
+          if (!cLat || !cLng) continue;
+
+          // Find distance to nearest hot CP
+          let minDist = Infinity;
+          for (const hot of hotCps) {
+            const d = haversineKm(cLat, cLng, hot.lat, hot.lng);
+            if (d < minDist) minDist = d;
+          }
+
+          // Decay by distance rings
+          let score = 0;
+          if (minDist <= 5) {
+            score = Math.round(65 + (1 - minDist / 5) * 19);        // 65-84
+          } else if (minDist <= 15) {
+            score = Math.round(40 + (1 - (minDist - 5) / 10) * 24); // 40-64
+          } else if (minDist <= 30) {
+            score = Math.round(15 + (1 - (minDist - 15) / 15) * 24); // 15-39
+          } else if (minDist <= 50) {
+            score = Math.round(1 + (1 - (minDist - 30) / 20) * 13);  // 1-14
+          }
+
+          if (score > 0) {
+            const city = feature.properties?.city || feature.properties?.estado || '';
+            adjacentCps.push({
+              zipCode: cp, city, country: country,
+              lat: cLat, lng: cLng,
+              uniqueDevices: 0, totalVisitDays: 0,
+              avgDwellMinutes: 0, avgFrequency: 0,
+              affinityIndex: score,
+            });
+          }
+        }
+        console.log(`[DS-REPORT] Affinity decay: ${hotCps.length} hot + ${adjacentCps.length} adjacent CPs`);
+      }
+    } catch (e: any) {
+      console.warn(`[DS-REPORT] Affinity decay failed: ${e.message}`);
+    }
+  }
+
+  // ── Merge hot + adjacent, sort by affinity ─────────────────────
+  const allCps = [...hotCps, ...adjacentCps];
+  allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
 
   return {
     analyzedAt: new Date().toISOString(),
     datasetName,
-    byZipCode: result.filter(z => z.zipCode !== 'UNKNOWN'),
+    byZipCode: allCps,
   };
 }
 
@@ -664,10 +748,12 @@ export async function POST(
 
       // Geocode OD + catchment + affinity coords
       const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
+      let detectedCountry: string | undefined;
       if (coordsToGeocode.size > 0) {
         try {
           const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
-          if (analysis?.country) setCountryFilter([analysis.country]);
+          detectedCountry = analysis?.country;
+          if (detectedCountry) setCountryFilter([detectedCountry]);
 
           // Round to 1 decimal for geocoding efficiency
           const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
@@ -710,7 +796,7 @@ export async function POST(
 
       // Save affinity report
       if (affinityRows) {
-        const affinityReport = computeAffinityReport(datasetName, affinityRows, coordToZip);
+        const affinityReport = await computeAffinityReport(datasetName, affinityRows, coordToZip, detectedCountry);
         await putConfig(`${rk('affinity')}`, affinityReport, { compact: true });
         console.log(`[DS-REPORT] Affinity report: ${affinityReport.byZipCode.length} postal codes`);
       }
