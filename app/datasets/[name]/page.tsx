@@ -231,9 +231,8 @@ export default function DatasetAnalysisPage() {
 
     try {
       let done = false;
-      let attempts = 0;
-      while (!done && attempts < 200) {
-        attempts++;
+      let consecutiveErrors = 0;
+      while (!done) {
         let res: Response;
         try {
           res = await fetch(`/api/datasets/${datasetName}/reports/poll`, {
@@ -244,43 +243,46 @@ export default function DatasetAnalysisPage() {
               ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
             }),
           });
+          consecutiveErrors = 0;
         } catch (fetchErr: any) {
-          // Network error or timeout — retry
-          console.warn(`[REPORT-POLL] Fetch failed (attempt ${attempts}):`, fetchErr.message);
-          await new Promise((r) => setTimeout(r, 5000));
+          consecutiveErrors++;
+          console.warn(`[REPORT-POLL] Fetch failed (${consecutiveErrors}):`, fetchErr.message);
+          if (consecutiveErrors >= 10) {
+            setReportProgress({ step: 'error', percent: 0, message: 'Lost connection to server. Click Analyze to resume.' });
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 3000 + consecutiveErrors * 1000));
           continue;
         }
 
         if (res.status === 429) {
-          console.warn(`[REPORT-POLL] Rate limited (attempt ${attempts}), backing off...`);
-          await new Promise((r) => setTimeout(r, 5000 + attempts * 1000));
+          consecutiveErrors++;
+          console.warn(`[REPORT-POLL] Rate limited, backing off...`);
+          await new Promise((r) => setTimeout(r, 5000 + consecutiveErrors * 2000));
           continue;
         }
 
         if (!res.ok) {
+          consecutiveErrors++;
           const text = await res.text();
           let errMsg: string;
-          try {
-            const parsed = JSON.parse(text);
-            errMsg = parsed.error || `Server error ${res.status}`;
-          } catch {
-            errMsg = `Server error ${res.status}: ${text.substring(0, 200)}`;
-          }
+          try { errMsg = JSON.parse(text).error || `Server error ${res.status}`; }
+          catch { errMsg = `Server error ${res.status}`; }
           console.error(`[REPORT-POLL] ${res.status}:`, errMsg);
-          // Retry on server errors (Vercel timeouts, transient failures)
-          if (res.status >= 500 && attempts < 5) {
-            await new Promise((r) => setTimeout(r, 5000));
-            continue;
+          if (consecutiveErrors >= 5) {
+            setReportProgress({ step: 'error', percent: 0, message: `Error: ${errMsg}` });
+            toast({ title: 'Report generation failed', description: errMsg, variant: 'destructive' });
+            break;
           }
-          setReportProgress({ step: 'error', percent: 0, message: `Error: ${errMsg}` });
-          toast({ title: 'Report generation failed', description: errMsg, variant: 'destructive' });
-          break;
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
         }
 
         const data = await res.json();
 
-        if (data.error) {
-          setReportProgress({ step: 'error', percent: 0, message: `Error: ${data.error}` });
+        if (data.phase === 'error' || data.error) {
+          setReportProgress({ step: 'error', percent: 0, message: `Error: ${data.error || 'Unknown error'}` });
+          toast({ title: 'Report generation failed', description: data.error, variant: 'destructive' });
           break;
         }
 
@@ -291,7 +293,7 @@ export default function DatasetAnalysisPage() {
           setReportVersion((v) => v + 1);
           toast({ title: 'Reports generated', description: 'All reports are ready.' });
         } else {
-          await new Promise((r) => setTimeout(r, 3000));
+          await new Promise((r) => setTimeout(r, 4000));
         }
       }
     } catch (err: any) {
