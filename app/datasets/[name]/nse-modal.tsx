@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -56,50 +56,65 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
   const [computeProgress, setComputeProgress] = useState<string | null>(null);
   const [brackets, setBrackets] = useState<BracketResult[] | null>(null);
   const [totalMaids, setTotalMaids] = useState(0);
-  const { toast } = useToast();
-
   const [country, setCountry] = useState<string | null>(jobCountry || null);
+  const { toast } = useToast();
+  const loadedRef = useRef(false);
 
   // Load NSE data when modal opens
-  const loadNseData = useCallback(async () => {
-    // If no country from prop, try fetching it from the job directly
-    let cc = jobCountry || null;
-    if (!cc && datasetName) {
-      try {
-        const dsRes = await fetch('/api/datasets', { credentials: 'include' });
-        if (dsRes.ok) {
-          const dsData = await dsRes.json();
-          const ds = dsData.datasets?.find((d: any) => d.id === datasetName);
-          cc = ds?.country || null;
-        }
-      } catch {}
-    }
-    setCountry(cc);
-
-    if (!cc) {
-      setNseData(null);
-      setLoading(false);
+  useEffect(() => {
+    if (!open) {
+      loadedRef.current = false;
       return;
     }
+    if (loadedRef.current) return;
+    loadedRef.current = true;
 
-    try {
-      const res = await fetch(`/api/nse/${cc}`, { credentials: 'include' });
-      if (res.status === 404) {
-        setNotFound(true);
-        setNseData(null);
-      } else if (res.ok) {
-        const data = await res.json();
-        setNseData(data.data);
-        setNotFound(false);
-      } else {
-        throw new Error('Failed to load NSE data');
+    const load = async () => {
+      setLoading(true);
+      setBrackets(null);
+      setTotalMaids(0);
+      setNotFound(false);
+      setNseData(null);
+
+      // Resolve country
+      let cc = jobCountry || null;
+      if (!cc && datasetName) {
+        try {
+          const dsRes = await fetch('/api/datasets', { credentials: 'include' });
+          if (dsRes.ok) {
+            const dsData = await dsRes.json();
+            const ds = dsData.datasets?.find((d: any) => d.id === datasetName);
+            cc = ds?.country || null;
+          }
+        } catch {}
       }
-    } catch (e: any) {
-      toast({ title: 'Error', description: e.message, variant: 'destructive' });
-    } finally {
-      setLoading(false);
-    }
-  }, [jobCountry, datasetName, toast]);
+      setCountry(cc);
+
+      if (!cc) {
+        setLoading(false);
+        return;
+      }
+
+      // Load NSE data
+      try {
+        const res = await fetch(`/api/nse/${cc}`, { credentials: 'include' });
+        if (res.status === 404) {
+          setNotFound(true);
+        } else if (res.ok) {
+          const data = await res.json();
+          setNseData(data.data);
+        } else {
+          throw new Error('Failed to load NSE data');
+        }
+      } catch (e: any) {
+        toast({ title: 'Error', description: e.message, variant: 'destructive' });
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    load();
+  }, [open, jobCountry, datasetName]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Upload CSV
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -119,9 +134,15 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
       if (!res.ok) throw new Error(data.error);
 
       toast({ title: 'NSE data uploaded', description: `${data.records} postal codes for ${country}` });
+
+      // Reload NSE data
+      setNotFound(false);
       setBrackets(null);
-      setTotalMaids(0);
-      await loadNseData();
+      const nseRes = await fetch(`/api/nse/${country}`, { credentials: 'include' });
+      if (nseRes.ok) {
+        const nseJson = await nseRes.json();
+        setNseData(nseJson.data);
+      }
     } catch (e: any) {
       toast({ title: 'Upload failed', description: e.message, variant: 'destructive' });
     } finally {
@@ -138,7 +159,6 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
     setBrackets(null);
 
     try {
-      // First call: start the analysis
       let res = await fetch(`/api/datasets/${datasetName}/export/nse-poll`, {
         method: 'POST',
         credentials: 'include',
@@ -148,7 +168,6 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
       let data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to start');
 
-      // Poll until done or error
       while (data.phase !== 'done' && data.phase !== 'error') {
         setComputeProgress(data.progress?.message || 'Processing...');
         await new Promise(r => setTimeout(r, 4000));
@@ -183,17 +202,6 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
     link.download = `${datasetName}-maids-nse-${bracket.min}-${bracket.max}.csv`;
     link.click();
   };
-
-  // Load when modal opens (via prop)
-  useEffect(() => {
-    if (open) {
-      setLoading(true);
-      setBrackets(null);
-      setTotalMaids(0);
-      setNotFound(false);
-      loadNseData();
-    }
-  }, [open, loadNseData]);
 
   const handleOpenChange = (isOpen: boolean) => {
     if (!isOpen) onClose();
@@ -256,7 +264,6 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
 
         {!loading && nseData && !brackets && (
           <div className="space-y-4">
-            {/* Preview table */}
             <div className="rounded-lg border">
               <table className="w-full text-sm">
                 <thead>
