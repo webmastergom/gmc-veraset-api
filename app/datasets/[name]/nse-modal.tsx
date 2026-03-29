@@ -79,6 +79,7 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
   const loadNseData = useCallback(async () => {
     // If catchmentData not passed, fetch it directly
     let catchment = catchmentData;
+    console.log('[NSE] catchmentData prop:', catchment?.length || 0, 'items');
     if (!catchment?.length) {
       // Try current bucket, common buckets, then no-dwell fallback
       const bucketsToTry = [selectedBucket, 5, 30, 180, 0];
@@ -87,13 +88,18 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
         if (seen.has(bucket)) continue;
         seen.add(bucket);
         try {
+          console.log(`[NSE] Trying catchment bucket=${bucket}...`);
           const res = await fetch(`/api/datasets/${datasetName}/reports?type=catchment&bucket=${bucket}`, { credentials: 'include' });
+          console.log(`[NSE] bucket=${bucket} → ${res.status}`);
           if (res.ok) {
             const data = await res.json();
             catchment = data?.byZipCode || null;
+            console.log(`[NSE] bucket=${bucket} → ${catchment?.length || 0} zip codes`);
             if (catchment?.length) break;
           }
-        } catch {}
+        } catch (e: any) {
+          console.error(`[NSE] bucket=${bucket} error:`, e.message);
+        }
       }
     }
 
