@@ -268,7 +268,7 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
     LIMIT 50000`;
 }
 
-function buildMobilitySQL(table: string, minDwell = 0): string {
+function buildMobilitySQL(table: string, minDwell = 0, countryCode?: string): string {
   // Find POI categories visited before/after target POI visit.
   // Uses MEDIAN timestamp of poi_id pings as visit_time proxy
   // (MIN = first ping of day due to Veraset gotcha, MEDIAN ≈ actual visit).
@@ -313,6 +313,7 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
       WHERE category IS NOT NULL
+        ${countryCode ? `AND country = '${countryCode}'` : ''}
     ),
     matched AS (
       SELECT n.ad_id, n.date, n.timing, g.category
@@ -551,6 +552,22 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
+      // Infer country for mobility POI filtering
+      let jobCountry: string | undefined;
+      try {
+        const jobs = await getConfig<Record<string, any>>('jobs');
+        if (jobs) {
+          for (const [, j] of Object.entries(jobs)) {
+            const entry = j as any;
+            if (entry.s3DestPath?.includes(datasetName)) {
+              jobCountry = entry.country;
+              break;
+            }
+          }
+        }
+      } catch {}
+      console.log(`[DS-REPORT] Country for mobility: ${jobCountry || 'unknown (no filter)'}`);
+
       // Launch all 7 queries in parallel using poi_ids (no spatial join)
       const queries: Record<string, string> = {};
       await Promise.all([
@@ -559,7 +576,7 @@ export async function POST(
         startQueryAsync(buildCatchmentSQL(table, minDwell)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
         startQueryAsync(buildTemporalSQL(table, minDwell)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
         startQueryAsync(buildTotalDevicesSQL(table, minDwell)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table, minDwell)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell, jobCountry)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
         startQueryAsync(buildAffinitySQL(table, minDwell)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
