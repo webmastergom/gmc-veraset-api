@@ -22,7 +22,7 @@ function parseNseCsv(csv: string): NseRecord[] {
   const header = lines[0].toLowerCase().replace(/["\s]/g, '').split(',');
   const cpIdx = header.findIndex(h => ['postal_code', 'postalcode', 'cp', 'codigo_postal', 'zip', 'zipcode'].includes(h));
   const popIdx = header.findIndex(h => ['population', 'poblacion', 'pop'].includes(h));
-  const nseIdx = header.findIndex(h => ['nse', 'socioeconomic', 'nivel', 'level'].includes(h));
+  const nseIdx = header.findIndex(h => ['nse', 'socioeconomic', 'socioeconomicindex', 'nivel', 'level'].includes(h));
   const r1Idx = header.findIndex(h => ['region1', 'estado', 'state', 'province'].includes(h));
   const r2Idx = header.findIndex(h => ['region2', 'municipio', 'municipality', 'county'].includes(h));
   const r3Idx = header.findIndex(h => ['region3', 'localidad', 'locality', 'city'].includes(h));
