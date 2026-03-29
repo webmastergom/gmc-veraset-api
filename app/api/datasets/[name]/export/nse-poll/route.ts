@@ -3,13 +3,12 @@ import { isAuthenticated } from '@/lib/auth';
 import {
   startQueryAsync,
   checkQueryStatus,
-  fetchQueryResults,
   ensureTableForDataset,
   getTableName,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
-import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
@@ -82,8 +81,19 @@ export async function POST(
 
     let state = await getConfig<NseExportState>(STATE_KEY(datasetName));
 
-    // Reset if done, error, or if this is a new request with params
-    if (state?.phase === 'done' || state?.phase === 'error' || isNewRequest) state = null;
+    // If done and NOT a new request, return cached results
+    if (state?.phase === 'done' && !isNewRequest && state.brackets) {
+      const totalMaids = state.brackets.reduce((s, b) => s + b.maidCount, 0);
+      return NextResponse.json({
+        phase: 'done',
+        brackets: state.brackets,
+        totalMaids,
+        progress: { step: 'done', percent: 100, message: `${totalMaids.toLocaleString()} MAIDs analyzed` },
+      });
+    }
+
+    // Reset on error or new request
+    if (state?.phase === 'error' || isNewRequest) state = null;
 
     // ── Phase: start ─────────────────────────────────────────────
     if (!state) {
@@ -110,6 +120,8 @@ export async function POST(
         ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
         : '';
 
+      // Round origins to 1 decimal (~11km) — sufficient for postal code matching
+      // and dramatically reduces unique coords for geocoding (2.6M → ~37K)
       const sql = `
         WITH poi_visitors AS (
           SELECT ad_id, date
@@ -123,8 +135,8 @@ export async function POST(
         origins AS (
           SELECT
             pv.ad_id,
-            ROUND(MIN_BY(TRY_CAST(t.latitude AS DOUBLE), t.utc_timestamp), 4) as origin_lat,
-            ROUND(MIN_BY(TRY_CAST(t.longitude AS DOUBLE), t.utc_timestamp), 4) as origin_lng
+            ROUND(MIN_BY(TRY_CAST(t.latitude AS DOUBLE), t.utc_timestamp), 1) as origin_lat,
+            ROUND(MIN_BY(TRY_CAST(t.longitude AS DOUBLE), t.utc_timestamp), 1) as origin_lng
           FROM poi_visitors pv
           INNER JOIN ${table} t ON pv.ad_id = t.ad_id AND pv.date = t.date
           WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
@@ -197,9 +209,35 @@ export async function POST(
 
     // ── Phase: geocoding ─────────────────────────────────────────
     if (state.phase === 'geocoding' && state.queryId) {
-      console.log(`[NSE-POLL] Fetching query results...`);
-      const result = await fetchQueryResults(state.queryId);
-      console.log(`[NSE-POLL] ${result.rows.length} devices with origins`);
+      // Download CSV directly from S3 (much faster than paging Athena API for large results)
+      const csvKey = `athena-results/${state.queryId}.csv`;
+      console.log(`[NSE-POLL] Downloading results from S3: ${csvKey}`);
+      const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
+      const csvText = await csvObj.Body!.transformToString('utf-8');
+
+      // Parse CSV: header is "ad_id","origin_lat","origin_lng"
+      const lines = csvText.split('\n');
+      const header = lines[0];
+      console.log(`[NSE-POLL] CSV header: ${header}, ${lines.length - 1} data lines`);
+
+      // Pre-aggregate: group ad_ids by unique (lat,lng) coord
+      const coordToAdIds = new Map<string, string[]>();
+      let totalDevices = 0;
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        // CSV values may be quoted: "ad_id","lat","lng"
+        const parts = line.replace(/"/g, '').split(',');
+        if (parts.length < 3) continue;
+        const [adId, lat, lng] = parts;
+        const coordKey = `${lat},${lng}`;
+        let arr = coordToAdIds.get(coordKey);
+        if (!arr) { arr = []; coordToAdIds.set(coordKey, arr); }
+        arr.push(adId);
+        totalDevices++;
+      }
+
+      console.log(`[NSE-POLL] ${totalDevices} devices → ${coordToAdIds.size} unique coords`);
 
       // Load NSE data
       const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country));
@@ -209,33 +247,32 @@ export async function POST(
         return NextResponse.json({ phase: 'error', error: state.error });
       }
 
-      // Set country filter for efficient geocoding
+      // Geocode only unique coords (37K instead of 2.6M)
       setCountryFilter([state.country]);
+      const coordKeys = Array.from(coordToAdIds.keys());
+      const uniquePoints = coordKeys.map(k => {
+        const [lat, lng] = k.split(',').map(Number);
+        return { lat, lng, deviceCount: 1 };
+      });
 
-      const points = result.rows.map(r => ({
-        lat: parseFloat(r.origin_lat),
-        lng: parseFloat(r.origin_lng),
-        deviceCount: 1,
-      }));
+      console.log(`[NSE-POLL] Reverse geocoding ${uniquePoints.length} unique coords...`);
+      const geocoded = await batchReverseGeocode(uniquePoints);
 
-      console.log(`[NSE-POLL] Reverse geocoding ${points.length} origins...`);
-      const geocoded = await batchReverseGeocode(points);
-
-      // Build postal code → ad_id mapping
+      // Build postal code → ad_ids mapping
       const cpToAdIds = new Map<string, string[]>();
-      for (let i = 0; i < result.rows.length; i++) {
+      for (let i = 0; i < coordKeys.length; i++) {
         const geo = geocoded[i];
         if (geo.type === 'geojson_local') {
           const cp = geo.postcode?.replace(/^[A-Z]{2}[-\s]/, '') || '';
           if (cp) {
-            const list = cpToAdIds.get(cp) || [];
-            list.push(result.rows[i].ad_id);
-            cpToAdIds.set(cp, list);
+            const existing = cpToAdIds.get(cp) || [];
+            const adIds = coordToAdIds.get(coordKeys[i])!;
+            for (const id of adIds) existing.push(id);
+            cpToAdIds.set(cp, existing);
           }
         }
       }
 
-      // Clear country filter
       setCountryFilter(null);
 
       // Build NSE bracket → postal codes lookup

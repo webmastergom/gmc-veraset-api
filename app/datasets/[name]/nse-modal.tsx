@@ -150,6 +150,24 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
     }
   };
 
+  // Safe fetch that handles 504/non-JSON responses gracefully
+  const safePollFetch = async (url: string, options?: RequestInit) => {
+    const res = await fetch(url, options);
+    if (res.status === 504) {
+      // Vercel gateway timeout — backend is still working, keep polling
+      return { phase: 'polling', progress: { message: 'Server processing (retrying...)' } };
+    }
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      // Non-JSON response (e.g., Vercel error page) — retry
+      return { phase: 'polling', progress: { message: 'Server processing (retrying...)' } };
+    }
+    if (!res.ok) throw new Error(data.error || 'Failed');
+    return data;
+  };
+
   // Compute MAIDs per bracket via polling
   const handleComputeMaids = async () => {
     if (!country) return;
@@ -159,25 +177,21 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
     setBrackets(null);
 
     try {
-      let res = await fetch(`/api/datasets/${datasetName}/export/nse-poll`, {
+      let data = await safePollFetch(`/api/datasets/${datasetName}/export/nse-poll`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ country, minDwell: selectedBucket }),
       });
-      let data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to start');
 
       while (data.phase !== 'done' && data.phase !== 'error') {
         setComputeProgress(data.progress?.message || 'Processing...');
         await new Promise(r => setTimeout(r, 4000));
 
-        res = await fetch(`/api/datasets/${datasetName}/export/nse-poll`, {
+        data = await safePollFetch(`/api/datasets/${datasetName}/export/nse-poll`, {
           method: 'POST',
           credentials: 'include',
         });
-        data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Failed');
       }
 
       if (data.phase === 'error') {
