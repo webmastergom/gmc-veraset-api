@@ -80,13 +80,21 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
     // If catchmentData not passed, fetch it directly
     let catchment = catchmentData;
     if (!catchment?.length) {
-      try {
-        const res = await fetch(`/api/datasets/${datasetName}/reports?type=catchment&bucket=${selectedBucket}`, { credentials: 'include' });
-        if (res.ok) {
-          const data = await res.json();
-          catchment = data?.byZipCode || null;
-        }
-      } catch {}
+      // Try current bucket, common buckets, then no-dwell fallback
+      const bucketsToTry = [selectedBucket, 5, 30, 180, 0];
+      const seen = new Set<number>();
+      for (const bucket of bucketsToTry) {
+        if (seen.has(bucket)) continue;
+        seen.add(bucket);
+        try {
+          const res = await fetch(`/api/datasets/${datasetName}/reports?type=catchment&bucket=${bucket}`, { credentials: 'include' });
+          if (res.ok) {
+            const data = await res.json();
+            catchment = data?.byZipCode || null;
+            if (catchment?.length) break;
+          }
+        } catch {}
+      }
     }
 
     const cc = (() => {
