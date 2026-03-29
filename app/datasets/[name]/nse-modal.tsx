@@ -77,9 +77,31 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
 
   // Load NSE data when modal opens
   const loadNseData = useCallback(async () => {
-    const cc = inferCountry();
+    // If catchmentData not passed, fetch it directly
+    let catchment = catchmentData;
+    if (!catchment?.length) {
+      try {
+        const res = await fetch(`/api/datasets/${datasetName}/reports?type=catchment&bucket=${selectedBucket}`, { credentials: 'include' });
+        if (res.ok) {
+          const data = await res.json();
+          catchment = data?.byZipCode || null;
+        }
+      } catch {}
+    }
+
+    const cc = (() => {
+      if (!catchment?.length) return null;
+      const counts: Record<string, number> = {};
+      for (const z of catchment) {
+        if (z.country) counts[z.country] = (counts[z.country] || 0) + z.deviceDays;
+      }
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      return sorted[0]?.[0] || null;
+    })();
+
     if (!cc) {
       toast({ title: 'No catchment data', description: 'Run Analyze first to generate catchment report.', variant: 'destructive' });
+      setLoading(false);
       return;
     }
     setCountry(cc);
