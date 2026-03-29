@@ -67,6 +67,7 @@ interface DatasetInfo {
   jobId?: string | null;
   dateRange?: { from: string; to: string } | null;
   external?: boolean;
+  country?: string | null;
 }
 
 interface AnalysisResult {
@@ -154,6 +155,7 @@ export default function DatasetAnalysisPage() {
             jobId: ds.jobId,
             dateRange: ds.dateRange,
             external: ds.external,
+            country: ds.country,
           });
         }
       })
@@ -1075,6 +1077,7 @@ export default function DatasetAnalysisPage() {
         datasetName={datasetName}
         catchmentData={catchmentReport?.byZipCode || null}
         selectedBucket={selectedBucket}
+        jobCountry={datasetInfo?.country || null}
       />
     </MainLayout>
   );

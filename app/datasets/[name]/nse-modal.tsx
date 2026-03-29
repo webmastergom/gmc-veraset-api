@@ -8,7 +8,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { Download, Upload, Loader2, Users, MapPin } from 'lucide-react';
+import { Download, Upload, Loader2, Users, MapPin, Play } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 interface NseRecord {
@@ -20,23 +20,14 @@ interface NseRecord {
   region3: string;
 }
 
-interface CatchmentZip {
-  zipCode: string;
-  city: string;
-  country: string;
-  deviceDays: number;
-  lat: number;
-  lng: number;
-}
-
-interface BracketStats {
+interface BracketResult {
   label: string;
   min: number;
   max: number;
   postalCodes: number;
   population: number;
-  deviceDays: number;
-  matchedZips: string[];
+  maidCount: number;
+  downloadUrl: string | null;
 }
 
 const NSE_BRACKETS = [
@@ -51,80 +42,34 @@ interface NseModalProps {
   open: boolean;
   onClose: () => void;
   datasetName: string;
-  catchmentData: CatchmentZip[] | null;
+  catchmentData: any[] | null;
   selectedBucket: number;
+  jobCountry: string | null;
 }
 
-export function NseModal({ open, onClose, datasetName, catchmentData, selectedBucket }: NseModalProps) {
+export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountry }: NseModalProps) {
   const [nseData, setNseData] = useState<NseRecord[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [downloading, setDownloading] = useState<string | null>(null);
-  const [country, setCountry] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
+  const [computing, setComputing] = useState(false);
+  const [computeProgress, setComputeProgress] = useState<string | null>(null);
+  const [brackets, setBrackets] = useState<BracketResult[] | null>(null);
+  const [totalMaids, setTotalMaids] = useState(0);
   const { toast } = useToast();
 
-  // Derive country from catchment data
-  const inferCountry = useCallback(() => {
-    if (!catchmentData?.length) return null;
-    const counts: Record<string, number> = {};
-    for (const z of catchmentData) {
-      if (z.country) counts[z.country] = (counts[z.country] || 0) + z.deviceDays;
-    }
-    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-    return sorted[0]?.[0] || null;
-  }, [catchmentData]);
+  const country = jobCountry || null;
 
   // Load NSE data when modal opens
   const loadNseData = useCallback(async () => {
-    // If catchmentData not passed, fetch it directly
-    let catchment = catchmentData;
-    console.log('[NSE] catchmentData prop:', catchment?.length || 0, 'items');
-    if (!catchment?.length) {
-      // Try current bucket, common buckets, then no-dwell fallback
-      const bucketsToTry = [selectedBucket, 5, 30, 180, 0];
-      const seen = new Set<number>();
-      for (const bucket of bucketsToTry) {
-        if (seen.has(bucket)) continue;
-        seen.add(bucket);
-        try {
-          console.log(`[NSE] Trying catchment bucket=${bucket}...`);
-          const res = await fetch(`/api/datasets/${datasetName}/reports?type=catchment&bucket=${bucket}`, { credentials: 'include' });
-          console.log(`[NSE] bucket=${bucket} → ${res.status}`);
-          if (res.ok) {
-            const data = await res.json();
-            catchment = data?.byZipCode || null;
-            console.log(`[NSE] bucket=${bucket} → ${catchment?.length || 0} zip codes`);
-            if (catchment?.length) break;
-          }
-        } catch (e: any) {
-          console.error(`[NSE] bucket=${bucket} error:`, e.message);
-        }
-      }
-    }
-
-    const cc = (() => {
-      if (!catchment?.length) return null;
-      const counts: Record<string, number> = {};
-      for (const z of catchment) {
-        if (z.country) counts[z.country] = (counts[z.country] || 0) + z.deviceDays;
-      }
-      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-      return sorted[0]?.[0] || null;
-    })();
-
-    if (!cc) {
-      setCountry(null);
-      setNotFound(false);
+    if (!country) {
       setNseData(null);
       setLoading(false);
       return;
     }
-    setCountry(cc);
-    setNotFound(false);
 
     try {
-      const res = await fetch(`/api/nse/${cc}`, { credentials: 'include' });
+      const res = await fetch(`/api/nse/${country}`, { credentials: 'include' });
       if (res.status === 404) {
         setNotFound(true);
         setNseData(null);
@@ -140,7 +85,7 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
     } finally {
       setLoading(false);
     }
-  }, [inferCountry, toast]);
+  }, [country, toast]);
 
   // Upload CSV
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -160,6 +105,8 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
       if (!res.ok) throw new Error(data.error);
 
       toast({ title: 'NSE data uploaded', description: `${data.records} postal codes for ${country}` });
+      setBrackets(null);
+      setTotalMaids(0);
       await loadNseData();
     } catch (e: any) {
       toast({ title: 'Upload failed', description: e.message, variant: 'destructive' });
@@ -168,88 +115,83 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
     }
   };
 
-  // Compute bracket stats
-  const computeBrackets = (): BracketStats[] => {
-    if (!nseData || !catchmentData) return [];
+  // Compute MAIDs per bracket via polling
+  const handleComputeMaids = async () => {
+    if (!country) return;
 
-    // Build NSE lookup by postal code
-    const nseLookup = new Map<string, NseRecord>();
-    for (const r of nseData) {
-      nseLookup.set(r.postal_code, r);
-    }
+    setComputing(true);
+    setComputeProgress('Starting...');
+    setBrackets(null);
 
-    return NSE_BRACKETS.map(({ label, min, max }) => {
-      // Filter NSE records in this bracket
-      const inBracket = nseData.filter(r => r.nse >= min && r.nse <= max);
-      const bracketCPs = new Set(inBracket.map(r => r.postal_code));
-
-      // Cross-reference with catchment
-      let deviceDays = 0;
-      const matchedZips: string[] = [];
-      for (const z of catchmentData) {
-        const cleanZip = z.zipCode.replace(/^["']+|["']+$/g, '').replace(/^[A-Z]{2}[-\s]/, '');
-        if (bracketCPs.has(cleanZip)) {
-          deviceDays += z.deviceDays;
-          matchedZips.push(cleanZip);
-        }
-      }
-
-      return {
-        label,
-        min,
-        max,
-        postalCodes: inBracket.length,
-        population: inBracket.reduce((s, r) => s + r.population, 0),
-        deviceDays,
-        matchedZips,
-      };
-    });
-  };
-
-  // Download MAIDs for a bracket
-  const handleDownloadMaids = async (bracket: BracketStats) => {
-    setDownloading(bracket.label);
     try {
-      const res = await fetch(`/api/datasets/${datasetName}/export`, {
+      // First call: start the analysis
+      let res = await fetch(`/api/datasets/${datasetName}/export/nse-poll`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          format: 'maids-nse',
-          nsePostalCodes: bracket.matchedZips,
-          nseBracket: bracket.label,
-          minDwell: selectedBucket,
-        }),
+        body: JSON.stringify({ country, minDwell: selectedBucket }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Export failed');
+      let data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to start');
 
-      if (data.downloadUrl) {
-        const link = document.createElement('a');
-        link.href = data.downloadUrl;
-        link.download = `${datasetName}-maids-nse-${bracket.min}-${bracket.max}.csv`;
-        link.click();
-        toast({ title: 'Download started', description: `${data.totalDevices?.toLocaleString() || '?'} MAIDs` });
+      // Poll until done or error
+      while (data.phase !== 'done' && data.phase !== 'error') {
+        setComputeProgress(data.progress?.message || 'Processing...');
+        await new Promise(r => setTimeout(r, 4000));
+
+        res = await fetch(`/api/datasets/${datasetName}/export/nse-poll`, {
+          method: 'POST',
+          credentials: 'include',
+        });
+        data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed');
       }
+
+      if (data.phase === 'error') {
+        throw new Error(data.error || 'Analysis failed');
+      }
+
+      setBrackets(data.brackets);
+      setTotalMaids(data.totalMaids || 0);
+      toast({ title: 'Analysis complete', description: `${(data.totalMaids || 0).toLocaleString()} total MAIDs` });
     } catch (e: any) {
-      toast({ title: 'Download failed', description: e.message, variant: 'destructive' });
+      toast({ title: 'Analysis failed', description: e.message, variant: 'destructive' });
     } finally {
-      setDownloading(null);
+      setComputing(false);
+      setComputeProgress(null);
     }
   };
 
-  // Load data when modal opens
+  const handleDownload = (bracket: BracketResult) => {
+    if (!bracket.downloadUrl) return;
+    const link = document.createElement('a');
+    link.href = bracket.downloadUrl;
+    link.download = `${datasetName}-maids-nse-${bracket.min}-${bracket.max}.csv`;
+    link.click();
+  };
+
   const handleOpenChange = (isOpen: boolean) => {
     if (isOpen) {
       setLoading(true);
+      setBrackets(null);
+      setTotalMaids(0);
       loadNseData();
     } else {
       onClose();
     }
   };
 
-  const brackets = nseData ? computeBrackets() : [];
-  const totalDeviceDays = brackets.reduce((s, b) => s + b.deviceDays, 0);
+  // Preview brackets from NSE data (before computing MAIDs)
+  const previewBrackets = nseData ? NSE_BRACKETS.map(b => {
+    const inBracket = nseData.filter(r => r.nse >= b.min && r.nse <= b.max);
+    return {
+      label: b.label,
+      min: b.min,
+      max: b.max,
+      postalCodes: inBracket.length,
+      population: inBracket.reduce((s, r) => s + r.population, 0),
+    };
+  }) : [];
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -268,48 +210,35 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
           </div>
         )}
 
-        {!loading && !country && !notFound && !nseData && (
+        {!loading && !country && (
           <div className="py-8 text-center text-muted-foreground">
             <MapPin className="h-8 w-8 mx-auto mb-3 opacity-50" />
-            <p className="font-medium">No catchment data available</p>
-            <p className="text-sm mt-1">Run Analyze first to generate the catchment report.</p>
+            <p className="font-medium">No country set</p>
+            <p className="text-sm mt-1">Set the country for this job in the Jobs section first.</p>
           </div>
         )}
 
-        {!loading && notFound && (
+        {!loading && country && notFound && (
           <div className="space-y-4 py-4">
             <p className="text-muted-foreground">
               No NSE data found for <strong>{country}</strong>. Upload a CSV with columns:
               <code className="ml-1 text-xs bg-muted px-1 py-0.5 rounded">
-                postal_code, population, nse, region1, region2, region3
+                postal_code, population, nse
               </code>
             </p>
-            <div className="flex items-center gap-2">
-              <Button variant="outline" disabled={uploading} asChild>
-                <label className="cursor-pointer">
-                  {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
-                  {uploading ? 'Uploading...' : 'Upload NSE CSV'}
-                  <input
-                    type="file"
-                    accept=".csv"
-                    className="hidden"
-                    onChange={handleUpload}
-                    disabled={uploading}
-                  />
-                </label>
-              </Button>
-            </div>
+            <Button variant="outline" disabled={uploading} asChild>
+              <label className="cursor-pointer">
+                {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+                {uploading ? 'Uploading...' : 'Upload NSE CSV'}
+                <input type="file" accept=".csv" className="hidden" onChange={handleUpload} disabled={uploading} />
+              </label>
+            </Button>
           </div>
         )}
 
-        {!loading && nseData && (
+        {!loading && nseData && !brackets && (
           <div className="space-y-4">
-            {!catchmentData?.length && (
-              <p className="text-sm text-yellow-500">
-                Run Analyze first to see device counts per bracket.
-              </p>
-            )}
-
+            {/* Preview table */}
             <div className="rounded-lg border">
               <table className="w-full text-sm">
                 <thead>
@@ -317,31 +246,14 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
                     <th className="text-left p-3 font-medium">NSE Bracket</th>
                     <th className="text-right p-3 font-medium">Postal Codes</th>
                     <th className="text-right p-3 font-medium">Population</th>
-                    <th className="text-right p-3 font-medium">Device-Days</th>
-                    <th className="text-right p-3 font-medium"></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {brackets.map((b) => (
-                    <tr key={b.label} className="border-b last:border-0 hover:bg-muted/30">
+                  {previewBrackets.map(b => (
+                    <tr key={b.label} className="border-b last:border-0">
                       <td className="p-3 font-mono">{b.label}</td>
                       <td className="p-3 text-right">{b.postalCodes.toLocaleString()}</td>
                       <td className="p-3 text-right">{b.population.toLocaleString()}</td>
-                      <td className="p-3 text-right">{b.deviceDays.toLocaleString()}</td>
-                      <td className="p-3 text-right">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={b.deviceDays === 0 || downloading === b.label}
-                          onClick={() => handleDownloadMaids(b)}
-                        >
-                          {downloading === b.label ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <Download className="h-3 w-3" />
-                          )}
-                        </Button>
-                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -350,7 +262,74 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
                     <td className="p-3 font-medium">Total</td>
                     <td className="p-3 text-right font-medium">{nseData.length.toLocaleString()}</td>
                     <td className="p-3 text-right font-medium">{nseData.reduce((s, r) => s + r.population, 0).toLocaleString()}</td>
-                    <td className="p-3 text-right font-medium">{totalDeviceDays.toLocaleString()}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+
+            {computing && computeProgress && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground bg-muted/50 rounded-lg p-3">
+                <Loader2 className="h-4 w-4 animate-spin flex-shrink-0" />
+                {computeProgress}
+              </div>
+            )}
+
+            <Button onClick={handleComputeMaids} disabled={computing} className="w-full">
+              {computing ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Play className="mr-2 h-4 w-4" />
+              )}
+              {computing ? 'Computing...' : 'Compute MAIDs by NSE'}
+            </Button>
+          </div>
+        )}
+
+        {!loading && brackets && (
+          <div className="space-y-4">
+            <div className="rounded-lg border">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/50">
+                    <th className="text-left p-3 font-medium">NSE Bracket</th>
+                    <th className="text-right p-3 font-medium">Postal Codes</th>
+                    <th className="text-right p-3 font-medium">Population</th>
+                    <th className="text-right p-3 font-medium">MAIDs</th>
+                    <th className="text-right p-3 font-medium"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {brackets.map(b => (
+                    <tr key={b.label} className="border-b last:border-0 hover:bg-muted/30">
+                      <td className="p-3 font-mono">{b.label}</td>
+                      <td className="p-3 text-right">{b.postalCodes.toLocaleString()}</td>
+                      <td className="p-3 text-right">{b.population.toLocaleString()}</td>
+                      <td className="p-3 text-right font-semibold">{b.maidCount.toLocaleString()}</td>
+                      <td className="p-3 text-right">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={!b.downloadUrl}
+                          onClick={() => handleDownload(b)}
+                        >
+                          <Download className="h-3 w-3" />
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="bg-muted/50">
+                    <td className="p-3 font-medium">Total</td>
+                    <td className="p-3 text-right font-medium">
+                      {brackets.reduce((s, b) => s + b.postalCodes, 0).toLocaleString()}
+                    </td>
+                    <td className="p-3 text-right font-medium">
+                      {brackets.reduce((s, b) => s + b.population, 0).toLocaleString()}
+                    </td>
+                    <td className="p-3 text-right font-semibold">
+                      {totalMaids.toLocaleString()}
+                    </td>
                     <td></td>
                   </tr>
                 </tfoot>
@@ -358,21 +337,15 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
             </div>
 
             <div className="flex items-center justify-between">
-              <p className="text-xs text-muted-foreground">
-                <MapPin className="inline h-3 w-3 mr-1" />
-                {nseData.length} postal codes loaded for {country}
-              </p>
+              <Button variant="outline" size="sm" onClick={handleComputeMaids} disabled={computing}>
+                {computing ? <Loader2 className="mr-2 h-3 w-3 animate-spin" /> : <Play className="mr-2 h-3 w-3" />}
+                Recompute
+              </Button>
               <Button variant="ghost" size="sm" asChild>
                 <label className="cursor-pointer text-xs">
                   <Upload className="mr-1 h-3 w-3" />
-                  Replace CSV
-                  <input
-                    type="file"
-                    accept=".csv"
-                    className="hidden"
-                    onChange={handleUpload}
-                    disabled={uploading}
-                  />
+                  Replace NSE CSV
+                  <input type="file" accept=".csv" className="hidden" onChange={handleUpload} disabled={uploading} />
                 </label>
               </Button>
             </div>

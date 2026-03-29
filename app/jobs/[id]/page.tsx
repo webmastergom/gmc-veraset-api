@@ -9,6 +9,7 @@ import { S3StorageSection } from "@/components/jobs/s3-storage-section"
 import { JobAuditDialog } from "@/components/jobs/job-audit-dialog"
 import { MainLayout } from "@/components/layout/main-layout"
 import { AudienceAgentToggle } from "@/components/jobs/audience-agent-toggle"
+import { CountrySelector } from "@/components/jobs/country-selector"
 import { inferCountryFromName } from "@/lib/country-inference"
 import dynamic from "next/dynamic"
 
@@ -205,6 +206,12 @@ export default async function JobDetailPage({
             <div>
               <p className="text-sm font-medium text-muted-foreground">Schema</p>
               <p className="mt-1">{job.config.schema}</p>
+            </div>
+            <div>
+              <p className="text-sm font-medium text-muted-foreground">Country</p>
+              <div className="mt-1">
+                <CountrySelector jobId={job.job_id} initialCountry={job.country} />
+              </div>
             </div>
             <div>
               <p className="text-sm font-medium text-muted-foreground">Created</p>
