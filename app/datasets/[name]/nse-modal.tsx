@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -170,15 +170,19 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
     link.click();
   };
 
-  const handleOpenChange = (isOpen: boolean) => {
-    if (isOpen) {
+  // Load when modal opens (via prop)
+  useEffect(() => {
+    if (open) {
       setLoading(true);
       setBrackets(null);
       setTotalMaids(0);
+      setNotFound(false);
       loadNseData();
-    } else {
-      onClose();
     }
+  }, [open, loadNseData]);
+
+  const handleOpenChange = (isOpen: boolean) => {
+    if (!isOpen) onClose();
   };
 
   // Preview brackets from NSE data (before computing MAIDs)
