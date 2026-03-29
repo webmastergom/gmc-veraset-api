@@ -268,11 +268,10 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
     LIMIT 50000`;
 }
 
-function buildMobilitySQL(table: string, minDwell = 0, countryCode?: string): string {
+function buildMobilitySQL(table: string, minDwell = 0): string {
   // Find POI categories visited before/after target POI visit.
-  // Uses MEDIAN timestamp of poi_id pings as visit_time proxy
-  // (MIN = first ping of day due to Veraset gotcha, MEDIAN ≈ actual visit).
-  // Then spatial joins visitor pings (±2h) against lab_pois_gmc for category lookup.
+  // Uses MEDIAN timestamp of poi_id pings as visit_time proxy.
+  // Auto-filters GMC POIs to the bounding box of nearby_pings — no manual country needed.
 
   const dwellHaving = minDwell > 0
     ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
@@ -305,15 +304,27 @@ function buildMobilitySQL(table: string, minDwell = 0, countryCode?: string): st
         AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) <= 7200
         AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) > 0
     ),
-    gmc_buckets AS (
+    ping_bounds AS (
+      SELECT MIN(lat) - 0.05 as min_lat, MAX(lat) + 0.05 as max_lat,
+             MIN(lng) - 0.05 as min_lng, MAX(lng) + 0.05 as max_lng
+      FROM nearby_pings
+    ),
+    gmc_filtered AS (
       SELECT category, latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) + dlat as lat_bucket,
-        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) + dlng as lng_bucket
+        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) as lng_bucket
       FROM ${POI_GMC_TABLE}
+      WHERE category IS NOT NULL
+        AND latitude BETWEEN (SELECT min_lat FROM ping_bounds) AND (SELECT max_lat FROM ping_bounds)
+        AND longitude BETWEEN (SELECT min_lng FROM ping_bounds) AND (SELECT max_lng FROM ping_bounds)
+    ),
+    gmc_buckets AS (
+      SELECT category, poi_lat, poi_lng,
+        lat_bucket + dlat as lat_bucket,
+        lng_bucket + dlng as lng_bucket
+      FROM gmc_filtered
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
-      WHERE category IS NOT NULL
-        ${countryCode ? `AND country = '${countryCode}'` : ''}
     ),
     matched AS (
       SELECT n.ad_id, n.date, n.timing, g.category
@@ -552,22 +563,6 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      // Infer country for mobility POI filtering
-      let jobCountry: string | undefined;
-      try {
-        const jobs = await getConfig<Record<string, any>>('jobs');
-        if (jobs) {
-          for (const [, j] of Object.entries(jobs)) {
-            const entry = j as any;
-            if (entry.s3DestPath?.includes(datasetName)) {
-              jobCountry = entry.country;
-              break;
-            }
-          }
-        }
-      } catch {}
-      console.log(`[DS-REPORT] Country for mobility: ${jobCountry || 'unknown (no filter)'}`);
-
       // Launch all 7 queries in parallel using poi_ids (no spatial join)
       const queries: Record<string, string> = {};
       await Promise.all([
@@ -576,7 +571,7 @@ export async function POST(
         startQueryAsync(buildCatchmentSQL(table, minDwell)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
         startQueryAsync(buildTemporalSQL(table, minDwell)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
         startQueryAsync(buildTotalDevicesSQL(table, minDwell)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table, minDwell, jobCountry)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
         startQueryAsync(buildAffinitySQL(table, minDwell)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
