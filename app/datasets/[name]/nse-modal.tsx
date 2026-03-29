@@ -100,12 +100,13 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
     })();
 
     if (!cc) {
-      toast({ title: 'No catchment data', description: 'Run Analyze first to generate catchment report.', variant: 'destructive' });
+      setCountry(null);
+      setNotFound(false);
+      setNseData(null);
       setLoading(false);
       return;
     }
     setCountry(cc);
-    setLoading(true);
     setNotFound(false);
 
     try {
@@ -250,6 +251,14 @@ export function NseModal({ open, onClose, datasetName, catchmentData, selectedBu
         {loading && (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+          </div>
+        )}
+
+        {!loading && !country && !notFound && !nseData && (
+          <div className="py-8 text-center text-muted-foreground">
+            <MapPin className="h-8 w-8 mx-auto mb-3 opacity-50" />
+            <p className="font-medium">No catchment data available</p>
+            <p className="text-sm mt-1">Run Analyze first to generate the catchment report.</p>
           </div>
         )}
 
