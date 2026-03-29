@@ -58,18 +58,32 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
   const [totalMaids, setTotalMaids] = useState(0);
   const { toast } = useToast();
 
-  const country = jobCountry || null;
+  const [country, setCountry] = useState<string | null>(jobCountry || null);
 
   // Load NSE data when modal opens
   const loadNseData = useCallback(async () => {
-    if (!country) {
+    // If no country from prop, try fetching it from the job directly
+    let cc = jobCountry || null;
+    if (!cc && datasetName) {
+      try {
+        const dsRes = await fetch('/api/datasets', { credentials: 'include' });
+        if (dsRes.ok) {
+          const dsData = await dsRes.json();
+          const ds = dsData.datasets?.find((d: any) => d.id === datasetName);
+          cc = ds?.country || null;
+        }
+      } catch {}
+    }
+    setCountry(cc);
+
+    if (!cc) {
       setNseData(null);
       setLoading(false);
       return;
     }
 
     try {
-      const res = await fetch(`/api/nse/${country}`, { credentials: 'include' });
+      const res = await fetch(`/api/nse/${cc}`, { credentials: 'include' });
       if (res.status === 404) {
         setNotFound(true);
         setNseData(null);
@@ -85,7 +99,7 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
     } finally {
       setLoading(false);
     }
-  }, [country, toast]);
+  }, [jobCountry, datasetName, toast]);
 
   // Upload CSV
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
