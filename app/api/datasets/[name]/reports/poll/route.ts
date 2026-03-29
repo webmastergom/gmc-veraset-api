@@ -269,9 +269,14 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
 }
 
 function buildMobilitySQL(table: string, minDwell = 0): string {
-  // Find POI categories visited before/after target POI visit.
-  // Uses MEDIAN timestamp of poi_id pings as visit_time proxy.
-  // Auto-filters GMC POIs to the bounding box of nearby_pings — no manual country needed.
+  // Mobility: POI categories visited before/after target POI visit.
+  //
+  // Strategy: use Veraset's own poi_ids on the ±2h pings. Veraset assigns
+  // poi_ids when a device is near ANY POI. So pings before/after the target
+  // visit may already have poi_ids from other POIs (restaurants, shops, etc).
+  // We look up those poi_ids in lab_pois_gmc to get categories.
+  //
+  // This avoids the expensive spatial join entirely — just string matching.
 
   const dwellHaving = minDwell > 0
     ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
@@ -288,57 +293,40 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
       GROUP BY ad_id, date
       ${dwellHaving}
     ),
-    nearby_pings AS (
+    nearby_with_pois AS (
       SELECT t.ad_id, t.date,
         CASE WHEN TO_UNIXTIME(t.utc_timestamp) < v.median_ts THEN 'before' ELSE 'after' END as timing,
+        t.utc_timestamp,
         TRY_CAST(t.latitude AS DOUBLE) as lat,
         TRY_CAST(t.longitude AS DOUBLE) as lng,
-        CAST(FLOOR(TRY_CAST(t.latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_bucket,
-        CAST(FLOOR(TRY_CAST(t.longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_bucket
+        x.nearby_poi_id
       FROM ${table} t
       INNER JOIN visit_times v ON t.ad_id = v.ad_id AND t.date = v.date
+      CROSS JOIN UNNEST(t.poi_ids) AS x(nearby_poi_id)
       WHERE t.ad_id IS NOT NULL AND TRIM(t.ad_id) != ''
-        AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        AND x.nearby_poi_id IS NOT NULL AND x.nearby_poi_id != ''
         AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) <= 7200
         AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) > 0
     ),
-    ping_bounds AS (
-      SELECT MIN(lat) - 0.05 as min_lat, MAX(lat) + 0.05 as max_lat,
-             MIN(lng) - 0.05 as min_lng, MAX(lng) + 0.05 as max_lng
-      FROM nearby_pings
+    with_category AS (
+      SELECT n.ad_id, n.date, n.timing, n.lat, n.lng, g.category,
+        g.latitude as poi_lat, g.longitude as poi_lng
+      FROM nearby_with_pois n
+      INNER JOIN ${POI_GMC_TABLE} g ON n.nearby_poi_id = g.id
+      WHERE g.category IS NOT NULL
     ),
-    gmc_filtered AS (
-      SELECT category, latitude as poi_lat, longitude as poi_lng,
-        CAST(FLOOR(latitude / ${GRID}) AS BIGINT) as lat_bucket,
-        CAST(FLOOR(longitude / ${GRID}) AS BIGINT) as lng_bucket
-      FROM ${POI_GMC_TABLE}
-      WHERE category IS NOT NULL
-        AND latitude BETWEEN (SELECT min_lat FROM ping_bounds) AND (SELECT max_lat FROM ping_bounds)
-        AND longitude BETWEEN (SELECT min_lng FROM ping_bounds) AND (SELECT max_lng FROM ping_bounds)
-    ),
-    gmc_buckets AS (
-      SELECT category, poi_lat, poi_lng,
-        lat_bucket + dlat as lat_bucket,
-        lng_bucket + dlng as lng_bucket
-      FROM gmc_filtered
-      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
-      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
-    ),
-    matched AS (
-      SELECT n.ad_id, n.date, n.timing, g.category
-      FROM nearby_pings n
-      INNER JOIN gmc_buckets g ON n.lat_bucket = g.lat_bucket AND n.lng_bucket = g.lng_bucket
+    close_enough AS (
+      SELECT ad_id, date, timing, category
+      FROM with_category
       WHERE 111320 * SQRT(
-          POW(n.lat - g.poi_lat, 2) +
-          POW((n.lng - g.poi_lng) * COS(RADIANS((n.lat + g.poi_lat) / 2)), 2)
-        ) <= 200
+          POW(lat - poi_lat, 2) +
+          POW((lng - poi_lng) * COS(RADIANS((lat + poi_lat) / 2)), 2)
+        ) <= 300
     )
     SELECT category, timing,
       COUNT(DISTINCT ad_id || '|' || date) as device_days,
       COUNT(DISTINCT ad_id) as unique_devices
-    FROM matched
+    FROM close_enough
     GROUP BY category, timing
     ORDER BY device_days DESC
     LIMIT 500`;
