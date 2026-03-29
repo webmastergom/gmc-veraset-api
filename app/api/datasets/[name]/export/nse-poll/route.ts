@@ -75,15 +75,18 @@ export async function POST(
   const { name: datasetName } = await context.params;
 
   try {
+    // Parse body first to detect if this is a new request (has country)
+    let body: any;
+    try { body = await request.json(); } catch { body = {}; }
+    const isNewRequest = !!body.country;
+
     let state = await getConfig<NseExportState>(STATE_KEY(datasetName));
 
-    // Reset if done or error
-    if (state?.phase === 'done' || state?.phase === 'error') state = null;
+    // Reset if done, error, or if this is a new request with params
+    if (state?.phase === 'done' || state?.phase === 'error' || isNewRequest) state = null;
 
     // ── Phase: start ─────────────────────────────────────────────
     if (!state) {
-      let body: any;
-      try { body = await request.json(); } catch { body = {}; }
 
       const country: string = body.country || '';
       const minDwell: number = body.minDwell || 0;
