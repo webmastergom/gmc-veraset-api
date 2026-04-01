@@ -58,8 +58,10 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
 
   useEffect(() => {
     if (!mapRef.current || typeof window === 'undefined') return;
+    let cancelled = false;
 
     import('leaflet').then(async (L) => {
+      if (cancelled || !mapRef.current) return;
       if (mapInstance.current) {
         mapInstance.current.remove();
       }
@@ -113,6 +115,7 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
       } catch (err) {
         console.warn('[CatchmentMap] Failed to fetch GeoJSON polygons:', err);
       }
+      if (cancelled || !mapRef.current) return;
       setLoading(false);
 
       // ── Render GeoJSON choropleth ──────────────────────────────────
@@ -208,6 +211,7 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
     });
 
     return () => {
+      cancelled = true;
       if (mapInstance.current) {
         mapInstance.current.remove();
         mapInstance.current = null;

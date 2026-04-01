@@ -184,6 +184,17 @@ export default function MegaJobDetailPage() {
             } : {}),
           }),
         })
+        if (!res.ok) {
+          // Vercel timeout (504) or server error returns HTML, not JSON
+          let errMsg = `HTTP ${res.status}`
+          try {
+            const body = await res.json()
+            if (body.error) errMsg = body.error
+            if (body.progress?.message) errMsg = body.progress.message
+          } catch { /* HTML response, ignore parse error */ }
+          setConsolidateProgress(`Error: ${errMsg}. Click Re-consolidate to retry.`)
+          break
+        }
         const data = await res.json()
 
         if (data.error) {

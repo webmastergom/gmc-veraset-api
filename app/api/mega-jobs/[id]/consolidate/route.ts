@@ -36,7 +36,7 @@ export const maxDuration = 60;
  * Tracks parallel Athena queries across phases.
  */
 interface ConsolidationState {
-  phase: 'starting' | 'polling' | 'parsing_visits' | 'parsing_od' | 'done';
+  phase: 'starting' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'done';
   /** Query IDs for each report type */
   queries?: {
     visits?: string;
@@ -72,7 +72,8 @@ const CONSOLIDATION_KEY = (id: string) => `mega-consolidation-state/${id}`;
  * Phase 1 (starting): Start all Athena queries in parallel (visits, OD, hourly, catchment, mobility).
  * Phase 2 (polling): Poll all queries until all SUCCEEDED.
  * Phase 3 (parsing_visits): Parse visits + hourly + mobility (no geocoding needed).
- * Phase 4 (parsing_od): Parse OD + catchment (requires geocoding → separate phase for timeout).
+ * Phase 4a (parsing_geocode): Fetch OD + catchment results, geocode coords, save geocode map to S3.
+ * Phase 4b (parsing_od): Load geocode map from S3, build OD + catchment + affinity reports.
  * Phase 5 (done): All reports saved.
  */
 export async function POST(
@@ -341,7 +342,7 @@ export async function POST(
 
       state = {
         ...state,
-        phase: 'parsing_od',
+        phase: 'parsing_geocode',
         parsed: { visits: true, hourly: true, mobility: true, temporal: true },
         phase3ReportKeys: reportKeys,
         phase3Errors: errors,
@@ -349,35 +350,30 @@ export async function POST(
       await putConf(CONSOLIDATION_KEY(id), state);
 
       return NextResponse.json({
-        phase: 'parsing_od',
+        phase: 'parsing_geocode',
         progress: {
           step: 'parsing_geocode',
           percent: 60,
           message: errors.length > 0
-            ? `Parsed ${Object.keys(reportKeys).length} reports (${errors.length} errors). Geocoding...`
-            : 'Geocoding origins and destinations...',
+            ? `Parsed ${Object.keys(reportKeys).length} reports (${errors.length} errors). Fetching results & geocoding...`
+            : 'Fetching OD/catchment results & geocoding...',
         },
         ...(errors.length > 0 ? { errors } : {}),
         savedReports: Object.keys(reportKeys),
       });
     }
 
-    // ── Phase 4: Parse OD + catchment (requires geocoding) ─────────────
-    if (state.phase === 'parsing_od' && state.queries) {
+    // ── Phase 4a: Fetch OD + catchment results & geocode ────────────────
+    if (state.phase === 'parsing_geocode' && state.queries) {
       try {
-        const reportKeys: Record<string, string> = {};
-
         // Collect all coordinates that need geocoding
         const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-
-        let odClusters: ReturnType<typeof parseConsolidatedOD> | undefined;
-        let catchmentRows: Record<string, any>[] | undefined;
 
         // Fetch OD results
         if (state.queries.od) {
           try {
             const queryResult = await fetchQueryResults(state.queries.od);
-            odClusters = parseConsolidatedOD(queryResult.rows);
+            const odClusters = parseConsolidatedOD(queryResult.rows);
             for (const c of odClusters.clusters) {
               const oKey = `${c.originLat},${c.originLng}`;
               const existing = coordsToGeocode.get(oKey);
@@ -395,8 +391,7 @@ export async function POST(
         if (state.queries.catchment) {
           try {
             const queryResult = await fetchQueryResults(state.queries.catchment);
-            catchmentRows = queryResult.rows;
-            for (const row of catchmentRows) {
+            for (const row of queryResult.rows) {
               const lat = parseFloat(row.origin_lat) || 0;
               const lng = parseFloat(row.origin_lng) || 0;
               const dd = parseInt(row.device_days, 10) || 0;
@@ -410,12 +405,10 @@ export async function POST(
         }
 
         // Batch reverse geocode all coordinates
-        const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
+        const coordToZipEntries: Array<[string, { zipCode: string; city: string; country: string }]> = [];
         if (coordsToGeocode.size > 0) {
-          // Detect country from first sub-job's data
+          // Detect country from first sub-job
           const firstJob = syncedJobs[0];
-          const isoCountry = firstJob?.dateRange?.from ? undefined : undefined; // No country on job
-          // Try to detect from POI collection
           const datasetName = firstJob?.s3DestPath?.replace(/\/$/, '').split('/').pop();
           let detectedCountry: string | undefined;
           if (datasetName) {
@@ -426,67 +419,102 @@ export async function POST(
             setCountryFilter([detectedCountry]);
           }
 
-          const points = Array.from(coordsToGeocode.values());
           // Use 1-decimal precision for geocoding (×10 performance)
-          const roundedPoints = points.map((p) => ({
-            lat: Math.round(p.lat * 10) / 10,
-            lng: Math.round(p.lng * 10) / 10,
-            deviceCount: p.deviceCount,
-          }));
-
-          // Deduplicate rounded points
           const uniqueRounded = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-          for (const p of roundedPoints) {
-            const key = `${p.lat},${p.lng}`;
+          for (const p of coordsToGeocode.values()) {
+            const key = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
             const ex = uniqueRounded.get(key);
             if (ex) ex.deviceCount += p.deviceCount;
-            else uniqueRounded.set(key, { ...p });
+            else uniqueRounded.set(key, { lat: Math.round(p.lat * 10) / 10, lng: Math.round(p.lng * 10) / 10, deviceCount: p.deviceCount });
           }
 
+          console.log(`[MEGA] Geocoding ${uniqueRounded.size} unique rounded coords (from ${coordsToGeocode.size} original)`);
           const geocoded = await batchReverseGeocode(Array.from(uniqueRounded.values()));
 
-          // Build lookup map from rounded coords
-          const roundedLookup = new Map<string, { zipCode: string; city: string; country: string }>();
-          for (const g of geocoded) {
+          // Build rounded coord → zip lookup
+          const roundedToZip = new Map<string, { zipCode: string; city: string; country: string }>();
+          const roundedKeys = Array.from(uniqueRounded.keys());
+          for (let i = 0; i < roundedKeys.length && i < geocoded.length; i++) {
+            const g = geocoded[i];
             if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
-              // Find the original point that produced this result
-              roundedLookup.set(`${g.country}|${g.postcode}`, { zipCode: g.postcode, city: g.city, country: g.country });
+              roundedToZip.set(roundedKeys[i], { zipCode: g.postcode, city: g.city, country: g.country });
+            } else if (g.type === 'foreign') {
+              roundedToZip.set(roundedKeys[i], { zipCode: 'FOREIGN', city: 'FOREIGN', country: g.country });
             }
           }
 
-          // Map original coords to geocoded results via rounded matching
+          // Map original coords to geocoded results via rounded key
           for (const [key, p] of coordsToGeocode.entries()) {
             const roundedKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
-            // Find the geocoded result for this rounded point
-            const roundedP = uniqueRounded.get(roundedKey);
-            if (roundedP) {
-              // Find in geocoded array by index
-              const idx = Array.from(uniqueRounded.keys()).indexOf(roundedKey);
-              if (idx >= 0 && idx < geocoded.length) {
-                const g = geocoded[idx];
-                if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
-                  coordToZip.set(key, { zipCode: g.postcode, city: g.city, country: g.country });
-                } else if (g.type === 'foreign') {
-                  coordToZip.set(key, { zipCode: 'FOREIGN', city: 'FOREIGN', country: g.country });
-                }
-              }
-            }
+            const zip = roundedToZip.get(roundedKey);
+            if (zip) coordToZipEntries.push([key, zip]);
           }
 
-          // Reset country filter
           setCountryFilter(null);
         }
 
-        // Build OD report
-        if (odClusters) {
-          const odReport = buildODReport(id, odClusters.clusters, coordToZip);
-          reportKeys.od = await saveConsolidatedReport(id, 'od', odReport);
+        console.log(`[MEGA] Geocoded ${coordToZipEntries.length} of ${coordsToGeocode.size} coords. Saving to S3...`);
+
+        // Save geocode map to S3 for next phase
+        await putConf(`mega-consolidation-geocode/${id}`, coordToZipEntries);
+
+        state = {
+          ...state,
+          phase: 'parsing_od',
+        };
+        await putConf(CONSOLIDATION_KEY(id), state);
+
+        return NextResponse.json({
+          phase: 'parsing_od',
+          progress: {
+            step: 'parsing_reports',
+            percent: 80,
+            message: `Geocoded ${coordToZipEntries.length} coordinates. Building reports...`,
+          },
+        });
+      } catch (err: any) {
+        console.error('[MEGA] Error in geocoding phase:', err.message);
+        state = { ...state, phase: 'parsing_geocode', error: err.message };
+        await putConf(CONSOLIDATION_KEY(id), state);
+        await updateMegaJob(id, { status: 'error', error: `Geocoding failed: ${err.message}` });
+        return NextResponse.json({
+          phase: 'error',
+          progress: { step: 'error', percent: 0, message: `Geocoding failed: ${err.message}. Click Re-consolidate to retry.` },
+        }, { status: 500 });
+      }
+    }
+
+    // ── Phase 4b: Build OD + catchment + affinity reports ─────────────
+    if (state.phase === 'parsing_od' && state.queries) {
+      try {
+        const reportKeys: Record<string, string> = {};
+
+        // Load geocode map from S3
+        const coordToZipEntries = await getConf<Array<[string, { zipCode: string; city: string; country: string }]>>(`mega-consolidation-geocode/${id}`) || [];
+        const coordToZip = new Map(coordToZipEntries);
+        console.log(`[MEGA] Loaded ${coordToZip.size} geocoded coords from S3`);
+
+        // Re-fetch and build OD report
+        if (state.queries.od) {
+          try {
+            const queryResult = await fetchQueryResults(state.queries.od);
+            const odClusters = parseConsolidatedOD(queryResult.rows);
+            const odReport = buildODReport(id, odClusters.clusters, coordToZip);
+            reportKeys.od = await saveConsolidatedReport(id, 'od', odReport);
+          } catch (err: any) {
+            console.error('[MEGA] Error building OD report:', err.message);
+          }
         }
 
-        // Build catchment report
-        if (catchmentRows) {
-          const catchmentReport = buildCatchmentReport(id, catchmentRows, coordToZip);
-          reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
+        // Re-fetch and build catchment report
+        if (state.queries.catchment) {
+          try {
+            const queryResult = await fetchQueryResults(state.queries.catchment);
+            const catchmentReport = buildCatchmentReport(id, queryResult.rows, coordToZip);
+            reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
+          } catch (err: any) {
+            console.error('[MEGA] Error building catchment report:', err.message);
+          }
         }
 
         // Build affinity report
@@ -524,8 +552,7 @@ export async function POST(
           progress: { step: 'complete', percent: 100, message: 'Consolidation complete' },
         });
       } catch (err: any) {
-        console.error('[MEGA] Error in OD/catchment parsing:', err.message);
-        // Keep in parsing_od phase so Re-consolidate can retry
+        console.error('[MEGA] Error in report building:', err.message);
         state = { ...state, phase: 'parsing_od', error: err.message };
         await putConf(CONSOLIDATION_KEY(id), state);
         await updateMegaJob(id, { status: 'error', error: `Consolidation failed: ${err.message}` });
