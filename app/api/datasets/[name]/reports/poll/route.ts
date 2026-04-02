@@ -288,7 +288,7 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
   return `WITH
     target_visits AS (
       SELECT ad_id, date,
-        MIN(utc_timestamp) as visit_time
+        FROM_UNIXTIME(APPROX_PERCENTILE(TO_UNIXTIME(utc_timestamp), 0.5)) as visit_time
       FROM ${table}
       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
       WHERE poi_id IS NOT NULL AND poi_id != ''
