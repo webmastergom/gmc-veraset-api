@@ -230,27 +230,44 @@ export async function analyzePostalMaid(
     }
   }
 
-  report({ step: 'geocoding', percent: 80, message: 'Reverse geocoding device origins...', detail: `${coordMap.size} unique coordinates` });
-  console.log(`[POSTAL-MAID] Geocoding ${coordMap.size} unique origin coordinates...`);
+  // Pre-aggregate to 1-decimal precision for geocoding (×10-100x fewer points)
+  // This is sufficient for postal code matching (~11km resolution)
+  const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+  for (const p of coordMap.values()) {
+    const rKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+    const ex = roundedMap.get(rKey);
+    if (ex) ex.deviceCount += p.deviceCount;
+    else roundedMap.set(rKey, { lat: Math.round(p.lat * 10) / 10, lng: Math.round(p.lng * 10) / 10, deviceCount: p.deviceCount });
+  }
 
-  const coordPoints = Array.from(coordMap.values()).map(p => ({
+  report({ step: 'geocoding', percent: 80, message: 'Reverse geocoding device origins...', detail: `${roundedMap.size} unique coordinates (from ${coordMap.size} at full precision)` });
+  console.log(`[POSTAL-MAID] Geocoding ${roundedMap.size} unique rounded coords (from ${coordMap.size} at 4-decimal precision)`);
+
+  const roundedKeys = Array.from(roundedMap.keys());
+  const roundedPoints = Array.from(roundedMap.values()).map(p => ({
     lat: p.lat,
     lng: p.lng,
     deviceCount: p.deviceCount,
   }));
 
-  const classified = await batchReverseGeocode(coordPoints);
+  const classified = await batchReverseGeocode(roundedPoints);
   report({ step: 'geocoding', percent: 90, message: 'Geocoding complete' });
 
-  // Build coordKey → postalCode map (accept any classification with a postcode)
-  const coordToPostal = new Map<string, string>();
-  const coordEntries = Array.from(coordMap.entries());
-  for (let i = 0; i < classified.length; i++) {
+  // Build roundedKey → postalCode lookup
+  const roundedToPostal = new Map<string, string>();
+  for (let i = 0; i < roundedKeys.length && i < classified.length; i++) {
     const c = classified[i];
     if (c.type === 'geojson_local' || c.type === 'nominatim_match') {
-      const [coordKey] = coordEntries[i];
-      coordToPostal.set(coordKey, normalizePostalForCountry(filters.country, c.postcode));
+      roundedToPostal.set(roundedKeys[i], normalizePostalForCountry(filters.country, c.postcode));
     }
+  }
+
+  // Map 4-decimal coordKeys to postal codes via rounded lookup
+  const coordToPostal = new Map<string, string>();
+  for (const [coordKey, p] of coordMap.entries()) {
+    const rKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+    const postal = roundedToPostal.get(rKey);
+    if (postal) coordToPostal.set(coordKey, postal);
   }
 
   console.log(`[POSTAL-MAID] Geocoded ${coordToPostal.size}/${coordMap.size} coordinates to postal codes`);
