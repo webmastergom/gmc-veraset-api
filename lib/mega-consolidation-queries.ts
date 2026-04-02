@@ -832,7 +832,100 @@ export async function startConsolidatedMAIDsQuery(
   return await startQueryAsync(sql);
 }
 
-// ── Q7: Affinity data (per-origin visit metrics) ────────────────────────
+// ── Q7: NSE (ad_id + origin coords for socioeconomic segmentation) ──────
+
+/**
+ * Build and start a query that returns each MAID with its origin coordinates.
+ * Used for NSE (socioeconomic) segmentation: geocode origins → postal codes → match to NSE brackets.
+ * Origin = first ping of day per device (MIN_BY latitude/longitude by timestamp).
+ * Coordinates rounded to 1 decimal (~11km) at SQL level to reduce geocoding workload.
+ */
+export async function startConsolidatedNseQuery(
+  subJobs: Job[],
+  poiIds?: string[],
+  poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
+): Promise<string> {
+  const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
+  if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for NSE query');
+
+  // All pings with accuracy filter
+  const allPingsUnion = buildUnionAll(
+    syncedJobs,
+    'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+    `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+  );
+
+  let visitorsCTE: string;
+  if (poiCoords?.length) {
+    // Spatial proximity path (same as catchment)
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    const useDwell = hasDwellFilter(dwell);
+
+    visitorsCTE = `
+    all_pings_raw AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)}${dwellCTEs},
+    poi_visitors AS (
+      ${useDwell
+        ? `SELECT DISTINCT ad_id FROM dwell_filtered`
+        : `SELECT DISTINCT ad_id FROM at_poi_pings`}
+    ),
+    valid_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+    )`;
+  } else {
+    // Fallback: poi_ids
+    const poiFilter = buildPoiFilter(poiIds);
+    const poiUnion = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT ad_id FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    visitorsCTE = `
+    poi_visitors AS (
+      SELECT DISTINCT ad_id FROM (
+        ${poiUnion}
+      )
+    ),
+    valid_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    )`;
+  }
+
+  const sql = `
+    WITH
+    ${visitorsCTE},
+    first_pings AS (
+      SELECT
+        v.ad_id,
+        MIN_BY(vp.lat, vp.utc_timestamp) as origin_lat,
+        MIN_BY(vp.lng, vp.utc_timestamp) as origin_lng
+      FROM valid_pings vp
+      INNER JOIN poi_visitors v ON vp.ad_id = v.ad_id
+      GROUP BY v.ad_id
+    )
+    SELECT DISTINCT ad_id,
+      ROUND(origin_lat, 1) as origin_lat,
+      ROUND(origin_lng, 1) as origin_lng
+    FROM first_pings
+    WHERE origin_lat IS NOT NULL
+  `;
+
+  console.log(`[MEGA-NSE] Starting NSE query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
+  return await startQueryAsync(sql);
+}
+
+// ── Q8: Affinity data (per-origin visit metrics) ────────────────────────
 
 /**
  * Build and start the affinity data query.

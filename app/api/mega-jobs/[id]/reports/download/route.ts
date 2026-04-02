@@ -180,6 +180,24 @@ export async function GET(
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-affinity.csv`);
     }
 
+    // ── NSE bracket CSV (from exports/ in S3) ────────────────────────
+    if (reportType === 'nse') {
+      const fileName = request.nextUrl.searchParams.get('file');
+      if (!fileName || !fileName.startsWith(`mega-${id}-maids-nse-`)) {
+        return NextResponse.json({ error: 'Invalid NSE file parameter' }, { status: 400 });
+      }
+
+      try {
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-west-2' });
+        const resp = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: `exports/${fileName}` }));
+        const csv = await resp.Body?.transformToString() || '';
+        return csvResponse(csv, fileName);
+      } catch (err: any) {
+        console.error('[MEGA-NSE DOWNLOAD]', err.message);
+        return NextResponse.json({ error: `Failed to fetch NSE CSV: ${err.message}` }, { status: 500 });
+      }
+    }
+
     return NextResponse.json({ error: 'Invalid type' }, { status: 400 });
   } catch (error: any) {
     console.error('[MEGA-REPORTS DOWNLOAD]', error.message);

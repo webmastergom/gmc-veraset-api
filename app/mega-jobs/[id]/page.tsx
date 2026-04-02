@@ -8,7 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
-  Layers, ExternalLink, Loader2, Play, Download,
+  Layers, ExternalLink, Loader2, Play, Download, Users,
   CheckCircle2, XCircle, Clock, Map,
   BarChart3, TrendingUp, MapPin, Navigation,
   Compass, Timer, Activity,
@@ -24,6 +24,7 @@ import { ODTables } from '@/components/mega-jobs/od-tables'
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar'
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
 import { MovementMap } from '@/components/analysis/movement-map'
+import { MegaNseModal } from '@/components/mega-jobs/nse-modal'
 
 const statusColors: Record<string, string> = {
   planning: 'bg-blue-500/20 text-blue-400',
@@ -65,6 +66,9 @@ export default function MegaJobDetailPage() {
   // Dwell filter
   const [dwellMin, setDwellMin] = useState<string>('')
   const [dwellMax, setDwellMax] = useState<string>('')
+
+  // NSE modal
+  const [nseModalOpen, setNseModalOpen] = useState(false)
 
   // POI filter
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([])
@@ -438,6 +442,9 @@ export default function MegaJobDetailPage() {
                   </Button>
                 </a>
               )}
+              <Button variant="outline" size="sm" onClick={() => setNseModalOpen(true)}>
+                <Users className="h-4 w-4 mr-1" /> MAIDs by NSE
+              </Button>
             </div>
 
             {/* 2. Daily Activity Chart */}
@@ -636,6 +643,13 @@ export default function MegaJobDetailPage() {
           </>
         )}
       </div>
+
+      <MegaNseModal
+        open={nseModalOpen}
+        onClose={() => setNseModalOpen(false)}
+        megaJobId={id}
+        megaJobCountry={megaJob?.country || null}
+      />
     </MainLayout>
   )
 }
