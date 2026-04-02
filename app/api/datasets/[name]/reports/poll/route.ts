@@ -271,21 +271,24 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
 function buildMobilitySQL(table: string, minDwell = 0): string {
   // Mobility: POI categories visited before/after target POI visit.
   //
-  // Strategy: use Veraset's own poi_ids on the ±2h pings. Veraset assigns
-  // poi_ids when a device is near ANY POI. So pings before/after the target
-  // visit may already have poi_ids from other POIs (restaurants, shops, etc).
-  // We look up those poi_ids in lab_pois_gmc to get categories.
+  // Strategy: spatial join with Overture POIs (lab_pois_gmc) using geohash
+  // buckets for efficient matching. Same approach as mega-job consolidation.
   //
-  // This avoids the expensive spatial join entirely — just string matching.
+  // 1. Identify target visit times (median timestamp per ad_id/date at POI)
+  // 2. Find all pings ±2h of visit
+  // 3. Geohash-bucket join with Overture POIs (0.01° grid, 3×3 expansion)
+  // 4. Filter by distance ≤ 200m, keep closest per (ad_id, date, timing, category)
+  // 5. Aggregate by timing (before/after) + category
 
+  const GRID_STEP = 0.01; // ~1.1km geohash grid
   const dwellHaving = minDwell > 0
     ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
     : '';
 
   return `WITH
-    visit_times AS (
+    target_visits AS (
       SELECT ad_id, date,
-        APPROX_PERCENTILE(TO_UNIXTIME(utc_timestamp), 0.5) as median_ts
+        MIN(utc_timestamp) as visit_time
       FROM ${table}
       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
       WHERE poi_id IS NOT NULL AND poi_id != ''
@@ -293,43 +296,75 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
       GROUP BY ad_id, date
       ${dwellHaving}
     ),
-    nearby_with_pois AS (
-      SELECT t.ad_id, t.date,
-        CASE WHEN TO_UNIXTIME(t.utc_timestamp) < v.median_ts THEN 'before' ELSE 'after' END as timing,
-        t.utc_timestamp,
-        TRY_CAST(t.latitude AS DOUBLE) as lat,
-        TRY_CAST(t.longitude AS DOUBLE) as lng,
-        x.nearby_poi_id
-      FROM ${table} t
-      INNER JOIN visit_times v ON t.ad_id = v.ad_id AND t.date = v.date
-      CROSS JOIN UNNEST(t.poi_ids) AS x(nearby_poi_id)
-      WHERE t.ad_id IS NOT NULL AND TRIM(t.ad_id) != ''
-        AND x.nearby_poi_id IS NOT NULL AND x.nearby_poi_id != ''
-        AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) <= 7200
-        AND ABS(TO_UNIXTIME(t.utc_timestamp) - v.median_ts) > 0
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < 500)
     ),
-    with_category AS (
-      SELECT n.ad_id, n.date, n.timing, n.lat, n.lng, g.category,
-        g.latitude as poi_lat, g.longitude as poi_lng
-      FROM nearby_with_pois n
-      INNER JOIN ${POI_GMC_TABLE} g ON n.nearby_poi_id = g.id
-      WHERE g.category IS NOT NULL
+    nearby_pings AS (
+      SELECT
+        a.ad_id,
+        a.date,
+        a.utc_timestamp,
+        a.lat,
+        a.lng,
+        CAST(FLOOR(a.lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT) as lng_bucket,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing
+      FROM all_pings a
+      INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
+      WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
+        AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
     ),
-    close_enough AS (
-      SELECT ad_id, date, timing, category
-      FROM with_category
-      WHERE 111320 * SQRT(
-          POW(lat - poi_lat, 2) +
-          POW((lng - poi_lng) * COS(RADIANS((lat + poi_lat) / 2)), 2)
-        ) <= 300
+    poi_buckets AS (
+      SELECT
+        id as poi_id,
+        category,
+        latitude as poi_lat,
+        longitude as poi_lng,
+        CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) + dlat as lat_bucket,
+        CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) + dlng as lng_bucket
+      FROM ${POI_GMC_TABLE}
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
+      WHERE category IS NOT NULL
+    ),
+    matched AS (
+      SELECT
+        p.ad_id,
+        p.date,
+        p.timing,
+        b.category,
+        111320 * SQRT(
+          POW(p.lat - b.poi_lat, 2) +
+          POW((p.lng - b.poi_lng) * COS(RADIANS((p.lat + b.poi_lat) / 2)), 2)
+        ) as distance_m
+      FROM nearby_pings p
+      INNER JOIN poi_buckets b
+        ON p.lat_bucket = b.lat_bucket
+        AND p.lng_bucket = b.lng_bucket
+    ),
+    closest AS (
+      SELECT
+        ad_id, date, timing, category, distance_m,
+        ROW_NUMBER() OVER (PARTITION BY ad_id, date, timing, category ORDER BY distance_m) as rn
+      FROM matched
+      WHERE distance_m <= 200
     )
-    SELECT category, timing,
-      COUNT(DISTINCT ad_id || '|' || date) as device_days,
-      COUNT(DISTINCT ad_id) as unique_devices
-    FROM close_enough
-    GROUP BY category, timing
-    ORDER BY device_days DESC
-    LIMIT 500`;
+    SELECT
+      timing,
+      category,
+      COUNT(DISTINCT CONCAT(ad_id, '-', date)) as device_days,
+      COUNT(*) as hits
+    FROM closest
+    WHERE rn = 1
+    GROUP BY timing, category
+    ORDER BY timing, device_days DESC`;
 }
 
 // ── Affinity index computation ────────────────────────────────────────
@@ -705,16 +740,16 @@ export async function POST(
       if (queries.mobility) {
         try {
           const r = await fetchQueryResults(queries.mobility);
-          const beforeMap = new Map<string, { deviceDays: number; uniqueDevices: number }>();
-          const afterMap = new Map<string, { deviceDays: number; uniqueDevices: number }>();
+          const beforeMap = new Map<string, { deviceDays: number; hits: number }>();
+          const afterMap = new Map<string, { deviceDays: number; hits: number }>();
           for (const row of r.rows) {
             const cat = row.category;
             const dd = parseInt(row.device_days, 10) || 0;
-            const ud = parseInt(row.unique_devices, 10) || 0;
+            const h = parseInt(row.hits, 10) || 0;
             const map = row.timing === 'before' ? beforeMap : afterMap;
             const ex = map.get(cat);
-            if (ex) { ex.deviceDays += dd; ex.uniqueDevices += ud; }
-            else map.set(cat, { deviceDays: dd, uniqueDevices: ud });
+            if (ex) { ex.deviceDays += dd; ex.hits += h; }
+            else map.set(cat, { deviceDays: dd, hits: h });
           }
           const toArr = (m: Map<string, any>) =>
             Array.from(m.entries())
