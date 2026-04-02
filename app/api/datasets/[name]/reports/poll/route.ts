@@ -268,24 +268,91 @@ function buildAffinitySQL(table: string, minDwell = 0): string {
     LIMIT 50000`;
 }
 
-function buildMobilitySQL(table: string, minDwell = 0): string {
+interface PoiCoordForMobility {
+  lat: number;
+  lng: number;
+  radiusM: number;
+}
+
+function buildMobilitySQL(table: string, minDwell = 0, poiCoords?: PoiCoordForMobility[]): string {
   // Mobility: POI categories visited before/after target POI visit.
   //
-  // Strategy: spatial join with Overture POIs (lab_pois_gmc) using geohash
-  // buckets for efficient matching. Same approach as mega-job consolidation.
-  //
-  // 1. Identify target visit times (median timestamp per ad_id/date at POI)
+  // Strategy (same as mega-job consolidation):
+  // 1. Identify visit_time using spatial proximity to POI coords (if available)
+  //    or fallback to median timestamp of poi_id pings
   // 2. Find all pings ±2h of visit
   // 3. Geohash-bucket join with Overture POIs (0.01° grid, 3×3 expansion)
   // 4. Filter by distance ≤ 200m, keep closest per (ad_id, date, timing, category)
   // 5. Aggregate by timing (before/after) + category
 
   const GRID_STEP = 0.01; // ~1.1km geohash grid
-  const dwellHaving = minDwell > 0
-    ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
-    : '';
 
-  return `WITH
+  // Build visit_time CTE — spatial when POI coords available
+  let visitTimeCTE: string;
+  if (poiCoords?.length) {
+    // Spatial proximity: identify actual at-POI pings via Haversine distance
+    const poiValues = poiCoords
+      .map(p => `(${p.lat}, ${p.lng}, ${p.radiusM})`)
+      .join(', ');
+
+    const dwellCTEs = minDwell > 0 ? `,
+    visit_dwell AS (
+      SELECT ad_id, date,
+        ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes
+      FROM at_poi_pings
+      GROUP BY ad_id, date
+    ),
+    dwell_filtered AS (
+      SELECT ad_id, date FROM visit_dwell
+      WHERE dwell_minutes >= ${minDwell}
+    )` : '';
+
+    const visitorSource = minDwell > 0
+      ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
+      : `at_poi_pings`;
+    const visitorPrefix = minDwell > 0 ? 'a.' : '';
+
+    visitTimeCTE = `
+    all_pings_raw AS (
+      SELECT ad_id, date, utc_timestamp,
+        TRY_CAST(latitude AS DOUBLE) as lat,
+        TRY_CAST(longitude AS DOUBLE) as lng
+      FROM ${table}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    ),
+    target_pois AS (
+      SELECT * FROM (VALUES ${poiValues}) AS t(poi_lat, poi_lng, poi_radius_m)
+    ),
+    at_poi_pings AS (
+      SELECT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
+      FROM all_pings_raw p
+      CROSS JOIN target_pois tp
+      WHERE 111320 * SQRT(
+        POW(p.lat - tp.poi_lat, 2) +
+        POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
+      ) <= tp.poi_radius_m
+    )${dwellCTEs},
+    target_visits AS (
+      SELECT
+        ${visitorPrefix}ad_id,
+        ${visitorPrefix}date,
+        MIN(${visitorPrefix}utc_timestamp) as visit_time
+      FROM ${visitorSource}
+      GROUP BY ${visitorPrefix}ad_id, ${visitorPrefix}date
+    ),
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+    )`;
+  } else {
+    // Fallback: use poi_ids with median timestamp as visit_time proxy
+    const dwellHaving = minDwell > 0
+      ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
+      : '';
+
+    visitTimeCTE = `
     target_visits AS (
       SELECT ad_id, date,
         FROM_UNIXTIME(APPROX_PERCENTILE(TO_UNIXTIME(utc_timestamp), 0.5)) as visit_time
@@ -304,8 +371,12 @@ function buildMobilitySQL(table: string, minDwell = 0): string {
       WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < 500)
-    ),
+        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+    )`;
+  }
+
+  return `WITH
+    ${visitTimeCTE},
     nearby_pings AS (
       SELECT
         a.ad_id,
@@ -586,7 +657,33 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      // Launch all 7 queries in parallel using poi_ids (no spatial join)
+      // Try to load POI coords from the job associated with this dataset
+      let poiCoords: PoiCoordForMobility[] | undefined;
+      try {
+        const { getJob } = await import('@/lib/jobs');
+        const { extractPoiCoords } = await import('@/lib/mega-consolidation-queries');
+        const index = await getConfig<Record<string, any>>('jobs-index');
+        if (index) {
+          const jobEntry = Object.entries(index).find(
+            ([_, j]: [string, any]) => j.s3DestPath?.replace(/\/$/, '').split('/').pop() === datasetName
+          );
+          if (jobEntry) {
+            const job = await getJob(jobEntry[0]);
+            if (job) {
+              poiCoords = extractPoiCoords([job]);
+              if (poiCoords.length > 0) {
+                console.log(`[DS-REPORT] Loaded ${poiCoords.length} POI coords for spatial mobility`);
+              } else {
+                poiCoords = undefined;
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[DS-REPORT] Could not load POI coords: ${e.message}`);
+      }
+
+      // Launch all 7 queries in parallel
       const queries: Record<string, string> = {};
       await Promise.all([
         startQueryAsync(buildODSQL(table, minDwell)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
@@ -594,7 +691,7 @@ export async function POST(
         startQueryAsync(buildCatchmentSQL(table, minDwell)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
         startQueryAsync(buildTemporalSQL(table, minDwell)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
         startQueryAsync(buildTotalDevicesSQL(table, minDwell)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table, minDwell)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell, poiCoords)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
         startQueryAsync(buildAffinitySQL(table, minDwell)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
