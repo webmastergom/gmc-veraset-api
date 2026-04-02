@@ -180,17 +180,27 @@ export async function startConsolidatedVisitsQuery(
  */
 export function parseConsolidatedVisits(
   rows: Record<string, any>[],
-  subJobs: Job[]
+  subJobs: Job[],
+  /** Optional external name map (e.g. from POI collection GeoJSON) */
+  externalNames?: Map<string, string>
 ): ConsolidatedVisitByPoi[] {
   // Build unified POI mapping: verasetId → { originalId, name }
   // Since each sub-job has its own geo_radius_X → originalId mapping,
   // and the Athena query returns geo_radius_X IDs, we need all mappings.
   const poiNameMap = new Map<string, string>();
 
+  // First, load external names (from POI collection GeoJSON)
+  if (externalNames) {
+    for (const [id, name] of externalNames) {
+      poiNameMap.set(id, name);
+    }
+  }
+
   for (const job of subJobs) {
     if (job.poiMapping) {
       for (const [verasetId, originalId] of Object.entries(job.poiMapping)) {
-        const name = job.poiNames?.[verasetId] || originalId;
+        // Prefer external name, then job.poiNames, then originalId
+        const name = externalNames?.get(originalId) || externalNames?.get(verasetId) || job.poiNames?.[verasetId] || originalId;
         poiNameMap.set(verasetId, name);
         poiNameMap.set(originalId, name);
       }

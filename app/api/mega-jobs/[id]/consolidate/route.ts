@@ -270,9 +270,32 @@ export async function POST(
         }
       };
 
+      // Load POI names from collection GeoJSON
+      let poiNameMap: Map<string, string> | undefined;
+      const collectionId = megaJob.sourceScope?.poiCollectionIds?.[0];
+      if (collectionId) {
+        try {
+          const { getPOICollection } = await import('@/lib/poi-storage');
+          const geojson = await getPOICollection(collectionId);
+          if (geojson?.features) {
+            poiNameMap = new Map();
+            for (const f of geojson.features) {
+              const props = f.properties || {};
+              const poiId = props.id || props.poi_id || '';
+              // Try common name fields
+              const name = props.name || props['nombre / name'] || props.nombre || props.Name || '';
+              if (poiId && name) poiNameMap.set(poiId, name);
+            }
+            console.log(`[MEGA] Loaded ${poiNameMap.size} POI names from collection ${collectionId}`);
+          }
+        } catch (err: any) {
+          console.warn(`[MEGA] Could not load POI names: ${err.message}`);
+        }
+      }
+
       // Parse visits
       await parseAndSave('visits', state.queries.visits, (rows) => {
-        const visitsByPoi = parseConsolidatedVisits(rows, syncedJobs);
+        const visitsByPoi = parseConsolidatedVisits(rows, syncedJobs, poiNameMap);
         return { megaJobId: id, analyzedAt: new Date().toISOString(), totalPois: visitsByPoi.length, visitsByPoi };
       }, 'visits');
 
