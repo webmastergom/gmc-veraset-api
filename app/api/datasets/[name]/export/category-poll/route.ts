@@ -329,6 +329,42 @@ export async function POST(
 
     // ── Phase: processing ────────────────────────────────────────
     if (state.phase === 'processing' && state.queryId) {
+      // Ensure POI list is loaded (may not have finished during polling phase)
+      if (state.poiQueryId && !state.poiQueryDone) {
+        try {
+          const poiStatus = await checkQueryStatus(state.poiQueryId);
+          if (poiStatus.state === 'SUCCEEDED') {
+            const poiCsvKey = `athena-results/${state.poiQueryId}.csv`;
+            const poiObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: poiCsvKey }));
+            const poiCsvText = await poiObj.Body!.transformToString('utf-8');
+            const poiLines = poiCsvText.split('\n');
+            const pois: PoiInfo[] = [];
+            for (let i = 1; i < poiLines.length; i++) {
+              const line = poiLines[i].trim();
+              if (!line) continue;
+              const parts = line.match(/(?:"([^"]*)")|([^,]+)/g)?.map(s => s.replace(/^"|"$/g, '')) || [];
+              if (parts.length >= 4) {
+                pois.push({ name: parts[0] || 'Unknown', category: parts[1], lat: parseFloat(parts[2]), lng: parseFloat(parts[3]) });
+              }
+            }
+            state = { ...state, poiQueryDone: true, pois };
+            console.log(`[CATEGORY-POLL] POI query resolved in processing: ${pois.length} POIs`);
+          } else if (poiStatus.state === 'RUNNING' || poiStatus.state === 'QUEUED') {
+            // POI query still running — return to polling to wait
+            state = { ...state, phase: 'polling' };
+            await putConfig(STATE_KEY(datasetName), state, { compact: true });
+            return NextResponse.json({
+              phase: 'polling',
+              progress: { step: 'loading_pois', percent: 75, message: 'Loading POI list...' },
+            });
+          } else {
+            state = { ...state, poiQueryDone: true, pois: [] };
+          }
+        } catch {
+          state = { ...state, poiQueryDone: true, pois: [] };
+        }
+      }
+
       const csvKey = `athena-results/${state.queryId}.csv`;
       console.log(`[CATEGORY-POLL] Downloading results from S3: ${csvKey}`);
       const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
