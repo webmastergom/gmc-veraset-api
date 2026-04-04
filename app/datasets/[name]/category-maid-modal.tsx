@@ -38,7 +38,8 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
   const [minDwell, setMinDwell] = useState(5);
   const [computing, setComputing] = useState(false);
   const [computeProgress, setComputeProgress] = useState<string | null>(null);
-  const [result, setResult] = useState<{ maidCount: number; downloadKey: string } | null>(null);
+  const [result, setResult] = useState<{ maidCount: number; downloadKey: string; pois: { name: string; category: string; lat: number; lng: number }[] } | null>(null);
+  const [showPois, setShowPois] = useState(false);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
   const [country, setCountry] = useState<string | null>(jobCountry || null);
   const [loadingCountry, setLoadingCountry] = useState(false);
@@ -317,6 +318,43 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
                     </Button>
                   )}
                 </div>
+
+                {/* POI List */}
+                {result.pois && result.pois.length > 0 && (
+                  <div>
+                    <button
+                      onClick={() => setShowPois(!showPois)}
+                      className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1"
+                    >
+                      {showPois ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                      {result.pois.length.toLocaleString()} POIs considered
+                    </button>
+                    {showPois && (
+                      <div className="mt-2 max-h-[200px] overflow-y-auto border rounded">
+                        <table className="w-full text-xs">
+                          <thead className="sticky top-0 bg-muted">
+                            <tr>
+                              <th className="text-left px-2 py-1 font-medium">Name</th>
+                              <th className="text-left px-2 py-1 font-medium">Category</th>
+                              <th className="text-right px-2 py-1 font-medium">Lat</th>
+                              <th className="text-right px-2 py-1 font-medium">Lng</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {result.pois.map((poi, i) => (
+                              <tr key={i} className="border-t border-border/50">
+                                <td className="px-2 py-1 truncate max-w-[200px]">{poi.name}</td>
+                                <td className="px-2 py-1 text-muted-foreground">{poi.category.replace(/_/g, ' ')}</td>
+                                <td className="px-2 py-1 text-right tabular-nums">{poi.lat.toFixed(4)}</td>
+                                <td className="px-2 py-1 text-right tabular-nums">{poi.lng.toFixed(4)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>

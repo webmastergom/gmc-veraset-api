@@ -21,18 +21,44 @@ const SPATIAL_RADIUS = 200; // meters
 const GRID_STEP = 0.01; // ~1.1km grid cells
 const BBOX_BUFFER = 0.02; // ~2.2km buffer
 
+interface PoiInfo {
+  name: string;
+  category: string;
+  lat: number;
+  lng: number;
+}
+
 interface CategoryExportState {
   phase: 'querying' | 'polling' | 'processing' | 'done' | 'error';
   queryId?: string;
+  poiQueryId?: string;
+  poiQueryDone?: boolean;
   country: string;
   categories: string[];
   groupKey: string;
   minDwell: number;
   error?: string;
+  pois?: PoiInfo[];
   result?: {
     maidCount: number;
     downloadKey: string;
+    pois: PoiInfo[];
   };
+}
+
+/**
+ * Build a query to list POIs matching the selected categories + country.
+ */
+function buildPoiListQuery(categories: string[], country: string): string {
+  const catFilter = categories.map(c => `'${c}'`).join(',');
+  const countryFilter = country ? `AND country = '${toIsoCountry(country)}'` : '';
+  return `
+    SELECT name, category, latitude, longitude
+    FROM lab_pois_gmc
+    WHERE category IN (${catFilter})
+      ${countryFilter}
+    ORDER BY category, name
+  `;
 }
 
 /**
@@ -198,10 +224,14 @@ export async function POST(
       const table = getTableName(datasetName);
 
       const sql = buildCategoryMaidQuery(table, categories, country, minDwell);
-      const queryId = await startQueryAsync(sql);
-      console.log(`[CATEGORY-POLL] Athena query started: ${queryId}`);
+      const poiSql = buildPoiListQuery(categories, country);
+      const [queryId, poiQueryId] = await Promise.all([
+        startQueryAsync(sql),
+        startQueryAsync(poiSql),
+      ]);
+      console.log(`[CATEGORY-POLL] Athena queries started: maid=${queryId}, pois=${poiQueryId}`);
 
-      state = { phase: 'polling', queryId, country, categories, groupKey, minDwell };
+      state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
@@ -213,9 +243,54 @@ export async function POST(
     // ── Phase: polling ───────────────────────────────────────────
     if (state.phase === 'polling' && state.queryId) {
       try {
+        // Check main MAID query
         const status = await checkQueryStatus(state.queryId);
+        let mainDone = false;
 
-        if (status.state === 'RUNNING' || status.state === 'QUEUED') {
+        if (status.state === 'FAILED' || status.state === 'CANCELLED') {
+          state = { ...state, phase: 'error', error: status.error || 'Query failed' };
+          await putConfig(STATE_KEY(datasetName), state, { compact: true });
+          return NextResponse.json({ phase: 'error', error: state.error });
+        }
+
+        if (status.state === 'SUCCEEDED') {
+          mainDone = true;
+        }
+
+        // Check POI listing query (if not already done)
+        if (state.poiQueryId && !state.poiQueryDone) {
+          const poiStatus = await checkQueryStatus(state.poiQueryId);
+          if (poiStatus.state === 'SUCCEEDED') {
+            // Parse POI results immediately (small result set)
+            const poiCsvKey = `athena-results/${state.poiQueryId}.csv`;
+            const poiObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: poiCsvKey }));
+            const poiCsvText = await poiObj.Body!.transformToString('utf-8');
+            const poiLines = poiCsvText.split('\n');
+            const pois: PoiInfo[] = [];
+            for (let i = 1; i < poiLines.length; i++) {
+              const line = poiLines[i].trim();
+              if (!line) continue;
+              // CSV: "name","category","latitude","longitude"
+              const parts = line.match(/(?:"([^"]*)")|([^,]+)/g)?.map(s => s.replace(/^"|"$/g, '')) || [];
+              if (parts.length >= 4) {
+                pois.push({
+                  name: parts[0] || 'Unknown',
+                  category: parts[1],
+                  lat: parseFloat(parts[2]),
+                  lng: parseFloat(parts[3]),
+                });
+              }
+            }
+            state = { ...state, poiQueryDone: true, pois };
+            console.log(`[CATEGORY-POLL] POI query done: ${pois.length} POIs found`);
+          }
+          // If POI query failed, not critical — continue without it
+          if (poiStatus.state === 'FAILED' || poiStatus.state === 'CANCELLED') {
+            state = { ...state, poiQueryDone: true, pois: [] };
+          }
+        }
+
+        if (!mainDone) {
           const scannedGB = status.statistics?.dataScannedBytes
             ? (status.statistics.dataScannedBytes / 1e9).toFixed(1)
             : '0';
@@ -223,6 +298,7 @@ export async function POST(
             ? Math.round(status.statistics.engineExecutionTimeMs / 1000)
             : 0;
 
+          await putConfig(STATE_KEY(datasetName), state, { compact: true });
           return NextResponse.json({
             phase: 'polling',
             progress: {
@@ -233,13 +309,7 @@ export async function POST(
           });
         }
 
-        if (status.state === 'FAILED' || status.state === 'CANCELLED') {
-          state = { ...state, phase: 'error', error: status.error || 'Query failed' };
-          await putConfig(STATE_KEY(datasetName), state, { compact: true });
-          return NextResponse.json({ phase: 'error', error: state.error });
-        }
-
-        // SUCCEEDED → move to processing
+        // Main query SUCCEEDED → move to processing
         state = { ...state, phase: 'processing' };
         await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
@@ -294,7 +364,7 @@ export async function POST(
         ? `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`
         : null;
 
-      const result = { maidCount: adIds.length, downloadKey: downloadUrl || '' };
+      const result = { maidCount: adIds.length, downloadKey: downloadUrl || '', pois: state.pois || [] };
 
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
