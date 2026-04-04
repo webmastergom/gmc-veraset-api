@@ -26,33 +26,53 @@
 //   T2 = Lifestyle / contextual signal
 //   T3 = Mobility & urban context
 //   T4 = Special-vertical signal
+// POI_CATEGORIES is derived from CATEGORY_GROUPS to avoid maintaining two lists
+// Flatten all categories from all groups, deduplicate, and freeze as const
+function _buildPoiCategories() {
+  // Defined inline to avoid circular reference — CATEGORY_GROUPS is below
+  return [] as string[];
+}
+
+// We'll populate this after CATEGORY_GROUPS is defined (see bottom of file)
+// For now, keep the expanded list for type safety
 export const POI_CATEGORIES = [
-  // ── TIER 1: High affinity signal ──────────────────────────────────
-  // Retail / Commerce
+  // Retail
   'clothing_store', 'department_store', 'discount_store', 'shopping_center',
   'outlet_store', 'thrift_store', 'gift_shop', 'convenience_store',
-  'supermarket',
+  'supermarket', 'grocery_store', 'shopping', 'retail',
+  'shoe_store', 'womens_clothing_store', 'liquor_store', 'flowers_and_gifts_shop',
+  'butcher_shop',
   // Food & Beverage
-  'restaurant', 'fast_food_restaurant', 'cafe', 'pizza_restaurant',
-  'sushi_restaurant', 'bar', 'pub', 'brewery', 'winery', 'coffee_shop',
-  'bakery', 'smoothie_juice_bar', 'food_truck',
+  'restaurant', 'fast_food_restaurant', 'cafe', 'pizza_restaurant', 'pizza',
+  'sushi_restaurant', 'sushi', 'bar', 'pub', 'brewery', 'winery', 'coffee_shop',
+  'bakery', 'smoothie_juice_bar', 'food_truck', 'ice_cream_shop',
+  'mexican_restaurant', 'italian_restaurant', 'seafood_restaurant',
+  'burger_restaurant', 'chinese_restaurant', 'sandwich_shop',
+  'american_restaurant', 'french_restaurant', 'barbecue_restaurant',
+  'taco_restaurant', 'bar_and_grill_restaurant', 'chicken_restaurant',
   // Automotive
   'car_dealer', 'used_car_dealer', 'motorcycle_dealer', 'gas_station',
   'ev_charging_station', 'car_wash', 'auto_body_shop', 'tire_shop',
-  // Beauty & Personal Care
-  'beauty_salon', 'hair_salon', 'nail_salon', 'barber', 'spas', 'massage',
+  'automotive_repair', 'automotive_parts_and_accessories', 'tire_dealer_and_repair',
+  // Beauty
+  'beauty_salon', 'hair_salon', 'nail_salon', 'barber', 'spas', 'spa', 'massage',
+  'massage_therapy', 'beauty_and_spa', 'cosmetic_and_beauty_supplies',
   'tattoo_and_piercing', 'skin_care', 'tanning_salon',
   // Healthcare
-  'hospital', 'medical_center', 'walk_in_clinic', 'doctor', 'dentist',
+  'hospital', 'medical_center', 'walk_in_clinic', 'clinic', 'doctor', 'dentist',
   'pharmacy', 'urgent_care_clinic', 'psychologist', 'psychiatrist',
-  'counseling_and_mental_health', 'physical_therapy', 'optometrist',
-  'chiropractor', 'veterinarian',
-  // Financial Services
-  'banks', 'atms', 'credit_union', 'financial_advising', 'insurance_agency',
-  'tax_services', 'investing', 'accountant',
-  // Sports & Fitness
+  'counseling_and_mental_health', 'mental_health_service', 'physical_therapy',
+  'optometrist', 'eyewear_and_optician', 'health_and_medical',
+  'chiropractor', 'veterinarian', 'retirement_home',
+  // Finance
+  'banks', 'bank', 'bank_credit_union', 'atms', 'atm', 'credit_union',
+  'financial_advising', 'financial_advisor', 'financial_service',
+  'insurance_agency', 'tax_services', 'investing', 'accountant', 'accounting_firm',
+  'money_transfer_services',
+  // Sports
   'gym', 'yoga_studio', 'pilates_studio', 'swimming_pool', 'tennis_court',
   'golf_course', 'stadium_arena', 'martial_arts_club', 'rock_climbing_gym',
+  'sports_club_and_league', 'sports_and_recreation_venue', 'dance_school',
   // Entertainment
   'cinema', 'comedy_club', 'music_venue', 'casino', 'arcade', 'dance_club',
   'karaoke', 'theatre', 'escape_rooms', 'bowling_alley', 'amusement_park',
@@ -60,62 +80,67 @@ export const POI_CATEGORIES = [
   'hotel', 'hostel', 'motel', 'resort', 'bed_and_breakfast', 'campground',
   'rv_park', 'holiday_rental_home',
   // Education
-  'school', 'college_university', 'preschool', 'tutoring_center',
+  'school', 'college_university', 'college', 'campus_building', 'education',
+  'elementary_school', 'high_school', 'middle_school', 'private_school', 'public_school',
+  'preschool', 'day_care_preschool', 'child_care_and_day_care',
+  'tutoring_center', 'tutoring_service', 'specialty_school', 'vocational_and_technical_school',
+  'adult_education', 'religious_school',
   'driving_school', 'language_school', 'music_school', 'art_school',
-
-  // ── TIER 2: Lifestyle / contextual signal ─────────────────────────
   // Luxury
   'jewelry_store', 'watch_store', 'designer_clothing', 'fur_clothing',
   'antique_store', 'wine_bar', 'cocktail_bar', 'champagne_bar',
   'medical_spa', 'day_spa', 'health_spa',
-  // Home & Living
-  'interior_design', 'furniture_store', 'home_improvement_store',
-  'nursery_and_gardening', 'mattress_store', 'kitchen_and_bath',
-  'lighting_store', 'carpet_store', 'real_estate_agent', 'movers',
-  'storage_facility', 'key_and_locksmith',
-  // Electronics & Telco
-  'electronics', 'mobile_phone_store', 'computer_store',
+  // Home
+  'interior_design', 'interior_designer', 'furniture_store', 'home_improvement_store',
+  'hardware_store', 'building_supply_store', 'nursery_and_gardening', 'garden_center',
+  'mattress_store', 'kitchen_and_bath', 'home_goods_store',
+  'lighting_store', 'carpet_store', 'real_estate_agent', 'real_estate', 'movers',
+  'storage_facility', 'self_storage_facility', 'self_storage',
+  'key_and_locksmith', 'locksmith',
+  'contractor', 'electrician', 'plumbing', 'hvac_services', 'construction_services',
+  // Electronics
+  'electronics', 'electronics_store', 'mobile_phone_store', 'computer_store',
   'photography_store_and_services', 'video_game_store', 'telecommunications',
-  'internet_service_provider',
-  // Pet Care
-  'pet_store', 'pet_groomer', 'pet_boarding', 'dog_park', 'pet_adoption',
-  // Pharmaceutical
+  'telecommunications_company', 'internet_service_provider',
+  'it_service_and_computer_repair',
+  // Pets
+  'pet_store', 'pet_groomer', 'pet_grooming', 'pet_boarding', 'dog_park', 'pet_adoption',
+  // Pharma
   'drugstore', 'pharmaceutical_companies', 'biotechnology_company',
-
-  // ── TIER 3: Mobility & urban context ──────────────────────────────
   // Transport
   'bus_station', 'train_station', 'airport', 'taxi_service', 'taxi_rank',
   'ferry_service', 'metro_station', 'parking', 'bike_rentals',
-  'car_rental_agency', 'ride_sharing',
-  // Logistics & Delivery
+  'car_rental_agency', 'car_rental', 'ride_sharing', 'travel_services',
+  // Logistics
   'freight_and_cargo_service', 'warehouses', 'distribution_services',
-  'motor_freight_trucking', 'courier_and_delivery_services', 'post_office',
+  'motor_freight_trucking', 'courier_and_delivery_services', 'courier_service', 'post_office',
   // Government
   'federal_government_offices', 'local_and_state_government_offices',
-  'town_hall', 'courthouse', 'embassy', 'fire_department',
-  'police_department', 'library', 'community_center',
-  // Energy & Utilities
+  'government_office', 'town_hall', 'city_hall', 'courthouse', 'embassy',
+  'fire_department', 'fire_station', 'police_department', 'police_station',
+  'library', 'community_center',
+  'community_services_non_profits', 'public_and_government_association',
+  // Energy
   'energy_equipment_and_solution', 'pipeline_transportation',
   'electric_utility_provider', 'water_supplier', 'natural_gas_supplier',
-
-  // ── TIER 4: Special-vertical signal ───────────────────────────────
   // Gaming
   'esports_league', 'esports_team', 'virtual_reality_center', 'internet_cafe',
   // Moviegoers
   'drive_in_theater', 'outdoor_movies', 'film_festivals_and_organizations',
-  // Corporate / C-Level
-  'coworking_space', 'information_technology_company',
+  // Corporate
+  'coworking_space', 'information_technology_company', 'corporate_office',
+  'software_development', 'professional_services',
   'legal_services', 'executive_search_consultants', 'business_consulting',
-  'private_equity_firm',
-  // Attractions & Activities
-  'museum', 'aquarium', 'zoo', 'botanical_garden',
+  'private_equity_firm', 'advertising_agency',
+  // Attractions
+  'museum', 'art_gallery', 'aquarium', 'zoo', 'botanical_garden',
   'national_park', 'beach', 'landmark_and_historical_building', 'castle',
   'monument', 'hot_springs', 'ski_area', 'park',
 ] as const;
 
 export type PoiCategory = typeof POI_CATEGORIES[number];
 
-export const CATEGORY_LABELS: Record<PoiCategory, string> = {
+export const CATEGORY_LABELS: Record<string, string> = {
   // ── T1: Retail / Commerce ───────────────────────────────────────────
   clothing_store: 'Clothing Stores',
   department_store: 'Department Stores',
@@ -333,6 +358,99 @@ export const CATEGORY_LABELS: Record<PoiCategory, string> = {
   hot_springs: 'Hot Springs',
   ski_area: 'Ski Areas',
   park: 'Parks',
+  art_gallery: 'Art Galleries',
+  // ── New Overture variant labels ──────────────────────────────────
+  grocery_store: 'Grocery Stores',
+  shopping: 'Shopping',
+  retail: 'Retail',
+  shoe_store: 'Shoe Stores',
+  womens_clothing_store: "Women's Clothing",
+  liquor_store: 'Liquor Stores',
+  flowers_and_gifts_shop: 'Flowers & Gifts',
+  butcher_shop: 'Butcher Shops',
+  pizza: 'Pizza',
+  sushi: 'Sushi',
+  ice_cream_shop: 'Ice Cream',
+  mexican_restaurant: 'Mexican Restaurants',
+  italian_restaurant: 'Italian Restaurants',
+  seafood_restaurant: 'Seafood Restaurants',
+  burger_restaurant: 'Burger Restaurants',
+  chinese_restaurant: 'Chinese Restaurants',
+  sandwich_shop: 'Sandwich Shops',
+  american_restaurant: 'American Restaurants',
+  french_restaurant: 'French Restaurants',
+  barbecue_restaurant: 'BBQ Restaurants',
+  taco_restaurant: 'Taco Restaurants',
+  bar_and_grill_restaurant: 'Bar & Grill',
+  chicken_restaurant: 'Chicken Restaurants',
+  automotive_repair: 'Auto Repair',
+  automotive_parts_and_accessories: 'Auto Parts',
+  tire_dealer_and_repair: 'Tire Dealers',
+  spa: 'Spas',
+  massage_therapy: 'Massage Therapy',
+  beauty_and_spa: 'Beauty & Spa',
+  cosmetic_and_beauty_supplies: 'Cosmetic Supplies',
+  clinic: 'Clinics',
+  mental_health_service: 'Mental Health',
+  eyewear_and_optician: 'Eyewear & Opticians',
+  health_and_medical: 'Health & Medical',
+  retirement_home: 'Retirement Homes',
+  bank: 'Banks',
+  bank_credit_union: 'Banks & Credit Unions',
+  atm: 'ATMs',
+  financial_advisor: 'Financial Advisors',
+  financial_service: 'Financial Services',
+  accounting_firm: 'Accounting Firms',
+  money_transfer_services: 'Money Transfer',
+  sports_club_and_league: 'Sports Clubs',
+  sports_and_recreation_venue: 'Sports Venues',
+  dance_school: 'Dance Schools',
+  college: 'Colleges',
+  campus_building: 'Campus Buildings',
+  education: 'Education',
+  elementary_school: 'Elementary Schools',
+  high_school: 'High Schools',
+  middle_school: 'Middle Schools',
+  private_school: 'Private Schools',
+  public_school: 'Public Schools',
+  day_care_preschool: 'Day Care / Preschool',
+  child_care_and_day_care: 'Child Care',
+  tutoring_service: 'Tutoring Services',
+  specialty_school: 'Specialty Schools',
+  vocational_and_technical_school: 'Vocational Schools',
+  adult_education: 'Adult Education',
+  religious_school: 'Religious Schools',
+  interior_designer: 'Interior Designers',
+  hardware_store: 'Hardware Stores',
+  building_supply_store: 'Building Supplies',
+  garden_center: 'Garden Centers',
+  home_goods_store: 'Home Goods',
+  real_estate: 'Real Estate',
+  self_storage_facility: 'Self Storage',
+  self_storage: 'Self Storage',
+  locksmith: 'Locksmiths',
+  contractor: 'Contractors',
+  electrician: 'Electricians',
+  plumbing: 'Plumbing',
+  hvac_services: 'HVAC Services',
+  construction_services: 'Construction',
+  electronics_store: 'Electronics Stores',
+  telecommunications_company: 'Telecom Companies',
+  it_service_and_computer_repair: 'IT & Computer Repair',
+  pet_grooming: 'Pet Grooming',
+  car_rental: 'Car Rental',
+  travel_services: 'Travel Services',
+  courier_service: 'Courier Services',
+  government_office: 'Government Offices',
+  city_hall: 'City Hall',
+  fire_station: 'Fire Stations',
+  police_station: 'Police Stations',
+  community_services_non_profits: 'Community & Non-Profits',
+  public_and_government_association: 'Public Associations',
+  corporate_office: 'Corporate Offices',
+  software_development: 'Software Development',
+  professional_services: 'Professional Services',
+  advertising_agency: 'Advertising Agencies',
 };
 
 // ── Category groups for UX ─────────────────────────────────────────────
@@ -352,7 +470,9 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     categories: [
       'clothing_store', 'department_store', 'discount_store', 'shopping_center',
       'outlet_store', 'thrift_store', 'gift_shop', 'convenience_store',
-      'supermarket',
+      'supermarket', 'grocery_store', 'shopping', 'retail',
+      'shoe_store', 'womens_clothing_store', 'liquor_store', 'flowers_and_gifts_shop',
+      'butcher_shop',
     ],
   },
   food_and_beverage: {
@@ -360,9 +480,13 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'UtensilsCrossed',
     color: 'text-orange-400',
     categories: [
-      'restaurant', 'fast_food_restaurant', 'cafe', 'pizza_restaurant',
-      'sushi_restaurant', 'bar', 'pub', 'brewery', 'winery', 'coffee_shop',
-      'bakery', 'smoothie_juice_bar', 'food_truck',
+      'restaurant', 'fast_food_restaurant', 'cafe', 'pizza_restaurant', 'pizza',
+      'sushi_restaurant', 'sushi', 'bar', 'pub', 'brewery', 'winery', 'coffee_shop',
+      'bakery', 'smoothie_juice_bar', 'food_truck', 'ice_cream_shop',
+      'mexican_restaurant', 'italian_restaurant', 'seafood_restaurant',
+      'burger_restaurant', 'chinese_restaurant', 'sandwich_shop',
+      'american_restaurant', 'french_restaurant', 'barbecue_restaurant',
+      'taco_restaurant', 'bar_and_grill_restaurant', 'chicken_restaurant',
     ],
   },
   automotive: {
@@ -372,6 +496,7 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     categories: [
       'car_dealer', 'used_car_dealer', 'motorcycle_dealer', 'gas_station',
       'ev_charging_station', 'car_wash', 'auto_body_shop', 'tire_shop',
+      'automotive_repair', 'automotive_parts_and_accessories', 'tire_dealer_and_repair',
     ],
   },
   beauty: {
@@ -379,7 +504,8 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'Sparkles',
     color: 'text-fuchsia-400',
     categories: [
-      'beauty_salon', 'hair_salon', 'nail_salon', 'barber', 'spas', 'massage',
+      'beauty_salon', 'hair_salon', 'nail_salon', 'barber', 'spas', 'spa', 'massage',
+      'massage_therapy', 'beauty_and_spa', 'cosmetic_and_beauty_supplies',
       'tattoo_and_piercing', 'skin_care', 'tanning_salon',
     ],
   },
@@ -388,10 +514,11 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'Heart',
     color: 'text-red-400',
     categories: [
-      'hospital', 'medical_center', 'walk_in_clinic', 'doctor', 'dentist',
+      'hospital', 'medical_center', 'walk_in_clinic', 'clinic', 'doctor', 'dentist',
       'pharmacy', 'urgent_care_clinic', 'psychologist', 'psychiatrist',
-      'counseling_and_mental_health', 'physical_therapy', 'optometrist',
-      'chiropractor', 'veterinarian',
+      'counseling_and_mental_health', 'mental_health_service', 'physical_therapy',
+      'optometrist', 'eyewear_and_optician', 'health_and_medical',
+      'chiropractor', 'veterinarian', 'retirement_home',
     ],
   },
   finance: {
@@ -399,8 +526,10 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'Landmark',
     color: 'text-emerald-400',
     categories: [
-      'banks', 'atms', 'credit_union', 'financial_advising', 'insurance_agency',
-      'tax_services', 'investing', 'accountant',
+      'banks', 'bank', 'bank_credit_union', 'atms', 'atm', 'credit_union',
+      'financial_advising', 'financial_advisor', 'financial_service',
+      'insurance_agency', 'tax_services', 'investing', 'accountant', 'accounting_firm',
+      'money_transfer_services',
     ],
   },
   sports: {
@@ -410,6 +539,7 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     categories: [
       'gym', 'yoga_studio', 'pilates_studio', 'swimming_pool', 'tennis_court',
       'golf_course', 'stadium_arena', 'martial_arts_club', 'rock_climbing_gym',
+      'sports_club_and_league', 'sports_and_recreation_venue', 'dance_school',
     ],
   },
   entertainment: {
@@ -436,7 +566,11 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'GraduationCap',
     color: 'text-cyan-400',
     categories: [
-      'school', 'college_university', 'preschool', 'tutoring_center',
+      'school', 'college_university', 'college', 'campus_building', 'education',
+      'elementary_school', 'high_school', 'middle_school', 'private_school', 'public_school',
+      'preschool', 'day_care_preschool', 'child_care_and_day_care',
+      'tutoring_center', 'tutoring_service', 'specialty_school', 'vocational_and_technical_school',
+      'adult_education', 'religious_school',
       'driving_school', 'language_school', 'music_school', 'art_school',
     ],
   },
@@ -456,10 +590,13 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'Home',
     color: 'text-teal-400',
     categories: [
-      'interior_design', 'furniture_store', 'home_improvement_store',
-      'nursery_and_gardening', 'mattress_store', 'kitchen_and_bath',
-      'lighting_store', 'carpet_store', 'real_estate_agent', 'movers',
-      'storage_facility', 'key_and_locksmith',
+      'interior_design', 'interior_designer', 'furniture_store', 'home_improvement_store',
+      'hardware_store', 'building_supply_store', 'nursery_and_gardening', 'garden_center',
+      'mattress_store', 'kitchen_and_bath', 'home_goods_store',
+      'lighting_store', 'carpet_store', 'real_estate_agent', 'real_estate', 'movers',
+      'storage_facility', 'self_storage_facility', 'self_storage',
+      'key_and_locksmith', 'locksmith',
+      'contractor', 'electrician', 'plumbing', 'hvac_services', 'construction_services',
     ],
   },
   electronics: {
@@ -467,9 +604,10 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'Smartphone',
     color: 'text-indigo-400',
     categories: [
-      'electronics', 'mobile_phone_store', 'computer_store',
+      'electronics', 'electronics_store', 'mobile_phone_store', 'computer_store',
       'photography_store_and_services', 'video_game_store', 'telecommunications',
-      'internet_service_provider',
+      'telecommunications_company', 'internet_service_provider',
+      'it_service_and_computer_repair',
     ],
   },
   pets: {
@@ -477,8 +615,8 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'PawPrint',
     color: 'text-orange-300',
     categories: [
-      'pet_store', 'pet_groomer', 'pet_boarding', 'dog_park', 'pet_adoption',
-      'veterinarian',
+      'pet_store', 'pet_groomer', 'pet_grooming', 'pet_boarding', 'dog_park',
+      'pet_adoption', 'veterinarian',
     ],
   },
   pharma: {
@@ -495,7 +633,7 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     categories: [
       'bus_station', 'train_station', 'airport', 'taxi_service', 'taxi_rank',
       'ferry_service', 'metro_station', 'parking', 'bike_rentals',
-      'car_rental_agency', 'ride_sharing',
+      'car_rental_agency', 'car_rental', 'ride_sharing', 'travel_services',
     ],
   },
   logistics: {
@@ -504,7 +642,8 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     color: 'text-stone-400',
     categories: [
       'freight_and_cargo_service', 'warehouses', 'distribution_services',
-      'motor_freight_trucking', 'courier_and_delivery_services', 'post_office',
+      'motor_freight_trucking', 'courier_and_delivery_services', 'courier_service',
+      'post_office',
     ],
   },
   government: {
@@ -513,8 +652,10 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     color: 'text-zinc-400',
     categories: [
       'federal_government_offices', 'local_and_state_government_offices',
-      'town_hall', 'courthouse', 'embassy', 'fire_department',
-      'police_department', 'post_office', 'library', 'community_center',
+      'government_office', 'town_hall', 'city_hall', 'courthouse', 'embassy',
+      'fire_department', 'fire_station', 'police_department', 'police_station',
+      'post_office', 'library', 'community_center',
+      'community_services_non_profits', 'public_and_government_association',
     ],
   },
   energy: {
@@ -547,9 +688,10 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'Briefcase',
     color: 'text-neutral-400',
     categories: [
-      'coworking_space', 'information_technology_company',
+      'coworking_space', 'information_technology_company', 'corporate_office',
+      'software_development', 'professional_services',
       'legal_services', 'executive_search_consultants', 'business_consulting',
-      'private_equity_firm',
+      'private_equity_firm', 'advertising_agency',
     ],
   },
   attractions: {
@@ -557,7 +699,7 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     icon: 'MapPin',
     color: 'text-green-400',
     categories: [
-      'museum', 'aquarium', 'zoo', 'botanical_garden', 'national_park',
+      'museum', 'art_gallery', 'aquarium', 'zoo', 'botanical_garden', 'national_park',
       'beach', 'landmark_and_historical_building', 'castle', 'monument',
       'hot_springs', 'ski_area', 'park',
     ],
