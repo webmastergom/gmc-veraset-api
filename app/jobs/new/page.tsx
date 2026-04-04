@@ -587,7 +587,7 @@ export default function NewJobPage() {
             mode: 'auto-split',
             name: formData.name,
             description: `Auto-split job: ${daysDiffCheck} days, ${pois.length} POIs`,
-            poiCollectionId: collectionId,
+            poiCollectionIds: [collectionId],
             dateRange: { from: formData.dateRange!.from, to: formData.dateRange!.to },
             radius: formData.radius || 10,
             schema: formData.schema || 'BASIC',
