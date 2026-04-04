@@ -56,6 +56,7 @@ import { MegaDailyChart } from '@/components/mega-jobs/daily-chart';
 import { CatchmentPie } from '@/components/mega-jobs/catchment-pie';
 import { CatchmentMap } from '@/components/mega-jobs/catchment-map';
 import { NseModal } from './nse-modal';
+import { CategoryMaidModal } from './category-maid-modal';
 import { ODTables } from '@/components/mega-jobs/od-tables';
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar';
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart';
@@ -142,6 +143,7 @@ export default function DatasetAnalysisPage() {
   const [reportVersion, setReportVersion] = useState(0);
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([]);
   const [nseModalOpen, setNseModalOpen] = useState(false);
+  const [categoryMaidModalOpen, setCategoryMaidModalOpen] = useState(false);
 
   useEffect(() => {
     fetch('/api/datasets', { credentials: 'include' })
@@ -518,6 +520,10 @@ export default function DatasetAnalysisPage() {
           <Button variant="outline" onClick={() => setNseModalOpen(true)}>
             <Users className="mr-2 h-4 w-4" />
             MAIDs by NSE
+          </Button>
+          <Button variant="outline" onClick={() => setCategoryMaidModalOpen(true)}>
+            <Target className="mr-2 h-4 w-4" />
+            MAIDs by Category
           </Button>
           <Button variant="outline" onClick={handleActivate} disabled={activating} title="Upload MAIDs to S3 activations folder">
             {activating ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Zap className="mr-2 h-4 w-4" />}
@@ -1077,6 +1083,12 @@ export default function DatasetAnalysisPage() {
         datasetName={datasetName}
         catchmentData={catchmentReport?.byZipCode || null}
         selectedBucket={selectedBucket}
+        jobCountry={datasetInfo?.country || null}
+      />
+      <CategoryMaidModal
+        open={categoryMaidModalOpen}
+        onClose={() => setCategoryMaidModalOpen(false)}
+        datasetName={datasetName}
         jobCountry={datasetInfo?.country || null}
       />
     </MainLayout>
