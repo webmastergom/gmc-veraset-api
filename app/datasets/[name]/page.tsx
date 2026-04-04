@@ -579,6 +579,17 @@ export default function DatasetAnalysisPage() {
         </Card>
       )}
 
+      {/* ── Movement Map (always visible if we have date range) ──── */}
+      {datasetInfo?.dateRange && (
+        <div className="mb-4">
+          <MovementMap
+            datasetName={datasetName}
+            dateFrom={datasetInfo.dateRange.from}
+            dateTo={datasetInfo.dateRange.to}
+          />
+        </div>
+      )}
+
       {/* ── ANALYSIS RESULTS ──────────────────────────────────────── */}
       {analysis && (
         <>
@@ -629,15 +640,6 @@ export default function DatasetAnalysisPage() {
           <CollapsibleCard title="Daily Activity" icon={<TrendingUp className="h-4 w-4" />}>
             <MegaDailyChart data={dailyChartData} />
           </CollapsibleCard>
-
-          {/* Movement Map */}
-          <div className="mb-4">
-            <MovementMap
-              datasetName={datasetName}
-              dateFrom={analysis.summary.dateRange.from}
-              dateTo={analysis.summary.dateRange.to}
-            />
-          </div>
 
           {/* Visits by POI */}
           <CollapsibleCard
