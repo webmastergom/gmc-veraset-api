@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -38,7 +38,38 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
   const [computeProgress, setComputeProgress] = useState<string | null>(null);
   const [result, setResult] = useState<{ maidCount: number; downloadKey: string } | null>(null);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
+  const [country, setCountry] = useState<string | null>(jobCountry || null);
+  const [loadingCountry, setLoadingCountry] = useState(false);
+  const loadedRef = useRef(false);
   const { toast } = useToast();
+
+  // Resolve country when modal opens (fallback if prop is null)
+  useEffect(() => {
+    if (!open) {
+      loadedRef.current = false;
+      return;
+    }
+    // Update from prop if available
+    if (jobCountry) {
+      setCountry(jobCountry);
+      return;
+    }
+    if (loadedRef.current) return;
+    loadedRef.current = true;
+
+    const resolveCountry = async () => {
+      setLoadingCountry(true);
+      try {
+        const res = await fetch('/api/datasets', { credentials: 'include' });
+        if (res.ok) {
+          const data = await res.json();
+          const ds = data.datasets?.find((d: any) => d.id === datasetName);
+          if (ds?.country) setCountry(ds.country);
+        }
+      } catch {} finally { setLoadingCountry(false); }
+    };
+    resolveCountry();
+  }, [open, jobCountry, datasetName]);
 
   const handleOpenChange = (isOpen: boolean) => {
     if (!isOpen) onClose();
@@ -92,7 +123,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
   };
 
   const handleCompute = async () => {
-    if (!jobCountry || selectedCategories.size === 0) return;
+    if (!country || selectedCategories.size === 0) return;
 
     setComputing(true);
     setComputeProgress('Starting spatial join...');
@@ -107,7 +138,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
           categories: Array.from(selectedCategories),
           groupKey: selectedGroup || 'custom',
           minDwell,
-          country: jobCountry,
+          country,
         }),
       });
 
@@ -151,11 +182,11 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Target className="h-5 w-5" />
-            MAIDs by POI Category {jobCountry ? `— ${jobCountry}` : ''}
+            MAIDs by POI Category {country ? `— ${country}` : ''}
           </DialogTitle>
         </DialogHeader>
 
-        {!jobCountry && (
+        {!country && !loadingCountry && (
           <div className="py-8 text-center text-muted-foreground">
             <MapPin className="h-8 w-8 mx-auto mb-3 opacity-50" />
             <p className="font-medium">No country set</p>
@@ -163,7 +194,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
           </div>
         )}
 
-        {jobCountry && (
+        {country && (
           <div className="space-y-4">
             {/* Category Group Selector */}
             <div>
