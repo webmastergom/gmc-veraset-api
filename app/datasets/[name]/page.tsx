@@ -579,13 +579,13 @@ export default function DatasetAnalysisPage() {
         </Card>
       )}
 
-      {/* ── Movement Map (always visible if we have date range) ──── */}
-      {datasetInfo?.dateRange && (
+      {/* ── Movement Map (always visible) ──────────────────────── */}
+      {datasetInfo && (
         <div className="mb-4">
           <MovementMap
             datasetName={datasetName}
-            dateFrom={datasetInfo.dateRange.from}
-            dateTo={datasetInfo.dateRange.to}
+            dateFrom={datasetInfo.dateRange?.from || new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)}
+            dateTo={datasetInfo.dateRange?.to || new Date().toISOString().slice(0, 10)}
           />
         </div>
       )}
