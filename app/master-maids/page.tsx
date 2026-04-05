@@ -104,6 +104,7 @@ export default function MasterMaidsPage() {
   const [loading, setLoading] = useState(true)
   const [expandedCountry, setExpandedCountry] = useState<string | null>(null)
   const [countryDetail, setCountryDetail] = useState<CountryDetail | null>(null)
+  const [jobNames, setJobNames] = useState<Record<string, string>>({})
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [consolidating, setConsolidating] = useState<string | null>(null)
   const [consolidateProgress, setConsolidateProgress] = useState<string>('')
@@ -134,6 +135,7 @@ export default function MasterMaidsPage() {
       const res = await fetch(`/api/master-maids/${cc}`, { credentials: 'include' })
       const data = await res.json()
       setCountryDetail(data)
+      setJobNames(data.jobNames || {})
     } catch (e) {
       console.error('Failed to load detail:', e)
     } finally {
@@ -381,7 +383,7 @@ export default function MasterMaidsPage() {
                             <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
                               {Object.entries(countryDetail.stats.byDataset).map(([ds, count]) => (
                                 <div key={ds} className="flex items-center justify-between px-3 py-2 bg-secondary rounded text-sm">
-                                  <span className="truncate font-mono text-xs">{ds}</span>
+                                  <span className="truncate">{jobNames[ds] || ds}</span>
                                   <Badge variant="outline" className="ml-2 text-xs">{count}</Badge>
                                 </div>
                               ))}
@@ -415,7 +417,7 @@ export default function MasterMaidsPage() {
                                       </Badge>
                                     </TableCell>
                                     <TableCell className="text-sm">{contrib.attributeValue || '—'}</TableCell>
-                                    <TableCell className="font-mono text-xs">{contrib.sourceDataset}</TableCell>
+                                    <TableCell className="text-sm">{jobNames[contrib.sourceDataset] || contrib.sourceDataset}</TableCell>
                                     <TableCell className="text-xs text-muted-foreground">
                                       {formatShortDate(contrib.dateRange?.from)} → {formatShortDate(contrib.dateRange?.to)}
                                     </TableCell>

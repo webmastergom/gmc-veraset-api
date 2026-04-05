@@ -11,6 +11,7 @@ import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { toIsoCountry } from '@/lib/country-inference';
 import { writeContribution, type ContributionRow } from '@/lib/master-maids';
+import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -234,7 +235,16 @@ export async function POST(
       ]);
       console.log(`[CATEGORY-POLL] Athena queries started: maid=${queryId}, pois=${poiQueryId}`);
 
-      const dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+      // Resolve dateRange from job metadata (backend-side)
+      let dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+      if (dateRange.from === 'unknown') {
+        try {
+          const jobs = await getAllJobsSummary();
+          const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+          if (job?.actualDateRange) dateRange = { from: job.actualDateRange.from, to: job.actualDateRange.to };
+          else if (job?.dateRange) dateRange = { from: (job.dateRange as any).from, to: (job.dateRange as any).to };
+        } catch {}
+      }
       state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 

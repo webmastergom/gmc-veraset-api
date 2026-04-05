@@ -7,6 +7,7 @@ import {
   getTableName,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
+import { getAllJobsSummary } from '@/lib/jobs';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
@@ -153,7 +154,16 @@ export async function POST(
       const queryId = await startQueryAsync(sql);
       console.log(`[NSE-POLL] Athena query started: ${queryId}`);
 
-      const dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+      // Resolve dateRange from job metadata (backend-side, no frontend dependency)
+      let dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+      if (dateRange.from === 'unknown') {
+        try {
+          const jobs = await getAllJobsSummary();
+          const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+          if (job?.actualDateRange) dateRange = { from: job.actualDateRange.from, to: job.actualDateRange.to };
+          else if (job?.dateRange) dateRange = { from: (job.dateRange as any).from, to: (job.dateRange as any).to };
+        } catch {}
+      }
       state = { phase: 'polling', queryId, country, minDwell, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 

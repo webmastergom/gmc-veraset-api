@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { getCountryContributions, removeContribution } from '@/lib/master-maids';
+import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -26,9 +27,18 @@ export async function GET(
       return NextResponse.json({ error: 'No master MAID data for this country' }, { status: 404 });
     }
 
+    // Resolve job names for display
+    const jobs = await getAllJobsSummary().catch(() => []);
+    const jobNames: Record<string, string> = {};
+    for (const j of jobs) {
+      const folderId = j.s3DestPath?.replace('s3://', '').replace(/.*\//, '').replace(/\/$/, '') || '';
+      if (folderId && j.name) jobNames[folderId] = j.name;
+    }
+
     return NextResponse.json({
       country: country.toUpperCase(),
       ...entry,
+      jobNames, // { "job-6b0f6fc4": "Spain Density March 2026", ... }
     });
   } catch (error: any) {
     console.error('[MASTER-MAIDS] Error getting country detail:', error.message);
