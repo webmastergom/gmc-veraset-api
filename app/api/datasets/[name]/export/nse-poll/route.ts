@@ -11,7 +11,7 @@ import { getAllJobsSummary } from '@/lib/jobs';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
-import { writeContribution, type ContributionRow } from '@/lib/master-maids';
+import { registerContribution } from '@/lib/master-maids';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -346,31 +346,38 @@ export async function POST(
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
 
-      // Write enriched contributions to Master MAID list
-      // Each row: ad_id + nse_bracket + postal_code (from cpToAdIds)
+      // Write enriched contribution CSV directly to S3 (streaming, no in-memory array)
+      // Format: ad_id,attr_type,attr_value,dwell_minutes,postal_code
       const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
       try {
-        const contribRows: ContributionRow[] = [];
+        const cc = state.country.toUpperCase();
+        const contribTs = Date.now();
+        const contribKey = `master-maids/${cc}/contributions/${datasetName}-nse-${contribTs}.csv`;
+        const csvParts: string[] = ['ad_id,attr_type,attr_value,dwell_minutes,postal_code'];
+        let rowCount = 0;
+
         for (const b of NSE_BRACKETS) {
           const cps = bracketCPs.get(b.label)!;
           for (const cp of cps) {
             const adIds = cpToAdIds.get(cp);
             if (adIds) {
               for (const id of adIds) {
-                contribRows.push({
-                  ad_id: id,
-                  attr_type: 'nse_bracket',
-                  attr_value: b.label,
-                  dwell_minutes: null,
-                  postal_code: cp,
-                });
+                csvParts.push(`${id},nse_bracket,${b.label},,${cp}`);
+                rowCount++;
               }
             }
           }
         }
-        if (contribRows.length > 0) {
-          await writeContribution(state.country, datasetName, contribRows, dr, 'nse');
-          console.log(`[NSE-POLL] Wrote ${contribRows.length} enriched contribution rows`);
+
+        if (rowCount > 0) {
+          await s3Client.send(new PutObjectCommand({
+            Bucket: BUCKET,
+            Key: contribKey,
+            Body: csvParts.join('\n'),
+            ContentType: 'text/csv',
+          }));
+          await registerContribution(cc, datasetName, 'nse_bracket', 'nse', contribKey, dr);
+          console.log(`[NSE-POLL] Wrote ${rowCount} enriched rows to ${contribKey}`);
         }
       } catch (e: any) {
         console.warn(`[NSE-POLL] Failed to write contribution: ${e.message}`);
