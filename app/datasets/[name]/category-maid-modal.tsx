@@ -343,10 +343,10 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
                           <tbody>
                             {result.pois.map((poi, i) => (
                               <tr key={i} className="border-t border-border/50">
-                                <td className="px-2 py-1 truncate max-w-[200px]">{poi.name}</td>
-                                <td className="px-2 py-1 text-muted-foreground">{poi.category.replace(/_/g, ' ')}</td>
-                                <td className="px-2 py-1 text-right tabular-nums">{poi.lat.toFixed(4)}</td>
-                                <td className="px-2 py-1 text-right tabular-nums">{poi.lng.toFixed(4)}</td>
+                                <td className="px-2 py-1 truncate max-w-[200px]">{poi.name || '-'}</td>
+                                <td className="px-2 py-1 text-muted-foreground">{(poi.category || '').replace(/_/g, ' ')}</td>
+                                <td className="px-2 py-1 text-right tabular-nums">{typeof poi.lat === 'number' ? poi.lat.toFixed(4) : '-'}</td>
+                                <td className="px-2 py-1 text-right tabular-nums">{typeof poi.lng === 'number' ? poi.lng.toFixed(4) : '-'}</td>
                               </tr>
                             ))}
                           </tbody>

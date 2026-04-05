@@ -10,6 +10,7 @@ import { getConfig, putConfig } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
+import { registerContribution } from '@/lib/master-maids';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -46,6 +47,7 @@ interface NseExportState {
   queryId?: string;
   country: string;
   minDwell: number;
+  dateRange?: { from: string; to: string };
   error?: string;
   brackets?: BracketResult[];
 }
@@ -151,7 +153,8 @@ export async function POST(
       const queryId = await startQueryAsync(sql);
       console.log(`[NSE-POLL] Athena query started: ${queryId}`);
 
-      state = { phase: 'polling', queryId, country, minDwell };
+      const dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+      state = { phase: 'polling', queryId, country, minDwell, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
@@ -332,6 +335,19 @@ export async function POST(
 
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
+
+      // Register contributions to Master MAID list (fire-and-forget, never blocks export)
+      const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
+      for (const b of brackets) {
+        if (b.maidCount > 0 && b.downloadUrl) {
+          const contribFile = `${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
+          try {
+            await registerContribution(state.country, datasetName, 'nse_bracket', b.label, contribFile, dr);
+          } catch (e: any) {
+            console.warn(`[NSE-POLL] Failed to register contribution: ${e.message}`);
+          }
+        }
+      }
 
       state = { ...state, phase: 'done', brackets };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });

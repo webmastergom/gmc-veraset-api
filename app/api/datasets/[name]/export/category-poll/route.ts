@@ -10,6 +10,7 @@ import { getConfig, putConfig } from '@/lib/s3-config';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { toIsoCountry } from '@/lib/country-inference';
+import { registerContribution } from '@/lib/master-maids';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -37,6 +38,7 @@ interface CategoryExportState {
   categories: string[];
   groupKey: string;
   minDwell: number;
+  dateRange?: { from: string; to: string };
   error?: string;
   pois?: PoiInfo[];
   result?: {
@@ -231,7 +233,8 @@ export async function POST(
       ]);
       console.log(`[CATEGORY-POLL] Athena queries started: maid=${queryId}, pois=${poiQueryId}`);
 
-      state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell };
+      const dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+      state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
@@ -401,6 +404,16 @@ export async function POST(
         : null;
 
       const result = { maidCount: adIds.length, downloadKey: downloadUrl || '', pois: state.pois || [] };
+
+      // Register contribution to Master MAID list
+      if (adIds.length > 0) {
+        const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
+        try {
+          await registerContribution(state.country, datasetName, 'category', state.groupKey, fileName, dr);
+        } catch (e: any) {
+          console.warn(`[CATEGORY-POLL] Failed to register contribution: ${e.message}`);
+        }
+      }
 
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });

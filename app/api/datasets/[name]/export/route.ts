@@ -5,6 +5,8 @@ import { runQuery, ensureTableForDataset, getTableName } from '@/lib/athena';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
+import { registerContribution } from '@/lib/master-maids';
+import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -126,6 +128,27 @@ export async function POST(
     const mergedFilters: ExportFilters = { ...filters, format };
 
     const result = await exportDevices(datasetName, mergedFilters);
+
+    // Register contribution to Master MAID list (MAIDs format only)
+    if (format === 'maids' && result.success && result.deviceCount > 0) {
+      try {
+        const jobs = await getAllJobsSummary();
+        const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+        const country = job?.country || body.country || '';
+        const dateRange = job?.actualDateRange
+          ? { from: job.actualDateRange.from, to: job.actualDateRange.to }
+          : job?.dateRange
+            ? { from: (job.dateRange as any).from, to: (job.dateRange as any).to }
+            : { from: 'unknown', to: 'unknown' };
+        const fileName = result.downloadUrl?.split('file=')[1] || '';
+        if (country && fileName) {
+          await registerContribution(country, datasetName, 'plain', '', decodeURIComponent(fileName), dateRange);
+        }
+      } catch (e: any) {
+        console.warn(`[EXPORT] Failed to register contribution: ${e.message}`);
+      }
+    }
+
     return NextResponse.json(result);
   } catch (error: any) {
     console.error(`POST /api/datasets/${datasetName}/export error:`, error);
