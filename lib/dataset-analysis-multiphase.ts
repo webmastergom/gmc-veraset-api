@@ -74,8 +74,12 @@ async function saveState(state: AnalysisState): Promise<void> {
 export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisState> {
   let state = await getState(datasetName);
 
-  // Reset if previous run is done
+  // Reset if previous run is done (or if it completed without the MAIDs query)
   if (state && (state.status === 'completed' || state.status === 'error')) {
+    // If completed without MAIDs query, try to register MAIDs from existing analysis
+    if (state.status === 'completed' && !state.queryIds?.maids) {
+      console.log(`[ANALYSIS] ${datasetName}: completed without MAIDs query — re-running to capture MAIDs`);
+    }
     state = null;
   }
 
