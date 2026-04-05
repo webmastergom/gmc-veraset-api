@@ -227,7 +227,11 @@ export default function DatasetAnalysisPage() {
     setReportProgress({ step: 'starting', percent: 0, message: 'Starting analysis...' });
 
     try {
-      await generateReportsOnly();
+      // Run reports + basic analysis (with MAIDs extraction) in parallel
+      await Promise.all([
+        generateReportsOnly(),
+        runAnalysisOnly().catch(e => console.warn('[ANALYZE] Basic analysis (MAIDs) failed:', e.message)),
+      ]);
     } finally {
       setLoading(false);
     }

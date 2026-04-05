@@ -12,6 +12,8 @@ import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { registerContribution } from '@/lib/master-maids';
+import { createInterface } from 'readline';
+import { Readable } from 'stream';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -222,25 +224,26 @@ export async function POST(
 
     // ── Phase: geocoding ─────────────────────────────────────────
     if (state.phase === 'geocoding' && state.queryId) {
-      // Download CSV directly from S3 (much faster than paging Athena API for large results)
+      // Stream CSV line-by-line from S3 (handles 10M+ rows without OOM)
       const csvKey = `athena-results/${state.queryId}.csv`;
-      console.log(`[NSE-POLL] Downloading results from S3: ${csvKey}`);
+      console.log(`[NSE-POLL] Streaming results from S3: ${csvKey}`);
       const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-      const csvText = await csvObj.Body!.transformToString('utf-8');
 
-      // Parse CSV: header is "ad_id","origin_lat","origin_lng"
-      const lines = csvText.split('\n');
-      const header = lines[0];
-      console.log(`[NSE-POLL] CSV header: ${header}, ${lines.length - 1} data lines`);
-
-      // Pre-aggregate: group ad_ids by unique (lat,lng) coord
+      // Pre-aggregate: group ad_ids by unique (lat,lng) coord — streaming
       const coordToAdIds = new Map<string, string[]>();
       let totalDevices = 0;
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        // CSV values may be quoted: "ad_id","lat","lng"
-        const parts = line.replace(/"/g, '').split(',');
+
+      const rl = createInterface({
+        input: csvObj.Body as Readable,
+        crlfDelay: Infinity,
+      });
+
+      let isHeader = true;
+      for await (const line of rl) {
+        if (isHeader) { isHeader = false; continue; }
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const parts = trimmed.replace(/"/g, '').split(',');
         if (parts.length < 3) continue;
         const [adId, lat, lng] = parts;
         const coordKey = `${lat},${lng}`;
