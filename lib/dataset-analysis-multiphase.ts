@@ -15,7 +15,9 @@ import {
   runQuery,
 } from './athena';
 import { s3Client, BUCKET } from './s3-config';
-import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { getAllJobsSummary } from './jobs';
+import { registerContribution } from './master-maids';
 import type { AnalysisResult, DailyData, VisitByPoi } from './dataset-analysis';
 
 // ── State ────────────────────────────────────────────────────────────
@@ -24,8 +26,8 @@ export interface AnalysisState {
   status: 'preparing' | 'queries_running' | 'processing' | 'completed' | 'error';
   datasetName: string;
   progress: { step: string; percent: number; message: string };
-  /** Athena query IDs for the three parallel queries */
-  queryIds?: { daily: string; summary: string; visits: string };
+  /** Athena query IDs for the analysis queries */
+  queryIds?: { daily: string; summary: string; visits: string; maids?: string };
   /** Resolved date range */
   dateFrom?: string;
   dateTo?: string;
@@ -176,16 +178,27 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
       GROUP BY poi_id ORDER BY visits DESC
     `;
 
-    const [dailyId, summaryId, visitsId] = await Promise.all([
+    // 4th query: extract all unique MAIDs for master MAID list contribution
+    const maidsSql = `
+      SELECT DISTINCT ad_id
+      FROM ${tableName}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        AND poi_id IS NOT NULL AND poi_id != ''
+    `;
+
+    const [dailyId, summaryId, visitsId, maidsId] = await Promise.all([
       startQueryAsync(dailySql),
       startQueryAsync(summarySql),
       startQueryAsync(visitsByPoiSql),
+      startQueryAsync(maidsSql),
     ]);
 
     state = {
       status: 'queries_running',
       datasetName,
-      queryIds: { daily: dailyId, summary: summaryId, visits: visitsId },
+      queryIds: { daily: dailyId, summary: summaryId, visits: visitsId, maids: maidsId },
       dateFrom,
       dateTo,
       allDates,
@@ -203,13 +216,19 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
   // ── Phase 2: Poll Athena queries ────────────────────────────
   if (state.status === 'queries_running') {
     const ids = state.queryIds!;
-    const [dailyS, summaryS, visitsS] = await Promise.all([
+    const statusChecks = [
       checkQueryStatus(ids.daily),
       checkQueryStatus(ids.summary),
       checkQueryStatus(ids.visits),
-    ]);
+    ];
+    // MAIDs query is optional (added after this feature)
+    if (ids.maids) statusChecks.push(checkQueryStatus(ids.maids));
 
-    // Check for failures
+    const statuses = await Promise.all(statusChecks);
+    const [dailyS, summaryS, visitsS] = statuses;
+    const maidsS = ids.maids ? statuses[3] : null;
+
+    // Check for failures (MAIDs query failure is non-blocking)
     for (const [name, s] of [['daily', dailyS], ['summary', summaryS], ['visits', visitsS]] as const) {
       if (s.state === 'FAILED') {
         state.status = 'error';
@@ -220,11 +239,20 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
       }
     }
 
-    const allDone = dailyS.state === 'SUCCEEDED' && summaryS.state === 'SUCCEEDED' && visitsS.state === 'SUCCEEDED';
+    const coreAllDone = dailyS.state === 'SUCCEEDED' && summaryS.state === 'SUCCEEDED' && visitsS.state === 'SUCCEEDED';
+    // MAIDs can still be running — we don't block on it
+    const maidsReady = !maidsS || maidsS.state === 'SUCCEEDED' || maidsS.state === 'FAILED';
+    const allDone = coreAllDone && maidsReady;
 
-    if (!allDone) {
+    if (!coreAllDone) {
       const statusMsg = `Daily: ${dailyS.state}, Summary: ${summaryS.state}, Visits: ${visitsS.state}`;
       state.progress = { step: 'queries', percent: 40, message: `Waiting for queries... (${statusMsg})` };
+      await saveState(state);
+      return state;
+    }
+
+    if (!maidsReady) {
+      state.progress = { step: 'queries', percent: 55, message: 'Core queries done, extracting MAIDs...' };
       await saveState(state);
       return state;
     }
@@ -377,6 +405,40 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
     };
     await saveState(state);
     console.log(`[ANALYSIS] ${datasetName}: completed — ${result.summary.uniqueDevices} devices, ${dailyData.length} days`);
+
+    // Register MAIDs contribution to Master MAID list (fire-and-forget)
+    if (state.queryIds?.maids) {
+      try {
+        const jobs = await getAllJobsSummary();
+        const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+        const country = job?.country || '';
+
+        if (country) {
+          const maidsQueryId = state.queryIds.maids;
+          const srcKey = `athena-results/${maidsQueryId}.csv`;
+          const ts = Date.now();
+          const dstKey = `master-maids/${country.toUpperCase()}/contributions/${datasetName}-plain-${ts}.csv`;
+
+          // S3 CopyObject — server-side, instant, no memory needed (works for 100MB+ files)
+          await s3Client.send(new CopyObjectCommand({
+            Bucket: BUCKET,
+            CopySource: `${BUCKET}/${srcKey}`,
+            Key: dstKey,
+            ContentType: 'text/csv',
+          }));
+
+          const dateRange = state.dateFrom && state.dateTo
+            ? { from: state.dateFrom, to: state.dateTo }
+            : { from: 'unknown', to: 'unknown' };
+
+          await registerContribution(country, datasetName, 'plain', '', dstKey, dateRange);
+          console.log(`[ANALYSIS] Registered ${result.summary.uniqueDevices} MAIDs to master list for ${country}`);
+        }
+      } catch (e: any) {
+        console.warn(`[ANALYSIS] Failed to register MAIDs contribution: ${e.message}`);
+      }
+    }
+
     return state;
   }
 
