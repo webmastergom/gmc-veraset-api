@@ -346,41 +346,20 @@ export async function POST(
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
 
-      // Write enriched contribution CSV directly to S3 (streaming, no in-memory array)
-      // Format: ad_id,attr_type,attr_value,dwell_minutes,postal_code
+      // Register per-bracket export CSVs as master MAID contributions
+      // (reuse the existing bracket CSVs that were already written above)
       const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
       try {
         const cc = state.country.toUpperCase();
-        const contribTs = Date.now();
-        const contribKey = `master-maids/${cc}/contributions/${datasetName}-nse-${contribTs}.csv`;
-        const csvParts: string[] = ['ad_id,attr_type,attr_value,dwell_minutes,postal_code'];
-        let rowCount = 0;
-
-        for (const b of NSE_BRACKETS) {
-          const cps = bracketCPs.get(b.label)!;
-          for (const cp of cps) {
-            const adIds = cpToAdIds.get(cp);
-            if (adIds) {
-              for (const id of adIds) {
-                csvParts.push(`${id},nse_bracket,${b.label},,${cp}`);
-                rowCount++;
-              }
-            }
+        for (const b of brackets) {
+          if (b.maidCount > 0 && b.downloadUrl) {
+            const bracketFile = `exports/${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
+            await registerContribution(cc, datasetName, 'nse_bracket', b.label, bracketFile, dr);
           }
         }
-
-        if (rowCount > 0) {
-          await s3Client.send(new PutObjectCommand({
-            Bucket: BUCKET,
-            Key: contribKey,
-            Body: csvParts.join('\n'),
-            ContentType: 'text/csv',
-          }));
-          await registerContribution(cc, datasetName, 'nse_bracket', 'nse', contribKey, dr);
-          console.log(`[NSE-POLL] Wrote ${rowCount} enriched rows to ${contribKey}`);
-        }
+        console.log(`[NSE-POLL] Registered ${brackets.filter(b => b.maidCount > 0).length} bracket contributions`);
       } catch (e: any) {
-        console.warn(`[NSE-POLL] Failed to write contribution: ${e.message}`);
+        console.warn(`[NSE-POLL] Failed to register contributions: ${e.message}`);
       }
 
       state = { ...state, phase: 'done', brackets };

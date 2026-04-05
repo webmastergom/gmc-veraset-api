@@ -261,7 +261,8 @@ export function buildConsolidationSQL(
     TBLPROPERTIES ('skip.header.line.count' = '1')
   `;
 
-  const outputPath = `s3://${BUCKET}/master-maids/${cc}/consolidated/`;
+  // Use unique path per run to avoid HIVE_PATH_ALREADY_EXISTS
+  const outputPath = `s3://${BUCKET}/master-maids/${cc}/consolidated/${consolidatedTableName}/`;
 
   const ctasSQL = `
     CREATE TABLE ${consolidatedTableName}
