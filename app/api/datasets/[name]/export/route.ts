@@ -5,7 +5,7 @@ import { runQuery, ensureTableForDataset, getTableName } from '@/lib/athena';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
-import { registerContribution } from '@/lib/master-maids';
+// Master MAID registration imported dynamically below
 import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
@@ -129,7 +129,7 @@ export async function POST(
 
     const result = await exportDevices(datasetName, mergedFilters);
 
-    // Register contribution to Master MAID list (MAIDs format only)
+    // Write enriched contribution to Master MAID list (MAIDs format only)
     if (format === 'maids' && result.success && result.deviceCount > 0) {
       try {
         const jobs = await getAllJobsSummary();
@@ -140,12 +140,16 @@ export async function POST(
           : job?.dateRange
             ? { from: (job.dateRange as any).from, to: (job.dateRange as any).to }
             : { from: 'unknown', to: 'unknown' };
-        const fileName = result.downloadUrl?.split('file=')[1] || '';
-        if (country && fileName) {
-          await registerContribution(country, datasetName, 'plain', '', decodeURIComponent(fileName), dateRange);
+        if (country) {
+          // For plain exports, just register the existing CSV (no enriched data)
+          const { registerContribution } = await import('@/lib/master-maids');
+          const fileName = result.downloadUrl?.split('file=')[1] || '';
+          if (fileName) {
+            await registerContribution(country, datasetName, 'plain', '', decodeURIComponent(fileName), dateRange);
+          }
         }
       } catch (e: any) {
-        console.warn(`[EXPORT] Failed to register contribution: ${e.message}`);
+        console.warn(`[EXPORT] Failed to write contribution: ${e.message}`);
       }
     }
 

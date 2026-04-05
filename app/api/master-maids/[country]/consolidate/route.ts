@@ -3,7 +3,7 @@ import { isAuthenticated } from '@/lib/auth';
 import { getConfig, putConfig } from '@/lib/s3-config';
 import {
   getCountryContributions,
-  buildSingleTableConsolidation,
+  buildConsolidationSQL,
   buildStatsQuery,
   buildTotalQuery,
   saveConsolidationStats,
@@ -71,18 +71,15 @@ export async function POST(
 
       const runId = `${Date.now()}`;
       const consolidatedTable = `master_${cc.toLowerCase()}_${runId}`;
-      const { createTableSQL, ctasSQL, exportsTableName } = buildSingleTableConsolidation(
-        consolidatedTable,
-        entry.contributions,
-      );
+      const { createTableSQL, ctasSQL, contribTableName } = buildConsolidationSQL(cc, consolidatedTable);
 
-      // Create the exports table first
+      // Create the contributions external table
       try {
         await runQuery(createTableSQL);
-        console.log(`[CONSOLIDATE] Created exports table: ${exportsTableName}`);
+        console.log(`[CONSOLIDATE] Created contributions table: ${contribTableName}`);
       } catch (e: any) {
         if (!e.message?.includes('already exists')) {
-          console.warn(`[CONSOLIDATE] Warning creating exports table:`, e.message);
+          console.warn(`[CONSOLIDATE] Warning creating contributions table:`, e.message);
         }
       }
 
@@ -93,7 +90,7 @@ export async function POST(
       state = {
         phase: 'running_ctas',
         ctasQueryId,
-        tempTables: [exportsTableName],
+        tempTables: [contribTableName],
         consolidatedTable,
       };
       await putConfig(STATE_KEY(cc), state, { compact: true });
@@ -175,8 +172,10 @@ export async function POST(
           attributeType: String(row.attr_type),
           attributeValue: String(row.attr_value),
           maidCount: parseInt(String(row.maid_count)) || 0,
-          oldestData: String(row.oldest_data || ''),
-          newestData: String(row.newest_data || ''),
+          oldestData: '',
+          newestData: '',
+          avgDwell: parseFloat(String(row.avg_dwell)) || 0,
+          medianDwell: parseFloat(String(row.median_dwell)) || 0,
         }));
 
         // Get total unique MAIDs

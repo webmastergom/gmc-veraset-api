@@ -10,7 +10,7 @@ import { getConfig, putConfig } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
-import { registerContribution } from '@/lib/master-maids';
+import { writeContribution, type ContributionRow } from '@/lib/master-maids';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -336,17 +336,34 @@ export async function POST(
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
 
-      // Register contributions to Master MAID list (fire-and-forget, never blocks export)
+      // Write enriched contributions to Master MAID list
+      // Each row: ad_id + nse_bracket + postal_code (from cpToAdIds)
       const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
-      for (const b of brackets) {
-        if (b.maidCount > 0 && b.downloadUrl) {
-          const contribFile = `${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
-          try {
-            await registerContribution(state.country, datasetName, 'nse_bracket', b.label, contribFile, dr);
-          } catch (e: any) {
-            console.warn(`[NSE-POLL] Failed to register contribution: ${e.message}`);
+      try {
+        const contribRows: ContributionRow[] = [];
+        for (const b of NSE_BRACKETS) {
+          const cps = bracketCPs.get(b.label)!;
+          for (const cp of cps) {
+            const adIds = cpToAdIds.get(cp);
+            if (adIds) {
+              for (const id of adIds) {
+                contribRows.push({
+                  ad_id: id,
+                  attr_type: 'nse_bracket',
+                  attr_value: b.label,
+                  dwell_minutes: null,
+                  postal_code: cp,
+                });
+              }
+            }
           }
         }
+        if (contribRows.length > 0) {
+          await writeContribution(state.country, datasetName, contribRows, dr, 'nse');
+          console.log(`[NSE-POLL] Wrote ${contribRows.length} enriched contribution rows`);
+        }
+      } catch (e: any) {
+        console.warn(`[NSE-POLL] Failed to write contribution: ${e.message}`);
       }
 
       state = { ...state, phase: 'done', brackets };

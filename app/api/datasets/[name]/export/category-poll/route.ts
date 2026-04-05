@@ -10,7 +10,7 @@ import { getConfig, putConfig } from '@/lib/s3-config';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { toIsoCountry } from '@/lib/country-inference';
-import { registerContribution } from '@/lib/master-maids';
+import { writeContribution, type ContributionRow } from '@/lib/master-maids';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -158,9 +158,10 @@ function buildCategoryMaidQuery(
       FROM poi_pings
       GROUP BY ad_id, date, poi_id, category
     )
-    SELECT DISTINCT ad_id
+    SELECT ad_id, category, MAX(dwell_minutes) as dwell_minutes
     FROM visits v
     ${dwellFilter}
+    GROUP BY ad_id, category
   `;
 }
 
@@ -373,18 +374,41 @@ export async function POST(
       const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
       const csvText = await csvObj.Body!.transformToString('utf-8');
 
-      // Parse CSV: header is "ad_id"
+      // Parse CSV: header is "ad_id","category","dwell_minutes"
       const lines = csvText.split('\n');
       const adIds: string[] = [];
+      const enrichedRows: ContributionRow[] = [];
+      const seenAdIds = new Set<string>();
+
       for (let i = 1; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
-        adIds.push(line.replace(/"/g, ''));
+        const parts = line.replace(/"/g, '').split(',');
+        const adId = parts[0];
+        const category = parts[1] || state.groupKey;
+        const dwellMin = parseFloat(parts[2]) || 0;
+
+        if (!adId) continue;
+
+        // Deduplicate ad_ids for the export CSV
+        if (!seenAdIds.has(adId)) {
+          seenAdIds.add(adId);
+          adIds.push(adId);
+        }
+
+        // Keep all rows (with dwell) for enriched contribution
+        enrichedRows.push({
+          ad_id: adId,
+          attr_type: 'category',
+          attr_value: category,
+          dwell_minutes: dwellMin,
+          postal_code: '',
+        });
       }
 
-      console.log(`[CATEGORY-POLL] ${adIds.length} unique MAIDs found`);
+      console.log(`[CATEGORY-POLL] ${adIds.length} unique MAIDs, ${enrichedRows.length} enriched rows`);
 
-      // Save CSV to S3
+      // Save standard export CSV (just ad_ids, backward compatible)
       const timestamp = Date.now();
       const fileName = `${datasetName}-category-${state.groupKey}-${timestamp}.csv`;
       const key = `exports/${fileName}`;
@@ -405,13 +429,13 @@ export async function POST(
 
       const result = { maidCount: adIds.length, downloadKey: downloadUrl || '', pois: state.pois || [] };
 
-      // Register contribution to Master MAID list
-      if (adIds.length > 0) {
+      // Write enriched contribution to Master MAID list (with dwell per MAID)
+      if (enrichedRows.length > 0) {
         const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
         try {
-          await registerContribution(state.country, datasetName, 'category', state.groupKey, fileName, dr);
+          await writeContribution(state.country, datasetName, enrichedRows, dr, state.groupKey);
         } catch (e: any) {
-          console.warn(`[CATEGORY-POLL] Failed to register contribution: ${e.message}`);
+          console.warn(`[CATEGORY-POLL] Failed to write contribution: ${e.message}`);
         }
       }
 
