@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getAllJobs, Job } from '@/lib/jobs';
+import { getAllJobsSummary, Job } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -26,9 +26,9 @@ export async function GET() {
       return NextResponse.json({ datasets: cachedDatasets });
     }
 
-    const jobs = await getAllJobs().catch((e) => {
-      console.error('[DATASETS] getAllJobs failed:', e.message);
-      return [] as Job[];
+    const jobs = await getAllJobsSummary().catch((e) => {
+      console.error('[DATASETS] getAllJobsSummary failed:', e.message);
+      return [] as Partial<Job>[];
     });
 
     // Map jobs to dataset objects — only synced jobs with data in S3
