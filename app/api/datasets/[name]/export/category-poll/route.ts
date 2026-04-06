@@ -69,7 +69,11 @@ function buildPoiListQuery(categories: string[], country: string): string {
  * that visited POIs of the given categories with minimum dwell time.
  * Adapted from laboratory-analyzer.ts buildSpatialJoinQueries but much lighter.
  */
-function buildCategoryMaidQuery(
+/**
+ * Build the spatial join SELECT (without CREATE TABLE wrapper).
+ * Used both for regular queries (small datasets) and CTAS (large datasets).
+ */
+function buildSpatialJoinSelect(
   tableName: string,
   categories: string[],
   country: string,
@@ -167,6 +171,39 @@ function buildCategoryMaidQuery(
 }
 
 /**
+ * For large datasets (>50GB), use CTAS instead of regular query.
+ * CTAS has NO 30-min timeout limit — can run for hours if needed.
+ * Results go to S3 as Parquet (much smaller than CSV).
+ */
+function buildCategoryMaidQuery(
+  tableName: string,
+  categories: string[],
+  country: string,
+  minDwell: number,
+): string {
+  return buildSpatialJoinSelect(tableName, categories, country, minDwell);
+}
+
+function buildCategoryMaidCTAS(
+  tableName: string,
+  categories: string[],
+  country: string,
+  minDwell: number,
+  ctasTableName: string,
+): string {
+  const selectSql = buildSpatialJoinSelect(tableName, categories, country, minDwell);
+  return `
+    CREATE TABLE ${ctasTableName}
+    WITH (
+      format = 'PARQUET',
+      parquet_compression = 'SNAPPY',
+      external_location = 's3://${BUCKET}/athena-temp/${ctasTableName}/'
+    )
+    AS ${selectSql}
+  `;
+}
+
+/**
  * POST /api/datasets/[name]/export/category-poll
  *
  * Multi-phase polling endpoint for category-based MAID extraction.
@@ -227,12 +264,51 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      const sql = buildCategoryMaidQuery(table, categories, country, minDwell);
+      // Check dataset size to decide between regular query vs CTAS
+      // CTAS has NO 30-min timeout — essential for datasets >50GB
+      let useCTAS = false;
+      try {
+        const jobs = await getAllJobsSummary();
+        const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+        const totalBytes = (job as any)?.totalBytes || 0;
+        useCTAS = totalBytes > 50_000_000_000; // >50GB → use CTAS
+        if (useCTAS) console.log(`[CATEGORY-POLL] Large dataset (${(totalBytes/1e9).toFixed(0)}GB) — using CTAS`);
+      } catch {}
+
+      let queryId: string;
       const poiSql = buildPoiListQuery(categories, country);
-      const [queryId, poiQueryId] = await Promise.all([
-        startQueryAsync(sql),
-        startQueryAsync(poiSql),
-      ]);
+
+      if (useCTAS) {
+        const ctasTable = `cat_${datasetName.replace(/-/g, '_')}_${Date.now()}`;
+        const ctasSql = buildCategoryMaidCTAS(table, categories, country, minDwell, ctasTable);
+        const [ctasId, poiQueryId] = await Promise.all([
+          startQueryAsync(ctasSql),
+          startQueryAsync(poiSql),
+        ]);
+        queryId = ctasId;
+        console.log(`[CATEGORY-POLL] CTAS query started: ${queryId}, pois=${poiQueryId}`);
+        // Resolve dateRange
+        let dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
+        if (dateRange.from === 'unknown') {
+          try {
+            const jobs2 = await getAllJobsSummary();
+            const job2 = jobs2.find(j => j.s3DestPath?.includes(datasetName));
+            if (job2?.actualDateRange) dateRange = { from: job2.actualDateRange.from, to: job2.actualDateRange.to };
+            else if (job2?.dateRange) dateRange = { from: (job2.dateRange as any).from, to: (job2.dateRange as any).to };
+          } catch {}
+        }
+        state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell, dateRange };
+        await putConfig(STATE_KEY(datasetName), state, { compact: true });
+        return NextResponse.json({
+          phase: 'polling',
+          progress: { step: 'query_started', percent: 10, message: 'Running spatial join (CTAS, no timeout limit)...' },
+        });
+      }
+
+      const sql = buildCategoryMaidQuery(table, categories, country, minDwell);
+      const poiQueryId2 = await startQueryAsync(poiSql);
+      queryId = await startQueryAsync(sql);
+      const poiQueryId = poiQueryId2;
       console.log(`[CATEGORY-POLL] Athena queries started: maid=${queryId}, pois=${poiQueryId}`);
 
       // Resolve dateRange from job metadata (backend-side)
