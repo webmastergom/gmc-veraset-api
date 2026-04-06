@@ -227,7 +227,16 @@ export async function POST(
       // Stream CSV line-by-line from S3 (handles 10M+ rows without OOM)
       const csvKey = `athena-results/${state.queryId}.csv`;
       console.log(`[NSE-POLL] Streaming results from S3: ${csvKey}`);
-      const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
+      let csvObj;
+      try {
+        csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
+      } catch (err: any) {
+        // Query result expired or not found — auto-reset so user can retry
+        console.error(`[NSE-POLL] CSV not found (query expired?): ${csvKey}`);
+        state = { ...state, phase: 'error', error: 'Query results expired. Please retry.' };
+        await putConfig(STATE_KEY(datasetName), state, { compact: true });
+        return NextResponse.json({ phase: 'error', error: state.error });
+      }
 
       // Pre-aggregate: group ad_ids by unique (lat,lng) coord — streaming
       const coordToAdIds = new Map<string, string[]>();
