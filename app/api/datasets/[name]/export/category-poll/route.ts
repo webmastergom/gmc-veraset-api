@@ -83,6 +83,9 @@ function buildSpatialJoinSelect(
   const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
   const dwellFilter = minDwell > 0 ? `WHERE v.dwell_minutes >= ${minDwell}` : '';
 
+  // Optimized for TB-scale datasets: NO window functions (ROW_NUMBER kills memory)
+  // Instead of "closest POI per ping", we match all pings within radius and
+  // aggregate directly. This uses orders of magnitude less memory.
   return `
     WITH
     poi_base AS (
@@ -132,36 +135,23 @@ function buildSpatialJoinSelect(
         k.ad_id,
         k.date,
         k.utc_timestamp,
-        p.poi_id,
-        p.category,
-        111320 * SQRT(
-          POW(k.lat - p.poi_lat, 2) +
-          POW((k.lng - p.poi_lng) * COS(RADIANS((k.lat + p.poi_lat) / 2)), 2)
-        ) as distance_m
+        p.category
       FROM pings k
       INNER JOIN poi_buckets p
         ON k.lat_bucket = p.lat_bucket
         AND k.lng_bucket = p.lng_bucket
-    ),
-    closest AS (
-      SELECT
-        ad_id, date, utc_timestamp, poi_id, category, distance_m,
-        ROW_NUMBER() OVER (PARTITION BY ad_id, utc_timestamp ORDER BY distance_m) as rn
-      FROM matched
-      WHERE distance_m <= ${SPATIAL_RADIUS}
-    ),
-    poi_pings AS (
-      SELECT ad_id, date, utc_timestamp, poi_id, category
-      FROM closest WHERE rn = 1
+      WHERE 111320 * SQRT(
+          POW(k.lat - p.poi_lat, 2) +
+          POW((k.lng - p.poi_lng) * COS(RADIANS((k.lat + p.poi_lat) / 2)), 2)
+        ) <= ${SPATIAL_RADIUS}
     ),
     visits AS (
       SELECT
         ad_id,
-        poi_id,
         category,
         ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes
-      FROM poi_pings
-      GROUP BY ad_id, date, poi_id, category
+      FROM matched
+      GROUP BY ad_id, date, category
     )
     SELECT ad_id, category, MAX(dwell_minutes) as dwell_minutes
     FROM visits v
