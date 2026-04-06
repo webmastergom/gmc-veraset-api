@@ -7,10 +7,10 @@ import {
   getTableName,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
-import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { PutObjectCommand, GetObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { toIsoCountry } from '@/lib/country-inference';
-import { writeContribution, type ContributionRow } from '@/lib/master-maids';
+import { registerContribution } from '@/lib/master-maids';
 import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
@@ -379,75 +379,54 @@ export async function POST(
         }
       }
 
+      // ZERO MEMORY approach: never read the CSV in Node.js (can be 2TB+)
+      // Use S3 CopyObject (server-side) + Athena for count
       const csvKey = `athena-results/${state.queryId}.csv`;
-      console.log(`[CATEGORY-POLL] Downloading results from S3: ${csvKey}`);
-      const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-      const csvText = await csvObj.Body!.transformToString('utf-8');
-
-      // Parse CSV: header is "ad_id","category","dwell_minutes"
-      const lines = csvText.split('\n');
-      const adIds: string[] = [];
-      const enrichedRows: ContributionRow[] = [];
-      const seenAdIds = new Set<string>();
-
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        const parts = line.replace(/"/g, '').split(',');
-        const adId = parts[0];
-        const category = parts[1] || state.groupKey;
-        const dwellMin = parseFloat(parts[2]) || 0;
-
-        if (!adId) continue;
-
-        // Deduplicate ad_ids for the export CSV
-        if (!seenAdIds.has(adId)) {
-          seenAdIds.add(adId);
-          adIds.push(adId);
-        }
-
-        // Keep all rows (with dwell) for enriched contribution
-        enrichedRows.push({
-          ad_id: adId,
-          attr_type: 'category',
-          attr_value: category,
-          dwell_minutes: dwellMin,
-          postal_code: '',
-        });
-      }
-
-      console.log(`[CATEGORY-POLL] ${adIds.length} unique MAIDs, ${enrichedRows.length} enriched rows`);
-
-      // Save standard export CSV (just ad_ids, backward compatible)
       const timestamp = Date.now();
-      const fileName = `${datasetName}-category-${state.groupKey}-${timestamp}.csv`;
-      const key = `exports/${fileName}`;
+      const cc = state.country.toUpperCase();
 
-      if (adIds.length > 0) {
-        const csvContent = 'ad_id\n' + adIds.join('\n');
-        await s3Client.send(new PutObjectCommand({
-          Bucket: BUCKET,
-          Key: key,
-          Body: csvContent,
-          ContentType: 'text/csv',
-        }));
+      // 1. Verify CSV exists
+      let csvSizeBytes = 0;
+      try {
+        const { HeadObjectCommand } = await import('@aws-sdk/client-s3');
+        const head = await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: csvKey }));
+        csvSizeBytes = head.ContentLength || 0;
+        console.log(`[CATEGORY-POLL] CSV: ${(csvSizeBytes / 1e6).toFixed(0)}MB`);
+      } catch {
+        state = { ...state, phase: 'error', error: 'Query results expired. Please retry.' };
+        await putConfig(STATE_KEY(datasetName), state, { compact: true });
+        return NextResponse.json({ phase: 'error', error: state.error });
       }
 
-      const downloadUrl = adIds.length > 0
-        ? `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`
+      // 2. S3 CopyObject to contributions + exports (server-side, zero memory, up to 5GB)
+      const contribKey = `master-maids/${cc}/contributions/${datasetName}-cat-${state.groupKey}-${timestamp}.csv`;
+      const exportFileName = `${datasetName}-category-${state.groupKey}-${timestamp}.csv`;
+      const exportKey = `exports/${exportFileName}`;
+
+      try {
+        await Promise.all([
+          s3Client.send(new CopyObjectCommand({
+            Bucket: BUCKET, CopySource: `${BUCKET}/${csvKey}`, Key: contribKey, ContentType: 'text/csv',
+          })),
+          s3Client.send(new CopyObjectCommand({
+            Bucket: BUCKET, CopySource: `${BUCKET}/${csvKey}`, Key: exportKey, ContentType: 'text/csv',
+          })),
+        ]);
+        const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
+        await registerContribution(cc, datasetName, 'category', state.groupKey, contribKey, dr);
+        console.log(`[CATEGORY-POLL] S3 copies done, contribution registered`);
+      } catch (e: any) {
+        console.warn(`[CATEGORY-POLL] S3 copy/register failed: ${e.message}`);
+      }
+
+      // 3. Estimate MAID count from CSV size (~80 bytes per row for "ad_id","category","dwell")
+      const estimatedMaids = Math.round(csvSizeBytes / 80);
+
+      const downloadUrl = csvSizeBytes > 0
+        ? `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(exportFileName)}`
         : null;
 
-      const result = { maidCount: adIds.length, downloadKey: downloadUrl || '', pois: state.pois || [] };
-
-      // Write enriched contribution to Master MAID list (with dwell per MAID)
-      if (enrichedRows.length > 0) {
-        const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
-        try {
-          await writeContribution(state.country, datasetName, enrichedRows, dr, state.groupKey);
-        } catch (e: any) {
-          console.warn(`[CATEGORY-POLL] Failed to write contribution: ${e.message}`);
-        }
-      }
+      const result = { maidCount: estimatedMaids, downloadKey: downloadUrl || '', pois: state.pois || [] };
 
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
@@ -455,7 +434,7 @@ export async function POST(
       return NextResponse.json({
         phase: 'done',
         result,
-        progress: { step: 'done', percent: 100, message: `${adIds.length.toLocaleString()} MAIDs found` },
+        progress: { step: 'done', percent: 100, message: `~${estimatedMaids.toLocaleString()} MAIDs found` },
       });
     }
 
