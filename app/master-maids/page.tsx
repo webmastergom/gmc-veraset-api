@@ -28,14 +28,18 @@ import {
 
 const COUNTRY_FLAGS: Record<string, string> = {
   ES: '🇪🇸', MX: '🇲🇽', FR: '🇫🇷', PA: '🇵🇦', CR: '🇨🇷',
-  GB: '🇬🇧', IT: '🇮🇹', NL: '🇳🇱', DE: '🇩🇪', US: '🇺🇸',
+  GB: '🇬🇧', UK: '🇬🇧', IT: '🇮🇹', NL: '🇳🇱', DE: '🇩🇪', US: '🇺🇸',
   CO: '🇨🇴', AR: '🇦🇷', CL: '🇨🇱', BR: '🇧🇷', PE: '🇵🇪',
+  PT: '🇵🇹', BE: '🇧🇪', CH: '🇨🇭', AT: '🇦🇹', IE: '🇮🇪',
+  DO: '🇩🇴', GT: '🇬🇹', HN: '🇭🇳', SV: '🇸🇻', EC: '🇪🇨',
 }
 
 const COUNTRY_NAMES: Record<string, string> = {
   ES: 'Spain', MX: 'Mexico', FR: 'France', PA: 'Panama', CR: 'Costa Rica',
-  GB: 'United Kingdom', IT: 'Italy', NL: 'Netherlands', DE: 'Germany', US: 'United States',
+  GB: 'United Kingdom', UK: 'United Kingdom', IT: 'Italy', NL: 'Netherlands', DE: 'Germany', US: 'United States',
   CO: 'Colombia', AR: 'Argentina', CL: 'Chile', BR: 'Brazil', PE: 'Peru',
+  PT: 'Portugal', BE: 'Belgium', CH: 'Switzerland', AT: 'Austria', IE: 'Ireland',
+  DO: 'Dominican Republic', GT: 'Guatemala', HN: 'Honduras', SV: 'El Salvador', EC: 'Ecuador',
 }
 
 const ATTR_COLORS: Record<string, string> = {
