@@ -7,10 +7,10 @@ import {
   getTableName,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
-import { PutObjectCommand, GetObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { toIsoCountry } from '@/lib/country-inference';
-import { registerContribution } from '@/lib/master-maids';
+import { registerAthenaContribution, masterTableName } from '@/lib/master-maids';
 import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
@@ -33,6 +33,7 @@ interface PoiInfo {
 interface CategoryExportState {
   phase: 'querying' | 'polling' | 'processing' | 'done' | 'error';
   queryId?: string;
+  ctasTable?: string;          // v2: Athena CTAS table name
   poiQueryId?: string;
   poiQueryDone?: boolean;
   country: string;
@@ -254,52 +255,17 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      // Check dataset size to decide between regular query vs CTAS
-      // CTAS has NO 30-min timeout — essential for datasets >50GB
-      let useCTAS = false;
-      try {
-        const jobs = await getAllJobsSummary();
-        const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
-        const totalBytes = (job as any)?.totalBytes || 0;
-        useCTAS = totalBytes > 50_000_000_000; // >50GB → use CTAS
-        if (useCTAS) console.log(`[CATEGORY-POLL] Large dataset (${(totalBytes/1e9).toFixed(0)}GB) — using CTAS`);
-      } catch {}
-
-      let queryId: string;
+      // ALWAYS use CTAS — no timeout limits, Parquet output, works for any size
+      const cc = country.toUpperCase();
+      const ctasTable = masterTableName(cc, 'cat_' + (groupKey || 'custom'), datasetName);
+      const ctasSql = buildCategoryMaidCTAS(table, categories, country, minDwell, ctasTable);
       const poiSql = buildPoiListQuery(categories, country);
 
-      if (useCTAS) {
-        const ctasTable = `cat_${datasetName.replace(/-/g, '_')}_${Date.now()}`;
-        const ctasSql = buildCategoryMaidCTAS(table, categories, country, minDwell, ctasTable);
-        const [ctasId, poiQueryId] = await Promise.all([
-          startQueryAsync(ctasSql),
-          startQueryAsync(poiSql),
-        ]);
-        queryId = ctasId;
-        console.log(`[CATEGORY-POLL] CTAS query started: ${queryId}, pois=${poiQueryId}`);
-        // Resolve dateRange
-        let dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
-        if (dateRange.from === 'unknown') {
-          try {
-            const jobs2 = await getAllJobsSummary();
-            const job2 = jobs2.find(j => j.s3DestPath?.includes(datasetName));
-            if (job2?.actualDateRange) dateRange = { from: job2.actualDateRange.from, to: job2.actualDateRange.to };
-            else if (job2?.dateRange) dateRange = { from: (job2.dateRange as any).from, to: (job2.dateRange as any).to };
-          } catch {}
-        }
-        state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell, dateRange };
-        await putConfig(STATE_KEY(datasetName), state, { compact: true });
-        return NextResponse.json({
-          phase: 'polling',
-          progress: { step: 'query_started', percent: 10, message: 'Running spatial join (CTAS, no timeout limit)...' },
-        });
-      }
-
-      const sql = buildCategoryMaidQuery(table, categories, country, minDwell);
-      const poiQueryId2 = await startQueryAsync(poiSql);
-      queryId = await startQueryAsync(sql);
-      const poiQueryId = poiQueryId2;
-      console.log(`[CATEGORY-POLL] Athena queries started: maid=${queryId}, pois=${poiQueryId}`);
+      const [queryId, poiQueryId] = await Promise.all([
+        startQueryAsync(ctasSql),
+        startQueryAsync(poiSql),
+      ]);
+      console.log(`[CATEGORY-POLL] CTAS started: ${queryId}, pois=${poiQueryId}, table=${ctasTable}`);
 
       // Resolve dateRange from job metadata (backend-side)
       let dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
@@ -311,7 +277,7 @@ export async function POST(
           else if (job?.dateRange) dateRange = { from: (job.dateRange as any).from, to: (job.dateRange as any).to };
         } catch {}
       }
-      state = { phase: 'polling', queryId, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell, dateRange };
+      state = { phase: 'polling', queryId, ctasTable, poiQueryId, poiQueryDone: false, country, categories, groupKey, minDwell, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
@@ -445,54 +411,37 @@ export async function POST(
         }
       }
 
-      // ZERO MEMORY approach: never read the CSV in Node.js (can be 2TB+)
-      // Use S3 CopyObject (server-side) + Athena for count
-      const csvKey = `athena-results/${state.queryId}.csv`;
-      const timestamp = Date.now();
+      // v2: CTAS already materialized results as Parquet — get exact count from Athena
       const cc = state.country.toUpperCase();
+      const ctasTable = state.ctasTable || '';
+      let maidCount = 0;
 
-      // 1. Verify CSV exists
-      let csvSizeBytes = 0;
-      try {
-        const { HeadObjectCommand } = await import('@aws-sdk/client-s3');
-        const head = await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-        csvSizeBytes = head.ContentLength || 0;
-        console.log(`[CATEGORY-POLL] CSV: ${(csvSizeBytes / 1e6).toFixed(0)}MB`);
-      } catch {
-        state = { ...state, phase: 'error', error: 'Query results expired. Please retry.' };
-        await putConfig(STATE_KEY(datasetName), state, { compact: true });
-        return NextResponse.json({ phase: 'error', error: state.error });
-      }
+      if (ctasTable) {
+        // Get exact MAID count from the CTAS table (fast query on Parquet)
+        try {
+          const { runQuery: runAthenaQuery } = await import('@/lib/athena');
+          const countResult = await runAthenaQuery(`SELECT COUNT(DISTINCT ad_id) as cnt FROM ${ctasTable}`);
+          maidCount = parseInt(String(countResult.rows[0]?.cnt)) || 0;
+          console.log(`[CATEGORY-POLL] Exact count from CTAS: ${maidCount.toLocaleString()} MAIDs`);
+        } catch (e: any) {
+          console.warn(`[CATEGORY-POLL] Count query failed: ${e.message}`);
+        }
 
-      // 2. S3 CopyObject to contributions + exports (server-side, zero memory, up to 5GB)
-      const contribKey = `master-maids/${cc}/contributions/${datasetName}-cat-${state.groupKey}-${timestamp}.csv`;
-      const exportFileName = `${datasetName}-category-${state.groupKey}-${timestamp}.csv`;
-      const exportKey = `exports/${exportFileName}`;
-
-      try {
-        await Promise.all([
-          s3Client.send(new CopyObjectCommand({
-            Bucket: BUCKET, CopySource: `${BUCKET}/${csvKey}`, Key: contribKey, ContentType: 'text/csv',
-          })),
-          s3Client.send(new CopyObjectCommand({
-            Bucket: BUCKET, CopySource: `${BUCKET}/${csvKey}`, Key: exportKey, ContentType: 'text/csv',
-          })),
-        ]);
+        // Register the CTAS table as a contribution (zero copy, instant)
         const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
-        await registerContribution(cc, datasetName, 'category', state.groupKey, contribKey, dr);
-        console.log(`[CATEGORY-POLL] S3 copies done, contribution registered`);
-      } catch (e: any) {
-        console.warn(`[CATEGORY-POLL] S3 copy/register failed: ${e.message}`);
+        try {
+          await registerAthenaContribution(
+            cc, datasetName, 'category', state.groupKey,
+            ctasTable, `athena-temp/${ctasTable}/`,
+            maidCount, dr,
+          );
+          console.log(`[CATEGORY-POLL] Registered CTAS contribution: ${ctasTable}`);
+        } catch (e: any) {
+          console.warn(`[CATEGORY-POLL] Failed to register: ${e.message}`);
+        }
       }
 
-      // 3. Estimate MAID count from CSV size (~80 bytes per row for "ad_id","category","dwell")
-      const estimatedMaids = Math.round(csvSizeBytes / 80);
-
-      const downloadUrl = csvSizeBytes > 0
-        ? `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(exportFileName)}`
-        : null;
-
-      const result = { maidCount: estimatedMaids, downloadKey: downloadUrl || '', pois: state.pois || [] };
+      const result = { maidCount, downloadKey: '', pois: state.pois || [] };
 
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
@@ -500,7 +449,7 @@ export async function POST(
       return NextResponse.json({
         phase: 'done',
         result,
-        progress: { step: 'done', percent: 100, message: `~${estimatedMaids.toLocaleString()} MAIDs found` },
+        progress: { step: 'done', percent: 100, message: `${maidCount.toLocaleString()} MAIDs found` },
       });
     }
 
