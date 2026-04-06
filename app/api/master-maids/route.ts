@@ -23,7 +23,11 @@ export async function GET(request: Request) {
       country: code,
       contributionCount: entry.contributions.length,
       lastConsolidatedAt: entry.lastConsolidatedAt,
-      totalMaids: entry.stats?.totalMaids ?? null,
+      totalMaids: entry.stats?.totalMaids
+        // Fallback: sum maidCount from v2 contributions (instant, no consolidation)
+        ?? (entry.contributions.some(c => c.maidCount > 0)
+          ? entry.contributions.reduce((sum, c) => sum + (c.maidCount || 0), 0)
+          : null),
       attributeCount: entry.stats?.byAttribute?.length ?? 0,
       datasetCount: entry.stats?.byDataset ? Object.keys(entry.stats.byDataset).length : new Set(entry.contributions.map(c => c.sourceDataset)).size,
       // Date range from contributions
