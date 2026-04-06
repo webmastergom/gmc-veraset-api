@@ -16,7 +16,7 @@ import { createInterface } from 'readline';
 import { Readable } from 'stream';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const STATE_KEY = (ds: string) => `nse-export-state/${ds}`;
 const NSE_KEY = (cc: string) => `nse/${cc.toUpperCase()}`;

@@ -14,7 +14,7 @@ import { writeContribution, type ContributionRow } from '@/lib/master-maids';
 import { getAllJobsSummary } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const STATE_KEY = (ds: string) => `category-export-state/${ds}`;
 

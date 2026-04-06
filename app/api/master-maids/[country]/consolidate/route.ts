@@ -18,7 +18,7 @@ import {
 } from '@/lib/athena';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const STATE_KEY = (cc: string) => `master-maids-consolidation/${cc}`;
 
