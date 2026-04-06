@@ -159,6 +159,7 @@ export async function registerContribution(
   attributeValue: string,
   s3FileName: string,
   dateRange: { from: string; to: string },
+  maidCount?: number,
 ): Promise<void> {
   if (!country) return;
 
@@ -170,22 +171,31 @@ export async function registerContribution(
     index[cc] = { lastConsolidatedAt: null, stats: null, contributions: [] };
   }
 
+  const s3Key = s3FileName.startsWith('exports/') || s3FileName.startsWith('master-maids/') || s3FileName.startsWith('athena')
+    ? s3FileName : `exports/${s3FileName}`;
+
+  // Prevent duplicate registration of same file
+  if (index[cc].contributions.some(c => c.s3Key === s3Key)) {
+    console.log(`[MASTER-MAIDS] CSV ${s3Key} already registered for ${cc}`);
+    return;
+  }
+
   const contribution: Contribution = {
     id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     athenaTable: '',
     s3Prefix: '',
-    s3Key: s3FileName.startsWith('exports/') || s3FileName.startsWith('master-maids/') || s3FileName.startsWith('athena')
-      ? s3FileName : `exports/${s3FileName}`,
+    s3Key,
     attributeType: attributeType === 'nse_bracket' ? 'nse' : attributeType as AttributeType,
     attributeValue,
     sourceDataset,
     dateRange,
-    maidCount: 0,
+    maidCount: maidCount || 0,
     registeredAt: new Date().toISOString(),
   };
 
   index[cc].contributions.push(contribution);
   await putConfig(INDEX_KEY, index, { compact: true });
+  console.log(`[MASTER-MAIDS] Registered legacy ${attributeType}:${attributeValue} for ${cc} — ${s3Key} (${(maidCount || 0).toLocaleString()} MAIDs)`);
 }
 
 // ── Read ────────────────────────────────────────────────────────────────

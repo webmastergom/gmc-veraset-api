@@ -445,23 +445,37 @@ export async function POST(
         const timestamp = Date.now();
         const updatedBrackets = [...(state.brackets || [])];
         const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
+        const cc = state.country.toUpperCase();
 
         for (let i = 0; i < NSE_BRACKETS.length; i++) {
           const b = NSE_BRACKETS[i];
           const maids = bracketMaids[`${b.min}-${b.max}`];
           if (maids.length > 0) {
-            const csvContent = 'ad_id\n' + maids.join('\n');
+            // 1. Export CSV (ad_id only) for download
+            const downloadCsv = 'ad_id\n' + maids.join('\n');
             const fileName = `${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
-            const key = `exports/${fileName}`;
-            await s3Client.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: csvContent, ContentType: 'text/csv' }));
+            const exportKey = `exports/${fileName}`;
+
+            // 2. Consolidation CSV (5-column schema) for Master MAIDs UNION ALL
+            const contribLines = maids.map(adId => `${adId},nse,${b.label},,`);
+            const contribCsv = 'ad_id,attr_type,attr_value,dwell_minutes,postal_code\n' + contribLines.join('\n');
+            const contribFileName = `${datasetName}-nse-${b.min}-${b.max}-${timestamp}.csv`;
+            const contribKey = `master-maids/${cc}/contributions/${contribFileName}`;
+
+            // Save both in parallel
+            await Promise.all([
+              s3Client.send(new PutObjectCommand({ Bucket: BUCKET, Key: exportKey, Body: downloadCsv, ContentType: 'text/csv' })),
+              s3Client.send(new PutObjectCommand({ Bucket: BUCKET, Key: contribKey, Body: contribCsv, ContentType: 'text/csv' })),
+            ]);
+
             const downloadUrl = `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`;
             const idx = updatedBrackets.findIndex(x => x.label === b.label);
             if (idx >= 0) {
               updatedBrackets[idx] = { ...updatedBrackets[idx], maidCount: maids.length, downloadUrl };
             }
-            // Register contribution
+            // Register contribution with actual MAID count and correct path
             try {
-              await registerContribution(state.country.toUpperCase(), datasetName, 'nse_bracket', b.label, `exports/${fileName}`, dr);
+              await registerContribution(cc, datasetName, 'nse_bracket', b.label, contribKey, dr, maids.length);
             } catch {}
           }
         }

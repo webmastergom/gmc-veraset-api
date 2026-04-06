@@ -417,25 +417,33 @@ export async function POST(
       let maidCount = 0;
 
       if (ctasTable) {
-        // Get exact MAID count from the CTAS table (fast query on Parquet)
+        // Get exact MAID count + actual categories from the CTAS table
+        let actualCategories: string[] = [];
         try {
           const { runQuery: runAthenaQuery } = await import('@/lib/athena');
-          const countResult = await runAthenaQuery(`SELECT COUNT(DISTINCT ad_id) as cnt FROM ${ctasTable}`);
+          const countResult = await runAthenaQuery(
+            `SELECT COUNT(DISTINCT ad_id) as cnt, ARRAY_JOIN(ARRAY_AGG(DISTINCT category), ',') as cats FROM ${ctasTable}`
+          );
           maidCount = parseInt(String(countResult.rows[0]?.cnt)) || 0;
-          console.log(`[CATEGORY-POLL] Exact count from CTAS: ${maidCount.toLocaleString()} MAIDs`);
+          const catsStr = String(countResult.rows[0]?.cats || '');
+          if (catsStr) actualCategories = catsStr.split(',').filter(Boolean);
+          console.log(`[CATEGORY-POLL] Exact count from CTAS: ${maidCount.toLocaleString()} MAIDs, categories: ${actualCategories.join(', ')}`);
         } catch (e: any) {
           console.warn(`[CATEGORY-POLL] Count query failed: ${e.message}`);
         }
 
-        // Register the CTAS table as a contribution (zero copy, instant)
+        // Register with actual category names from the data (not the parent group key)
+        const attrValue = actualCategories.length > 0
+          ? actualCategories.join(',')
+          : state.groupKey;
         const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
         try {
           await registerAthenaContribution(
-            cc, datasetName, 'category', state.groupKey,
+            cc, datasetName, 'category', attrValue,
             ctasTable, `athena-temp/${ctasTable}/`,
             maidCount, dr,
           );
-          console.log(`[CATEGORY-POLL] Registered CTAS contribution: ${ctasTable}`);
+          console.log(`[CATEGORY-POLL] Registered CTAS contribution: ${ctasTable} (${attrValue})`);
         } catch (e: any) {
           console.warn(`[CATEGORY-POLL] Failed to register: ${e.message}`);
         }

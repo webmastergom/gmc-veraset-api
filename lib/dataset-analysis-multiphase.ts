@@ -35,6 +35,8 @@ export interface AnalysisState {
     catchmentQueryId: string;
     catchmentTable: string;
     registered: boolean;
+    plainRegistered?: boolean;
+    catchmentRegistered?: boolean;
   };
   /** Resolved date range */
   dateFrom?: string;
@@ -462,7 +464,8 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
     await saveState(state);
     console.log(`[ANALYSIS] ${datasetName}: completed — ${result.summary.uniqueDevices} devices, ${dailyData.length} days`);
 
-    // Register CTAS contributions to Master MAID list (fire-and-forget)
+    // Register CTAS contributions to Master MAID list
+    // Retries on subsequent polls until both CTAS queries reach terminal state
     if (state.maidsCtas && !state.maidsCtas.registered) {
       try {
         const jobs = await getAllJobsSummary();
@@ -473,15 +476,16 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
           : { from: 'unknown', to: 'unknown' };
 
         if (country) {
-          // Check if CTAS queries completed
           const [plainStatus, catchmentStatus] = await Promise.all([
             checkQueryStatus(state.maidsCtas.plainQueryId).catch(() => ({ state: 'UNKNOWN' as const })),
             checkQueryStatus(state.maidsCtas.catchmentQueryId).catch(() => ({ state: 'UNKNOWN' as const })),
           ]);
 
-          if (plainStatus.state === 'SUCCEEDED') {
-            // Get MAID count via quick query on the CTAS table
-            let maidCount = result.summary.uniqueDevices; // use analysis count as fallback
+          const plainDone = plainStatus.state === 'SUCCEEDED' || plainStatus.state === 'FAILED';
+          const catchmentDone = catchmentStatus.state === 'SUCCEEDED' || catchmentStatus.state === 'FAILED';
+
+          if (plainStatus.state === 'SUCCEEDED' && !state.maidsCtas.plainRegistered) {
+            let maidCount = result.summary.uniqueDevices;
             try {
               const countResult = await runQuery(`SELECT COUNT(*) as cnt FROM ${state.maidsCtas.plainTable}`);
               maidCount = parseInt(String(countResult.rows[0]?.cnt)) || maidCount;
@@ -493,10 +497,11 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
               `athena-temp/${state.maidsCtas.plainTable}/`,
               maidCount, dateRange,
             );
+            state.maidsCtas.plainRegistered = true;
             console.log(`[ANALYSIS] Registered plain CTAS: ${maidCount.toLocaleString()} MAIDs for ${country}`);
           }
 
-          if (catchmentStatus.state === 'SUCCEEDED') {
+          if (catchmentStatus.state === 'SUCCEEDED' && !state.maidsCtas.catchmentRegistered) {
             let catchmentCount = 0;
             try {
               const countResult = await runQuery(`SELECT COUNT(*) as cnt FROM ${state.maidsCtas.catchmentTable}`);
@@ -509,10 +514,14 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
               `athena-temp/${state.maidsCtas.catchmentTable}/`,
               catchmentCount, dateRange,
             );
+            state.maidsCtas.catchmentRegistered = true;
             console.log(`[ANALYSIS] Registered catchment CTAS: ${catchmentCount.toLocaleString()} origins for ${country}`);
           }
 
-          state.maidsCtas.registered = true;
+          // Only mark fully registered when both queries reached terminal state
+          if (plainDone && catchmentDone) {
+            state.maidsCtas.registered = true;
+          }
           await saveState(state);
         }
       } catch (e: any) {
