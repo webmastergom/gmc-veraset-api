@@ -1,25 +1,20 @@
 /**
- * Master MAID List per Country
+ * Master MAID List per Country — v2 (Athena-Native)
  *
- * Enriched contribution model: each export writes a multi-column CSV to
- * master-maids/{CC}/contributions/ with the format:
- *   ad_id,attr_type,attr_value,dwell_minutes,postal_code
- *
- * Node.js writes these CSVs + registers metadata in the index.
- * Athena handles consolidation (dedup, stats) by pointing at the contributions prefix.
+ * Architecture: Node.js NEVER touches MAID data.
+ * Each contribution is an Athena table (Parquet via CTAS).
+ * Consolidation uses UNION ALL of registered tables.
  *
  * Flow:
- * 1. Each MAID export writes an enriched CSV + calls registerContribution()
- * 2. registerContribution() appends metadata to config/master-maids-index.json
- * 3. User triggers "Consolidate" → Athena queries contribution CSVs directly
- * 4. Stats saved back to the index JSON
+ * 1. Each export runs a CTAS query → creates a Parquet-backed Athena table
+ * 2. registerAthenaContribution() records table name + metadata in the index
+ * 3. Consolidation builds UNION ALL of all registered tables → deduped stats
  */
 
 import { getConfig, putConfig, invalidateCache } from './s3-config';
-import { PutObjectCommand } from '@aws-sdk/client-s3';
-import { s3Client, BUCKET } from './s3-config';
 
 const INDEX_KEY = 'master-maids-index';
+const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 
 /** Normalize country codes (UK → GB, etc.) */
 function normalizeCC(cc: string): string {
@@ -30,26 +25,30 @@ function normalizeCC(cc: string): string {
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export type AttributeType = 'plain' | 'nse_bracket' | 'category' | 'catchment';
+export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment';
 
-/** A single row in a contribution CSV */
-export interface ContributionRow {
-  ad_id: string;
-  attr_type: AttributeType;
-  attr_value: string;
-  dwell_minutes: number | null;     // Only for category contributions
-  postal_code: string;              // Catchment postal code (if available)
-}
-
+/**
+ * Each contribution is an Athena table backed by Parquet.
+ * The table has a known schema based on attributeType:
+ *   plain:     (ad_id STRING)
+ *   category:  (ad_id STRING, category STRING, dwell_minutes DOUBLE)
+ *   nse:       (ad_id STRING, nse_bracket STRING, postal_code STRING)
+ *   catchment: (ad_id STRING, origin_lat DOUBLE, origin_lng DOUBLE)
+ */
 export interface Contribution {
   id: string;
-  s3Key: string;                    // e.g. "master-maids/ES/contributions/job-xxx-nse-123.csv"
+  athenaTable: string;          // Athena table name (e.g. "master_es_plain_job6b0f_123")
+  s3Prefix: string;             // Where the Parquet lives (e.g. "athena-temp/master_es_plain_...")
   attributeType: AttributeType;
-  attributeValue: string;           // e.g. "0-19", "university", "" (summary label)
+  attributeValue: string;       // Summary label: "", "sports", "nse", etc.
   sourceDataset: string;
   dateRange: { from: string; to: string };
-  rowCount: number;
+  maidCount: number;            // Known at creation time from CTAS stats
   registeredAt: string;
+
+  // Legacy fields (for backward compat with old CSV contributions)
+  s3Key?: string;               // Old CSV path
+  rowCount?: number;
 }
 
 export interface AttributeStat {
@@ -85,7 +84,6 @@ export interface ConsolidationState {
   error?: string;
 }
 
-// Dwell time buckets for UI display
 export const DWELL_BUCKETS = [
   { label: '2-10 min', min: 2, max: 10 },
   { label: '10-30 min', min: 10, max: 30 },
@@ -94,54 +92,31 @@ export const DWELL_BUCKETS = [
   { label: '3+ hr', min: 180, max: 999999 },
 ];
 
-// ── Write enriched contribution CSV ─────────────────────────────────────
+// ── Registration ────────────────────────────────────────────────────────
 
 /**
- * Write an enriched contribution CSV to S3 and register it in the index.
+ * Register an Athena CTAS table as a contribution to the master list.
+ * This is the PRIMARY registration function in v2.
  *
- * CSV format: ad_id,attr_type,attr_value,dwell_minutes,postal_code
- *
- * For NSE: rows have attr_type=nse_bracket, attr_value=bracket label, postal_code=origin
- * For Category: rows have attr_type=category, attr_value=category name, dwell_minutes=actual dwell
- * For Plain: rows have attr_type=plain, minimal data
+ * Called after a CTAS query completes. The table already exists in Athena
+ * and its Parquet files are in S3. Node.js never touches the data.
  */
-export async function writeContribution(
+export async function registerAthenaContribution(
   country: string,
   sourceDataset: string,
-  rows: ContributionRow[],
+  attributeType: AttributeType,
+  attributeValue: string,
+  athenaTable: string,
+  s3Prefix: string,
+  maidCount: number,
   dateRange: { from: string; to: string },
-  label: string = '',  // Summary label for the contribution (e.g. "nse_brackets", "university")
 ): Promise<void> {
-  if (!country || rows.length === 0) {
-    console.warn(`[MASTER-MAIDS] Skipping: ${!country ? 'no country' : 'no rows'}`);
+  if (!country) {
+    console.warn('[MASTER-MAIDS] Skipping: no country');
     return;
   }
 
   const cc = normalizeCC(country);
-  const timestamp = Date.now();
-  const attrType = rows[0].attr_type;
-  const safeLabel = (label || attrType).replace(/[^a-zA-Z0-9_-]/g, '_');
-  const fileName = `${sourceDataset}-${safeLabel}-${timestamp}.csv`;
-  const s3Key = `master-maids/${cc}/contributions/${fileName}`;
-
-  // Build CSV
-  const header = 'ad_id,attr_type,attr_value,dwell_minutes,postal_code';
-  const csvLines = rows.map(r =>
-    `${r.ad_id},${r.attr_type},${(r.attr_value || '').replace(/,/g, ' ')},${r.dwell_minutes ?? ''},${(r.postal_code || '').replace(/,/g, '')}`
-  );
-  const csvContent = header + '\n' + csvLines.join('\n');
-
-  // Write to S3
-  await s3Client.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: s3Key,
-    Body: csvContent,
-    ContentType: 'text/csv',
-  }));
-
-  console.log(`[MASTER-MAIDS] Wrote ${rows.length} rows to ${s3Key}`);
-
-  // Register in index
   invalidateCache(INDEX_KEY);
   const index = await getConfig<MasterMaidsIndex>(INDEX_KEY) || {};
 
@@ -149,40 +124,43 @@ export async function writeContribution(
     index[cc] = { lastConsolidatedAt: null, stats: null, contributions: [] };
   }
 
+  // Prevent duplicate registration of same table
+  if (index[cc].contributions.some(c => c.athenaTable === athenaTable)) {
+    console.log(`[MASTER-MAIDS] Table ${athenaTable} already registered for ${cc}`);
+    return;
+  }
+
   const contribution: Contribution = {
-    id: `c_${timestamp}_${Math.random().toString(36).slice(2, 8)}`,
-    s3Key,
-    attributeType: attrType,
-    attributeValue: label || attrType,
+    id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    athenaTable,
+    s3Prefix,
+    attributeType,
+    attributeValue,
     sourceDataset,
     dateRange,
-    rowCount: rows.length,
+    maidCount,
     registeredAt: new Date().toISOString(),
   };
 
   index[cc].contributions.push(contribution);
   await putConfig(INDEX_KEY, index, { compact: true });
 
-  console.log(`[MASTER-MAIDS] Registered ${attrType}:${label} for ${cc} from ${sourceDataset} (${contribution.id}, ${rows.length} rows)`);
+  console.log(`[MASTER-MAIDS] Registered ${attributeType}:${attributeValue} for ${cc} — ${athenaTable} (${maidCount.toLocaleString()} MAIDs)`);
 }
 
-// ── Registration (lightweight, kept for backward compat) ─────────────────
-
 /**
- * Register an EXISTING export CSV. For new code, prefer writeContribution().
+ * Legacy registration for old CSV-based contributions.
+ * Kept for backward compatibility during migration.
  */
 export async function registerContribution(
   country: string,
   sourceDataset: string,
-  attributeType: AttributeType,
+  attributeType: AttributeType | 'nse_bracket',
   attributeValue: string,
   s3FileName: string,
   dateRange: { from: string; to: string },
 ): Promise<void> {
-  if (!country) {
-    console.warn('[MASTER-MAIDS] Skipping registration: no country');
-    return;
-  }
+  if (!country) return;
 
   const cc = normalizeCC(country);
   invalidateCache(INDEX_KEY);
@@ -194,21 +172,20 @@ export async function registerContribution(
 
   const contribution: Contribution = {
     id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    s3Key: s3FileName.startsWith('exports/') || s3FileName.startsWith('master-maids/')
-      ? s3FileName
-      : `exports/${s3FileName}`,
-    attributeType,
+    athenaTable: '',
+    s3Prefix: '',
+    s3Key: s3FileName.startsWith('exports/') || s3FileName.startsWith('master-maids/') || s3FileName.startsWith('athena')
+      ? s3FileName : `exports/${s3FileName}`,
+    attributeType: attributeType === 'nse_bracket' ? 'nse' : attributeType as AttributeType,
     attributeValue,
     sourceDataset,
     dateRange,
-    rowCount: 0,
+    maidCount: 0,
     registeredAt: new Date().toISOString(),
   };
 
   index[cc].contributions.push(contribution);
   await putConfig(INDEX_KEY, index, { compact: true });
-
-  console.log(`[MASTER-MAIDS] Registered ${attributeType}:${attributeValue} for ${cc} from ${sourceDataset} (${contribution.id})`);
 }
 
 // ── Read ────────────────────────────────────────────────────────────────
@@ -236,48 +213,112 @@ export async function removeContribution(country: string, contributionId: string
   return true;
 }
 
-// ── Consolidation (Athena) ──────────────────────────────────────────────
+// ── Consolidation v2: UNION ALL of Athena Tables ────────────────────────
 
 /**
- * Build CREATE EXTERNAL TABLE + CTAS for consolidation.
+ * Build consolidation SQL from registered Athena tables.
+ * Each contribution has its own table with a known schema.
+ * The UNION ALL normalizes them into a common schema.
  *
- * The contributions table reads ALL CSVs under master-maids/{CC}/contributions/.
- * Each CSV has the same schema: ad_id,attr_type,attr_value,dwell_minutes,postal_code.
- * No $path filtering needed — one table, one prefix, Athena reads everything.
+ * Also handles legacy CSV-based contributions via an external CSV table.
  */
-export function buildConsolidationSQL(
+export function buildConsolidationFromTables(
   country: string,
+  contributions: Contribution[],
   consolidatedTableName: string,
-): { createTableSQL: string; ctasSQL: string; contribTableName: string } {
+): { ctasSQL: string; legacyCsvTableSQL?: string; legacyCsvTableName?: string } {
   const cc = normalizeCC(country);
-  const contribTableName = `master_contrib_${cc.toLowerCase()}_${Date.now()}`;
-  const contribPrefix = `s3://${BUCKET}/master-maids/${cc}/contributions/`;
-
-  const createTableSQL = `
-    CREATE EXTERNAL TABLE IF NOT EXISTS ${contribTableName} (
-      ad_id STRING,
-      attr_type STRING,
-      attr_value STRING,
-      dwell_minutes STRING,
-      postal_code STRING
-    )
-    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-    STORED AS TEXTFILE
-    LOCATION '${contribPrefix}'
-    TBLPROPERTIES ('skip.header.line.count' = '1')
-  `;
-
-  // Use unique path per run to avoid HIVE_PATH_ALREADY_EXISTS
   const outputPath = `s3://${BUCKET}/master-maids/${cc}/consolidated/${consolidatedTableName}/`;
 
-  // Handle mixed CSV formats:
-  // 1-col (plain):    ad_id                          → attr_type=NULL, attr_value=NULL
-  // 3-col (category): ad_id, category, dwell_minutes → attr_type=category, attr_value=dwell (WRONG position)
-  // 5-col (enriched): ad_id, attr_type, attr_value, dwell_minutes, postal_code
-  //
-  // For 3-col CSVs: attr_type contains the category name (not 'category'),
-  // and attr_value contains the dwell_minutes number. We detect this and remap.
+  const selects: string[] = [];
+  let legacyCsvTableSQL: string | undefined;
+  let legacyCsvTableName: string | undefined;
+  const legacyContribs: Contribution[] = [];
+
+  for (const c of contributions) {
+    if (c.athenaTable) {
+      // v2: Athena table contribution
+      switch (c.attributeType) {
+        case 'plain':
+          selects.push(`
+            SELECT ad_id, 'plain' as attr_type, '' as attr_value,
+                   CAST(NULL AS DOUBLE) as dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+        case 'category':
+          selects.push(`
+            SELECT ad_id, 'category' as attr_type, category as attr_value,
+                   dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+        case 'nse':
+          selects.push(`
+            SELECT ad_id, 'nse' as attr_type, nse_bracket as attr_value,
+                   CAST(NULL AS DOUBLE) as dwell_minutes, postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+        case 'catchment':
+          selects.push(`
+            SELECT ad_id, 'catchment' as attr_type, '' as attr_value,
+                   CAST(NULL AS DOUBLE) as dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+      }
+    } else if (c.s3Key) {
+      // Legacy CSV contribution — collect for batch processing
+      legacyContribs.push(c);
+    }
+  }
+
+  // Handle legacy CSV contributions via a single external table
+  if (legacyContribs.length > 0) {
+    legacyCsvTableName = `master_legacy_${cc.toLowerCase()}_${Date.now()}`;
+    const contribPrefix = `s3://${BUCKET}/master-maids/${cc}/contributions/`;
+
+    legacyCsvTableSQL = `
+      CREATE EXTERNAL TABLE IF NOT EXISTS ${legacyCsvTableName} (
+        ad_id STRING, attr_type STRING, attr_value STRING,
+        dwell_minutes STRING, postal_code STRING
+      )
+      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+      STORED AS TEXTFILE
+      LOCATION '${contribPrefix}'
+      TBLPROPERTIES ('skip.header.line.count' = '1')
+    `;
+
+    // Legacy CSVs: handle mixed formats with CASE
+    selects.push(`
+      SELECT
+        ad_id,
+        CASE
+          WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL THEN 'category'
+          WHEN attr_type IS NULL OR attr_type = '' THEN 'plain'
+          ELSE attr_type
+        END as attr_type,
+        CASE
+          WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL THEN attr_type
+          ELSE COALESCE(attr_value, '')
+        END as attr_value,
+        CASE
+          WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
+            THEN TRY_CAST(attr_value AS DOUBLE)
+          ELSE TRY_CAST(NULLIF(dwell_minutes, '') AS DOUBLE)
+        END as dwell_minutes,
+        NULLIF(postal_code, '') as postal_code
+      FROM ${legacyCsvTableName}
+      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' AND ad_id != 'ad_id'
+    `);
+  }
+
+  if (selects.length === 0) {
+    throw new Error('No contributions to consolidate');
+  }
+
   const ctasSQL = `
     CREATE TABLE ${consolidatedTableName}
     WITH (
@@ -286,38 +327,14 @@ export function buildConsolidationSQL(
       external_location = '${outputPath}'
     )
     AS
-    SELECT
-      ad_id,
-      CASE
-        -- 3-col Athena CSV: attr_type has category name, attr_value has dwell number
-        WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
-          THEN 'category'
-        WHEN attr_type IS NULL OR attr_type = '' THEN 'plain'
-        ELSE attr_type
-      END as attr_type,
-      CASE
-        -- 3-col: attr_type already has the real value (gym, college, etc.)
-        WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
-          THEN attr_type
-        ELSE COALESCE(attr_value, '')
-      END as attr_value,
-      CASE
-        -- 3-col: dwell is in attr_value position
-        WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
-          THEN TRY_CAST(attr_value AS DOUBLE)
-        ELSE TRY_CAST(NULLIF(dwell_minutes, '') AS DOUBLE)
-      END as dwell_minutes,
-      NULLIF(postal_code, '') as postal_code
-    FROM ${contribTableName}
-    WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
-      AND ad_id != 'ad_id'
+    ${selects.join('\nUNION ALL\n')}
   `;
 
-  return { createTableSQL, ctasSQL, contribTableName };
+  return { ctasSQL, legacyCsvTableSQL, legacyCsvTableName };
 }
 
 /**
- * Stats query: breakdown by attr_type + attr_value, plus dwell bucket distribution.
+ * Stats query on consolidated table.
  */
 export function buildStatsQuery(consolidatedTableName: string): string {
   return `
@@ -337,9 +354,6 @@ export function buildTotalQuery(consolidatedTableName: string): string {
   return `SELECT COUNT(DISTINCT ad_id) as total FROM ${consolidatedTableName}`;
 }
 
-/**
- * Dwell distribution query: how many MAIDs per dwell bucket for category attributes.
- */
 export function buildDwellDistributionQuery(consolidatedTableName: string): string {
   return `
     SELECT
@@ -356,14 +370,9 @@ export function buildDwellDistributionQuery(consolidatedTableName: string): stri
   `;
 }
 
-/**
- * Postal code distribution query: top postal codes by MAID count.
- */
 export function buildPostalCodeQuery(consolidatedTableName: string): string {
   return `
-    SELECT
-      postal_code,
-      COUNT(DISTINCT ad_id) as maid_count
+    SELECT postal_code, COUNT(DISTINCT ad_id) as maid_count
     FROM ${consolidatedTableName}
     WHERE postal_code IS NOT NULL AND postal_code != ''
     GROUP BY postal_code
@@ -394,4 +403,12 @@ export async function saveConsolidationStats(
 
   await putConfig(INDEX_KEY, index, { compact: true });
   console.log(`[MASTER-MAIDS] Saved stats for ${cc}: ${totalMaids} total MAIDs, ${byAttribute.length} attributes`);
+}
+
+// ── CTAS helpers ────────────────────────────────────────────────────────
+
+/** Generate safe Athena table name from components */
+export function masterTableName(cc: string, type: string, dataset: string): string {
+  const safe = (s: string) => s.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+  return `master_${safe(cc)}_${safe(type)}_${safe(dataset)}_${Date.now()}`;
 }

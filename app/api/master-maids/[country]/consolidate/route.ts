@@ -3,7 +3,7 @@ import { isAuthenticated } from '@/lib/auth';
 import { getConfig, putConfig } from '@/lib/s3-config';
 import {
   getCountryContributions,
-  buildConsolidationSQL,
+  buildConsolidationFromTables,
   buildStatsQuery,
   buildTotalQuery,
   saveConsolidationStats,
@@ -71,15 +71,24 @@ export async function POST(
 
       const runId = `${Date.now()}`;
       const consolidatedTable = `master_${cc.toLowerCase()}_${runId}`;
-      const { createTableSQL, ctasSQL, contribTableName } = buildConsolidationSQL(cc, consolidatedTable);
 
-      // Create the contributions external table
-      try {
-        await runQuery(createTableSQL);
-        console.log(`[CONSOLIDATE] Created contributions table: ${contribTableName}`);
-      } catch (e: any) {
-        if (!e.message?.includes('already exists')) {
-          console.warn(`[CONSOLIDATE] Warning creating contributions table:`, e.message);
+      // v2: Build UNION ALL from registered Athena tables
+      const { ctasSQL, legacyCsvTableSQL, legacyCsvTableName } = buildConsolidationFromTables(
+        cc, entry.contributions, consolidatedTable,
+      );
+
+      const tempTables: string[] = [];
+
+      // Create legacy CSV table if needed (for old contributions)
+      if (legacyCsvTableSQL && legacyCsvTableName) {
+        try {
+          await runQuery(legacyCsvTableSQL);
+          tempTables.push(legacyCsvTableName);
+          console.log(`[CONSOLIDATE] Created legacy CSV table: ${legacyCsvTableName}`);
+        } catch (e: any) {
+          if (!e.message?.includes('already exists')) {
+            console.warn(`[CONSOLIDATE] Warning creating legacy table:`, e.message);
+          }
         }
       }
 
@@ -90,7 +99,7 @@ export async function POST(
       state = {
         phase: 'running_ctas',
         ctasQueryId,
-        tempTables: [contribTableName],
+        tempTables,
         consolidatedTable,
       };
       await putConfig(STATE_KEY(cc), state, { compact: true });
