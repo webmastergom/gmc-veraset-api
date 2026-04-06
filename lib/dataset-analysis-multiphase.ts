@@ -420,23 +420,39 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
         if (country) {
           const maidsQueryId = state.queryIds.maids;
           const srcKey = `athena-results/${maidsQueryId}.csv`;
-          const ts = Date.now();
-          const dstKey = `master-maids/${country.toUpperCase()}/contributions/${datasetName}-plain-${ts}.csv`;
+          const { HeadObjectCommand } = await import('@aws-sdk/client-s3');
 
-          // S3 CopyObject — server-side, instant, no memory needed (works for 100MB+ files)
-          await s3Client.send(new CopyObjectCommand({
-            Bucket: BUCKET,
-            CopySource: `${BUCKET}/${srcKey}`,
-            Key: dstKey,
-            ContentType: 'text/csv',
-          }));
+          // Check CSV size to decide strategy
+          let csvSize = 0;
+          try {
+            const head = await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: srcKey }));
+            csvSize = head.ContentLength || 0;
+          } catch { /* CSV might not exist yet */ }
 
           const dateRange = state.dateFrom && state.dateTo
             ? { from: state.dateFrom, to: state.dateTo }
             : { from: 'unknown', to: 'unknown' };
+          const cc = country.toUpperCase();
+          const ts = Date.now();
 
-          await registerContribution(country, datasetName, 'plain', '', dstKey, dateRange);
-          console.log(`[ANALYSIS] Registered ${result.summary.uniqueDevices} MAIDs to master list for ${country}`);
+          if (csvSize > 0 && csvSize < 4_500_000_000) {
+            // <4.5GB: S3 CopyObject (server-side, fast)
+            const dstKey = `master-maids/${cc}/contributions/${datasetName}-plain-${ts}.csv`;
+            await s3Client.send(new CopyObjectCommand({
+              Bucket: BUCKET,
+              CopySource: `${BUCKET}/${srcKey}`,
+              Key: dstKey,
+              ContentType: 'text/csv',
+            }));
+            await registerContribution(country, datasetName, 'plain', '', dstKey, dateRange);
+            console.log(`[ANALYSIS] Registered ${result.summary.uniqueDevices} MAIDs (${(csvSize/1e6).toFixed(0)}MB copy) for ${cc}`);
+          } else if (csvSize > 0) {
+            // >4.5GB: register the Athena CSV directly (no copy needed)
+            await registerContribution(country, datasetName, 'plain', '', srcKey, dateRange);
+            console.log(`[ANALYSIS] Registered ${result.summary.uniqueDevices} MAIDs (${(csvSize/1e6).toFixed(0)}MB direct ref) for ${cc}`);
+          } else {
+            console.warn(`[ANALYSIS] MAIDs CSV not found or empty: ${srcKey}`);
+          }
         }
       } catch (e: any) {
         console.warn(`[ANALYSIS] Failed to register MAIDs contribution: ${e.message}`);
