@@ -410,11 +410,16 @@ export async function POST(
         await runQuery(createLookupSql);
         console.log(`[NSE-POLL] Created bracket lookup table: ${lookupTable}`);
 
-        // Start 5 per-bracket queries (each returns ad_id list for one bracket)
+        // Start 5 per-bracket queries — output 5-column format for Master MAIDs consolidation
+        // Result CSV can be directly copied to contributions/ without Node.js processing
         const bracketQueryIds: Record<string, string> = {};
         for (const b of NSE_BRACKETS) {
           const sql = `
-            SELECT DISTINCT f.ad_id
+            SELECT DISTINCT f.ad_id,
+              'nse' as attr_type,
+              '${b.label}' as attr_value,
+              CAST(NULL AS VARCHAR) as dwell_minutes,
+              CAST(NULL AS VARCHAR) as postal_code
             FROM ${ctasTable} f
             INNER JOIN ${lookupTable} b
               ON f.origin_lat = CAST(b.origin_lat AS DOUBLE)
@@ -478,7 +483,7 @@ export async function POST(
         });
       }
 
-      // All done (or some failed) — copy results to exports, register contributions
+      // All done (or some failed) — copy results via S3 server-side copy (NO memory loading)
       const cc = state.country.toUpperCase();
       const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
       const timestamp = Date.now();
@@ -492,43 +497,30 @@ export async function POST(
           const s = await checkQueryStatus(qid);
           if (s.state !== 'SUCCEEDED') continue;
 
-          // The Athena result CSV is at athena-results/{qid}.csv — it has header "ad_id" + one ad_id per line
-          // Copy it to exports for download
           const srcKey = `athena-results/${qid}.csv`;
           const fileName = `${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
           const exportKey = `exports/${fileName}`;
-
-          await s3Client.send(new CopyObjectCommand({
-            Bucket: BUCKET,
-            CopySource: `${BUCKET}/${srcKey}`,
-            Key: exportKey,
-          }));
-
-          // Use bracket estimate from geocoding phase (exact count updated below from CSV)
-          let maidCount = (state.brackets || []).find(x => x.label === b.label)?.maidCount || 0;
-
-          const downloadUrl = `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`;
-
-          // Read the Athena result CSV to build contribution CSV + get exact count
-          // Each bracket CSV is small (just ad_ids), safe for Node.js
           const contribFileName = `${datasetName}-nse-${b.min}-${b.max}-${timestamp}.csv`;
           const contribKey = `master-maids/${cc}/contributions/${contribFileName}`;
 
+          // Server-side copy to both exports (download) and contributions (consolidation)
+          // The Athena result already has 5-column format — no Node.js processing needed
+          await Promise.all([
+            s3Client.send(new CopyObjectCommand({
+              Bucket: BUCKET, CopySource: `${BUCKET}/${srcKey}`, Key: exportKey,
+            })),
+            s3Client.send(new CopyObjectCommand({
+              Bucket: BUCKET, CopySource: `${BUCKET}/${srcKey}`, Key: contribKey,
+            })),
+          ]);
+
+          // Use geocoding estimate for maidCount (accurate, avoids reading large CSV)
+          const maidCount = (state.brackets || []).find(x => x.label === b.label)?.maidCount || 0;
+          const downloadUrl = `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`;
+
           try {
-            const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: srcKey }));
-            const csvText = await csvObj.Body!.transformToString('utf-8');
-            const adIds = csvText.split('\n').slice(1).map(l => l.replace(/"/g, '').trim()).filter(Boolean);
-            maidCount = adIds.length; // Exact count from Athena result
-
-            // Save 5-column contribution CSV for Master MAIDs consolidation
-            const contribLines = adIds.map(id => `${id},nse,${b.label},,`);
-            const contribCsv = 'ad_id,attr_type,attr_value,dwell_minutes,postal_code\n' + contribLines.join('\n');
-            await s3Client.send(new PutObjectCommand({
-              Bucket: BUCKET, Key: contribKey, Body: contribCsv, ContentType: 'text/csv',
-            }));
-
             await registerContribution(cc, datasetName, 'nse_bracket', b.label, contribKey, dr, maidCount);
-            console.log(`[NSE-POLL] Bracket ${b.label}: ${maidCount.toLocaleString()} MAIDs → ${exportKey} + registered`);
+            console.log(`[NSE-POLL] Bracket ${b.label}: ~${maidCount.toLocaleString()} MAIDs → ${exportKey} + registered`);
           } catch (e: any) {
             console.warn(`[NSE-POLL] Failed to register bracket ${b.label}: ${e.message}`);
           }
