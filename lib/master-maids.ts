@@ -21,6 +21,13 @@ import { s3Client, BUCKET } from './s3-config';
 
 const INDEX_KEY = 'master-maids-index';
 
+/** Normalize country codes (UK → GB, etc.) */
+function normalizeCC(cc: string): string {
+  const upper = cc.toUpperCase();
+  if (upper === 'UK') return 'GB';
+  return upper;
+}
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 export type AttributeType = 'plain' | 'nse_bracket' | 'category' | 'catchment';
@@ -110,7 +117,7 @@ export async function writeContribution(
     return;
   }
 
-  const cc = country.toUpperCase();
+  const cc = normalizeCC(country);
   const timestamp = Date.now();
   const attrType = rows[0].attr_type;
   const safeLabel = (label || attrType).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -177,7 +184,7 @@ export async function registerContribution(
     return;
   }
 
-  const cc = country.toUpperCase();
+  const cc = normalizeCC(country);
   invalidateCache(INDEX_KEY);
   const index = await getConfig<MasterMaidsIndex>(INDEX_KEY) || {};
 
@@ -212,11 +219,11 @@ export async function getMasterIndex(): Promise<MasterMaidsIndex> {
 
 export async function getCountryContributions(country: string): Promise<CountryEntry | null> {
   const index = await getMasterIndex();
-  return index[country.toUpperCase()] || null;
+  return index[normalizeCC(country)] || null;
 }
 
 export async function removeContribution(country: string, contributionId: string): Promise<boolean> {
-  const cc = country.toUpperCase();
+  const cc = normalizeCC(country);
   invalidateCache(INDEX_KEY);
   const index = await getConfig<MasterMaidsIndex>(INDEX_KEY) || {};
   if (!index[cc]) return false;
@@ -242,7 +249,7 @@ export function buildConsolidationSQL(
   country: string,
   consolidatedTableName: string,
 ): { createTableSQL: string; ctasSQL: string; contribTableName: string } {
-  const cc = country.toUpperCase();
+  const cc = normalizeCC(country);
   const contribTableName = `master_contrib_${cc.toLowerCase()}_${Date.now()}`;
   const contribPrefix = `s3://${BUCKET}/master-maids/${cc}/contributions/`;
 
@@ -349,7 +356,7 @@ export async function saveConsolidationStats(
   totalMaids: number,
   byAttribute: AttributeStat[],
 ): Promise<void> {
-  const cc = country.toUpperCase();
+  const cc = normalizeCC(country);
   invalidateCache(INDEX_KEY);
   const index = await getConfig<MasterMaidsIndex>(INDEX_KEY) || {};
   if (!index[cc]) return;
