@@ -15,9 +15,9 @@ import {
   runQuery,
 } from './athena';
 import { s3Client, BUCKET } from './s3-config';
-import { GetObjectCommand, PutObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getAllJobsSummary } from './jobs';
-import { registerContribution } from './master-maids';
+import { registerAthenaContribution, masterTableName } from './master-maids';
 import type { AnalysisResult, DailyData, VisitByPoi } from './dataset-analysis';
 
 // ── State ────────────────────────────────────────────────────────────
@@ -27,7 +27,15 @@ export interface AnalysisState {
   datasetName: string;
   progress: { step: string; percent: number; message: string };
   /** Athena query IDs for the analysis queries */
-  queryIds?: { daily: string; summary: string; visits: string; maids?: string };
+  queryIds?: { daily: string; summary: string; visits: string };
+  /** CTAS queries for Master MAIDs (non-blocking, fire-and-forget) */
+  maidsCtas?: {
+    plainQueryId: string;
+    plainTable: string;
+    catchmentQueryId: string;
+    catchmentTable: string;
+    registered: boolean;
+  };
   /** Resolved date range */
   dateFrom?: string;
   dateTo?: string;
@@ -76,9 +84,9 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
 
   // Reset if previous run is done (or if it completed without the MAIDs query)
   if (state && (state.status === 'completed' || state.status === 'error')) {
-    // If completed without MAIDs query, try to register MAIDs from existing analysis
-    if (state.status === 'completed' && !state.queryIds?.maids) {
-      console.log(`[ANALYSIS] ${datasetName}: completed without MAIDs query — re-running to capture MAIDs`);
+    // If completed without CTAS contributions, re-run to capture MAIDs
+    if (state.status === 'completed' && !state.maidsCtas) {
+      console.log(`[ANALYSIS] ${datasetName}: completed without CTAS — re-running to capture MAIDs`);
     }
     state = null;
   }
@@ -182,27 +190,86 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
       GROUP BY poi_id ORDER BY visits DESC
     `;
 
-    // 4th query: extract all unique MAIDs for master MAID list contribution
-    const maidsSql = `
-      SELECT DISTINCT ad_id
-      FROM ${tableName}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        AND poi_id IS NOT NULL AND poi_id != ''
-    `;
+    // CTAS queries for Master MAIDs (non-blocking, fire-and-forget)
+    // These run in parallel with the analysis queries but never block completion
+    let maidsCtas: AnalysisState['maidsCtas'];
+    try {
+      const jobs = await getAllJobsSummary();
+      const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+      const country = (job?.country || '').toUpperCase();
 
-    const [dailyId, summaryId, visitsId, maidsId] = await Promise.all([
+      if (country) {
+        const safeDs = datasetName.replace(/-/g, '_');
+        const plainTable = masterTableName(country, 'plain', safeDs);
+        const catchmentTable = masterTableName(country, 'catchment', safeDs);
+
+        const plainCtas = `
+          CREATE TABLE ${plainTable}
+          WITH (format='PARQUET', parquet_compression='SNAPPY',
+                external_location='s3://${BUCKET}/athena-temp/${plainTable}/')
+          AS SELECT DISTINCT ad_id FROM ${tableName}
+          CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+          WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
+            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+            AND poi_id IS NOT NULL AND poi_id != ''
+        `;
+
+        const catchmentCtas = `
+          CREATE TABLE ${catchmentTable}
+          WITH (format='PARQUET', parquet_compression='SNAPPY',
+                external_location='s3://${BUCKET}/athena-temp/${catchmentTable}/')
+          AS
+          WITH poi_visitors AS (
+            SELECT ad_id, date FROM ${tableName}
+            CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+            WHERE poi_id IS NOT NULL AND poi_id != ''
+              AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+              AND date >= '${dateFrom}' AND date <= '${dateTo}'
+            GROUP BY ad_id, date
+          ),
+          origins AS (
+            SELECT pv.ad_id,
+              ROUND(MIN_BY(TRY_CAST(t.latitude AS DOUBLE), t.utc_timestamp), 1) as origin_lat,
+              ROUND(MIN_BY(TRY_CAST(t.longitude AS DOUBLE), t.utc_timestamp), 1) as origin_lng
+            FROM poi_visitors pv
+            INNER JOIN ${tableName} t ON pv.ad_id = t.ad_id AND pv.date = t.date
+            WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
+              AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
+            GROUP BY pv.ad_id
+          )
+          SELECT DISTINCT ad_id, origin_lat, origin_lng
+          FROM origins WHERE origin_lat IS NOT NULL
+        `;
+
+        const [plainQid, catchmentQid] = await Promise.all([
+          startQueryAsync(plainCtas),
+          startQueryAsync(catchmentCtas),
+        ]);
+
+        maidsCtas = {
+          plainQueryId: plainQid,
+          plainTable,
+          catchmentQueryId: catchmentQid,
+          catchmentTable,
+          registered: false,
+        };
+        console.log(`[ANALYSIS] CTAS queries started: plain=${plainQid}, catchment=${catchmentQid}`);
+      }
+    } catch (e: any) {
+      console.warn(`[ANALYSIS] Failed to start CTAS queries: ${e.message}`);
+    }
+
+    const [dailyId, summaryId, visitsId] = await Promise.all([
       startQueryAsync(dailySql),
       startQueryAsync(summarySql),
       startQueryAsync(visitsByPoiSql),
-      startQueryAsync(maidsSql),
     ]);
 
     state = {
       status: 'queries_running',
       datasetName,
-      queryIds: { daily: dailyId, summary: summaryId, visits: visitsId, maids: maidsId },
+      queryIds: { daily: dailyId, summary: summaryId, visits: visitsId },
+      maidsCtas,
       dateFrom,
       dateTo,
       allDates,
@@ -220,19 +287,13 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
   // ── Phase 2: Poll Athena queries ────────────────────────────
   if (state.status === 'queries_running') {
     const ids = state.queryIds!;
-    const statusChecks = [
+    const [dailyS, summaryS, visitsS] = await Promise.all([
       checkQueryStatus(ids.daily),
       checkQueryStatus(ids.summary),
       checkQueryStatus(ids.visits),
-    ];
-    // MAIDs query is optional (added after this feature)
-    if (ids.maids) statusChecks.push(checkQueryStatus(ids.maids));
+    ]);
 
-    const statuses = await Promise.all(statusChecks);
-    const [dailyS, summaryS, visitsS] = statuses;
-    const maidsS = ids.maids ? statuses[3] : null;
-
-    // Check for failures (MAIDs query failure is non-blocking)
+    // Check for failures
     for (const [name, s] of [['daily', dailyS], ['summary', summaryS], ['visits', visitsS]] as const) {
       if (s.state === 'FAILED') {
         state.status = 'error';
@@ -243,20 +304,11 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
       }
     }
 
-    const coreAllDone = dailyS.state === 'SUCCEEDED' && summaryS.state === 'SUCCEEDED' && visitsS.state === 'SUCCEEDED';
-    // MAIDs can still be running — we don't block on it
-    const maidsReady = !maidsS || maidsS.state === 'SUCCEEDED' || maidsS.state === 'FAILED';
-    const allDone = coreAllDone && maidsReady;
+    const allDone = dailyS.state === 'SUCCEEDED' && summaryS.state === 'SUCCEEDED' && visitsS.state === 'SUCCEEDED';
 
-    if (!coreAllDone) {
+    if (!allDone) {
       const statusMsg = `Daily: ${dailyS.state}, Summary: ${summaryS.state}, Visits: ${visitsS.state}`;
       state.progress = { step: 'queries', percent: 40, message: `Waiting for queries... (${statusMsg})` };
-      await saveState(state);
-      return state;
-    }
-
-    if (!maidsReady) {
-      state.progress = { step: 'queries', percent: 55, message: 'Core queries done, extracting MAIDs...' };
       await saveState(state);
       return state;
     }
@@ -410,52 +462,61 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
     await saveState(state);
     console.log(`[ANALYSIS] ${datasetName}: completed — ${result.summary.uniqueDevices} devices, ${dailyData.length} days`);
 
-    // Register MAIDs contribution to Master MAID list (fire-and-forget)
-    if (state.queryIds?.maids) {
+    // Register CTAS contributions to Master MAID list (fire-and-forget)
+    if (state.maidsCtas && !state.maidsCtas.registered) {
       try {
         const jobs = await getAllJobsSummary();
         const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
         const country = job?.country || '';
+        const dateRange = state.dateFrom && state.dateTo
+          ? { from: state.dateFrom, to: state.dateTo }
+          : { from: 'unknown', to: 'unknown' };
 
         if (country) {
-          const maidsQueryId = state.queryIds.maids;
-          const srcKey = `athena-results/${maidsQueryId}.csv`;
-          const { HeadObjectCommand } = await import('@aws-sdk/client-s3');
+          // Check if CTAS queries completed
+          const [plainStatus, catchmentStatus] = await Promise.all([
+            checkQueryStatus(state.maidsCtas.plainQueryId).catch(() => ({ state: 'UNKNOWN' as const })),
+            checkQueryStatus(state.maidsCtas.catchmentQueryId).catch(() => ({ state: 'UNKNOWN' as const })),
+          ]);
 
-          // Check CSV size to decide strategy
-          let csvSize = 0;
-          try {
-            const head = await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: srcKey }));
-            csvSize = head.ContentLength || 0;
-          } catch { /* CSV might not exist yet */ }
+          if (plainStatus.state === 'SUCCEEDED') {
+            // Get MAID count via quick query on the CTAS table
+            let maidCount = result.summary.uniqueDevices; // use analysis count as fallback
+            try {
+              const countResult = await runQuery(`SELECT COUNT(*) as cnt FROM ${state.maidsCtas.plainTable}`);
+              maidCount = parseInt(String(countResult.rows[0]?.cnt)) || maidCount;
+            } catch {}
 
-          const dateRange = state.dateFrom && state.dateTo
-            ? { from: state.dateFrom, to: state.dateTo }
-            : { from: 'unknown', to: 'unknown' };
-          const cc = country.toUpperCase();
-          const ts = Date.now();
-
-          if (csvSize > 0 && csvSize < 4_500_000_000) {
-            // <4.5GB: S3 CopyObject (server-side, fast)
-            const dstKey = `master-maids/${cc}/contributions/${datasetName}-plain-${ts}.csv`;
-            await s3Client.send(new CopyObjectCommand({
-              Bucket: BUCKET,
-              CopySource: `${BUCKET}/${srcKey}`,
-              Key: dstKey,
-              ContentType: 'text/csv',
-            }));
-            await registerContribution(country, datasetName, 'plain', '', dstKey, dateRange);
-            console.log(`[ANALYSIS] Registered ${result.summary.uniqueDevices} MAIDs (${(csvSize/1e6).toFixed(0)}MB copy) for ${cc}`);
-          } else if (csvSize > 0) {
-            // >4.5GB: register the Athena CSV directly (no copy needed)
-            await registerContribution(country, datasetName, 'plain', '', srcKey, dateRange);
-            console.log(`[ANALYSIS] Registered ${result.summary.uniqueDevices} MAIDs (${(csvSize/1e6).toFixed(0)}MB direct ref) for ${cc}`);
-          } else {
-            console.warn(`[ANALYSIS] MAIDs CSV not found or empty: ${srcKey}`);
+            await registerAthenaContribution(
+              country, datasetName, 'plain', '',
+              state.maidsCtas.plainTable,
+              `athena-temp/${state.maidsCtas.plainTable}/`,
+              maidCount, dateRange,
+            );
+            console.log(`[ANALYSIS] Registered plain CTAS: ${maidCount.toLocaleString()} MAIDs for ${country}`);
           }
+
+          if (catchmentStatus.state === 'SUCCEEDED') {
+            let catchmentCount = 0;
+            try {
+              const countResult = await runQuery(`SELECT COUNT(*) as cnt FROM ${state.maidsCtas.catchmentTable}`);
+              catchmentCount = parseInt(String(countResult.rows[0]?.cnt)) || 0;
+            } catch {}
+
+            await registerAthenaContribution(
+              country, datasetName, 'catchment', '',
+              state.maidsCtas.catchmentTable,
+              `athena-temp/${state.maidsCtas.catchmentTable}/`,
+              catchmentCount, dateRange,
+            );
+            console.log(`[ANALYSIS] Registered catchment CTAS: ${catchmentCount.toLocaleString()} origins for ${country}`);
+          }
+
+          state.maidsCtas.registered = true;
+          await saveState(state);
         }
       } catch (e: any) {
-        console.warn(`[ANALYSIS] Failed to register MAIDs contribution: ${e.message}`);
+        console.warn(`[ANALYSIS] Failed to register CTAS contributions: ${e.message}`);
       }
     }
 
