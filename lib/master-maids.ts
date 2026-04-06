@@ -274,13 +274,13 @@ export function buildConsolidationSQL(
     AS
     SELECT
       ad_id,
-      attr_type,
-      attr_value,
+      COALESCE(NULLIF(attr_type, ''), 'plain') as attr_type,
+      COALESCE(attr_value, '') as attr_value,
       TRY_CAST(NULLIF(dwell_minutes, '') AS DOUBLE) as dwell_minutes,
       NULLIF(postal_code, '') as postal_code
     FROM ${contribTableName}
     WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
-      AND attr_type IS NOT NULL AND attr_type != 'attr_type'
+      AND ad_id != 'ad_id'
   `;
 
   return { createTableSQL, ctasSQL, contribTableName };
