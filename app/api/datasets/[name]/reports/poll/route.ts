@@ -19,7 +19,7 @@ import {
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
 const REPORT_KEY = (ds: string, type: string, minDwell = 0) =>
