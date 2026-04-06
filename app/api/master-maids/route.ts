@@ -42,10 +42,12 @@ export async function GET(request: Request) {
         : null,
     }));
 
-    // Sort by contribution count descending
-    countries.sort((a, b) => b.contributionCount - a.contributionCount);
+    // Sort by MAID count descending (consolidated first, then by contributions)
+    countries.sort((a, b) => (b.totalMaids ?? -1) - (a.totalMaids ?? -1));
 
-    return NextResponse.json({ countries });
+    const globalTotal = countries.reduce((sum, c) => sum + (c.totalMaids ?? 0), 0);
+
+    return NextResponse.json({ countries, globalTotal });
   } catch (error: any) {
     console.error('[MASTER-MAIDS] Error listing countries:', error.message);
     return NextResponse.json({ error: error.message }, { status: 500 });

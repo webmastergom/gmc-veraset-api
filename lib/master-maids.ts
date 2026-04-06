@@ -271,6 +271,13 @@ export function buildConsolidationSQL(
   // Use unique path per run to avoid HIVE_PATH_ALREADY_EXISTS
   const outputPath = `s3://${BUCKET}/master-maids/${cc}/consolidated/${consolidatedTableName}/`;
 
+  // Handle mixed CSV formats:
+  // 1-col (plain):    ad_id                          → attr_type=NULL, attr_value=NULL
+  // 3-col (category): ad_id, category, dwell_minutes → attr_type=category, attr_value=dwell (WRONG position)
+  // 5-col (enriched): ad_id, attr_type, attr_value, dwell_minutes, postal_code
+  //
+  // For 3-col CSVs: attr_type contains the category name (not 'category'),
+  // and attr_value contains the dwell_minutes number. We detect this and remap.
   const ctasSQL = `
     CREATE TABLE ${consolidatedTableName}
     WITH (
@@ -281,9 +288,25 @@ export function buildConsolidationSQL(
     AS
     SELECT
       ad_id,
-      COALESCE(NULLIF(attr_type, ''), 'plain') as attr_type,
-      COALESCE(attr_value, '') as attr_value,
-      TRY_CAST(NULLIF(dwell_minutes, '') AS DOUBLE) as dwell_minutes,
+      CASE
+        -- 3-col Athena CSV: attr_type has category name, attr_value has dwell number
+        WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
+          THEN 'category'
+        WHEN attr_type IS NULL OR attr_type = '' THEN 'plain'
+        ELSE attr_type
+      END as attr_type,
+      CASE
+        -- 3-col: attr_type already has the real value (gym, college, etc.)
+        WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
+          THEN attr_type
+        ELSE COALESCE(attr_value, '')
+      END as attr_value,
+      CASE
+        -- 3-col: dwell is in attr_value position
+        WHEN TRY_CAST(attr_value AS DOUBLE) IS NOT NULL AND dwell_minutes IS NULL
+          THEN TRY_CAST(attr_value AS DOUBLE)
+        ELSE TRY_CAST(NULLIF(dwell_minutes, '') AS DOUBLE)
+      END as dwell_minutes,
       NULLIF(postal_code, '') as postal_code
     FROM ${contribTableName}
     WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''

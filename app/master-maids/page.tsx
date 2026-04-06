@@ -105,6 +105,7 @@ function formatShortDate(d: string | null): string {
 
 export default function MasterMaidsPage() {
   const [countries, setCountries] = useState<CountrySummary[]>([])
+  const [globalTotal, setGlobalTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [expandedCountry, setExpandedCountry] = useState<string | null>(null)
   const [countryDetail, setCountryDetail] = useState<CountryDetail | null>(null)
@@ -118,6 +119,7 @@ export default function MasterMaidsPage() {
       const res = await fetch('/api/master-maids', { credentials: 'include' })
       const data = await res.json()
       setCountries(data.countries || [])
+      setGlobalTotal(data.globalTotal || 0)
     } catch (e) {
       console.error('Failed to load master MAIDs:', e)
     } finally {
@@ -215,6 +217,24 @@ export default function MasterMaidsPage() {
             </p>
           </div>
         </div>
+
+        {!loading && globalTotal > 0 && (
+          <Card className="mb-6 bg-gradient-to-r from-theme-accent/10 to-transparent border-theme-accent/30">
+            <CardContent className="py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <span className="text-2xl">🌍</span>
+                <div>
+                  <div className="text-sm text-muted-foreground">Global Total</div>
+                  <div className="text-sm text-muted-foreground">{countries.length} countries</div>
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-3xl font-bold tabular-nums text-theme-accent">{formatNumber(globalTotal)}</div>
+                <div className="text-sm text-muted-foreground">unique MAIDs worldwide</div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {loading ? (
           <div className="flex items-center gap-2 text-muted-foreground py-12 justify-center">
