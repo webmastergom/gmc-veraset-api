@@ -46,11 +46,13 @@ interface BracketResult {
 }
 
 interface NseExportState {
-  phase: 'querying' | 'polling' | 'geocoding' | 'done' | 'error';
-  queryId?: string;
+  phase: 'querying' | 'polling' | 'geocoding' | 'saving' | 'done' | 'error';
+  queryId?: string;         // Full query: ad_id, origin_lat, origin_lng
+  coordQueryId?: string;    // Coord-only query: DISTINCT origin_lat, origin_lng (small)
   country: string;
   minDwell: number;
   dateRange?: { from: string; to: string };
+  coordToPostalCode?: Record<string, string>; // Geocoded mapping (saved in state)
   error?: string;
   brackets?: BracketResult[];
 }
@@ -125,9 +127,10 @@ export async function POST(
         ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
         : '';
 
-      // Round origins to 1 decimal (~11km) — sufficient for postal code matching
-      // and dramatically reduces unique coords for geocoding (2.6M → ~37K)
-      const sql = `
+      // Two queries:
+      // 1. Full: ad_id + origin coords (large, used later for per-bracket CSV export)
+      // 2. Coords-only: DISTINCT coords with device count (small ~37K rows, for geocoding)
+      const originsCTE = `
         WITH poi_visitors AS (
           SELECT ad_id, date
           FROM ${table}
@@ -148,13 +151,16 @@ export async function POST(
             AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
           GROUP BY pv.ad_id
         )
-        SELECT DISTINCT ad_id, origin_lat, origin_lng
-        FROM origins
-        WHERE origin_lat IS NOT NULL
       `;
 
-      const queryId = await startQueryAsync(sql);
-      console.log(`[NSE-POLL] Athena query started: ${queryId}`);
+      const fullSql = `${originsCTE} SELECT DISTINCT ad_id, origin_lat, origin_lng FROM origins WHERE origin_lat IS NOT NULL`;
+      const coordSql = `${originsCTE} SELECT origin_lat, origin_lng, COUNT(*) as device_count FROM origins WHERE origin_lat IS NOT NULL GROUP BY origin_lat, origin_lng`;
+
+      const [queryId, coordQueryId] = await Promise.all([
+        startQueryAsync(fullSql),
+        startQueryAsync(coordSql),
+      ]);
+      console.log(`[NSE-POLL] Athena queries started: full=${queryId}, coords=${coordQueryId}`);
 
       // Resolve dateRange from job metadata (backend-side, no frontend dependency)
       let dateRange = body.dateRange || { from: 'unknown', to: 'unknown' };
@@ -166,7 +172,7 @@ export async function POST(
           else if (job?.dateRange) dateRange = { from: (job.dateRange as any).from, to: (job.dateRange as any).to };
         } catch {}
       }
-      state = { phase: 'polling', queryId, country, minDwell, dateRange };
+      state = { phase: 'polling', queryId, coordQueryId, country, minDwell, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
@@ -176,9 +182,12 @@ export async function POST(
     }
 
     // ── Phase: polling ───────────────────────────────────────────
-    if (state.phase === 'polling' && state.queryId) {
+    // Wait for the COORD query (small) — the full query can finish in background
+    if (state.phase === 'polling' && (state.coordQueryId || state.queryId)) {
       try {
-        const status = await checkQueryStatus(state.queryId);
+        // Check coord query (or fall back to full query for old states)
+        const checkId = state.coordQueryId || state.queryId!;
+        const status = await checkQueryStatus(checkId);
 
         if (status.state === 'RUNNING' || status.state === 'QUEUED') {
           const scannedGB = status.statistics?.dataScannedBytes
@@ -223,46 +232,47 @@ export async function POST(
     }
 
     // ── Phase: geocoding ─────────────────────────────────────────
-    if (state.phase === 'geocoding' && state.queryId) {
-      // Stream CSV line-by-line from S3 (handles 10M+ rows without OOM)
-      const csvKey = `athena-results/${state.queryId}.csv`;
-      console.log(`[NSE-POLL] Streaming results from S3: ${csvKey}`);
+    // Use the SMALL coord CSV (~37K rows) for geocoding, not the full CSV (10M+ rows)
+    if (state.phase === 'geocoding' && (state.coordQueryId || state.queryId)) {
+      const csvKey = `athena-results/${state.coordQueryId || state.queryId}.csv`;
+      console.log(`[NSE-POLL] Reading coord CSV from S3: ${csvKey}`);
       let csvObj;
       try {
         csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
       } catch (err: any) {
-        // Query result expired or not found — auto-reset so user can retry
         console.error(`[NSE-POLL] CSV not found (query expired?): ${csvKey}`);
         state = { ...state, phase: 'error', error: 'Query results expired. Please retry.' };
         await putConfig(STATE_KEY(datasetName), state, { compact: true });
         return NextResponse.json({ phase: 'error', error: state.error });
       }
 
-      // Pre-aggregate: group ad_ids by unique (lat,lng) coord — streaming
-      const coordToAdIds = new Map<string, string[]>();
+      // Parse coord CSV — small file: origin_lat, origin_lng, device_count (~37K rows)
+      const csvText = await csvObj.Body!.transformToString('utf-8');
+      const lines = csvText.split('\n');
+      const coordDeviceCounts = new Map<string, number>();
       let totalDevices = 0;
 
-      const rl = createInterface({
-        input: csvObj.Body as Readable,
-        crlfDelay: Infinity,
-      });
-
-      let isHeader = true;
-      for await (const line of rl) {
-        if (isHeader) { isHeader = false; continue; }
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const parts = trimmed.replace(/"/g, '').split(',');
-        if (parts.length < 3) continue;
-        const [adId, lat, lng] = parts;
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const parts = line.replace(/"/g, '').split(',');
+        if (parts.length < 2) continue;
+        // Format: origin_lat,origin_lng,device_count (coord query)
+        // OR: ad_id,origin_lat,origin_lng (old full query — fallback)
+        let lat: string, lng: string, count: number;
+        if (parts.length >= 3 && state.coordQueryId) {
+          [lat, lng] = parts;
+          count = parseInt(parts[2]) || 1;
+        } else if (parts.length >= 3) {
+          // Old format: ad_id, lat, lng — count each row as 1
+          lat = parts[1]; lng = parts[2]; count = 1;
+        } else continue;
         const coordKey = `${lat},${lng}`;
-        let arr = coordToAdIds.get(coordKey);
-        if (!arr) { arr = []; coordToAdIds.set(coordKey, arr); }
-        arr.push(adId);
-        totalDevices++;
+        coordDeviceCounts.set(coordKey, (coordDeviceCounts.get(coordKey) || 0) + count);
+        totalDevices += count;
       }
 
-      console.log(`[NSE-POLL] ${totalDevices} devices → ${coordToAdIds.size} unique coords`);
+      console.log(`[NSE-POLL] ${totalDevices} devices → ${coordDeviceCounts.size} unique coords`);
 
       // Load NSE data
       const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country));
@@ -272,117 +282,207 @@ export async function POST(
         return NextResponse.json({ phase: 'error', error: state.error });
       }
 
-      // Geocode only unique coords (37K instead of 2.6M)
+      // Geocode unique coords (~37K points — fast)
       setCountryFilter([state.country]);
-      const coordKeys = Array.from(coordToAdIds.keys());
+      const coordKeys = Array.from(coordDeviceCounts.keys());
       const uniquePoints = coordKeys.map(k => {
         const [lat, lng] = k.split(',').map(Number);
-        return { lat, lng, deviceCount: 1 };
+        return { lat, lng, deviceCount: coordDeviceCounts.get(k) || 1 };
       });
 
       console.log(`[NSE-POLL] Reverse geocoding ${uniquePoints.length} unique coords...`);
       const geocoded = await batchReverseGeocode(uniquePoints);
 
-      // Build postal code → ad_ids mapping
-      const cpToAdIds = new Map<string, string[]>();
+      // Build coord → postal code mapping
+      const coordToPostalCode: Record<string, string> = {};
       for (let i = 0; i < coordKeys.length; i++) {
         const geo = geocoded[i];
         if (geo.type === 'geojson_local') {
           const cp = geo.postcode?.replace(/^[A-Z]{2}[-\s]/, '') || '';
-          if (cp) {
-            const existing = cpToAdIds.get(cp) || [];
-            const adIds = coordToAdIds.get(coordKeys[i])!;
-            for (const id of adIds) existing.push(id);
-            cpToAdIds.set(cp, existing);
-          }
+          if (cp) coordToPostalCode[coordKeys[i]] = cp;
         }
       }
 
       setCountryFilter(null);
 
-      // Build NSE bracket → postal codes lookup
-      const bracketCPs: Map<string, Set<string>> = new Map();
-      for (const b of NSE_BRACKETS) {
-        bracketCPs.set(b.label, new Set(
-          nseData.filter(r => r.nse >= b.min && r.nse <= b.max).map(r => r.postal_code)
-        ));
+      // Build postal code → device count (using coord device counts)
+      const cpDeviceCounts = new Map<string, number>();
+      for (const [coord, cp] of Object.entries(coordToPostalCode)) {
+        const count = coordDeviceCounts.get(coord) || 0;
+        cpDeviceCounts.set(cp, (cpDeviceCounts.get(cp) || 0) + count);
       }
 
-      // Compute per-bracket MAIDs and save CSVs
+      // Compute per-bracket stats using device counts (no individual MAIDs needed)
       const brackets: BracketResult[] = [];
-      const timestamp = Date.now();
-
       for (const b of NSE_BRACKETS) {
-        const cps = bracketCPs.get(b.label)!;
         const inBracket = nseData.filter(r => r.nse >= b.min && r.nse <= b.max);
         const population = inBracket.reduce((s, r) => s + r.population, 0);
+        const bracketCPs = new Set(inBracket.map(r => r.postal_code));
 
-        // Collect unique MAIDs for this bracket
-        const maidSet = new Set<string>();
-        for (const cp of cps) {
-          const adIds = cpToAdIds.get(cp);
-          if (adIds) {
-            for (const id of adIds) maidSet.add(id);
-          }
+        let maidCount = 0;
+        for (const cp of bracketCPs) {
+          maidCount += cpDeviceCounts.get(cp) || 0;
         }
 
-        let downloadUrl: string | null = null;
-        if (maidSet.size > 0) {
-          const csvContent = 'ad_id\n' + Array.from(maidSet).join('\n');
-          const fileName = `${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
-          const key = `exports/${fileName}`;
-
-          await s3Client.send(new PutObjectCommand({
-            Bucket: BUCKET,
-            Key: key,
-            Body: csvContent,
-            ContentType: 'text/csv',
-          }));
-
-          downloadUrl = `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`;
-        }
-
+        // Download URL — CSVs will be generated on-demand from the full query when ready
+        // For now, mark as null (full query may still be running)
         brackets.push({
           label: b.label,
           min: b.min,
           max: b.max,
           postalCodes: inBracket.length,
           population,
-          maidCount: maidSet.size,
-          downloadUrl,
+          maidCount,
+          downloadUrl: null,
         });
 
-        console.log(`[NSE-POLL] Bracket ${b.label}: ${maidSet.size} MAIDs from ${cps.size} CPs`);
+        console.log(`[NSE-POLL] Bracket ${b.label}: ~${maidCount} devices from ${bracketCPs.size} CPs`);
       }
 
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
-      console.log(`[NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
+      console.log(`[NSE-POLL] Done: ~${totalMaids} total devices across ${brackets.length} brackets`);
 
-      // Register per-bracket export CSVs as master MAID contributions
-      // (reuse the existing bracket CSVs that were already written above)
-      const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
-      try {
-        const cc = state.country.toUpperCase();
-        for (const b of brackets) {
-          if (b.maidCount > 0 && b.downloadUrl) {
-            const bracketFile = `exports/${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
-            await registerContribution(cc, datasetName, 'nse_bracket', b.label, bracketFile, dr);
-          }
-        }
-        console.log(`[NSE-POLL] Registered ${brackets.filter(b => b.maidCount > 0).length} bracket contributions`);
-      } catch (e: any) {
-        console.warn(`[NSE-POLL] Failed to register contributions: ${e.message}`);
-      }
-
-      state = { ...state, phase: 'done', brackets };
+      // Save coord→postalCode mapping in state for the saving phase
+      state = { ...state, phase: 'saving', brackets, coordToPostalCode };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
-        phase: 'done',
+        phase: 'saving',
         brackets,
         totalMaids,
-        progress: { step: 'done', percent: 100, message: `${totalMaids.toLocaleString()} MAIDs analyzed` },
+        progress: { step: 'saving', percent: 80, message: `Generating per-bracket CSV files...` },
       });
+    }
+
+    // ── Phase: saving ──────────────────────────────────────────────
+    // Wait for the full query to complete, then generate per-bracket CSVs
+    if (state.phase === 'saving' && state.queryId) {
+      // Check if full query is ready
+      try {
+        const fullStatus = await checkQueryStatus(state.queryId);
+
+        if (fullStatus.state === 'RUNNING' || fullStatus.state === 'QUEUED') {
+          return NextResponse.json({
+            phase: 'saving',
+            brackets: state.brackets,
+            totalMaids: (state.brackets || []).reduce((s: number, b: BracketResult) => s + b.maidCount, 0),
+            progress: { step: 'saving', percent: 85, message: `Waiting for full query to complete...` },
+          });
+        }
+
+        if (fullStatus.state === 'FAILED' || fullStatus.state === 'CANCELLED') {
+          // Full query failed — still return bracket counts (no download CSVs)
+          console.warn(`[NSE-POLL] Full query failed: ${fullStatus.error}. Returning counts only.`);
+          state = { ...state, phase: 'done' };
+          await putConfig(STATE_KEY(datasetName), state, { compact: true });
+          const totalMaids = (state.brackets || []).reduce((s: number, b: BracketResult) => s + b.maidCount, 0);
+          return NextResponse.json({
+            phase: 'done', brackets: state.brackets, totalMaids,
+            progress: { step: 'done', percent: 100, message: `${totalMaids.toLocaleString()} MAIDs analyzed (download not available for large datasets)` },
+          });
+        }
+
+        // Full query succeeded — stream CSV and generate per-bracket files
+        const fullCsvKey = `athena-results/${state.queryId}.csv`;
+        console.log(`[NSE-POLL] Streaming full CSV for per-bracket export: ${fullCsvKey}`);
+
+        let fullCsvObj;
+        try {
+          fullCsvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: fullCsvKey }));
+        } catch {
+          // CSV expired — skip download generation
+          state = { ...state, phase: 'done' };
+          await putConfig(STATE_KEY(datasetName), state, { compact: true });
+          const totalMaids = (state.brackets || []).reduce((s: number, b: BracketResult) => s + b.maidCount, 0);
+          return NextResponse.json({
+            phase: 'done', brackets: state.brackets, totalMaids,
+            progress: { step: 'done', percent: 100, message: `${totalMaids.toLocaleString()} MAIDs analyzed` },
+          });
+        }
+
+        // Load NSE data for bracket assignment
+        const nseData2 = await getConfig<NseRecord[]>(NSE_KEY(state.country));
+        if (!nseData2?.length) {
+          state = { ...state, phase: 'done' };
+          await putConfig(STATE_KEY(datasetName), state, { compact: true });
+          const totalMaids = (state.brackets || []).reduce((s: number, b: BracketResult) => s + b.maidCount, 0);
+          return NextResponse.json({ phase: 'done', brackets: state.brackets, totalMaids });
+        }
+
+        // Build postal code → NSE bracket lookup
+        const cpToBracket = new Map<string, string>();
+        for (const b of NSE_BRACKETS) {
+          for (const r of nseData2) {
+            if (r.nse >= b.min && r.nse <= b.max) {
+              cpToBracket.set(r.postal_code, b.label);
+            }
+          }
+        }
+
+        // Stream full CSV and assign each MAID to a bracket via coord→postalCode→bracket
+        const bracketMaids: Record<string, string[]> = {};
+        for (const b of NSE_BRACKETS) bracketMaids[`${b.min}-${b.max}`] = [];
+
+        const savedCoordToCP = state.coordToPostalCode || {};
+        const rl = createInterface({ input: fullCsvObj.Body as Readable, crlfDelay: Infinity });
+        let isHeader = true;
+        for await (const line of rl) {
+          if (isHeader) { isHeader = false; continue; }
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const parts = trimmed.replace(/"/g, '').split(',');
+          if (parts.length < 3) continue;
+          const [adId, lat, lng] = parts;
+          const cp = savedCoordToCP[`${lat},${lng}`];
+          if (!cp) continue;
+          const bracket = cpToBracket.get(cp);
+          if (!bracket) continue;
+          const b = NSE_BRACKETS.find(x => x.label === bracket);
+          if (b) bracketMaids[`${b.min}-${b.max}`].push(adId);
+        }
+
+        // Save per-bracket CSVs
+        const timestamp = Date.now();
+        const updatedBrackets = [...(state.brackets || [])];
+        const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
+
+        for (let i = 0; i < NSE_BRACKETS.length; i++) {
+          const b = NSE_BRACKETS[i];
+          const maids = bracketMaids[`${b.min}-${b.max}`];
+          if (maids.length > 0) {
+            const csvContent = 'ad_id\n' + maids.join('\n');
+            const fileName = `${datasetName}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
+            const key = `exports/${fileName}`;
+            await s3Client.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: csvContent, ContentType: 'text/csv' }));
+            const downloadUrl = `/api/datasets/${datasetName}/export/download?file=${encodeURIComponent(fileName)}`;
+            const idx = updatedBrackets.findIndex(x => x.label === b.label);
+            if (idx >= 0) {
+              updatedBrackets[idx] = { ...updatedBrackets[idx], maidCount: maids.length, downloadUrl };
+            }
+            // Register contribution
+            try {
+              await registerContribution(state.country.toUpperCase(), datasetName, 'nse_bracket', b.label, `exports/${fileName}`, dr);
+            } catch {}
+          }
+        }
+
+        const totalMaids = updatedBrackets.reduce((s, b) => s + b.maidCount, 0);
+        state = { ...state, phase: 'done', brackets: updatedBrackets };
+        await putConfig(STATE_KEY(datasetName), state, { compact: true });
+
+        return NextResponse.json({
+          phase: 'done', brackets: updatedBrackets, totalMaids,
+          progress: { step: 'done', percent: 100, message: `${totalMaids.toLocaleString()} MAIDs analyzed` },
+        });
+      } catch (err: any) {
+        if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
+          state = { ...state, phase: 'done' };
+          await putConfig(STATE_KEY(datasetName), state, { compact: true });
+          const totalMaids = (state.brackets || []).reduce((s: number, b: BracketResult) => s + b.maidCount, 0);
+          return NextResponse.json({ phase: 'done', brackets: state.brackets, totalMaids });
+        }
+        throw err;
+      }
     }
 
     return NextResponse.json({ phase: 'error', error: 'Unknown state — please retry' });
