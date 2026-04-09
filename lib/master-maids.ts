@@ -130,6 +130,16 @@ export async function registerAthenaContribution(
     return;
   }
 
+  // Replace any existing contribution for same dataset + type + value
+  const before = index[cc].contributions.length;
+  index[cc].contributions = index[cc].contributions.filter(c =>
+    !(c.sourceDataset === sourceDataset && c.attributeType === attributeType && c.attributeValue === attributeValue)
+  );
+  const removed = before - index[cc].contributions.length;
+  if (removed > 0) {
+    console.log(`[MASTER-MAIDS] Replaced ${removed} old ${attributeType}:${attributeValue} contribution(s) for ${sourceDataset}`);
+  }
+
   const contribution: Contribution = {
     id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     athenaTable,
@@ -180,12 +190,24 @@ export async function registerContribution(
     return;
   }
 
+  const normalizedType = attributeType === 'nse_bracket' ? 'nse' : attributeType as AttributeType;
+
+  // Replace any existing contribution for same dataset + type + value
+  const before = index[cc].contributions.length;
+  index[cc].contributions = index[cc].contributions.filter(c =>
+    !(c.sourceDataset === sourceDataset && c.attributeType === normalizedType && c.attributeValue === attributeValue)
+  );
+  const removed = before - index[cc].contributions.length;
+  if (removed > 0) {
+    console.log(`[MASTER-MAIDS] Replaced ${removed} old ${normalizedType}:${attributeValue} contribution(s) for ${sourceDataset}`);
+  }
+
   const contribution: Contribution = {
     id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     athenaTable: '',
     s3Prefix: '',
     s3Key,
-    attributeType: attributeType === 'nse_bracket' ? 'nse' : attributeType as AttributeType,
+    attributeType: normalizedType,
     attributeValue,
     sourceDataset,
     dateRange,
@@ -207,6 +229,47 @@ export async function getMasterIndex(): Promise<MasterMaidsIndex> {
 export async function getCountryContributions(country: string): Promise<CountryEntry | null> {
   const index = await getMasterIndex();
   return index[normalizeCC(country)] || null;
+}
+
+/**
+ * Remove duplicate contributions from the index.
+ * Keeps only the most recent contribution per (sourceDataset, attributeType, attributeValue).
+ * Returns count of removed duplicates per country.
+ */
+export async function deduplicateIndex(): Promise<Record<string, number>> {
+  invalidateCache(INDEX_KEY);
+  const index = await getConfig<MasterMaidsIndex>(INDEX_KEY) || {};
+  const result: Record<string, number> = {};
+
+  for (const [cc, entry] of Object.entries(index)) {
+    const seen = new Map<string, number>(); // key → index of newest
+    const toKeep = new Set<number>();
+
+    // Walk backwards so we find newest first
+    for (let i = entry.contributions.length - 1; i >= 0; i--) {
+      const c = entry.contributions[i];
+      const key = `${c.sourceDataset}|${c.attributeType}|${c.attributeValue}`;
+      if (!seen.has(key)) {
+        seen.set(key, i);
+        toKeep.add(i);
+      }
+    }
+
+    const before = entry.contributions.length;
+    entry.contributions = entry.contributions.filter((_, i) => toKeep.has(i));
+    const removed = before - entry.contributions.length;
+    if (removed > 0) {
+      result[cc] = removed;
+      // Clear stale stats so user must re-consolidate
+      entry.stats = null;
+      entry.lastConsolidatedAt = null;
+    }
+  }
+
+  if (Object.keys(result).length > 0) {
+    await putConfig(INDEX_KEY, index, { compact: true });
+  }
+  return result;
 }
 
 export async function removeContribution(country: string, contributionId: string): Promise<boolean> {

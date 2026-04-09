@@ -54,6 +54,7 @@ interface CountrySummary {
   contributionCount: number
   lastConsolidatedAt: string | null
   totalMaids: number | null
+  isEstimate?: boolean
   attributeCount: number
   datasetCount: number
   dateRange: { from: string | null; to: string | null } | null
@@ -106,6 +107,7 @@ function formatShortDate(d: string | null): string {
 export default function MasterMaidsPage() {
   const [countries, setCountries] = useState<CountrySummary[]>([])
   const [globalTotal, setGlobalTotal] = useState(0)
+  const [hasEstimates, setHasEstimates] = useState(false)
   const [loading, setLoading] = useState(true)
   const [expandedCountry, setExpandedCountry] = useState<string | null>(null)
   const [countryDetail, setCountryDetail] = useState<CountryDetail | null>(null)
@@ -113,13 +115,16 @@ export default function MasterMaidsPage() {
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [consolidating, setConsolidating] = useState<string | null>(null)
   const [consolidateProgress, setConsolidateProgress] = useState<string>('')
+  const [deduplicating, setDeduplicating] = useState(false)
 
   const loadCountries = useCallback(async () => {
     try {
       const res = await fetch('/api/master-maids', { credentials: 'include' })
       const data = await res.json()
-      setCountries(data.countries || [])
+      const cs = data.countries || []
+      setCountries(cs)
       setGlobalTotal(data.globalTotal || 0)
+      setHasEstimates(cs.some((c: CountrySummary) => c.isEstimate))
     } catch (e) {
       console.error('Failed to load master MAIDs:', e)
     } finally {
@@ -192,6 +197,30 @@ export default function MasterMaidsPage() {
     }
   }
 
+  const handleDeduplicate = async () => {
+    setDeduplicating(true)
+    try {
+      const res = await fetch('/api/master-maids', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'deduplicate' }),
+      })
+      const data = await res.json()
+      if (data.totalRemoved > 0) {
+        alert(`Removed ${data.totalRemoved} duplicate contributions. Please re-consolidate each country.`)
+      } else {
+        alert('No duplicates found.')
+      }
+      await loadCountries()
+      if (expandedCountry) await loadDetail(expandedCountry)
+    } catch (e: any) {
+      alert(`Error: ${e.message}`)
+    } finally {
+      setDeduplicating(false)
+    }
+  }
+
   const handleRemoveContribution = async (cc: string, id: string) => {
     try {
       await fetch(`/api/master-maids/${cc}?id=${id}`, {
@@ -208,14 +237,27 @@ export default function MasterMaidsPage() {
   return (
     <MainLayout>
       <div className="max-w-6xl mx-auto">
-        <div className="flex items-center gap-3 mb-6">
-          <Fingerprint className="h-8 w-8 text-theme-accent" />
-          <div>
-            <h1 className="text-2xl font-bold">Master MAIDs by Country</h1>
-            <p className="text-sm text-muted-foreground">
-              Deduplicated device lists enriched with attributes across all datasets
-            </p>
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <Fingerprint className="h-8 w-8 text-theme-accent" />
+            <div>
+              <h1 className="text-2xl font-bold">Master MAIDs by Country</h1>
+              <p className="text-sm text-muted-foreground">
+                Deduplicated device lists enriched with attributes across all datasets
+              </p>
+            </div>
           </div>
+          {countries.length > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleDeduplicate}
+              disabled={deduplicating}
+            >
+              {deduplicating ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+              Deduplicate Index
+            </Button>
+          )}
         </div>
 
         {!loading && globalTotal > 0 && (
@@ -229,8 +271,12 @@ export default function MasterMaidsPage() {
                 </div>
               </div>
               <div className="text-right">
-                <div className="text-3xl font-bold tabular-nums text-theme-accent">{formatNumber(globalTotal)}</div>
-                <div className="text-sm text-muted-foreground">unique MAIDs worldwide</div>
+                <div className="text-3xl font-bold tabular-nums text-theme-accent">
+                  {hasEstimates ? '~' : ''}{formatNumber(globalTotal)}
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  {hasEstimates ? 'MAIDs worldwide (consolidate for exact count)' : 'unique MAIDs worldwide'}
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -293,8 +339,12 @@ export default function MasterMaidsPage() {
                     <div className="flex items-center gap-3">
                       {c.totalMaids !== null && (
                         <div className="text-right">
-                          <div className="text-xl font-bold tabular-nums">{formatNumber(c.totalMaids)}</div>
-                          <div className="text-xs text-muted-foreground">unique MAIDs</div>
+                          <div className="text-xl font-bold tabular-nums">
+                            {c.isEstimate ? '~' : ''}{formatNumber(c.totalMaids)}
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            {c.isEstimate ? 'MAIDs (not deduplicated)' : 'unique MAIDs'}
+                          </div>
                         </div>
                       )}
                       {c.attributeCount > 0 && (
