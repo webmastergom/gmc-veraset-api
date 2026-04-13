@@ -126,7 +126,7 @@ export const POI_CATEGORIES = [
   // Gaming
   'esports_league', 'esports_team', 'virtual_reality_center', 'internet_cafe',
   // Moviegoers
-  'drive_in_theater', 'outdoor_movies', 'film_festivals_and_organizations',
+  'drive_in_theater', 'outdoor_movies', 'film_festival', 'film_festivals_and_organizations',
   // Corporate
   'coworking_space', 'information_technology_company', 'corporate_office',
   'software_development', 'professional_services',
@@ -337,6 +337,7 @@ export const CATEGORY_LABELS: Record<string, string> = {
   // ── T4: Moviegoers ──────────────────────────────────────────────────
   drive_in_theater: 'Drive-in Theaters',
   outdoor_movies: 'Outdoor Movies',
+  film_festival: 'Film Festivals',
   film_festivals_and_organizations: 'Film Festivals',
   // ── T4: Corporate / C-Level ─────────────────────────────────────────
   coworking_space: 'Coworking Spaces',
@@ -681,7 +682,7 @@ export const CATEGORY_GROUPS: Record<string, CategoryGroup> = {
     label: 'Moviegoers',
     icon: 'Film',
     color: 'text-rose-400',
-    categories: ['cinema', 'drive_in_theater', 'outdoor_movies', 'film_festivals_and_organizations'],
+    categories: ['cinema', 'drive_in_theater', 'outdoor_movies', 'film_festival'],
   },
   corporate: {
     label: 'Corporate / C-Level',
