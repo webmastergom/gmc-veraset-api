@@ -84,6 +84,7 @@ export function buildSpatialJoinQueries(
   dateFrom?: string,
   dateTo?: string,
   spatialRadius = 200,
+  poiBatchFilter?: string,
 ): { spatialQuery: string; spatialSelectForCTAS: string; totalDevicesQuery: string } {
   const tableName = getTableName(datasetId);
   const poiTableName = 'lab_pois_gmc';
@@ -96,6 +97,7 @@ export function buildSpatialJoinQueries(
 
   const catFilter = `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`;
   const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
+  const batchFilter = poiBatchFilter || '';
 
   const GRID_STEP = 0.01;
   // Buffer around POI bounding box to pre-filter pings (degrees, ~2.2km)
@@ -111,6 +113,7 @@ export function buildSpatialJoinQueries(
       WHERE p.category IS NOT NULL
         ${catFilter}
         ${countryFilter}
+        ${batchFilter}
     ),
     poi_bounds AS (
       SELECT
@@ -216,6 +219,7 @@ export function buildSpatialJoinQueries(
       WHERE p.category IS NOT NULL
         ${catFilter}
         ${countryFilter}
+        ${batchFilter}
     ),
     poi_bounds AS (
       SELECT

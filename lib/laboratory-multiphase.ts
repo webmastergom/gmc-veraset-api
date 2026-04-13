@@ -37,6 +37,12 @@ const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
 const LAB_STATE_PREFIX = 'config/laboratory-state';
 const STALE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min
 
+// ── Batching constants ──────────────────────────────────────────────────
+// When POI count exceeds this, split into geographic batches to avoid
+// Athena "Query exhausted resources" on the spatial join CTAS.
+const POI_BATCH_THRESHOLD = 5000;
+const MAX_POI_BATCHES = 4;
+
 const s3Client = new S3Client({
   region: process.env.AWS_REGION || 'us-west-2',
   credentials: {
@@ -52,13 +58,15 @@ export interface LaboratoryState {
   datasetName: string;
   config: LabConfig;
   runId: string;
-  // Query tracking
-  spatialCTASId?: string;
+  // Query tracking (arrays for batched spatial join)
+  spatialCTASIds?: string[];
   totalDevicesQueryId?: string;
   originsCTASId?: string;
-  // Temp table names
-  spatialTableName?: string;
+  // Temp table names (arrays for batched spatial join)
+  spatialTableNames?: string[];
   originsTableName?: string;
+  // Batching info
+  poiBatchCount?: number;
   // Intermediate values
   totalDevices?: number;
   visitCount?: number;
@@ -177,9 +185,11 @@ export async function analyzeLaboratoryMultiPhase(
   } catch (error: any) {
     console.error(`[LAB-MP] ${datasetName} error:`, error.message);
     // Clean up any partial temp data on failure
-    if (state?.spatialTableName) {
-      dropTempTable(state.spatialTableName).catch(() => {});
-      cleanupTempS3(state.spatialTableName).catch(() => {});
+    if (state?.spatialTableNames) {
+      for (const tbl of state.spatialTableNames) {
+        dropTempTable(tbl).catch(() => {});
+        cleanupTempS3(tbl).catch(() => {});
+      }
     }
     if (state?.originsTableName) {
       dropTempTable(state.originsTableName).catch(() => {});
@@ -207,16 +217,9 @@ export async function analyzeLaboratoryMultiPhase(
 async function phaseStarting(config: LabConfig): Promise<LaboratoryState> {
   const datasetName = config.datasetId;
   const runId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const spatialTableName = `temp_lab_spatial_${runId}`;
   const originsTableName = `temp_lab_origins_${runId}`;
 
   console.log(`[LAB-MP] ${datasetName}: Phase 1 — Starting (runId=${runId})`);
-
-  // Drop temp tables if they exist from a previous failed run
-  await Promise.all([
-    dropTempTable(spatialTableName).catch(() => {}),
-    dropTempTable(originsTableName).catch(() => {}),
-  ]);
 
   // Ensure dataset table exists
   try {
@@ -248,32 +251,89 @@ async function phaseStarting(config: LabConfig): Promise<LaboratoryState> {
   }
   const categoryList = Array.from(allCategories);
   const spatialRadius = config.spatialJoinRadiusMeters || 200;
+  const country = config.country;
+  const isoCountry = country ? toIsoCountry(country) : '';
+  const catSql = categoryList.map(c => `'${c}'`).join(',');
 
-  // Build queries
-  const { spatialSelectForCTAS, totalDevicesQuery } = buildSpatialJoinQueries(
+  // Count POIs + get latitude range to decide if batching is needed
+  const poiCountSql = `
+    SELECT COUNT(*) as cnt, MIN(latitude) as min_lat, MAX(latitude) as max_lat
+    FROM lab_pois_gmc
+    WHERE category IS NOT NULL
+      AND category IN (${catSql})
+      ${isoCountry ? `AND country = '${isoCountry}'` : ''}
+  `;
+  const poiCountRes = await runQuery(poiCountSql);
+  const poiCount = parseInt(String(poiCountRes.rows[0]?.cnt)) || 0;
+  const minLat = parseFloat(String(poiCountRes.rows[0]?.min_lat)) || 0;
+  const maxLat = parseFloat(String(poiCountRes.rows[0]?.max_lat)) || 0;
+
+  // Determine batch count based on POI count
+  const batchCount = poiCount > POI_BATCH_THRESHOLD
+    ? Math.min(Math.ceil(poiCount / POI_BATCH_THRESHOLD), MAX_POI_BATCHES)
+    : 1;
+
+  console.log(`[LAB-MP] ${datasetName}: ${poiCount} POIs (lat ${minLat.toFixed(1)}–${maxLat.toFixed(1)}), batchCount=${batchCount}`);
+
+  // Build geographic batch filters (contiguous latitude bands)
+  const batchFilters: string[] = [];
+  if (batchCount > 1) {
+    const bandHeight = (maxLat - minLat) / batchCount;
+    for (let i = 0; i < batchCount; i++) {
+      const bandMin = minLat + i * bandHeight;
+      // Last band uses open-ended upper bound to catch any rounding edge cases
+      if (i === batchCount - 1) {
+        batchFilters.push(`AND p.latitude >= ${bandMin}`);
+      } else {
+        const bandMax = minLat + (i + 1) * bandHeight;
+        batchFilters.push(`AND p.latitude >= ${bandMin} AND p.latitude < ${bandMax}`);
+      }
+    }
+  } else {
+    batchFilters.push(''); // single batch, no extra filter
+  }
+
+  // Create table names and drop any leftovers
+  const spatialTableNames = batchFilters.map((_, i) =>
+    batchCount > 1 ? `temp_lab_spatial_${runId}_b${i}` : `temp_lab_spatial_${runId}`
+  );
+  await Promise.all([
+    ...spatialTableNames.map(t => dropTempTable(t).catch(() => {})),
+    dropTempTable(originsTableName).catch(() => {}),
+  ]);
+
+  // Fire spatial CTAS per batch + one total devices query
+  const { totalDevicesQuery } = buildSpatialJoinQueries(
     datasetName, categoryList, config.country,
     config.dateFrom, config.dateTo, spatialRadius,
   );
 
-  // Fire spatial CTAS with LIMIT 500000 (matches current behavior)
-  const limitedSpatial = `${spatialSelectForCTAS} LIMIT 500000`;
-  const [spatialCTASId, totalDevicesQueryId] = await Promise.all([
-    startCTASAsync(limitedSpatial, spatialTableName),
-    startQueryAsync(totalDevicesQuery),
-  ]);
+  const spatialCTASIds: string[] = [];
+  for (let i = 0; i < batchCount; i++) {
+    const { spatialSelectForCTAS } = buildSpatialJoinQueries(
+      datasetName, categoryList, config.country,
+      config.dateFrom, config.dateTo, spatialRadius,
+      batchFilters[i],
+    );
+    const limitedSpatial = `${spatialSelectForCTAS} LIMIT ${Math.ceil(500000 / batchCount)}`;
+    const ctasId = await startCTASAsync(limitedSpatial, spatialTableNames[i]);
+    spatialCTASIds.push(ctasId);
+  }
+  const totalDevicesQueryId = await startQueryAsync(totalDevicesQuery);
 
-  console.log(`[LAB-MP] ${datasetName}: Spatial CTAS started (${spatialCTASId}), Total devices query (${totalDevicesQueryId})`);
+  console.log(`[LAB-MP] ${datasetName}: Fired ${batchCount} spatial CTAS + total devices query`);
 
   return {
     status: 'spatial_running',
     datasetName,
     config,
     runId,
-    spatialCTASId,
+    spatialCTASIds,
     totalDevicesQueryId,
-    spatialTableName,
+    spatialTableNames,
     originsTableName,
-    progress: { step: 'spatial_join', percent: 10, message: 'Running spatial join...' },
+    poiBatchCount: batchCount,
+    progress: { step: 'spatial_join', percent: 10, message: `Running spatial join${batchCount > 1 ? ` (${batchCount} batches)` : ''}...` },
     startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -282,23 +342,28 @@ async function phaseStarting(config: LabConfig): Promise<LaboratoryState> {
 // ── Phase 2: Spatial Running ─────────────────────────────────────────────
 
 async function phaseSpatialRunning(state: LaboratoryState): Promise<LaboratoryState> {
-  const { datasetName, spatialCTASId, totalDevicesQueryId } = state;
+  const { datasetName, spatialCTASIds, totalDevicesQueryId, spatialTableNames } = state;
+  const batchCount = state.poiBatchCount || 1;
 
-  // Poll both queries
-  const [spatialStatus, totalStatus] = await Promise.all([
-    checkQueryStatus(spatialCTASId!),
-    checkQueryStatus(totalDevicesQueryId!),
-  ]);
+  // Poll all spatial batch queries + total devices query
+  const spatialStatuses = await Promise.all(
+    (spatialCTASIds || []).map(id => checkQueryStatus(id)),
+  );
+  const totalStatus = await checkQueryStatus(totalDevicesQueryId!);
 
-  console.log(`[LAB-MP] ${datasetName}: spatial=${spatialStatus.state}, total=${totalStatus.state}`);
+  const spatialStates = spatialStatuses.map(s => s.state);
+  console.log(`[LAB-MP] ${datasetName}: spatial=[${spatialStates.join(',')}], total=${totalStatus.state}`);
 
-  // Check for failures — clean up partial S3 data from failed CTAS
-  if (spatialStatus.state === 'FAILED') {
-    if (state.spatialTableName) {
-      dropTempTable(state.spatialTableName).catch(() => {});
-      cleanupTempS3(state.spatialTableName).catch(() => {});
+  // Check for failures — clean up partial S3 data from failed CTAS batches
+  for (let i = 0; i < spatialStatuses.length; i++) {
+    if (spatialStatuses[i].state === 'FAILED') {
+      // Clean up all batch tables
+      for (const tbl of (spatialTableNames || [])) {
+        dropTempTable(tbl).catch(() => {});
+        cleanupTempS3(tbl).catch(() => {});
+      }
+      throw new Error(`Spatial join query failed: ${spatialStatuses[i].error}`);
     }
-    throw new Error(`Spatial join query failed: ${spatialStatus.error}`);
   }
   if (totalStatus.state === 'FAILED') {
     throw new Error(`Total devices query failed: ${totalStatus.error}`);
@@ -311,29 +376,37 @@ async function phaseSpatialRunning(state: LaboratoryState): Promise<LaboratorySt
     console.log(`[LAB-MP] ${datasetName}: totalDevices = ${state.totalDevices}`);
   }
 
-  // Both done? Check visit count and fire origins
-  if (spatialStatus.state === 'SUCCEEDED' && totalStatus.state === 'SUCCEEDED') {
-    // Quick COUNT to check if spatial join returned results
-    const countRes = await runQuery(`SELECT COUNT(*) as cnt FROM ${state.spatialTableName}`);
+  // All spatial batches + total devices done?
+  const allSpatialDone = spatialStatuses.every(s => s.state === 'SUCCEEDED');
+  if (allSpatialDone && totalStatus.state === 'SUCCEEDED') {
+    // Count visits across all batch tables
+    const countParts = (spatialTableNames || []).map(t => `SELECT COUNT(*) as cnt FROM ${t}`);
+    const countSql = batchCount > 1
+      ? `SELECT SUM(cnt) as cnt FROM (${countParts.join(' UNION ALL ')})`
+      : `SELECT COUNT(*) as cnt FROM ${spatialTableNames![0]}`;
+    const countRes = await runQuery(countSql);
     const visitCount = parseInt(String(countRes.rows[0]?.cnt)) || 0;
     state.visitCount = visitCount;
-    console.log(`[LAB-MP] ${datasetName}: ${visitCount} spatial visits`);
+    console.log(`[LAB-MP] ${datasetName}: ${visitCount} spatial visits (${batchCount} batch${batchCount > 1 ? 'es' : ''})`);
 
     if (visitCount === 0) {
-      // No visits — return empty result
       console.log(`[LAB-MP] ${datasetName}: No visits found, completing with empty result`);
       state.status = 'completed';
       state.result = buildEmptyResult(state.config, state.totalDevices);
       state.progress = { step: 'completed', percent: 100, message: 'No visits found matching criteria' };
-      // Clean up
-      dropTempTable(state.spatialTableName!).catch(() => {});
+      for (const tbl of (spatialTableNames || [])) dropTempTable(tbl).catch(() => {});
       return state;
     }
+
+    // Build ad_id source from all batch tables for origins query
+    const adIdSource = batchCount > 1
+      ? `(${(spatialTableNames || []).map(t => `SELECT DISTINCT ad_id FROM ${t}`).join(' UNION ')})`
+      : spatialTableNames![0];
 
     // Fire origins CTAS
     const originsSelect = buildOriginsCTASQuery(
       state.config.datasetId,
-      state.spatialTableName!,
+      adIdSource,
       state.config.dateFrom,
       state.config.dateTo,
     );
@@ -343,11 +416,14 @@ async function phaseSpatialRunning(state: LaboratoryState): Promise<LaboratorySt
     console.log(`[LAB-MP] ${datasetName}: Origins CTAS started (${state.originsCTASId})`);
   } else {
     // Still running — update progress
-    const spatialRunning = spatialStatus.state === 'RUNNING' || spatialStatus.state === 'QUEUED';
+    const completedBatches = spatialStatuses.filter(s => s.state === 'SUCCEEDED').length;
+    const pct = 10 + Math.round((completedBatches / batchCount) * 30);
     state.progress = {
       step: 'spatial_join',
-      percent: spatialRunning ? 20 : 40,
-      message: spatialRunning ? 'Spatial join running...' : 'Waiting for queries...',
+      percent: pct,
+      message: batchCount > 1
+        ? `Spatial join: ${completedBatches}/${batchCount} batches complete...`
+        : 'Spatial join running...',
     };
   }
 
@@ -384,11 +460,17 @@ async function phaseOriginsRunning(state: LaboratoryState): Promise<LaboratorySt
 // ── Phase 4: Processing ──────────────────────────────────────────────────
 
 async function phaseProcessing(state: LaboratoryState): Promise<LaboratoryState> {
-  const { datasetName, spatialTableName, originsTableName, config } = state;
+  const { datasetName, spatialTableNames, originsTableName, config } = state;
+  const batchCount = state.poiBatchCount || 1;
 
-  console.log(`[LAB-MP] ${datasetName}: Phase 4 — Processing`);
+  console.log(`[LAB-MP] ${datasetName}: Phase 4 — Processing (${batchCount} batch${batchCount > 1 ? 'es' : ''})`);
   state.progress = { step: 'geocoding', percent: 70, message: 'Downloading results...' };
   await saveLabState(state);
+
+  // Build spatial source: UNION ALL for multi-batch, direct table for single
+  const spatialSource = batchCount > 1
+    ? `(${(spatialTableNames || []).map(t => `SELECT * FROM ${t}`).join(' UNION ALL ')})`
+    : spatialTableNames![0];
 
   // Read spatial visits + origins in a single joined query
   const joinedSql = `
@@ -396,7 +478,7 @@ async function phaseProcessing(state: LaboratoryState): Promise<LaboratoryState>
       v.ad_id, v.date, v.poi_id, v.category, v.dwell_minutes, v.visit_hour,
       COALESCE(o.origin_lat, 0) as origin_lat,
       COALESCE(o.origin_lng, 0) as origin_lng
-    FROM ${spatialTableName} v
+    FROM ${spatialSource} v
     LEFT JOIN ${originsTableName} o ON v.ad_id = o.ad_id AND v.date = o.date
   `;
 
@@ -449,7 +531,7 @@ async function phaseProcessing(state: LaboratoryState): Promise<LaboratoryState>
   console.log(`[LAB-MP] ${datasetName}: Analysis complete — ${result.segment.totalDevices} devices in segment, ${result.profiles.length} postal codes`);
 
   // Clean up temp tables (fire and forget)
-  dropTempTable(spatialTableName!).catch(() => {});
+  for (const tbl of (spatialTableNames || [])) dropTempTable(tbl).catch(() => {});
   dropTempTable(originsTableName!).catch(() => {});
 
   state.status = 'completed';
