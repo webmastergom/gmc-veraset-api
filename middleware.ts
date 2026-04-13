@@ -58,8 +58,10 @@ export function middleware(request: NextRequest) {
     
     // Apply rate limiting to all API routes
     const clientId = getClientIdentifier(request)
+    // Polling-heavy routes (laboratory, reports, consolidation, NSE) need higher limits
+    const isPollingRoute = pathname.includes('/laboratory/') || pathname.includes('/reports/poll') || pathname.includes('/consolidation/') || pathname.includes('/nse-poll')
     // External routes get higher limits (they use API key auth)
-    const rateLimitMax = isPublicRoute ? 5 : (isExternalRoute ? 100 : 20)
+    const rateLimitMax = isPublicRoute ? 5 : (isExternalRoute ? 100 : (isPollingRoute ? 120 : 20))
     const rateLimit = checkRateLimit(
       `${clientId}:${pathname}`,
       rateLimitMax,
