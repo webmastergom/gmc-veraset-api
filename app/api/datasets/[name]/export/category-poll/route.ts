@@ -79,10 +79,25 @@ function buildSpatialJoinSelect(
   categories: string[],
   country: string,
   minDwell: number,
+  maxDwell = 0,
+  hourFrom = 0,
+  hourTo = 23,
 ): string {
   const catFilter = `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`;
   const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
-  const dwellFilter = minDwell > 0 ? `WHERE v.dwell_minutes >= ${minDwell}` : '';
+  const dwellParts: string[] = [];
+  if (minDwell > 0) dwellParts.push(`v.dwell_minutes >= ${minDwell}`);
+  if (maxDwell > 0) dwellParts.push(`v.dwell_minutes <= ${maxDwell}`);
+  const dwellFilter = dwellParts.length > 0 ? `WHERE ${dwellParts.join(' AND ')}` : '';
+  // Hour filter on pings
+  let hourFilter = '';
+  if (hourFrom > 0 || hourTo < 23) {
+    if (hourFrom <= hourTo) {
+      hourFilter = `AND HOUR(utc_timestamp) >= ${hourFrom} AND HOUR(utc_timestamp) <= ${hourTo}`;
+    } else {
+      hourFilter = `AND (HOUR(utc_timestamp) >= ${hourFrom} OR HOUR(utc_timestamp) <= ${hourTo})`;
+    }
+  }
 
   // Optimized for TB-scale datasets: NO window functions (ROW_NUMBER kills memory)
   // Instead of "closest POI per ping", we match all pings within radius and
@@ -122,6 +137,7 @@ function buildSpatialJoinSelect(
         AND TRY_CAST(longitude AS DOUBLE) BETWEEN (SELECT min_lng FROM poi_bounds) AND (SELECT max_lng FROM poi_bounds)
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${hourFilter}
     ),
     poi_buckets AS (
       SELECT poi_id, category, poi_lat, poi_lng,
@@ -171,8 +187,11 @@ function buildCategoryMaidQuery(
   categories: string[],
   country: string,
   minDwell: number,
+  maxDwell = 0,
+  hourFrom = 0,
+  hourTo = 23,
 ): string {
-  return buildSpatialJoinSelect(tableName, categories, country, minDwell);
+  return buildSpatialJoinSelect(tableName, categories, country, minDwell, maxDwell, hourFrom, hourTo);
 }
 
 function buildCategoryMaidCTAS(
@@ -181,8 +200,11 @@ function buildCategoryMaidCTAS(
   country: string,
   minDwell: number,
   ctasTableName: string,
+  maxDwell = 0,
+  hourFrom = 0,
+  hourTo = 23,
 ): string {
-  const selectSql = buildSpatialJoinSelect(tableName, categories, country, minDwell);
+  const selectSql = buildSpatialJoinSelect(tableName, categories, country, minDwell, maxDwell, hourFrom, hourTo);
   return `
     CREATE TABLE ${ctasTableName}
     WITH (
@@ -240,7 +262,10 @@ export async function POST(
     if (!state) {
       const categories: string[] = body.categories || [];
       const country: string = body.country || '';
-      const minDwell: number = body.minDwell || 0;
+      const minDwell: number = parseInt(body.minDwell, 10) || 0;
+      const maxDwell: number = parseInt(body.maxDwell, 10) || 0;
+      const hourFrom: number = parseInt(body.hourFrom, 10) || 0;
+      const hourTo: number = body.hourTo != null ? parseInt(body.hourTo, 10) : 23;
       const groupKey: string = body.groupKey || 'custom';
 
       if (!categories.length) {
@@ -250,7 +275,11 @@ export async function POST(
         return NextResponse.json({ error: 'country required' }, { status: 400 });
       }
 
-      console.log(`[CATEGORY-POLL] Starting for ${datasetName}, country=${country}, minDwell=${minDwell}, categories=${categories.length}`);
+      const filterLabel = [
+        minDwell > 0 || maxDwell > 0 ? `dwell=${minDwell}-${maxDwell || '∞'}` : `dwell=${minDwell}`,
+        hourFrom > 0 || hourTo < 23 ? `hours=${hourFrom}-${hourTo}` : '',
+      ].filter(Boolean).join(', ');
+      console.log(`[CATEGORY-POLL] Starting for ${datasetName}, country=${country}, ${filterLabel}, categories=${categories.length}`);
 
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
@@ -258,7 +287,7 @@ export async function POST(
       // ALWAYS use CTAS — no timeout limits, Parquet output, works for any size
       const cc = country.toUpperCase();
       const ctasTable = masterTableName(cc, 'cat_' + (groupKey || 'custom'), datasetName);
-      const ctasSql = buildCategoryMaidCTAS(table, categories, country, minDwell, ctasTable);
+      const ctasSql = buildCategoryMaidCTAS(table, categories, country, minDwell, ctasTable, maxDwell, hourFrom, hourTo);
       const poiSql = buildPoiListQuery(categories, country);
 
       const [queryId, poiQueryId] = await Promise.all([

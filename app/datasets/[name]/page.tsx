@@ -1170,6 +1170,8 @@ export default function DatasetAnalysisPage() {
         catchmentData={catchmentReport?.byZipCode || null}
         dwellMin={dwellMin}
         dwellMax={dwellMax}
+        hourFrom={hourFrom}
+        hourTo={hourTo}
         jobCountry={datasetInfo?.country || null}
       />
       <CategoryMaidModal
@@ -1177,6 +1179,10 @@ export default function DatasetAnalysisPage() {
         onClose={() => setCategoryMaidModalOpen(false)}
         datasetName={datasetName}
         jobCountry={datasetInfo?.country || null}
+        dwellMin={dwellMin}
+        dwellMax={dwellMax}
+        hourFrom={hourFrom}
+        hourTo={hourTo}
       />
     </MainLayout>
   );

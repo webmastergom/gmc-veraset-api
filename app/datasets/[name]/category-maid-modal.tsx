@@ -30,9 +30,13 @@ interface CategoryMaidModalProps {
   onClose: () => void;
   datasetName: string;
   jobCountry: string | null;
+  dwellMin?: number;
+  dwellMax?: number;
+  hourFrom?: number;
+  hourTo?: number;
 }
 
-export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: CategoryMaidModalProps) {
+export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwellMin = 0, dwellMax = 0, hourFrom = 0, hourTo = 23 }: CategoryMaidModalProps) {
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
   const [minDwell, setMinDwell] = useState(5);
@@ -141,6 +145,9 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry }: Ca
           categories: Array.from(selectedCategories),
           groupKey: selectedGroup || 'custom',
           minDwell,
+          maxDwell: dwellMax,
+          hourFrom,
+          hourTo,
           country,
         }),
       });

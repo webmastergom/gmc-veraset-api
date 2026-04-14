@@ -55,6 +55,9 @@ interface NseExportState {
   ctasTable?: string;       // Athena table name from CTAS
   country: string;
   minDwell: number;
+  maxDwell: number;
+  hourFrom: number;
+  hourTo: number;
   dateRange?: { from: string; to: string };
   coordToPostalCode?: Record<string, string>;
   brackets?: BracketResult[];
@@ -112,7 +115,10 @@ export async function POST(
     // ── Phase: start ─────────────────────────────────────────────
     if (!state) {
       const country: string = body.country || '';
-      const minDwell: number = body.minDwell || 0;
+      const minDwell: number = parseInt(body.minDwell, 10) || 0;
+      const maxDwell: number = parseInt(body.maxDwell, 10) || 0;
+      const hourFrom: number = parseInt(body.hourFrom, 10) || 0;
+      const hourTo: number = body.hourTo != null ? parseInt(body.hourTo, 10) : 23;
 
       if (!country) {
         return NextResponse.json({ error: 'country required' }, { status: 400 });
@@ -123,15 +129,32 @@ export async function POST(
         return NextResponse.json({ error: `No NSE data for ${country}. Upload CSV first.` }, { status: 404 });
       }
 
-      console.log(`[NSE-POLL] Starting for ${datasetName}, country=${country}, minDwell=${minDwell}, ${nseData.length} NSE CPs`);
+      const filterLabel = [
+        minDwell > 0 || maxDwell > 0 ? `dwell=${minDwell}-${maxDwell || '∞'}` : '',
+        hourFrom > 0 || hourTo < 23 ? `hours=${hourFrom}-${hourTo}` : '',
+      ].filter(Boolean).join(', ');
+      console.log(`[NSE-POLL] Starting for ${datasetName}, country=${country}, ${filterLabel || 'no filters'}, ${nseData.length} NSE CPs`);
 
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
       const cc = country.toUpperCase();
 
-      const dwellHaving = minDwell > 0
-        ? `HAVING DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`
-        : '';
+      // Build dwell HAVING clause (min and/or max)
+      const dwellParts: string[] = [];
+      if (minDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`);
+      if (maxDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${maxDwell}`);
+      const dwellHaving = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
+
+      // Build hour filter
+      let hourFilter = '';
+      if (hourFrom > 0 || hourTo < 23) {
+        if (hourFrom <= hourTo) {
+          hourFilter = `AND HOUR(utc_timestamp) >= ${hourFrom} AND HOUR(utc_timestamp) <= ${hourTo}`;
+        } else {
+          // Cross-midnight (e.g., 22h to 6h)
+          hourFilter = `AND (HOUR(utc_timestamp) >= ${hourFrom} OR HOUR(utc_timestamp) <= ${hourTo})`;
+        }
+      }
 
       const originsCTE = `
         WITH poi_visitors AS (
@@ -140,6 +163,7 @@ export async function POST(
           CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
           WHERE poi_id IS NOT NULL AND poi_id != ''
             AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+            ${hourFilter}
           GROUP BY ad_id, date
           ${dwellHaving}
         ),
@@ -186,7 +210,7 @@ export async function POST(
         } catch {}
       }
 
-      state = { phase: 'polling', queryId, coordQueryId, ctasTable, country, minDwell, dateRange };
+      state = { phase: 'polling', queryId, coordQueryId, ctasTable, country, minDwell, maxDwell, hourFrom, hourTo, dateRange };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({

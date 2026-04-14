@@ -36,7 +36,7 @@ export const maxDuration = 60;
  * Tracks parallel Athena queries across phases.
  */
 interface ConsolidationState {
-  phase: 'starting' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'done';
+  phase: 'starting' | 'launching' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'done';
   /** Query IDs for each report type */
   queries?: {
     visits?: string;
@@ -126,7 +126,7 @@ export async function POST(
       await updateMegaJob(id, { status: 'consolidating' });
     }
 
-    // ── Phase 1: Start all queries in parallel ─────────────────────────
+    // ── Phase 1a: Ensure Athena tables + create VIEW ────────────────────
     if (state.phase === 'starting') {
       try {
         const effectivePoiIds = state.poiIds || poiIds;
@@ -158,6 +158,30 @@ export async function POST(
             // Non-fatal — consolidation continues without the integrated view
           }
         }
+
+        // Tables + VIEW ready → advance to launching phase (separate HTTP request)
+        state = {
+          phase: 'launching',
+          poiIds: effectivePoiIds,
+          dwellFilter: state.dwellFilter || dwellFilter,
+        };
+        await putConf(CONSOLIDATION_KEY(id), state);
+
+        return NextResponse.json({
+          phase: 'launching',
+          progress: { step: 'tables_ready', percent: 5, message: `Tables ready. Launching queries...` },
+        });
+      } catch (err: any) {
+        state = { phase: 'starting', error: err.message };
+        await putConf(CONSOLIDATION_KEY(id), state);
+        return NextResponse.json({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // ── Phase 1b: Extract POI coords + launch all 9 Athena queries ─────
+    if (state.phase === 'launching') {
+      try {
+        const effectivePoiIds = state.poiIds || poiIds;
 
         // Extract POI coordinates from sub-job metadata for spatial proximity queries
         const poiCoords = extractPoiCoords(syncedJobs);
@@ -204,7 +228,7 @@ export async function POST(
           progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
         });
       } catch (err: any) {
-        state = { phase: 'starting', error: err.message };
+        state = { phase: 'launching', error: err.message };
         await putConf(CONSOLIDATION_KEY(id), state);
         return NextResponse.json({ error: err.message }, { status: 500 });
       }
