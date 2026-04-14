@@ -105,11 +105,11 @@ function targetVisitsCTE(
       ${havingClause}
     ),
     target_daily AS (
-      SELECT ad_id, date,
-        MIN(arrival) as first_arrival,
-        MAX(departure) as last_departure
-      FROM target_visits
-      GROUP BY ad_id, date
+      SELECT ad_id, date, arrival as first_arrival, departure as last_departure, dwell
+      FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_id, date ORDER BY dwell DESC, arrival) as rn
+        FROM target_visits
+      ) t_ranked WHERE rn = 1
     )`;
 }
 
@@ -164,8 +164,7 @@ function spatialJoinCTEs(
         CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_b,
         CASE
           WHEN p.utc_timestamp < td.first_arrival THEN 'before'
-          WHEN p.utc_timestamp > td.last_departure THEN 'after'
-          ELSE 'during'
+          ELSE 'after'
         END as direction
       FROM ${table} p
       INNER JOIN ${pinsCTE} s ON p.ad_id = s.ad_id
@@ -174,6 +173,7 @@ function spatialJoinCTEs(
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
         AND p.ad_id IS NOT NULL AND TRIM(p.ad_id) != ''
+        AND (p.utc_timestamp < td.first_arrival OR p.utc_timestamp > td.last_departure)
         ${hourWhere}
     ),
     matched AS (
@@ -257,6 +257,7 @@ function buildSampleRoutesSQL(
     ),
     ${spatialJoinCTEs(table, country, hourFrom, hourTo, 'sampled')},
     categorized AS (
+      -- Before/after stops: spatial join with lab_pois_gmc
       SELECT
         ad_id, date, direction, category,
         MIN(utc_timestamp) as first_ts,
@@ -264,6 +265,17 @@ function buildSampleRoutesSQL(
         ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_min
       FROM matched
       GROUP BY ad_id, date, direction, category
+
+      UNION ALL
+
+      -- Target visit: single entry per device-day (no spatial join explosion)
+      SELECT
+        td.ad_id, td.date, 'during' as direction, 'target' as category,
+        td.first_arrival as first_ts,
+        td.last_departure as last_ts,
+        CAST(td.dwell AS DOUBLE) as dwell_min
+      FROM target_daily td
+      INNER JOIN sampled s ON td.ad_id = s.ad_id
     )
     SELECT
       ad_id, date,
@@ -509,7 +521,8 @@ export async function POST(
         try {
           const res = await fetchQueryResults(state.sampleQueryId);
           sampleStops = res.rows.map((row: any) => {
-            const g = catToGroup(row.category || 'unknown');
+            const isTarget = row.category === 'target' || row.direction === 'during';
+            const g = isTarget ? { key: 'target', label: 'Target POI' } : catToGroup(row.category || 'unknown');
             return {
               ad_id: row.ad_id,
               date: row.date,
