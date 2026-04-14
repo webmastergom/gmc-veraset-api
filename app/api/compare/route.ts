@@ -3,12 +3,12 @@ import { isAuthenticated } from '@/lib/auth';
 import {
   startQueryAsync,
   checkQueryStatus,
+  fetchQueryResults,
   ensureTableForDataset,
   getTableName,
+  runQuery,
 } from '@/lib/athena';
-import { getConfig, putConfig } from '@/lib/s3-config';
-import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { s3Client, BUCKET } from '@/lib/s3-config';
+import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -21,14 +21,25 @@ interface DatasetSide {
 }
 
 interface CompareState {
-  phase: 'querying' | 'polling' | 'processing' | 'done' | 'error';
+  phase: 'starting' | 'polling' | 'reading' | 'done' | 'error';
   stateId: string;
   datasetA: DatasetSide;
   datasetB: DatasetSide;
-  queryIdA?: string;
-  queryIdB?: string;
-  queryDoneA?: boolean;
-  queryDoneB?: boolean;
+  // 4 parallel queries: countA, countB, countOverlap, exportOverlap
+  queryIds: {
+    countA?: string;
+    countB?: string;
+    countOverlap?: string;
+    exportOverlap?: string;
+  };
+  done: {
+    countA?: boolean;
+    countB?: boolean;
+    countOverlap?: boolean;
+    exportOverlap?: boolean;
+  };
+  // For CSV-export sides: temp table names to clean up
+  tempTables?: string[];
   error?: string;
   result?: {
     totalA: number;
@@ -42,61 +53,88 @@ interface CompareState {
 
 const STATE_KEY = (id: string) => `compare-state/${id}`;
 
-function needsAthena(side: DatasetSide): boolean {
-  return side.source === 'all';
+/**
+ * Build a SQL subquery that returns DISTINCT ad_id for a dataset side.
+ */
+function maidSubquery(side: DatasetSide, tableName: string): string {
+  if (side.source === 'all') {
+    const minDwell = side.minDwell || 0;
+    if (minDwell > 0) {
+      return `(
+        SELECT DISTINCT ad_id FROM (
+          SELECT ad_id, date,
+            DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell
+          FROM ${tableName}
+          CROSS JOIN UNNEST(poi_ids) AS t2(poi_id)
+          WHERE t2.poi_id IS NOT NULL AND t2.poi_id != ''
+            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          GROUP BY ad_id, date, t2.poi_id
+        ) WHERE dwell >= ${minDwell}
+      )`;
+    }
+    return `(SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '')`;
+  }
+  // CSV export: uses temp external table
+  return `(SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '')`;
 }
 
-function buildMaidQuery(tableName: string, minDwell: number): string {
-  if (minDwell > 0) {
-    return `
-      WITH visits AS (
-        SELECT ad_id, date, t2.poi_id,
-          DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell
-        FROM ${tableName}
-        CROSS JOIN UNNEST(poi_ids) AS t2(poi_id)
-        WHERE t2.poi_id IS NOT NULL AND t2.poi_id != ''
-          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        GROUP BY ad_id, date, t2.poi_id
-      )
-      SELECT DISTINCT ad_id FROM visits WHERE dwell >= ${minDwell}
-    `;
-  }
-  return `SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''`;
+/**
+ * Create a temporary Athena external table from a CSV export in S3.
+ * The CSV has a header "ad_id" and one MAID per line.
+ */
+async function createTempTableFromCsv(exportFile: string, stateId: string, side: string): Promise<string> {
+  const tempName = `compare_tmp_${side}_${Date.now()}`;
+  const s3Key = `exports/${exportFile}`;
+  const tempFolder = `compare-temp/${tempName}/`;
+
+  // Copy CSV to a dedicated folder (Athena LOCATION needs a directory)
+  const { CopyObjectCommand } = await import('@aws-sdk/client-s3');
+  await s3Client.send(new CopyObjectCommand({
+    Bucket: BUCKET,
+    CopySource: `${BUCKET}/${s3Key}`,
+    Key: `${tempFolder}data.csv`,
+  }));
+
+  const createSql = `
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${tempName} (
+      ad_id STRING
+    )
+    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+    LOCATION 's3://${BUCKET}/${tempFolder}'
+    TBLPROPERTIES ('skip.header.line.count'='1')
+  `;
+  await runQuery(createSql);
+  console.log(`[COMPARE] Created temp table ${tempName} from ${exportFile}`);
+  return tempName;
 }
 
-async function loadMaidsFromCsv(fileName: string): Promise<Set<string>> {
-  const key = `exports/${fileName}`;
-  const obj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
-  const text = await obj.Body!.transformToString('utf-8');
-  const lines = text.split('\n');
-  const maids = new Set<string>();
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim().replace(/"/g, '');
-    if (line) maids.add(line);
+/** Clean up temp tables and their S3 data */
+async function cleanupTempTables(tables: string[]): Promise<void> {
+  for (const t of tables) {
+    try {
+      await runQuery(`DROP TABLE IF EXISTS ${t}`);
+      const { DeleteObjectCommand } = await import('@aws-sdk/client-s3');
+      await s3Client.send(new DeleteObjectCommand({
+        Bucket: BUCKET,
+        Key: `compare-temp/${t}/data.csv`,
+      })).catch(() => {});
+    } catch (e: any) {
+      console.warn(`[COMPARE] Cleanup ${t}:`, e.message);
+    }
   }
-  return maids;
-}
-
-async function loadMaidsFromAthenaResult(queryId: string): Promise<Set<string>> {
-  const csvKey = `athena-results/${queryId}.csv`;
-  const obj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-  const text = await obj.Body!.transformToString('utf-8');
-  const lines = text.split('\n');
-  const maids = new Set<string>();
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim().replace(/"/g, '');
-    if (line) maids.add(line);
-  }
-  return maids;
 }
 
 /**
  * POST /api/compare
  *
- * Multi-phase polling endpoint for MAID comparison between two datasets.
+ * Multi-phase Athena-native comparison. No large CSV downloads into memory.
  *
- * First call body: { datasetA: DatasetSide, datasetB: DatasetSide }
- * Subsequent calls: { stateId: string } (reads state from S3)
+ * Phase 1 (start): Ensure tables, fire 4 Athena queries in parallel:
+ *   - COUNT(A), COUNT(B), COUNT(A∩B), SELECT A∩B (for CSV download)
+ * Phase 2 (polling): Poll all 4 queries
+ * Phase 3 (reading): Fetch the 3 count results (1 row each), build response
+ *   - The overlap export CSV stays in Athena output — linked for download
  */
 export async function POST(request: NextRequest) {
   if (!isAuthenticated(request)) {
@@ -110,23 +148,18 @@ export async function POST(request: NextRequest) {
     const isNewRequest = !!body.datasetA;
     const stateId = body.stateId || '';
 
-    // Read existing state if polling
     let state: CompareState | null = null;
     if (!isNewRequest && stateId) {
       state = await getConfig<CompareState>(STATE_KEY(stateId));
 
-      // Return cached results
       if (state?.phase === 'done' && state.result) {
         return NextResponse.json({
-          phase: 'done',
-          stateId: state.stateId,
-          result: state.result,
+          phase: 'done', stateId: state.stateId, result: state.result,
           progress: { step: 'done', percent: 100, message: 'Comparison complete' },
         });
       }
     }
 
-    // Reset on error or new request
     if (state?.phase === 'error' || isNewRequest) state = null;
 
     // ── Phase: start ─────────────────────────────────────────────
@@ -139,79 +172,52 @@ export async function POST(request: NextRequest) {
       }
 
       const newStateId = `${datasetA.name}-${datasetB.name}-${Date.now()}`;
-      console.log(`[COMPARE] Starting comparison: ${datasetA.name} (${datasetA.source}) vs ${datasetB.name} (${datasetB.source})`);
+      console.log(`[COMPARE] Starting: ${datasetA.name} (${datasetA.source}) vs ${datasetB.name} (${datasetB.source})`);
 
-      // Fast path: both are CSV exports → no Athena needed
-      if (!needsAthena(datasetA) && !needsAthena(datasetB)) {
-        console.log(`[COMPARE] Fast path: both from CSV exports`);
+      const tempTables: string[] = [];
+      let tableA: string;
+      let tableB: string;
 
-        const [maidsA, maidsB] = await Promise.all([
-          loadMaidsFromCsv(datasetA.exportFile!),
-          loadMaidsFromCsv(datasetB.exportFile!),
-        ]);
-
-        const overlap = new Set<string>();
-        for (const id of maidsA) {
-          if (maidsB.has(id)) overlap.add(id);
-        }
-
-        // Save overlap CSV
-        const fileName = `compare-${datasetA.name}-${datasetB.name}-${Date.now()}.csv`;
-        const csvContent = 'ad_id\n' + Array.from(overlap).join('\n');
-        await s3Client.send(new PutObjectCommand({
-          Bucket: BUCKET,
-          Key: `exports/${fileName}`,
-          Body: csvContent,
-          ContentType: 'text/csv',
-        }));
-
-        const result = {
-          totalA: maidsA.size,
-          totalB: maidsB.size,
-          overlap: overlap.size,
-          overlapPctA: maidsA.size > 0 ? Math.round((overlap.size / maidsA.size) * 10000) / 100 : 0,
-          overlapPctB: maidsB.size > 0 ? Math.round((overlap.size / maidsB.size) * 10000) / 100 : 0,
-          downloadKey: `/api/datasets/${datasetA.name}/export/download?file=${encodeURIComponent(fileName)}`,
-        };
-
-        state = { phase: 'done', stateId: newStateId, datasetA, datasetB, result };
-        await putConfig(STATE_KEY(newStateId), state, { compact: true });
-
-        return NextResponse.json({ phase: 'done', stateId: newStateId, result, progress: { step: 'done', percent: 100, message: 'Comparison complete' } });
-      }
-
-      // Athena path: start queries for sides that need it
-      let queryIdA: string | undefined;
-      let queryIdB: string | undefined;
-      let queryDoneA = !needsAthena(datasetA);
-      let queryDoneB = !needsAthena(datasetB);
-
-      if (needsAthena(datasetA)) {
+      if (datasetA.source === 'all') {
         await ensureTableForDataset(datasetA.name);
-        const table = getTableName(datasetA.name);
-        const sql = buildMaidQuery(table, datasetA.minDwell || 0);
-        queryIdA = await startQueryAsync(sql);
-        console.log(`[COMPARE] Athena query A started: ${queryIdA}`);
+        tableA = getTableName(datasetA.name);
+      } else {
+        tableA = await createTempTableFromCsv(datasetA.exportFile!, newStateId, 'a');
+        tempTables.push(tableA);
       }
 
-      if (needsAthena(datasetB)) {
+      if (datasetB.source === 'all') {
         await ensureTableForDataset(datasetB.name);
-        const table = getTableName(datasetB.name);
-        const sql = buildMaidQuery(table, datasetB.minDwell || 0);
-        queryIdB = await startQueryAsync(sql);
-        console.log(`[COMPARE] Athena query B started: ${queryIdB}`);
+        tableB = getTableName(datasetB.name);
+      } else {
+        tableB = await createTempTableFromCsv(datasetB.exportFile!, newStateId, 'b');
+        tempTables.push(tableB);
       }
+
+      const subA = maidSubquery(datasetA, tableA);
+      const subB = maidSubquery(datasetB, tableB);
+
+      // Fire 4 queries in parallel
+      const [countAId, countBId, countOverlapId, exportOverlapId] = await Promise.all([
+        startQueryAsync(`SELECT COUNT(*) as total FROM ${subA} t`),
+        startQueryAsync(`SELECT COUNT(*) as total FROM ${subB} t`),
+        startQueryAsync(`SELECT COUNT(*) as total FROM ${subA} a INNER JOIN ${subB} b ON a.ad_id = b.ad_id`),
+        startQueryAsync(`SELECT a.ad_id FROM ${subA} a INNER JOIN ${subB} b ON a.ad_id = b.ad_id`),
+      ]);
+
+      console.log(`[COMPARE] 4 queries started — countA:${countAId} countB:${countBId} countOvl:${countOverlapId} export:${exportOverlapId}`);
 
       state = {
         phase: 'polling', stateId: newStateId, datasetA, datasetB,
-        queryIdA, queryIdB, queryDoneA, queryDoneB,
+        queryIds: { countA: countAId, countB: countBId, countOverlap: countOverlapId, exportOverlap: exportOverlapId },
+        done: {},
+        tempTables: tempTables.length > 0 ? tempTables : undefined,
       };
       await putConfig(STATE_KEY(newStateId), state, { compact: true });
 
       return NextResponse.json({
-        phase: 'polling',
-        stateId: newStateId,
-        progress: { step: 'queries_started', percent: 10, message: 'Running Athena queries...' },
+        phase: 'polling', stateId: newStateId,
+        progress: { step: 'queries_started', percent: 10, message: 'Running 4 Athena queries...' },
       });
     }
 
@@ -220,134 +226,92 @@ export async function POST(request: NextRequest) {
       let allDone = true;
       let anyFailed = false;
       let errorMsg = '';
-      let scannedInfo = '';
+      let scannedGB = 0;
 
-      // Check query A
-      if (state.queryIdA && !state.queryDoneA) {
+      for (const [key, qId] of Object.entries(state.queryIds)) {
+        if (!qId || state.done[key as keyof typeof state.done]) continue;
         try {
-          const status = await checkQueryStatus(state.queryIdA);
+          const status = await checkQueryStatus(qId);
           if (status.state === 'RUNNING' || status.state === 'QUEUED') {
             allDone = false;
-            const gb = status.statistics?.dataScannedBytes ? (status.statistics.dataScannedBytes / 1e9).toFixed(1) : '0';
-            scannedInfo += `A: ${gb}GB `;
+            scannedGB += (status.statistics?.dataScannedBytes || 0) / 1e9;
           } else if (status.state === 'FAILED' || status.state === 'CANCELLED') {
             anyFailed = true;
-            errorMsg = `Query A failed: ${status.error || 'unknown'}`;
+            errorMsg = `${key} failed: ${status.error || 'unknown'}`;
           } else {
-            state.queryDoneA = true;
+            (state.done as any)[key] = true;
           }
         } catch (err: any) {
           if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
             anyFailed = true;
-            errorMsg = 'Query A expired — please retry';
-          } else { throw err; }
-        }
-      }
-
-      // Check query B
-      if (state.queryIdB && !state.queryDoneB) {
-        try {
-          const status = await checkQueryStatus(state.queryIdB);
-          if (status.state === 'RUNNING' || status.state === 'QUEUED') {
-            allDone = false;
-            const gb = status.statistics?.dataScannedBytes ? (status.statistics.dataScannedBytes / 1e9).toFixed(1) : '0';
-            scannedInfo += `B: ${gb}GB`;
-          } else if (status.state === 'FAILED' || status.state === 'CANCELLED') {
-            anyFailed = true;
-            errorMsg = `Query B failed: ${status.error || 'unknown'}`;
-          } else {
-            state.queryDoneB = true;
-          }
-        } catch (err: any) {
-          if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
-            anyFailed = true;
-            errorMsg = 'Query B expired — please retry';
+            errorMsg = `${key} expired — please retry`;
           } else { throw err; }
         }
       }
 
       if (anyFailed) {
+        if (state.tempTables?.length) await cleanupTempTables(state.tempTables).catch(() => {});
         state = { ...state, phase: 'error', error: errorMsg };
         await putConfig(STATE_KEY(state.stateId), state, { compact: true });
         return NextResponse.json({ phase: 'error', stateId: state.stateId, error: errorMsg });
       }
 
-      if (!allDone || !state.queryDoneA || !state.queryDoneB) {
+      if (!allDone) {
         await putConfig(STATE_KEY(state.stateId), state, { compact: true });
+        const doneCount = Object.values(state.done).filter(Boolean).length;
+        const pct = 10 + Math.round((doneCount / 4) * 60);
         return NextResponse.json({
-          phase: 'polling',
-          stateId: state.stateId,
-          progress: { step: 'polling', percent: 40, message: `Queries running... ${scannedInfo}`.trim() },
+          phase: 'polling', stateId: state.stateId,
+          progress: { step: 'polling', percent: pct, message: `Queries running (${doneCount}/4 done, ${scannedGB.toFixed(1)}GB scanned)` },
         });
       }
 
-      // Both done → move to processing
-      state = { ...state, phase: 'processing' };
+      // All done → advance to reading
+      state = { ...state, phase: 'reading' };
       await putConfig(STATE_KEY(state.stateId), state, { compact: true });
 
       return NextResponse.json({
-        phase: 'processing',
-        stateId: state.stateId,
-        progress: { step: 'processing', percent: 70, message: 'Queries complete, computing overlap...' },
+        phase: 'reading', stateId: state.stateId,
+        progress: { step: 'reading', percent: 80, message: 'Queries complete, reading results...' },
       });
     }
 
-    // ── Phase: processing ────────────────────────────────────────
-    if (state.phase === 'processing') {
-      console.log(`[COMPARE] Processing: loading MAIDs from both sides`);
-
-      // Load MAIDs from each side
-      const [maidsA, maidsB] = await Promise.all([
-        state.queryIdA
-          ? loadMaidsFromAthenaResult(state.queryIdA)
-          : loadMaidsFromCsv(state.datasetA.exportFile!),
-        state.queryIdB
-          ? loadMaidsFromAthenaResult(state.queryIdB)
-          : loadMaidsFromCsv(state.datasetB.exportFile!),
+    // ── Phase: reading (lightweight — only fetches 3 single-row results) ──
+    if (state.phase === 'reading') {
+      const [countARes, countBRes, countOvlRes] = await Promise.all([
+        fetchQueryResults(state.queryIds.countA!),
+        fetchQueryResults(state.queryIds.countB!),
+        fetchQueryResults(state.queryIds.countOverlap!),
       ]);
 
-      console.log(`[COMPARE] A: ${maidsA.size} MAIDs, B: ${maidsB.size} MAIDs`);
+      const totalA = parseInt(countARes.rows[0]?.total, 10) || 0;
+      const totalB = parseInt(countBRes.rows[0]?.total, 10) || 0;
+      const overlapCount = parseInt(countOvlRes.rows[0]?.total, 10) || 0;
 
-      // Compute intersection
-      const overlap = new Set<string>();
-      const smaller = maidsA.size <= maidsB.size ? maidsA : maidsB;
-      const larger = maidsA.size <= maidsB.size ? maidsB : maidsA;
-      for (const id of smaller) {
-        if (larger.has(id)) overlap.add(id);
-      }
+      // The export overlap CSV is the Athena output of the 4th query
+      const downloadKey = overlapCount > 0
+        ? `/api/compare/download?queryId=${state.queryIds.exportOverlap}`
+        : '';
 
-      console.log(`[COMPARE] Overlap: ${overlap.size} MAIDs`);
-
-      // Save overlap CSV
-      const fileName = `compare-${state.datasetA.name}-${state.datasetB.name}-${Date.now()}.csv`;
-      if (overlap.size > 0) {
-        const csvContent = 'ad_id\n' + Array.from(overlap).join('\n');
-        await s3Client.send(new PutObjectCommand({
-          Bucket: BUCKET,
-          Key: `exports/${fileName}`,
-          Body: csvContent,
-          ContentType: 'text/csv',
-        }));
-      }
+      // Clean up temp tables
+      if (state.tempTables?.length) await cleanupTempTables(state.tempTables).catch(() => {});
 
       const result = {
-        totalA: maidsA.size,
-        totalB: maidsB.size,
-        overlap: overlap.size,
-        overlapPctA: maidsA.size > 0 ? Math.round((overlap.size / maidsA.size) * 10000) / 100 : 0,
-        overlapPctB: maidsB.size > 0 ? Math.round((overlap.size / maidsB.size) * 10000) / 100 : 0,
-        downloadKey: overlap.size > 0
-          ? `/api/datasets/${state.datasetA.name}/export/download?file=${encodeURIComponent(fileName)}`
-          : '',
+        totalA,
+        totalB,
+        overlap: overlapCount,
+        overlapPctA: totalA > 0 ? Math.round((overlapCount / totalA) * 10000) / 100 : 0,
+        overlapPctB: totalB > 0 ? Math.round((overlapCount / totalB) * 10000) / 100 : 0,
+        downloadKey,
       };
 
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(state.stateId), state, { compact: true });
 
+      console.log(`[COMPARE] Done: A=${totalA}, B=${totalB}, overlap=${overlapCount} (${result.overlapPctA}%/${result.overlapPctB}%)`);
+
       return NextResponse.json({
-        phase: 'done',
-        stateId: state.stateId,
-        result,
+        phase: 'done', stateId: state.stateId, result,
         progress: { step: 'done', percent: 100, message: 'Comparison complete' },
       });
     }
