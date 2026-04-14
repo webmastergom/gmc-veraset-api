@@ -17,6 +17,9 @@ interface DatasetSide {
   name: string;
   source: 'all' | 'category-export' | 'nse-export';
   minDwell?: number;
+  maxDwell?: number;
+  hourFrom?: number;
+  hourTo?: number;
   exportFile?: string;
 }
 
@@ -55,11 +58,34 @@ const STATE_KEY = (id: string) => `compare-state/${id}`;
 
 /**
  * Build a SQL subquery that returns DISTINCT ad_id for a dataset side.
+ * Supports dwell interval (min/max) and hour-of-visit (from/to) filters.
  */
 function maidSubquery(side: DatasetSide, tableName: string): string {
   if (side.source === 'all') {
     const minDwell = side.minDwell || 0;
-    if (minDwell > 0) {
+    const maxDwell = side.maxDwell || 0;
+    const hourFrom = side.hourFrom ?? 0;
+    const hourTo = side.hourTo ?? 23;
+    const hasHourFilter = hourFrom > 0 || hourTo < 23;
+    const hasDwellFilter = minDwell > 0 || maxDwell > 0;
+
+    if (hasDwellFilter || hasHourFilter) {
+      // Build hour WHERE clause (supports cross-midnight ranges like 22→06)
+      let hourWhere = '';
+      if (hasHourFilter) {
+        if (hourFrom <= hourTo) {
+          hourWhere = `AND HOUR(utc_timestamp) >= ${hourFrom} AND HOUR(utc_timestamp) <= ${hourTo}`;
+        } else {
+          hourWhere = `AND (HOUR(utc_timestamp) >= ${hourFrom} OR HOUR(utc_timestamp) <= ${hourTo})`;
+        }
+      }
+
+      // Build dwell HAVING clauses
+      const dwellHavings: string[] = [];
+      if (minDwell > 0) dwellHavings.push(`dwell >= ${minDwell}`);
+      if (maxDwell > 0) dwellHavings.push(`dwell <= ${maxDwell}`);
+      const havingClause = dwellHavings.length > 0 ? `WHERE ${dwellHavings.join(' AND ')}` : '';
+
       return `(
         SELECT DISTINCT ad_id FROM (
           SELECT ad_id, date,
@@ -68,8 +94,9 @@ function maidSubquery(side: DatasetSide, tableName: string): string {
           CROSS JOIN UNNEST(poi_ids) AS t2(poi_id)
           WHERE t2.poi_id IS NOT NULL AND t2.poi_id != ''
             AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+            ${hourWhere}
           GROUP BY ad_id, date, t2.poi_id
-        ) WHERE dwell >= ${minDwell}
+        ) ${havingClause}
       )`;
     }
     return `(SELECT DISTINCT ad_id FROM ${tableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '')`;

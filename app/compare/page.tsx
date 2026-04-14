@@ -36,14 +36,26 @@ interface CompareResult {
 }
 
 const DWELL_OPTIONS = [
-  { value: 0, label: 'No minimum' },
-  { value: 2, label: '2+ min' },
-  { value: 5, label: '5+ min' },
-  { value: 10, label: '10+ min' },
-  { value: 15, label: '15+ min' },
-  { value: 30, label: '30+ min' },
-  { value: 60, label: '60+ min' },
+  { value: 0, label: 'No limit' },
+  { value: 2, label: '2 min' },
+  { value: 5, label: '5 min' },
+  { value: 10, label: '10 min' },
+  { value: 15, label: '15 min' },
+  { value: 30, label: '30 min' },
+  { value: 45, label: '45 min' },
+  { value: 60, label: '1 hr' },
+  { value: 90, label: '1.5 hr' },
+  { value: 120, label: '2 hr' },
+  { value: 180, label: '3 hr' },
+  { value: 240, label: '4 hr' },
+  { value: 360, label: '6 hr' },
+  { value: 480, label: '8 hr' },
 ];
+
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, i) => ({
+  value: i,
+  label: `${i.toString().padStart(2, '0')}:00`,
+}));
 
 type SourceType = 'all' | 'category-export' | 'nse-export';
 
@@ -56,6 +68,12 @@ function DatasetSideSelector({
   onSourceChange,
   minDwell,
   onMinDwellChange,
+  maxDwell,
+  onMaxDwellChange,
+  hourFrom,
+  onHourFromChange,
+  hourTo,
+  onHourToChange,
   exportFile,
   onExportFileChange,
   exports,
@@ -69,6 +87,12 @@ function DatasetSideSelector({
   onSourceChange: (v: SourceType) => void;
   minDwell: number;
   onMinDwellChange: (v: number) => void;
+  maxDwell: number;
+  onMaxDwellChange: (v: number) => void;
+  hourFrom: number;
+  onHourFromChange: (v: number) => void;
+  hourTo: number;
+  onHourToChange: (v: number) => void;
   exportFile: string;
   onExportFileChange: (v: string) => void;
   exports: ExportOption[];
@@ -118,21 +142,63 @@ function DatasetSideSelector({
         </div>
       )}
 
-      {/* Dwell time (only for "all" source) */}
+      {/* Filters (only for "all" source) */}
       {selectedDataset && source === 'all' && (
-        <div>
-          <label className="text-xs text-muted-foreground block mb-1">Min Dwell Time at POI</label>
-          <Select value={String(minDwell)} onValueChange={v => onMinDwellChange(Number(v))}>
-            <SelectTrigger className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {DWELL_OPTIONS.map(opt => (
-                <SelectItem key={opt.value} value={String(opt.value)}>{opt.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
+        <>
+          {/* Dwell time interval */}
+          <div>
+            <label className="text-xs text-muted-foreground block mb-1">Dwell Time at POI</label>
+            <div className="grid grid-cols-2 gap-2">
+              <Select value={String(minDwell)} onValueChange={v => onMinDwellChange(Number(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {DWELL_OPTIONS.map(opt => (
+                    <SelectItem key={opt.value} value={String(opt.value)}>From: {opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select value={String(maxDwell)} onValueChange={v => onMaxDwellChange(Number(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {DWELL_OPTIONS.map(opt => (
+                    <SelectItem key={opt.value} value={String(opt.value)}>To: {opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {/* Hour of visit interval */}
+          <div>
+            <label className="text-xs text-muted-foreground block mb-1">Hour of Visit</label>
+            <div className="grid grid-cols-2 gap-2">
+              <Select value={String(hourFrom)} onValueChange={v => onHourFromChange(Number(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {HOUR_OPTIONS.map(opt => (
+                    <SelectItem key={opt.value} value={String(opt.value)}>From: {opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select value={String(hourTo)} onValueChange={v => onHourToChange(Number(v))}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {HOUR_OPTIONS.map(opt => (
+                    <SelectItem key={opt.value} value={String(opt.value)}>To: {opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </>
       )}
 
       {/* Export file selector */}
@@ -171,6 +237,9 @@ export default function ComparePage() {
   const [datasetA, setDatasetA] = useState('');
   const [sourceA, setSourceA] = useState<SourceType>('all');
   const [minDwellA, setMinDwellA] = useState(0);
+  const [maxDwellA, setMaxDwellA] = useState(0);
+  const [hourFromA, setHourFromA] = useState(0);
+  const [hourToA, setHourToA] = useState(23);
   const [exportFileA, setExportFileA] = useState('');
   const [exportsA, setExportsA] = useState<ExportOption[]>([]);
   const [loadingExportsA, setLoadingExportsA] = useState(false);
@@ -179,6 +248,9 @@ export default function ComparePage() {
   const [datasetB, setDatasetB] = useState('');
   const [sourceB, setSourceB] = useState<SourceType>('all');
   const [minDwellB, setMinDwellB] = useState(0);
+  const [maxDwellB, setMaxDwellB] = useState(0);
+  const [hourFromB, setHourFromB] = useState(0);
+  const [hourToB, setHourToB] = useState(23);
   const [exportFileB, setExportFileB] = useState('');
   const [exportsB, setExportsB] = useState<ExportOption[]>([]);
   const [loadingExportsB, setLoadingExportsB] = useState(false);
@@ -255,12 +327,18 @@ export default function ComparePage() {
             name: datasetA,
             source: sourceA,
             minDwell: sourceA === 'all' ? minDwellA : undefined,
+            maxDwell: sourceA === 'all' ? maxDwellA : undefined,
+            hourFrom: sourceA === 'all' ? hourFromA : undefined,
+            hourTo: sourceA === 'all' ? hourToA : undefined,
             exportFile: sourceA !== 'all' ? exportFileA : undefined,
           },
           datasetB: {
             name: datasetB,
             source: sourceB,
             minDwell: sourceB === 'all' ? minDwellB : undefined,
+            maxDwell: sourceB === 'all' ? maxDwellB : undefined,
+            hourFrom: sourceB === 'all' ? hourFromB : undefined,
+            hourTo: sourceB === 'all' ? hourToB : undefined,
             exportFile: sourceB !== 'all' ? exportFileB : undefined,
           },
         }),
@@ -335,6 +413,12 @@ export default function ComparePage() {
                 onSourceChange={v => { setSourceA(v); setResult(null); }}
                 minDwell={minDwellA}
                 onMinDwellChange={v => { setMinDwellA(v); setResult(null); }}
+                maxDwell={maxDwellA}
+                onMaxDwellChange={v => { setMaxDwellA(v); setResult(null); }}
+                hourFrom={hourFromA}
+                onHourFromChange={v => { setHourFromA(v); setResult(null); }}
+                hourTo={hourToA}
+                onHourToChange={v => { setHourToA(v); setResult(null); }}
                 exportFile={exportFileA}
                 onExportFileChange={v => { setExportFileA(v); setResult(null); }}
                 exports={exportsA}
@@ -350,6 +434,12 @@ export default function ComparePage() {
                 onSourceChange={v => { setSourceB(v); setResult(null); }}
                 minDwell={minDwellB}
                 onMinDwellChange={v => { setMinDwellB(v); setResult(null); }}
+                maxDwell={maxDwellB}
+                onMaxDwellChange={v => { setMaxDwellB(v); setResult(null); }}
+                hourFrom={hourFromB}
+                onHourFromChange={v => { setHourFromB(v); setResult(null); }}
+                hourTo={hourToB}
+                onHourToChange={v => { setHourToB(v); setResult(null); }}
                 exportFile={exportFileB}
                 onExportFileChange={v => { setExportFileB(v); setResult(null); }}
                 exports={exportsB}
