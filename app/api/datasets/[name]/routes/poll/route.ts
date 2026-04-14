@@ -250,10 +250,10 @@ function buildSampleRoutesSQL(
     WITH
     ${tvCTE},
     sampled AS (
-      SELECT DISTINCT ad_id
-      FROM target_daily
-      ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))
-      LIMIT 1000
+      SELECT ad_id FROM (
+        SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
+        FROM (SELECT DISTINCT ad_id FROM target_daily)
+      ) WHERE rn <= 1000
     ),
     ${spatialJoinCTEs(table, country, hourFrom, hourTo, 'sampled')},
     categorized AS (
