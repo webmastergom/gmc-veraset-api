@@ -83,10 +83,11 @@ function targetVisitsCTE(
     }
   }
 
-  // Dwell HAVING
+  // Dwell HAVING — must use full expression, not SELECT alias (Athena/Presto restriction)
+  const dwellExpr = "DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp))";
   const dwellParts: string[] = [];
-  if (minDwell > 0) dwellParts.push(`dwell >= ${minDwell}`);
-  if (maxDwell > 0) dwellParts.push(`dwell <= ${maxDwell}`);
+  if (minDwell > 0) dwellParts.push(`${dwellExpr} >= ${minDwell}`);
+  if (maxDwell > 0) dwellParts.push(`${dwellExpr} <= ${maxDwell}`);
   const havingClause = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
 
   return `
