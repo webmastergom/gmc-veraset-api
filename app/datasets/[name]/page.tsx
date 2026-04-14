@@ -61,8 +61,7 @@ import { ODTables } from '@/components/mega-jobs/od-tables';
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar';
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart';
 import { PoiFilter } from '@/components/mega-jobs/poi-filter';
-import { SankeyChart } from '@/components/analysis/sankey-chart';
-import { RouteTimeline } from '@/components/analysis/route-timeline';
+// Route analysis has its own page at /routes
 
 interface DatasetInfo {
   id: string;
@@ -159,11 +158,6 @@ export default function DatasetAnalysisPage() {
   const [nseModalOpen, setNseModalOpen] = useState(false);
   const [categoryMaidModalOpen, setCategoryMaidModalOpen] = useState(false);
 
-  // Route analysis state
-  const [routesLoading, setRoutesLoading] = useState(false);
-  const [routesProgress, setRoutesProgress] = useState<string | null>(null);
-  const [routesResult, setRoutesResult] = useState<any>(null);
-  const [routesStateKey, setRoutesStateKey] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/datasets', { credentials: 'include' })
@@ -340,65 +334,6 @@ export default function DatasetAnalysisPage() {
     } finally {
       setGeneratingReports(false);
       setReportProgress(null);
-    }
-  };
-
-  // ── Route analysis (Sankey + Sample Routes) ─────────────────────
-  const runRouteAnalysis = async (isRefresh = false) => {
-    if (!datasetInfo?.country) {
-      toast({ title: 'Country required', description: 'Set the country on the job before running route analysis.', variant: 'destructive' });
-      return;
-    }
-    setRoutesLoading(true);
-    setRoutesProgress('Starting route analysis...');
-    if (!isRefresh) setRoutesResult(null);
-
-    try {
-      let data = await fetch(`/api/datasets/${datasetName}/routes/poll`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          country: datasetInfo.country,
-          minDwell: dwellMin,
-          maxDwell: dwellMax,
-          hourFrom,
-          hourTo,
-        }),
-      }).then(r => r.json());
-
-      const sk = data.stateKey || '';
-      setRoutesStateKey(sk);
-
-      while (data.phase !== 'done' && data.phase !== 'error') {
-        setRoutesProgress(data.progress?.message || 'Processing...');
-        await new Promise(r => setTimeout(r, 4000));
-
-        const res = await fetch(`/api/datasets/${datasetName}/routes/poll`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ stateKey: sk }),
-        });
-
-        if (res.status === 504) {
-          data = { phase: 'polling', progress: { message: 'Server processing (retrying...)' } };
-          continue;
-        }
-        data = await res.json();
-      }
-
-      if (data.phase === 'error') {
-        throw new Error(data.error || 'Route analysis failed');
-      }
-
-      setRoutesResult(data.result);
-      toast({ title: 'Route analysis complete', description: `${data.result?.sankey?.length || 0} category flows found` });
-    } catch (e: any) {
-      toast({ title: 'Route analysis failed', description: e.message, variant: 'destructive' });
-    } finally {
-      setRoutesLoading(false);
-      setRoutesProgress(null);
     }
   };
 
@@ -1001,90 +936,6 @@ export default function DatasetAnalysisPage() {
               </div>
             </CollapsibleCard>
           )}
-
-          {/* ── Device Routes & Category Flows ────────────────────── */}
-          <CollapsibleCard
-            title="Device Routes & Category Flows"
-            icon={<Navigation className="h-4 w-4" />}
-          >
-            {!routesResult && !routesLoading && (
-              <div className="text-center py-6">
-                <p className="text-sm text-muted-foreground mb-3">
-                  Analyze device routes to see which POI categories are visited before and after the target POI.
-                  Uses spatial join with {'>'}200K real POIs from Overture Maps.
-                </p>
-                <Button onClick={() => runRouteAnalysis()} disabled={routesLoading || !datasetInfo?.country}>
-                  <Play className="mr-2 h-4 w-4" />
-                  Run Route Analysis
-                </Button>
-                {!datasetInfo?.country && (
-                  <p className="text-xs text-amber-400 mt-2">Set the country on the job first</p>
-                )}
-              </div>
-            )}
-
-            {routesLoading && (
-              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {routesProgress || 'Processing...'}
-              </div>
-            )}
-
-            {routesResult && (
-              <div className="space-y-6">
-                {/* Stats */}
-                <div className="flex items-center gap-4 text-sm">
-                  <span className="text-muted-foreground">
-                    <span className="font-semibold text-foreground">{routesResult.totalVisitors?.toLocaleString()}</span> visitors analyzed
-                  </span>
-                  <span className="text-muted-foreground">
-                    <span className="font-semibold text-foreground">{routesResult.sankey?.length || 0}</span> category flows
-                  </span>
-                  <span className="text-muted-foreground">
-                    <span className="font-semibold text-foreground">
-                      {new Set(routesResult.sampleRoutes?.map((s: any) => s.ad_id) || []).size}
-                    </span> devices sampled
-                  </span>
-                  <Button variant="outline" size="sm" onClick={() => runRouteAnalysis()} disabled={routesLoading} className="ml-auto">
-                    <Play className="mr-1.5 h-3.5 w-3.5" />
-                    Re-run
-                  </Button>
-                </div>
-
-                {/* Sankey diagram */}
-                {routesResult.sankey?.length > 0 && (
-                  <div>
-                    <h4 className="text-sm font-semibold mb-2">Category Flows (Before → Target → After)</h4>
-                    <p className="text-xs text-muted-foreground mb-3">
-                      Categories of POIs visited before arriving at and after leaving the target POI.
-                      Width proportional to device count. Hover for details.
-                    </p>
-                    <SankeyChart
-                      data={routesResult.sankey}
-                      targetLabel={datasetInfo?.name || datasetName}
-                    />
-                  </div>
-                )}
-
-                {/* Sample routes timeline */}
-                {routesResult.sampleRoutes?.length > 0 && (
-                  <div>
-                    <h4 className="text-sm font-semibold mb-2">Sample Device Routes</h4>
-                    <p className="text-xs text-muted-foreground mb-3">
-                      Daily routes for a random sample of devices. Each bar is a POI visit —
-                      colored by category. The highlighted segment is the target POI visit.
-                      Click a device to expand its timeline.
-                    </p>
-                    <RouteTimeline
-                      data={routesResult.sampleRoutes}
-                      onRefresh={() => runRouteAnalysis(true)}
-                      refreshing={routesLoading}
-                    />
-                  </div>
-                )}
-              </div>
-            )}
-          </CollapsibleCard>
 
           {/* Departure Hour */}
           {catchmentReport?.departureByHour && (

@@ -19,6 +19,7 @@ import {
   Layers,
   GitCompareArrows,
   Fingerprint,
+  Route,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -29,6 +30,7 @@ const navigation = [
   { name: 'Jobs', href: '/jobs', icon: Briefcase },
   { name: 'Datasets', href: '/datasets', icon: Database },
   { name: 'Compare', href: '/compare', icon: GitCompareArrows },
+  { name: 'Routes', href: '/routes', icon: Route },
   { name: 'Mega-Jobs', href: '/mega-jobs', icon: Layers },
   { name: 'Laboratory', href: '/laboratory', icon: FlaskConical },
   { name: 'Roamy', href: '/laboratory/audiences', icon: Users },
