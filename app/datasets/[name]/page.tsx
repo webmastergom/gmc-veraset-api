@@ -134,6 +134,9 @@ export default function DatasetAnalysisPage() {
 
   // Dwell filter
   const [selectedBucket, setSelectedBucket] = useState<number>(0);
+  // Hour filter
+  const [hourFrom, setHourFrom] = useState<number>(0);
+  const [hourTo, setHourTo] = useState<number>(23);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
@@ -164,8 +167,8 @@ export default function DatasetAnalysisPage() {
       .catch(console.error);
   }, [datasetName]);
 
-  // Load reports for a specific dwell bucket
-  const loadReportsForBucket = (bucket: number) => {
+  // Load reports for a specific dwell bucket + hour range
+  const loadReportsForBucket = (bucket: number, hFrom = hourFrom, hTo = hourTo) => {
     const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -175,8 +178,9 @@ export default function DatasetAnalysisPage() {
       temporal: setTemporalReport,
       affinity: setAffinityReport,
     };
+    const hourParams = (hFrom > 0 || hTo < 23) ? `&hourFrom=${hFrom}&hourTo=${hTo}` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}&bucket=${bucket}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}&bucket=${bucket}${hourParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -255,6 +259,7 @@ export default function DatasetAnalysisPage() {
             body: JSON.stringify({
               ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
               ...(selectedBucket > 0 ? { minDwell: selectedBucket } : {}),
+              ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
             }),
           });
           consecutiveErrors = 0;
@@ -491,7 +496,7 @@ export default function DatasetAnalysisPage() {
         <h2 className="text-xl font-semibold">Data analysis</h2>
         <div className="flex flex-wrap gap-2 items-center">
           <div className="flex items-center gap-2 mr-2">
-            <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell filter:</label>
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell:</label>
             <select
               value={selectedBucket}
               onChange={(e) => {
@@ -503,6 +508,36 @@ export default function DatasetAnalysisPage() {
             >
               {DWELL_BUCKET_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-1 mr-2">
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Hours:</label>
+            <select
+              value={hourFrom}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setHourFrom(v);
+                loadReportsForBucket(selectedBucket, v, hourTo);
+              }}
+              className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+            >
+              {Array.from({ length: 24 }, (_, i) => (
+                <option key={i} value={i}>{String(i).padStart(2, '0')}h</option>
+              ))}
+            </select>
+            <span className="text-xs text-muted-foreground">to</span>
+            <select
+              value={hourTo}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setHourTo(v);
+                loadReportsForBucket(selectedBucket, hourFrom, v);
+              }}
+              className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+            >
+              {Array.from({ length: 24 }, (_, i) => (
+                <option key={i} value={i}>{String(i).padStart(2, '0')}h</option>
               ))}
             </select>
           </div>
