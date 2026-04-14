@@ -289,19 +289,59 @@ function buildSampleRoutesSQL(
 }
 
 /**
- * Build a simple count query for total visitors.
+ * Build diagnostic count query — counts at each stage to identify where matches drop.
+ * Returns: total_visitors, total_pings_sampled, before_after_pings, ambient_pings (empty poi_ids), matched_pings, gmc_poi_count
  */
-function buildVisitorCountSQL(
+function buildDiagnosticSQL(
   table: string,
+  country: string,
   minDwell: number,
   maxDwell: number,
   hourFrom: number,
   hourTo: number,
 ): string {
   const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo);
+  const cc = toIsoCountry(country);
+
   return `
-    WITH ${tvCTE}
-    SELECT COUNT(DISTINCT ad_id) as total FROM target_daily
+    WITH
+    ${tvCTE},
+    diag_sample AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
+        FROM (SELECT DISTINCT ad_id FROM target_daily) t_uniq
+      ) t_ranked WHERE rn <= 10
+    ),
+    diag_pings AS (
+      SELECT
+        p.ad_id,
+        p.utc_timestamp,
+        TRY_CAST(p.latitude AS DOUBLE) as lat,
+        TRY_CAST(p.longitude AS DOUBLE) as lng,
+        p.poi_ids,
+        td.first_arrival,
+        td.last_departure,
+        CASE
+          WHEN p.utc_timestamp < td.first_arrival THEN 'before'
+          WHEN p.utc_timestamp > td.last_departure THEN 'after'
+          ELSE 'during'
+        END as direction
+      FROM ${table} p
+      INNER JOIN diag_sample s ON p.ad_id = s.ad_id
+      INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
+      WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
+    )
+    SELECT
+      (SELECT COUNT(DISTINCT ad_id) FROM target_daily) as total_visitors,
+      COUNT(*) as total_pings_10devices,
+      COUNT(CASE WHEN direction = 'before' THEN 1 END) as before_pings,
+      COUNT(CASE WHEN direction = 'during' THEN 1 END) as during_pings,
+      COUNT(CASE WHEN direction = 'after' THEN 1 END) as after_pings,
+      COUNT(CASE WHEN CARDINALITY(poi_ids) = 0 OR poi_ids IS NULL THEN 1 END) as ambient_pings,
+      COUNT(CASE WHEN CARDINALITY(poi_ids) > 0 THEN 1 END) as poi_tagged_pings,
+      (SELECT COUNT(*) FROM lab_pois_gmc WHERE country = '${cc}') as gmc_pois_for_country
+    FROM diag_pings
   `;
 }
 
@@ -380,7 +420,7 @@ export async function POST(
 
       const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
       const sampleSql = buildSampleRoutesSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
-      const countSql = buildVisitorCountSQL(table, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
+      const countSql = buildDiagnosticSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
 
       const [sankeyQId, sampleQId, countQId] = await Promise.all([
         startQueryAsync(sankeySql).catch(e => { console.error('[ROUTES] Sankey query failed:', e.message); return undefined; }),
@@ -538,14 +578,21 @@ export async function POST(
         }
       }
 
-      // Parse total visitors count
+      // Parse diagnostic results
       let totalVisitors = 0;
       if ((state as any).countQueryId) {
         try {
           const res = await fetchQueryResults((state as any).countQueryId);
-          totalVisitors = parseInt(res.rows[0]?.total, 10) || 0;
+          const diag = res.rows[0] || {};
+          totalVisitors = parseInt(diag.total_visitors, 10) || 0;
+          // Log diagnostic info for debugging
+          console.log(`[ROUTES DIAGNOSTIC] Visitors: ${diag.total_visitors}, ` +
+            `10-device pings: ${diag.total_pings_10devices}, ` +
+            `before: ${diag.before_pings}, during: ${diag.during_pings}, after: ${diag.after_pings}, ` +
+            `ambient (no poi_ids): ${diag.ambient_pings}, poi-tagged: ${diag.poi_tagged_pings}, ` +
+            `GMC POIs for country: ${diag.gmc_pois_for_country}`);
         } catch (err: any) {
-          console.error('[ROUTES] Error reading count:', err.message);
+          console.error('[ROUTES] Error reading diagnostic:', err.message);
         }
       }
 
