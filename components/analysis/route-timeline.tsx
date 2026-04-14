@@ -71,6 +71,17 @@ export function RouteTimeline({ data, onRefresh, refreshing }: RouteTimelineProp
       .sort((a, b) => b[1].length - a[1].length);
   }, [data]);
 
+  // Collect legend entries from visible data
+  const legendGroups = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const stop of (data || [])) {
+      if (!seen.has(stop.group_key)) {
+        seen.set(stop.group_key, stop.group_label);
+      }
+    }
+    return Array.from(seen.entries()).sort((a, b) => a[1].localeCompare(b[1]));
+  }, [data]);
+
   if (!data?.length) {
     return (
       <div className="h-40 flex items-center justify-center text-muted-foreground">
@@ -81,17 +92,6 @@ export function RouteTimeline({ data, onRefresh, refreshing }: RouteTimelineProp
 
   const totalPages = Math.ceil(deviceRoutes.length / PAGE_SIZE);
   const pageDevices = deviceRoutes.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-
-  // Collect legend entries from visible data
-  const legendGroups = useMemo(() => {
-    const seen = new Map<string, string>();
-    for (const stop of data) {
-      if (!seen.has(stop.group_key)) {
-        seen.set(stop.group_key, stop.group_label);
-      }
-    }
-    return Array.from(seen.entries()).sort((a, b) => a[1].localeCompare(b[1]));
-  }, [data]);
 
   return (
     <div className="space-y-4">
