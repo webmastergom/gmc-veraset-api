@@ -1043,6 +1043,8 @@ export async function tableExists(datasetName: string): Promise<boolean> {
  * createTableForDataset when the table doesn't exist or is empty.
  *
  * This is ~100× faster than createTableForDataset for repeat runs.
+ * For mega-dataset VIEWs: verifies the VIEW exists and has data; does NOT
+ * attempt to create an EXTERNAL TABLE (VIEWs are managed by createMegaDatasetView).
  */
 export async function ensureTableForDataset(datasetName: string): Promise<void> {
   const tableName = getTableName(datasetName);
@@ -1055,8 +1057,18 @@ export async function ensureTableForDataset(datasetName: string): Promise<void> 
         console.log(`✅ Table ${tableName} exists and has data — skipping full rebuild`);
         return; // Table is usable
       }
+      // If empty, check if it's a VIEW — don't rebuild views as external tables
+      if (await isViewDataset(datasetName)) {
+        console.log(`⚠️  View ${tableName} exists but is empty — cannot rebuild (managed by createMegaDatasetView)`);
+        return;
+      }
       console.log(`⚠️  Table ${tableName} exists but is empty — running full rebuild`);
     } catch {
+      // Check if it's a VIEW before falling back to full rebuild
+      if (await isViewDataset(datasetName)) {
+        console.log(`⚠️  View ${tableName} exists but probe failed — cannot rebuild (managed by createMegaDatasetView)`);
+        return;
+      }
       console.log(`⚠️  Table ${tableName} exists but probe failed — running full rebuild`);
     }
   }
@@ -1072,4 +1084,92 @@ export function getTableName(datasetName: string): string {
   const sanitized = datasetName.replace(/-/g, '_').replace(/[^a-z0-9_]/gi, '_');
   // SQL table names cannot start with a number, so add prefix if needed
   return /^[0-9]/.test(sanitized) ? `ds_${sanitized}` : sanitized;
+}
+
+// ── Mega-Dataset VIEW Management ─────────────────────────────────────
+
+/**
+ * Sanitize a mega-job name into a dataset-friendly ID.
+ * e.g., "MX OXXO Jan-Mar 2025" → "mx-oxxo-jan-mar-2025"
+ */
+export function megaJobNameToDatasetId(megaJobName: string): string {
+  return megaJobName
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
+ * Check if a dataset name corresponds to a mega-dataset VIEW
+ * (as opposed to a regular EXTERNAL TABLE).
+ */
+export async function isViewDataset(datasetName: string): Promise<boolean> {
+  const tableName = getTableName(datasetName);
+  try {
+    const result = await runQuery(
+      `SHOW CREATE TABLE ${tableName}`
+    );
+    // Athena SHOW CREATE TABLE for views contains "CREATE VIEW"
+    const ddl = result.rows.map(r => Object.values(r).join(' ')).join(' ');
+    return ddl.includes('CREATE VIEW') || ddl.includes('create view');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Create or replace an Athena VIEW that UNION ALLs all sub-job tables.
+ * This makes the mega-job appear as a single dataset for all existing features
+ * (analysis, reports, dwell filter, hour filter, NSE, export, comparison).
+ *
+ * @param megaDatasetName - Sanitized mega-job name (used as view name)
+ * @param subDatasetNames - Array of sub-job dataset names (each has its own table)
+ * @returns The view name created
+ */
+export async function createMegaDatasetView(
+  megaDatasetName: string,
+  subDatasetNames: string[],
+): Promise<string> {
+  if (subDatasetNames.length === 0) {
+    throw new Error('Cannot create mega-dataset VIEW with zero sub-datasets');
+  }
+
+  const viewName = getTableName(megaDatasetName);
+
+  // Ensure all sub-job tables exist first
+  console.log(`[MEGA-VIEW] Ensuring ${subDatasetNames.length} sub-job tables...`);
+  await Promise.all(subDatasetNames.map(ds => ensureTableForDataset(ds)));
+
+  // Build UNION ALL query
+  const unionParts = subDatasetNames.map(ds => {
+    const tbl = getTableName(ds);
+    return `SELECT ad_id, utc_timestamp, horizontal_accuracy, id_type, ip_address, latitude, longitude, iso_country_code, poi_ids, date FROM ${tbl}`;
+  });
+
+  const sql = `
+    CREATE OR REPLACE VIEW ${viewName} AS
+    ${unionParts.join('\n    UNION ALL\n    ')}
+  `.trim();
+
+  console.log(`[MEGA-VIEW] Creating view ${viewName} from ${subDatasetNames.length} tables...`);
+  await runQuery(sql);
+  console.log(`✅ [MEGA-VIEW] View ${viewName} created successfully`);
+
+  return viewName;
+}
+
+/**
+ * Drop a mega-dataset VIEW if it exists (for cleanup).
+ */
+export async function dropMegaDatasetView(megaDatasetName: string): Promise<void> {
+  const viewName = getTableName(megaDatasetName);
+  try {
+    await runQuery(`DROP VIEW IF EXISTS ${viewName}`);
+    console.log(`[MEGA-VIEW] Dropped view ${viewName}`);
+  } catch (err: any) {
+    console.warn(`[MEGA-VIEW] Failed to drop view ${viewName}:`, err.message);
+  }
 }

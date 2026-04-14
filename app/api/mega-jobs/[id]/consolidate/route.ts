@@ -25,7 +25,7 @@ import {
   type PoiCoord,
   type DwellFilter,
 } from '@/lib/mega-consolidation-queries';
-import { checkQueryStatus, fetchQueryResults, ensureTableForDataset } from '@/lib/athena';
+import { checkQueryStatus, fetchQueryResults, ensureTableForDataset, createMegaDatasetView, megaJobNameToDatasetId } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
@@ -143,6 +143,21 @@ export async function POST(
           })
         );
         console.log(`[MEGA] All Athena tables ready`);
+
+        // Create/refresh the mega-dataset VIEW (UNION ALL of sub-job tables)
+        const subDatasetNames = syncedJobs
+          .map(j => j.s3DestPath?.replace(/\/$/, '').split('/').pop())
+          .filter((n): n is string => !!n);
+        const megaDatasetId = megaJobNameToDatasetId(megaJob.name || id);
+        if (megaDatasetId && subDatasetNames.length > 0) {
+          try {
+            await createMegaDatasetView(megaDatasetId, subDatasetNames);
+            console.log(`[MEGA] Integrated dataset VIEW "${megaDatasetId}" created`);
+          } catch (viewErr: any) {
+            console.error(`[MEGA] Failed to create integrated VIEW:`, viewErr.message);
+            // Non-fatal — consolidation continues without the integrated view
+          }
+        }
 
         // Extract POI coordinates from sub-job metadata for spatial proximity queries
         const poiCoords = extractPoiCoords(syncedJobs);

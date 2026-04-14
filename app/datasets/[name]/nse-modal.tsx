@@ -43,11 +43,12 @@ interface NseModalProps {
   onClose: () => void;
   datasetName: string;
   catchmentData: any[] | null;
-  selectedBucket: number;
+  dwellMin: number;
+  dwellMax: number;
   jobCountry: string | null;
 }
 
-export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountry }: NseModalProps) {
+export function NseModal({ open, onClose, datasetName, dwellMin, dwellMax, jobCountry }: NseModalProps) {
   const [nseData, setNseData] = useState<NseRecord[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -181,7 +182,7 @@ export function NseModal({ open, onClose, datasetName, selectedBucket, jobCountr
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ country, minDwell: selectedBucket }),
+        body: JSON.stringify({ country, minDwell: dwellMin, maxDwell: dwellMax }),
       });
 
       while (data.phase !== 'done' && data.phase !== 'error') {

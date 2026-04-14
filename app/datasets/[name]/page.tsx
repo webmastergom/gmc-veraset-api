@@ -85,17 +85,25 @@ interface AnalysisResult {
   visitsByPoi: VisitByPoi[];
 }
 
-const DWELL_BUCKET_OPTIONS = [
-  { value: 0, label: 'All visits' },
-  { value: 2, label: '2+ min' },
-  { value: 5, label: '5+ min' },
-  { value: 10, label: '10+ min' },
-  { value: 15, label: '15+ min' },
-  { value: 30, label: '30+ min' },
-  { value: 60, label: '1+ hour' },
-  { value: 120, label: '2+ hours' },
-  { value: 180, label: '3+ hours' },
+/** Dwell time options (in minutes) for the min/max interval selectors */
+const DWELL_OPTIONS = [
+  { value: 0, label: 'No limit' },
+  { value: 2, label: '2 min' },
+  { value: 5, label: '5 min' },
+  { value: 10, label: '10 min' },
+  { value: 15, label: '15 min' },
+  { value: 30, label: '30 min' },
+  { value: 45, label: '45 min' },
+  { value: 60, label: '1 hr' },
+  { value: 90, label: '1.5 hr' },
+  { value: 120, label: '2 hr' },
+  { value: 180, label: '3 hr' },
+  { value: 240, label: '4 hr' },
+  { value: 360, label: '6 hr' },
+  { value: 480, label: '8 hr' },
 ];
+const DWELL_MIN_OPTIONS = DWELL_OPTIONS; // "No limit" (0) = no minimum
+const DWELL_MAX_OPTIONS = DWELL_OPTIONS; // "No limit" (0) = no maximum
 
 function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]) {
   const line = (arr: (string | number)[]) =>
@@ -132,8 +140,9 @@ export default function DatasetAnalysisPage() {
   const [generatingReports, setGeneratingReports] = useState(false);
   const [reportProgress, setReportProgress] = useState<{ step: string; percent: number; message: string } | null>(null);
 
-  // Dwell filter
-  const [selectedBucket, setSelectedBucket] = useState<number>(0);
+  // Dwell filter (min/max interval in minutes, 0 = no limit)
+  const [dwellMin, setDwellMin] = useState<number>(0);
+  const [dwellMax, setDwellMax] = useState<number>(0);
   // Hour filter
   const [hourFrom, setHourFrom] = useState<number>(0);
   const [hourTo, setHourTo] = useState<number>(23);
@@ -167,8 +176,8 @@ export default function DatasetAnalysisPage() {
       .catch(console.error);
   }, [datasetName]);
 
-  // Load reports for a specific dwell bucket + hour range
-  const loadReportsForBucket = (bucket: number, hFrom = hourFrom, hTo = hourTo) => {
+  // Load reports for specific dwell interval + hour range
+  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo) => {
     const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -178,9 +187,10 @@ export default function DatasetAnalysisPage() {
       temporal: setTemporalReport,
       affinity: setAffinityReport,
     };
+    const dwellParams = (dMin > 0 ? `&dwellMin=${dMin}` : '') + (dMax > 0 ? `&dwellMax=${dMax}` : '');
     const hourParams = (hFrom > 0 || hTo < 23) ? `&hourFrom=${hFrom}&hourTo=${hTo}` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}&bucket=${bucket}${hourParams}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -189,7 +199,7 @@ export default function DatasetAnalysisPage() {
 
   // Load saved reports on mount
   useEffect(() => {
-    loadReportsForBucket(selectedBucket);
+    loadReportsForFilters(dwellMin, dwellMax);
   }, [datasetName, reportVersion]);
 
   // ── Run analysis (basic stats) ──────────────────────────────────
@@ -258,7 +268,8 @@ export default function DatasetAnalysisPage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
-              ...(selectedBucket > 0 ? { minDwell: selectedBucket } : {}),
+              ...(dwellMin > 0 ? { minDwell: dwellMin } : {}),
+              ...(dwellMax > 0 ? { maxDwell: dwellMax } : {}),
               ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
             }),
           });
@@ -495,19 +506,33 @@ export default function DatasetAnalysisPage() {
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <h2 className="text-xl font-semibold">Data analysis</h2>
         <div className="flex flex-wrap gap-2 items-center">
-          <div className="flex items-center gap-2 mr-2">
+          <div className="flex items-center gap-1 mr-2">
             <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell:</label>
             <select
-              value={selectedBucket}
+              value={dwellMin}
               onChange={(e) => {
-                const bucket = parseInt(e.target.value, 10);
-                setSelectedBucket(bucket);
-                loadReportsForBucket(bucket);
+                const v = parseInt(e.target.value, 10);
+                setDwellMin(v);
+                loadReportsForFilters(v, dwellMax);
               }}
-              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+              className="h-8 w-20 rounded-md border border-input bg-background px-1 text-sm text-center"
             >
-              {DWELL_BUCKET_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              {DWELL_MIN_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.value === 0 ? 'Min' : opt.label}</option>
+              ))}
+            </select>
+            <span className="text-xs text-muted-foreground">to</span>
+            <select
+              value={dwellMax}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setDwellMax(v);
+                loadReportsForFilters(dwellMin, v);
+              }}
+              className="h-8 w-20 rounded-md border border-input bg-background px-1 text-sm text-center"
+            >
+              {DWELL_MAX_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.value === 0 ? 'Max' : opt.label}</option>
               ))}
             </select>
           </div>
@@ -518,7 +543,7 @@ export default function DatasetAnalysisPage() {
               onChange={(e) => {
                 const v = parseInt(e.target.value, 10);
                 setHourFrom(v);
-                loadReportsForBucket(selectedBucket, v, hourTo);
+                loadReportsForFilters(dwellMin, dwellMax, v, hourTo);
               }}
               className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
             >
@@ -532,7 +557,7 @@ export default function DatasetAnalysisPage() {
               onChange={(e) => {
                 const v = parseInt(e.target.value, 10);
                 setHourTo(v);
-                loadReportsForBucket(selectedBucket, hourFrom, v);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, v);
               }}
               className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
             >
@@ -598,17 +623,17 @@ export default function DatasetAnalysisPage() {
                 <div className="flex flex-wrap gap-1.5 pt-1">
                   {(reportProgress as any).completedBuckets?.map((b: number) => (
                     <span key={`c-${b}`} className="inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2.5 py-0.5 text-xs text-green-400">
-                      ✓ {DWELL_BUCKET_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
+                      ✓ {DWELL_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
                     </span>
                   ))}
                   {(reportProgress as any).runningBuckets?.map((b: number) => (
                     <span key={`r-${b}`} className="inline-flex items-center gap-1 rounded-full bg-yellow-500/10 px-2.5 py-0.5 text-xs text-yellow-400 animate-pulse">
-                      ⟳ {DWELL_BUCKET_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
+                      ⟳ {DWELL_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
                     </span>
                   ))}
                   {(reportProgress as any).pendingBuckets?.map((b: number) => (
                     <span key={`p-${b}`} className="inline-flex items-center gap-1 rounded-full bg-zinc-500/10 px-2.5 py-0.5 text-xs text-zinc-500">
-                      ○ {DWELL_BUCKET_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
+                      ○ {DWELL_OPTIONS.find(o => o.value === b)?.label || `${b}min`}
                     </span>
                   ))}
                 </div>
@@ -791,6 +816,26 @@ export default function DatasetAnalysisPage() {
               </div>
             );
           })()}
+
+          {/* Action buttons for filtered reports */}
+          <div className="flex flex-wrap gap-2 items-center">
+            <Button variant="outline" size="sm" onClick={handleDownloadMaids} disabled={downloadingMaids}>
+              {downloadingMaids ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Download className="mr-1.5 h-3.5 w-3.5" />}
+              Download MAIDs
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setNseModalOpen(true)}>
+              <Users className="mr-1.5 h-3.5 w-3.5" />
+              MAIDs by NSE
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setCategoryMaidModalOpen(true)}>
+              <Target className="mr-1.5 h-3.5 w-3.5" />
+              MAIDs by Category
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleActivate} disabled={activating} title="Upload MAIDs to S3 activations folder">
+              {activating ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Zap className="mr-1.5 h-3.5 w-3.5" />}
+              Activate
+            </Button>
+          </div>
 
           {/* Temporal Daily Chart */}
           {temporalReport?.daily && (
@@ -1123,7 +1168,8 @@ export default function DatasetAnalysisPage() {
         onClose={() => setNseModalOpen(false)}
         datasetName={datasetName}
         catchmentData={catchmentReport?.byZipCode || null}
-        selectedBucket={selectedBucket}
+        dwellMin={dwellMin}
+        dwellMax={dwellMax}
         jobCountry={datasetInfo?.country || null}
       />
       <CategoryMaidModal
