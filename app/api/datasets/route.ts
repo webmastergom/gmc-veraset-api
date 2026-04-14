@@ -107,6 +107,11 @@ export async function GET() {
       // Skip if no synced sub-jobs
       if (syncedCount === 0) continue;
 
+      // Inherit country from sub-jobs (first one that has it set)
+      const inheritedCountry = subJobDetails.find(sj => sj?.country)?.country
+        || (mj as any).country
+        || null;
+
       datasets.push({
         id: megaDatasetId,
         name: `${mj.name || mj.megaJobId} (integrated)`,
@@ -122,7 +127,7 @@ export async function GET() {
         dateRange: minDate && maxDate ? { from: minDate, to: maxDate } : null,
         lastModified: mj.updatedAt || mj.createdAt,
         syncedAt: mj.updatedAt || mj.createdAt,
-        country: mj.country ?? null,
+        country: inheritedCountry,
         dateRangeDiscrepancy: null,
         verasetPayload: null,
         actualDateRange: minDate && maxDate ? { from: minDate, to: maxDate, days: 0 } : null,
