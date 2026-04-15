@@ -212,19 +212,54 @@ function buildSankeySQL(
   minVisits: number = 1,
 ): string {
   const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
-  // Sample 50K devices for Sankey — spatial join on 3M+ devices is too heavy
-  const sjCTEs = spatialJoinCTEs(table, country, 'sankey_sample');
+  const cc = toIsoCountry(country);
 
+  // Sankey uses a single optimized join (no redundant pinsCTE join)
+  // since target_daily already provides both ad_id filter and date+timing info
   return `
     WITH
     ${tvCTE},
-    sankey_sample AS (
-      SELECT ad_id FROM (
-        SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
-        FROM (SELECT DISTINCT ad_id FROM target_daily) t_uniq
-      ) t_ranked WHERE rn <= 50000
+    gmc_pois AS (
+      SELECT id as poi_id, category,
+        CAST(latitude AS DOUBLE) as poi_lat,
+        CAST(longitude AS DOUBLE) as poi_lng,
+        CAST(FLOOR(CAST(latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lat_b,
+        CAST(FLOOR(CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lng_b
+      FROM lab_pois_gmc
+      WHERE category IS NOT NULL AND country = '${cc}'
     ),
-    ${sjCTEs},
+    poi_buckets AS (
+      SELECT poi_id, category, poi_lat, poi_lng,
+        base_lat_b + dlat as lat_b, base_lng_b + dlng as lng_b
+      FROM gmc_pois
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
+    ),
+    all_pings AS (
+      SELECT
+        p.ad_id, p.date, p.utc_timestamp,
+        TRY_CAST(p.latitude AS DOUBLE) as lat,
+        TRY_CAST(p.longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(p.latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lat_b,
+        CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_b,
+        CASE WHEN p.utc_timestamp < td.first_arrival THEN 'before' ELSE 'after' END as direction
+      FROM ${table} p
+      INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
+      WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
+        AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+        AND p.ad_id IS NOT NULL AND TRIM(p.ad_id) != ''
+        AND (p.utc_timestamp < td.first_arrival OR p.utc_timestamp > td.last_departure)
+    ),
+    matched AS (
+      SELECT ap.ad_id, ap.date, ap.utc_timestamp, ap.direction, pb.category
+      FROM all_pings ap
+      INNER JOIN poi_buckets pb ON ap.lat_b = pb.lat_b AND ap.lng_b = pb.lng_b
+      WHERE 111320 * SQRT(
+          POW(ap.lat - pb.poi_lat, 2) +
+          POW((ap.lng - pb.poi_lng) * COS(RADIANS((ap.lat + pb.poi_lat) / 2)), 2)
+        ) <= ${SPATIAL_RADIUS}
+    ),
     categorized AS (
       SELECT
         ad_id, direction, date,
