@@ -55,6 +55,7 @@ export default function RoutesPage() {
   const [dwellMax, setDwellMax] = useState(0);
   const [hourFrom, setHourFrom] = useState(0);
   const [hourTo, setHourTo] = useState(23);
+  const [minVisits, setMinVisits] = useState(1);
 
   // Analysis state
   const [analyzing, setAnalyzing] = useState(false);
@@ -108,6 +109,7 @@ export default function RoutesPage() {
           maxDwell: dwellMax,
           hourFrom,
           hourTo,
+          minVisits,
         }),
       });
 
@@ -237,6 +239,21 @@ export default function RoutesPage() {
                         </SelectContent>
                       </Select>
                     </div>
+                  </div>
+
+                  {/* Min visits */}
+                  <div>
+                    <label className="text-xs text-muted-foreground block mb-1">Min Visits</label>
+                    <Select value={String(minVisits)} onValueChange={v => { setMinVisits(Number(v)); setResult(null); }}>
+                      <SelectTrigger className="w-20">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {[1, 2, 3, 5, 10, 15, 20].map(n => (
+                          <SelectItem key={n} value={String(n)}>{n}+</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
 
                   {/* Run button */}

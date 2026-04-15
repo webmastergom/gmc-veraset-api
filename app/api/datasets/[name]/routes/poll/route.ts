@@ -32,6 +32,7 @@ interface RoutesState {
     maxDwell: number;
     hourFrom: number;
     hourTo: number;
+    minVisits: number;
     country: string;
   };
   error?: string;
@@ -72,6 +73,7 @@ function targetVisitsCTE(
   maxDwell: number,
   hourFrom: number,
   hourTo: number,
+  minVisits: number = 1,
 ): string {
   // Hour filter on pings
   let hourWhere = '';
@@ -107,9 +109,11 @@ function targetVisitsCTE(
     target_daily AS (
       SELECT ad_id, date, arrival as first_arrival, departure as last_departure, dwell
       FROM (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_id, date ORDER BY dwell DESC, arrival) as rn
+        SELECT *,
+          ROW_NUMBER() OVER (PARTITION BY ad_id, date ORDER BY dwell DESC, arrival) as rn,
+          COUNT(*) OVER (PARTITION BY ad_id) as total_visits
         FROM target_visits
-      ) t_ranked WHERE rn = 1
+      ) t_ranked WHERE rn = 1${minVisits > 1 ? ` AND total_visits >= ${minVisits}` : ''}
     )`;
 }
 
@@ -202,8 +206,9 @@ function buildSankeySQL(
   maxDwell: number,
   hourFrom: number,
   hourTo: number,
+  minVisits: number = 1,
 ): string {
-  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo);
+  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
   // For Sankey we use ALL visitors (no sampling)
   // But we need a CTE that provides ad_id for the spatial join
   const sjCTEs = spatialJoinCTEs(table, country, hourFrom, hourTo, 'target_daily');
@@ -243,8 +248,9 @@ function buildSampleRoutesSQL(
   maxDwell: number,
   hourFrom: number,
   hourTo: number,
+  minVisits: number = 1,
 ): string {
-  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo);
+  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
 
   return `
     WITH
@@ -299,8 +305,9 @@ function buildDiagnosticSQL(
   maxDwell: number,
   hourFrom: number,
   hourTo: number,
+  minVisits: number = 1,
 ): string {
-  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo);
+  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
   const cc = toIsoCountry(country);
 
   return `
@@ -346,7 +353,7 @@ function buildDiagnosticSQL(
 }
 
 function filtersKey(f: RoutesState['filters']): string {
-  return `d${f.minDwell}-${f.maxDwell}_h${f.hourFrom}-${f.hourTo}`;
+  return `d${f.minDwell}-${f.maxDwell}_h${f.hourFrom}-${f.hourTo}_v${f.minVisits}`;
 }
 
 /**
@@ -378,6 +385,7 @@ export async function POST(
       maxDwell: parseInt(body.maxDwell, 10) || 0,
       hourFrom: parseInt(body.hourFrom, 10) || 0,
       hourTo: body.hourTo != null ? parseInt(body.hourTo, 10) : 23,
+      minVisits: parseInt(body.minVisits, 10) || 1,
       country: body.country || '',
     };
 
@@ -418,9 +426,9 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
-      const sampleSql = buildSampleRoutesSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
-      const countSql = buildDiagnosticSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo);
+      const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
+      const sampleSql = buildSampleRoutesSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
+      const countSql = buildDiagnosticSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
 
       const [sankeyQId, sampleQId, countQId] = await Promise.all([
         startQueryAsync(sankeySql).catch(e => { console.error('[ROUTES] Sankey query failed:', e.message); return undefined; }),
