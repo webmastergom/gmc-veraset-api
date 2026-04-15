@@ -147,6 +147,7 @@ export default function DatasetAnalysisPage() {
   // Hour filter
   const [hourFrom, setHourFrom] = useState<number>(0);
   const [hourTo, setHourTo] = useState<number>(23);
+  const [minVisits, setMinVisits] = useState<number>(1);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
@@ -179,7 +180,7 @@ export default function DatasetAnalysisPage() {
   }, [datasetName]);
 
   // Load reports for specific dwell interval + hour range
-  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo) => {
+  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits) => {
     const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -191,8 +192,9 @@ export default function DatasetAnalysisPage() {
     };
     const dwellParams = (dMin > 0 ? `&dwellMin=${dMin}` : '') + (dMax > 0 ? `&dwellMax=${dMax}` : '');
     const hourParams = (hFrom > 0 || hTo < 23) ? `&hourFrom=${hFrom}&hourTo=${hTo}` : '';
+    const visitParams = mVisits > 1 ? `&minVisits=${mVisits}` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -273,6 +275,7 @@ export default function DatasetAnalysisPage() {
               ...(dwellMin > 0 ? { minDwell: dwellMin } : {}),
               ...(dwellMax > 0 ? { maxDwell: dwellMax } : {}),
               ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
+              ...(minVisits > 1 ? { minVisits } : {}),
             }),
           });
           consecutiveErrors = 0;
@@ -565,6 +568,21 @@ export default function DatasetAnalysisPage() {
             >
               {Array.from({ length: 24 }, (_, i) => (
                 <option key={i} value={i}>{String(i).padStart(2, '0')}h</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-1 mr-2">
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Min Visits:</label>
+            <select
+              value={minVisits}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setMinVisits(v);
+              }}
+              className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+            >
+              {[1, 2, 3, 5, 10, 15, 20].map(n => (
+                <option key={n} value={n}>{n}+</option>
               ))}
             </select>
           </div>

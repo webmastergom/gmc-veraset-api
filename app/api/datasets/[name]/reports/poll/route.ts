@@ -22,10 +22,11 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
-function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
+function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
   let key = `dataset-reports/${ds}/${type}`;
   if (minDwell > 0 || maxDwell > 0) key += `-dwell-${minDwell}-${maxDwell}`;
   if (hourFrom > 0 || hourTo < 23) key += `-h${hourFrom}-${hourTo}`;
+  if (minVisits > 1) key += `-v${minVisits}`;
   return key;
 }
 
@@ -39,6 +40,7 @@ interface ReportState {
   maxDwell?: number;
   hourFrom?: number;
   hourTo?: number;
+  minVisits?: number;
   error?: string;
 }
 
@@ -76,13 +78,26 @@ function hourFilterSQL(hourFrom: number, hourTo: number, tsCol = 'utc_timestamp'
  * @param hourFrom - start hour filter (0-23, default 0)
  * @param hourTo - end hour filter (0-23, default 23)
  */
-function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
+function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
   const havingParts: string[] = [];
   if (minDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`);
   if (maxDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${maxDwell}`);
   const dwellFilter = havingParts.length > 0 ? `\n    HAVING ${havingParts.join(' AND ')}` : '';
   const hFilter = hourFilterSQL(hourFrom, hourTo);
-  return `raw_poi_pings AS (
+  const visitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, COUNT(DISTINCT date) as vd
+        FROM ${table}
+        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+        WHERE poi_id IS NOT NULL AND poi_id != ''
+          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        GROUP BY ad_id
+        HAVING COUNT(DISTINCT date) >= ${minVisits}
+      ) t_vc
+    ),
+    ` : '';
+  const visitWhere = minVisits > 1 ? `AND ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
+  return `${visitFilterCTE}raw_poi_pings AS (
       SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
         TRY_CAST(longitude AS DOUBLE) as lng
@@ -94,6 +109,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
         ${hFilter}
+        ${visitWhere}
     ),
     at_poi AS (
       SELECT ad_id, date,
@@ -111,15 +127,29 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
 /** Simple CTE for queries that just need the raw pings (hourly, temporal).
  * When minDwell/maxDwell > 0, only includes device-days with dwell in range.
  * When hourFrom/hourTo specified, only includes pings within the time window. */
-function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
+function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
   const hFilter = hourFilterSQL(hourFrom, hourTo);
   const hFilterT = hourFilterSQL(hourFrom, hourTo, 't.utc_timestamp');
+  const visitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, COUNT(DISTINCT date) as vd
+        FROM ${table}
+        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+        WHERE poi_id IS NOT NULL AND poi_id != ''
+          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        GROUP BY ad_id
+        HAVING COUNT(DISTINCT date) >= ${minVisits}
+      ) t_vc
+    ),
+    ` : '';
+  const visitWhere = minVisits > 1 ? `AND ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
+  const visitWhereT = minVisits > 1 ? `AND t.ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
   if (minDwell > 0 || maxDwell > 0) {
     // Need to compute dwell first, then filter, then expand back to individual pings
     const havingParts: string[] = [];
     if (minDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`);
     if (maxDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${maxDwell}`);
-    return `poi_device_days AS (
+    return `${visitFilterCTE}poi_device_days AS (
       SELECT ad_id, date
       FROM ${table}
       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
@@ -127,6 +157,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         ${hFilter}
+        ${visitWhere}
       GROUP BY ad_id, date
       HAVING ${havingParts.join(' AND ')}
     ),
@@ -144,7 +175,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         ${hFilterT}
     )`;
   }
-  return `at_poi AS (
+  return `${visitFilterCTE}at_poi AS (
       SELECT DISTINCT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
         TRY_CAST(longitude AS DOUBLE) as lng
@@ -156,29 +187,30 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
         ${hFilter}
+        ${visitWhere}
     )`;
 }
 
-function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo)}
+function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
     SELECT HOUR(utc_timestamp) as touch_hour,
       COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY 1 ORDER BY 1`;
 }
 
-function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo)}
+function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
     SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY date ORDER BY date`;
 }
 
-function buildTotalDevicesSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo)}
+function buildTotalDevicesSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
     SELECT COUNT(DISTINCT ad_id) as total_unique_devices FROM at_poi`;
 }
 
-function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo)},
+function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)},
     poi_visits AS (
       SELECT ad_id, date, first_ping as first_poi_visit
       FROM at_poi
@@ -218,8 +250,8 @@ function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hou
     LIMIT 100000`;
 }
 
-function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo)},
+function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)},
     poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
     valid_pings AS (
       SELECT t.ad_id, t.date, t.utc_timestamp,
@@ -256,8 +288,8 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
  * avg dwell, and visit frequency. These feed the affinity index calculation
  * after reverse geocoding groups them by postal code.
  */
-function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23): string {
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo)},
+function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)},
     all_pings AS (
       SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
@@ -308,7 +340,7 @@ interface PoiCoordForMobility {
   radiusM: number;
 }
 
-function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?: PoiCoordForMobility[], hourFrom = 0, hourTo = 23): string {
+function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?: PoiCoordForMobility[], hourFrom = 0, hourTo = 23, minVisits = 1): string {
   // Mobility: POI categories visited before/after target POI visit.
   //
   // Strategy (same as mega-job consolidation):
@@ -320,6 +352,21 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
   // 5. Aggregate by timing (before/after) + category
 
   const GRID_STEP = 0.01; // ~1.1km geohash grid
+
+  // Optional min-visits filter CTE
+  const mobilityVisitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, COUNT(DISTINCT date) as vd
+        FROM ${table}
+        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+        WHERE poi_id IS NOT NULL AND poi_id != ''
+          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        GROUP BY ad_id
+        HAVING COUNT(DISTINCT date) >= ${minVisits}
+      ) t_vc
+    ),
+    ` : '';
+  const mobilityVisitWhere = minVisits > 1 ? `AND ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
 
   // Build visit_time CTE — spatial when POI coords available
   let visitTimeCTE: string;
@@ -373,6 +420,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
       ) <= tp.poi_radius_m
         ${hourFilterSQL(hourFrom, hourTo, 'p.utc_timestamp')}
+        ${minVisits > 1 ? 'AND p.ad_id IN (SELECT ad_id FROM visit_day_filter)' : ''}
     )${dwellCTEs},
     target_visits AS (
       SELECT
@@ -401,6 +449,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
       WHERE poi_id IS NOT NULL AND poi_id != ''
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${hourFilterSQL(hourFrom, hourTo)}
+        ${mobilityVisitWhere}
       GROUP BY ad_id, date
       ${dwellHaving}
     ),
@@ -417,7 +466,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
   }
 
   return `WITH
-    ${visitTimeCTE},
+    ${mobilityVisitFilterCTE}${visitTimeCTE},
     nearby_pings AS (
       SELECT
         a.ad_id,
@@ -677,17 +726,19 @@ export async function POST(
   try {
     let state = await getState(datasetName);
 
-    // Parse request body for dwell interval + hour filters
+    // Parse request body for dwell interval + hour filters + min visits
     let minDwell = 0;
     let maxDwell = 0;
     let hourFrom = 0;
     let hourTo = 23;
+    let minVisits = 1;
     try {
       const body = await request.json();
       if (body?.minDwell) minDwell = parseInt(body.minDwell, 10) || 0;
       if (body?.maxDwell) maxDwell = parseInt(body.maxDwell, 10) || 0;
       if (body?.hourFrom != null) hourFrom = Math.max(0, Math.min(23, parseInt(body.hourFrom, 10) || 0));
       if (body?.hourTo != null) hourTo = Math.max(0, Math.min(23, parseInt(body.hourTo, 10) || 23));
+      if (body?.minVisits) minVisits = parseInt(body.minVisits, 10) || 1;
     } catch { /* no body */ }
 
     // Reset if done, error, or filters changed
@@ -700,12 +751,17 @@ export async function POST(
       console.log(`[DS-REPORT] Hour filter changed (${state.hourFrom ?? 0}-${state.hourTo ?? 23} → ${hourFrom}-${hourTo}), resetting`);
       state = null;
     }
+    if (state && (state.minVisits ?? 1) !== minVisits) {
+      console.log(`[DS-REPORT] Min visits changed (${state.minVisits ?? 1} → ${minVisits}), resetting`);
+      state = null;
+    }
 
     // ── Phase: start ────────────────────────────────────────────
     if (!state) {
       const dwellLabel = (minDwell > 0 || maxDwell > 0) ? `, dwell=${minDwell}-${maxDwell || '∞'}` : '';
       const hourLabel = (hourFrom > 0 || hourTo < 23) ? `, hours=${hourFrom}-${hourTo}` : '';
-      console.log(`[DS-REPORT] Starting reports for ${datasetName} (${dwellLabel}${hourLabel})`);
+      const visitLabel = minVisits > 1 ? `, minVisits=${minVisits}` : '';
+      console.log(`[DS-REPORT] Starting reports for ${datasetName} (${dwellLabel}${hourLabel}${visitLabel})`);
 
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
@@ -739,13 +795,13 @@ export async function POST(
       // Launch all 7 queries in parallel
       const queries: Record<string, string> = {};
       await Promise.all([
-        startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
-        startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
-        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
-        startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
-        startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
-        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
+        startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
+        startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
+        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
+        startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
+        startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo, minVisits)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
       // Get dataset size for progress estimation
@@ -770,6 +826,7 @@ export async function POST(
         maxDwell: maxDwell || undefined,
         hourFrom: hourFrom > 0 ? hourFrom : undefined,
         hourTo: hourTo < 23 ? hourTo : undefined,
+        minVisits: minVisits > 1 ? minVisits : undefined,
       };
       await saveState(datasetName, state);
 
@@ -864,7 +921,8 @@ export async function POST(
       const dMax = state.maxDwell || 0;
       const hFrom = state.hourFrom ?? 0;
       const hTo = state.hourTo ?? 23;
-      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo);
+      const mVisits = state.minVisits ?? 1;
+      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo, mVisits);
       const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
 
       // Parse hourly

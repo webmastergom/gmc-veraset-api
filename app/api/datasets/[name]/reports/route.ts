@@ -4,10 +4,11 @@ import { getConfig } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 
-function REPORT_KEY_FULL(ds: string, type: string, dwellMin: number, dwellMax: number, hourFrom = 0, hourTo = 23): string {
+function REPORT_KEY_FULL(ds: string, type: string, dwellMin: number, dwellMax: number, hourFrom = 0, hourTo = 23, minVisits = 1): string {
   let key = `dataset-reports/${ds}/${type}`;
   if (dwellMin > 0 || dwellMax > 0) key += `-dwell-${dwellMin}-${dwellMax}`;
   if (hourFrom > 0 || hourTo < 23) key += `-h${hourFrom}-${hourTo}`;
+  if (minVisits > 1) key += `-v${minVisits}`;
   return key;
 }
 const REPORT_KEY_LEGACY = (ds: string, type: string) =>
@@ -39,6 +40,7 @@ export async function GET(
   const effectiveDwellMin = dwellMin || legacyBucket;
   const hourFrom = parseInt(request.nextUrl.searchParams.get('hourFrom') || '0', 10) || 0;
   const hourTo = parseInt(request.nextUrl.searchParams.get('hourTo') || '23', 10);
+  const minVisits = parseInt(request.nextUrl.searchParams.get('minVisits') || '1', 10) || 1;
 
   if (!VALID_TYPES.includes(reportType)) {
     return NextResponse.json(
@@ -48,8 +50,8 @@ export async function GET(
   }
 
   try {
-    // Try full-keyed report first (dwell interval + hour)
-    let report = await getConfig<any>(REPORT_KEY_FULL(datasetName, reportType, effectiveDwellMin, dwellMax, hourFrom, hourTo));
+    // Try full-keyed report first (dwell interval + hour + minVisits)
+    let report = await getConfig<any>(REPORT_KEY_FULL(datasetName, reportType, effectiveDwellMin, dwellMax, hourFrom, hourTo, minVisits));
 
     // Fallback: old single-bucket key format (dwell-{N} without max)
     if (!report && effectiveDwellMin > 0 && dwellMax === 0) {
@@ -59,13 +61,13 @@ export async function GET(
     }
 
     // Fallback: legacy key (pre-filter migration) — only when no filters active
-    if (!report && effectiveDwellMin === 0 && dwellMax === 0 && hourFrom === 0 && hourTo === 23) {
+    if (!report && effectiveDwellMin === 0 && dwellMax === 0 && hourFrom === 0 && hourTo === 23 && minVisits <= 1) {
       report = await getConfig<any>(REPORT_KEY_LEGACY(datasetName, reportType));
     }
 
     if (!report) {
       return NextResponse.json(
-        { error: `Report "${reportType}" (dwell ${effectiveDwellMin}-${dwellMax || '∞'}, hours ${hourFrom}-${hourTo}) not found. Run Analyze first.` },
+        { error: `Report "${reportType}" (dwell ${effectiveDwellMin}-${dwellMax || '∞'}, hours ${hourFrom}-${hourTo}${minVisits > 1 ? `, minVisits=${minVisits}` : ''}) not found. Run Analyze first.` },
         { status: 404 }
       );
     }
