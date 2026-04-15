@@ -469,28 +469,25 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
+      // Only 2 queries: sample routes + diagnostic count
+      // Sankey is computed server-side from sample routes (avoids 116GB+ scan timeout)
       const sampleSql = buildSampleRoutesSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
       const countSql = buildDiagnosticSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
 
-      const [sankeyQId, sampleQId, countQId] = await Promise.all([
-        startQueryAsync(sankeySql).catch(e => { console.error('[ROUTES] Sankey query failed:', e.message); return undefined; }),
+      const [sampleQId, countQId] = await Promise.all([
         startQueryAsync(sampleSql).catch(e => { console.error('[ROUTES] Sample query failed:', e.message); return undefined; }),
         startQueryAsync(countSql).catch(e => { console.error('[ROUTES] Count query failed:', e.message); return undefined; }),
       ]);
 
-      console.log(`[ROUTES] 3 queries launched: sankey=${sankeyQId}, sample=${sampleQId}, count=${countQId}`);
+      console.log(`[ROUTES] 2 queries launched: sample=${sampleQId}, count=${countQId}`);
 
       state = {
         phase: 'polling',
-        sankeyQueryId: sankeyQId,
         sampleQueryId: sampleQId,
         sankeySeed: Date.now(),
         filters,
-        sankeyDone: false,
         sampleDone: false,
       };
-      // Store countQId in state too
       (state as any).countQueryId = countQId;
       await putConfig(stateKey, state, { compact: true });
 
@@ -508,7 +505,6 @@ export async function POST(
       let errorMsg = '';
 
       const queries = [
-        { name: 'sankey', id: state.sankeyQueryId, doneKey: 'sankeyDone' },
         { name: 'sample', id: state.sampleQueryId, doneKey: 'sampleDone' },
         { name: 'count', id: (state as any).countQueryId, doneKey: 'countDone' },
       ];
@@ -547,8 +543,8 @@ export async function POST(
           stateKey,
           progress: {
             step: 'polling',
-            percent: 10 + Math.round((doneCount / 3) * 50),
-            message: `Queries running (${doneCount}/3 done)...`,
+            percent: 10 + Math.round((doneCount / 2) * 50),
+            message: `Queries running (${doneCount}/2 done)...`,
           },
         });
       }
@@ -573,40 +569,7 @@ export async function POST(
         return { key: 'other', label: 'Other' };
       };
 
-      // Parse Sankey results
-      let sankeyFlows: SankeyFlow[] = [];
-      if (state.sankeyQueryId) {
-        try {
-          const res = await fetchQueryResults(state.sankeyQueryId);
-          // Aggregate by group
-          const grouped = new Map<string, SankeyFlow>();
-          for (const row of res.rows) {
-            const dir = row.direction as 'before' | 'after';
-            const cat = row.category || 'unknown';
-            const g = catToGroup(cat);
-            const mapKey = `${dir}:${g.key}`;
-            const existing = grouped.get(mapKey);
-            if (existing) {
-              existing.devices += parseInt(row.devices, 10) || 0;
-              existing.pings += parseInt(row.visits, 10) || 0;
-            } else {
-              grouped.set(mapKey, {
-                direction: dir,
-                group_key: g.key,
-                group_label: g.label,
-                devices: parseInt(row.devices, 10) || 0,
-                pings: parseInt(row.visits, 10) || 0,
-              });
-            }
-          }
-          sankeyFlows = Array.from(grouped.values())
-            .sort((a, b) => b.devices - a.devices);
-        } catch (err: any) {
-          console.error('[ROUTES] Error reading sankey results:', err.message);
-        }
-      }
-
-      // Parse sample routes
+      // Parse sample routes (Sankey is computed from these — no separate heavy query)
       let sampleStops: SampleStop[] = [];
       if (state.sampleQueryId) {
         try {
@@ -646,6 +609,36 @@ export async function POST(
           console.error('[ROUTES] Error reading diagnostic:', err.message);
         }
       }
+
+      // Compute Sankey flows from sample routes (aggregated by direction + group)
+      const sankeyMap = new Map<string, SankeyFlow>();
+      for (const stop of sampleStops) {
+        if (stop.direction === 'during') continue; // Only before/after
+        const dir = stop.direction as 'before' | 'after';
+        const mapKey = `${dir}:${stop.group_key}`;
+        const existing = sankeyMap.get(mapKey);
+        if (existing) {
+          existing.pings += 1;
+          // Track unique devices via a Set (stored temporarily)
+          (existing as any)._devices.add(stop.ad_id);
+          existing.devices = (existing as any)._devices.size;
+        } else {
+          const devSet = new Set([stop.ad_id]);
+          sankeyMap.set(mapKey, {
+            direction: dir,
+            group_key: stop.group_key,
+            group_label: stop.group_label,
+            devices: 1,
+            pings: 1,
+            ...({ _devices: devSet } as any),
+          });
+        }
+      }
+      const sankeyFlows = Array.from(sankeyMap.values())
+        .map(f => { delete (f as any)._devices; return f; })
+        .sort((a, b) => b.devices - a.devices);
+
+      console.log(`[ROUTES] Sankey computed from sample: ${sankeyFlows.length} flows`);
 
       const result: RoutesResult = {
         sankey: sankeyFlows,
