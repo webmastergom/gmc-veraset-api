@@ -14,6 +14,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import { s3Client, BUCKET, getConfig } from './s3-config';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getAllJobs } from './jobs';
 
 /**
  * Get POI collection GeoJSON from S3, with fallback to local files.
@@ -99,4 +100,89 @@ export async function putPOICollection(collectionId: string, geojson: any): Prom
   });
 
   await s3Client.send(command);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Dataset → POI positions helper
+// Used by /api/datasets/[name]/pois/positions and /api/compare to fetch
+// POI lat/lng/name for map rendering. Mirrors the 3-path lookup:
+//   1. job.verasetPayload.geo_radius (pre-enriched)
+//   2. job.externalPois
+//   3. POI collection GeoJSON + job.poiMapping
+// ─────────────────────────────────────────────────────────────────────
+
+export interface DatasetPoiPosition {
+  poiId: string;
+  lat: number;
+  lng: number;
+  name?: string;
+}
+
+export async function getPOIPositionsForDataset(datasetName: string): Promise<DatasetPoiPosition[]> {
+  const jobs = await getAllJobs();
+  const job = jobs.find((j: any) => {
+    if (!j.s3DestPath) return false;
+    const s3Path = String(j.s3DestPath).replace('s3://', '').replace(`${BUCKET}/`, '').trim();
+    const parts = s3Path.split('/').filter(Boolean);
+    const jobFolderName = parts[0] || parts.pop() || s3Path.replace(/\/$/, '');
+    return jobFolderName === datasetName;
+  });
+
+  const positions: DatasetPoiPosition[] = [];
+  if (!job) return positions;
+
+  const geoRadius = (job as any)?.verasetPayload?.geo_radius || (job as any)?.auditTrail?.userInput?.verasetConfig?.geo_radius;
+  if (geoRadius && Array.isArray(geoRadius)) {
+    for (const poi of geoRadius) {
+      const lat = Number(poi.latitude);
+      const lng = Number(poi.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      const poiId = poi.poi_id || '';
+      const name = (job as any)?.poiNames?.[poiId];
+      positions.push({ poiId, lat, lng, name });
+    }
+  }
+
+  if (positions.length === 0 && (job as any)?.externalPois?.length) {
+    for (const p of (job as any).externalPois) {
+      if (Number.isFinite(p.latitude) && Number.isFinite(p.longitude)) {
+        positions.push({ poiId: p.id, lat: p.latitude, lng: p.longitude, name: p.name });
+      }
+    }
+  }
+
+  if (positions.length === 0 && (job as any)?.poiCollectionId) {
+    try {
+      const geojson = await getPOICollection((job as any).poiCollectionId);
+      const features = geojson?.features || [];
+      const poiMapping = (job as any).poiMapping || {};
+      const poiNames = (job as any).poiNames || {};
+      for (const f of features) {
+        const geom = f.geometry;
+        const props = f.properties || {};
+        const originalId = props.id || props.name || f.id || '';
+        const verasetId = Object.entries(poiMapping).find(([, v]) => v === originalId)?.[0] || originalId;
+        let coords: number[] = [];
+        if (geom?.type === 'Point' && Array.isArray(geom.coordinates)) {
+          coords = geom.coordinates;
+        } else if (geom?.type === 'MultiPoint' && geom.coordinates?.[0]) {
+          coords = geom.coordinates[0];
+        } else if (geom?.type === 'Polygon' && geom.coordinates?.[0]?.[0]) {
+          coords = geom.coordinates[0][0];
+        } else if (geom?.type === 'MultiPolygon' && geom.coordinates?.[0]?.[0]?.[0]) {
+          coords = geom.coordinates[0][0][0];
+        }
+        if (coords.length >= 2) {
+          const lng = coords[0];
+          const lat = coords[1];
+          const name = props.name || poiNames[verasetId as string] || originalId;
+          positions.push({ poiId: (verasetId as string) || originalId, lat, lng, name });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return positions;
 }
