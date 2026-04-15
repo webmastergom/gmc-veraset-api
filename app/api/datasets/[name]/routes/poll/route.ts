@@ -92,6 +92,18 @@ function targetVisitsCTE(
   if (maxDwell > 0) dwellParts.push(`${dwellExpr} <= ${maxDwell}`);
   const havingClause = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
 
+  // minVisits: count distinct visit-days per device (not rows, which explode due to poi_ids)
+  const visitCountCTE = minVisits > 1 ? `
+    visit_day_counts AS (
+      SELECT ad_id, COUNT(DISTINCT date) as visit_days
+      FROM target_visits
+      GROUP BY ad_id
+      HAVING COUNT(DISTINCT date) >= ${minVisits}
+    ),` : '';
+  const visitCountJoin = minVisits > 1
+    ? 'INNER JOIN visit_day_counts vc ON t_ranked.ad_id = vc.ad_id'
+    : '';
+
   return `
     target_visits AS (
       SELECT ad_id, date,
@@ -105,15 +117,16 @@ function targetVisitsCTE(
         ${hourWhere}
       GROUP BY ad_id, date, t2.poi_id
       ${havingClause}
-    ),
+    ),${visitCountCTE}
     target_daily AS (
-      SELECT ad_id, date, arrival as first_arrival, departure as last_departure, dwell
+      SELECT t_ranked.ad_id, t_ranked.date,
+        t_ranked.arrival as first_arrival, t_ranked.departure as last_departure, t_ranked.dwell
       FROM (
-        SELECT *,
-          ROW_NUMBER() OVER (PARTITION BY ad_id, date ORDER BY dwell DESC, arrival) as rn,
-          COUNT(*) OVER (PARTITION BY ad_id) as total_visits
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_id, date ORDER BY dwell DESC, arrival) as rn
         FROM target_visits
-      ) t_ranked WHERE rn = 1${minVisits > 1 ? ` AND total_visits >= ${minVisits}` : ''}
+      ) t_ranked
+      ${visitCountJoin}
+      WHERE t_ranked.rn = 1
     )`;
 }
 
@@ -124,21 +137,12 @@ function targetVisitsCTE(
 function spatialJoinCTEs(
   table: string,
   country: string,
-  hourFrom: number,
-  hourTo: number,
   pinsCTE: string, // name of the CTE providing ad_id rows to join against
 ): string {
   const cc = toIsoCountry(country);
 
-  // Hour filter on ALL pings (not just target visits)
-  let hourWhere = '';
-  if (hourFrom > 0 || hourTo < 23) {
-    if (hourFrom <= hourTo) {
-      hourWhere = `AND HOUR(p.utc_timestamp) >= ${hourFrom} AND HOUR(p.utc_timestamp) <= ${hourTo}`;
-    } else {
-      hourWhere = `AND (HOUR(p.utc_timestamp) >= ${hourFrom} OR HOUR(p.utc_timestamp) <= ${hourTo})`;
-    }
-  }
+  // NO hour filter here — hour filter only applies to target visit selection (in targetVisitsCTE).
+  // Before/after pings should be any hour to maximize route coverage.
 
   return `
     gmc_pois AS (
@@ -178,7 +182,6 @@ function spatialJoinCTEs(
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
         AND p.ad_id IS NOT NULL AND TRIM(p.ad_id) != ''
         AND (p.utc_timestamp < td.first_arrival OR p.utc_timestamp > td.last_departure)
-        ${hourWhere}
     ),
     matched AS (
       SELECT
@@ -211,7 +214,7 @@ function buildSankeySQL(
   const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
   // For Sankey we use ALL visitors (no sampling)
   // But we need a CTE that provides ad_id for the spatial join
-  const sjCTEs = spatialJoinCTEs(table, country, hourFrom, hourTo, 'target_daily');
+  const sjCTEs = spatialJoinCTEs(table, country, 'target_daily');
 
   return `
     WITH
@@ -261,7 +264,7 @@ function buildSampleRoutesSQL(
         FROM (SELECT DISTINCT ad_id FROM target_daily) t_uniq
       ) t_ranked WHERE rn <= 1000
     ),
-    ${spatialJoinCTEs(table, country, hourFrom, hourTo, 'sampled')},
+    ${spatialJoinCTEs(table, country, 'sampled')},
     categorized AS (
       -- Before/after stops: spatial join with lab_pois_gmc
       SELECT
