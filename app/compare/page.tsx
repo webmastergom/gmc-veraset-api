@@ -335,14 +335,16 @@ export default function ComparePage() {
 
   const safePollFetch = async (url: string, options?: RequestInit) => {
     const res = await fetch(url, options);
+    // 504 = Vercel gateway timeout → retry is legit
     if (res.status === 504) {
       return { phase: 'main_polling', progress: { message: 'Server processing (retrying...)' } };
     }
-    let data;
+    let data: any;
     try { data = await res.json(); } catch {
-      return { phase: 'main_polling', progress: { message: 'Server processing (retrying...)' } };
+      // Any non-504 that is also not JSON → surface as error, don't silently retry
+      throw new Error(`Server error (status ${res.status})`);
     }
-    if (!res.ok) throw new Error(data.error || 'Failed');
+    if (!res.ok) throw new Error(data.error || `Server error (status ${res.status})`);
     return data;
   };
 
