@@ -212,13 +212,18 @@ function buildSankeySQL(
   minVisits: number = 1,
 ): string {
   const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
-  // For Sankey we use ALL visitors (no sampling)
-  // But we need a CTE that provides ad_id for the spatial join
-  const sjCTEs = spatialJoinCTEs(table, country, 'target_daily');
+  // Sample 50K devices for Sankey — spatial join on 3M+ devices is too heavy
+  const sjCTEs = spatialJoinCTEs(table, country, 'sankey_sample');
 
   return `
     WITH
     ${tvCTE},
+    sankey_sample AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
+        FROM (SELECT DISTINCT ad_id FROM target_daily) t_uniq
+      ) t_ranked WHERE rn <= 50000
+    ),
     ${sjCTEs},
     categorized AS (
       SELECT
