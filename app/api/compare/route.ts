@@ -9,11 +9,10 @@ import {
   runQuery,
 } from '@/lib/athena';
 import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
-import { getAllJobs } from '@/lib/jobs';
-import { setCountryFilter, batchReverseGeocode } from '@/lib/reverse-geocode';
-// NOTE: @/lib/poi-storage is imported dynamically in the reading phase — it pulls in
-// `fs` and triggers Next.js File Tracing on the POIs/ directory, which blows up the
-// Lambda bundle for this route at cold-start. Keep it behind a lazy import.
+// NOTE: @/lib/jobs, @/lib/reverse-geocode, @/lib/poi-storage are imported dynamically
+// inside the specific phases that need them. Keeping them out of the module-level
+// import graph reduces the Lambda cold-start bundle. @/lib/poi-storage in particular
+// pulls in `fs` and triggers Next.js File Tracing on the POIs/ directory.
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -31,24 +30,31 @@ interface DatasetSide {
 
 interface CompareState {
   phase:
-    | 'home_polling'       // geocoding-prep: home-coord queries running
-    | 'geocoding'          // reverse-geocode + ZIP filter in JS
-    | 'main_polling'       // main 5 queries running (counts + POI overlap + export)
-    | 'reading'            // fetch results
+    | 'home_polling'       // phase 1: unique home-coord queries running
+    | 'geocoding'          // phase 2: JS geocodes small coord set, fires kept-devices queries
+    | 'devices_polling'    // phase 3: kept-devices queries (Athena materializes ad_id lists)
+    | 'main_polling'       // phase 4: main 5 queries running (counts + POI overlap + export)
+    | 'reading'            // phase 5: fetch results, build POI list
     | 'done'
     | 'error';
+  schemaVersion?: number;  // bump when changing phase semantics; old states rejected
   stateId: string;
   datasetA: DatasetSide;
   datasetB: DatasetSide;
-  zipCodes?: string[];           // normalized (trim/uppercase) — empty = no ZIP filter
+  zipCodes?: string[];
   countryA?: string;
   countryB?: string;
 
-  // Home-coord query ids (only set when zipCodes present)
+  // Phase 1: home-coord-unique queries
   homeQueryIds?: { homeA?: string; homeB?: string };
   homeDone?: { homeA?: boolean; homeB?: boolean };
 
-  // Kept ad_id temp-table names after geocoding (per side, only when ZIP filter applied)
+  // After geocoding: kept-coords tables (tiny) + kept-devices query IDs (Athena materializes ad_id list)
+  keptCoordsTables?: { keptCoordsA?: string; keptCoordsB?: string };
+  keptDevicesQueryIds?: { keptDevicesA?: string; keptDevicesB?: string };
+  keptDevicesDone?: { keptDevicesA?: boolean; keptDevicesB?: boolean };
+
+  // After devices_polling: kept ad_id tables (inputs to main queries)
   keptTables?: { keptA?: string; keptB?: string };
   keptCounts?: { keptA?: number; keptB?: number };
 
@@ -101,6 +107,7 @@ interface CompareResult {
 
 const STATE_KEY = (id: string) => `compare-state/${id}`;
 const HOME_COORD_PRECISION = 1; // 1-decimal ~= 11km — matches catchment-multiphase
+const CURRENT_SCHEMA_VERSION = 2; // v2: coord-unique home query + Athena-side device materialization
 
 /**
  * Build a SQL subquery that returns DISTINCT ad_id for a dataset side.
@@ -174,12 +181,10 @@ function maidSubquery(side: DatasetSide, tableName: string, keptTable?: string):
 }
 
 /**
- * Home-coord query (for ZIP filter only). Returns one row per device-location with
- * the count of distinct days where the first ping of the day was at that location.
- * Aggregates at HOME_COORD_PRECISION decimals and filters locations repeated 2+ days.
+ * Build the first_pings / ad_home CTEs once. Used by both the coord-unique
+ * query (phase 1) and the kept-devices materialization query (phase 3).
  */
-function homeCoordSQL(side: DatasetSide, tableName: string): string {
-  // Only meaningful for source='all' — CSV sides don't have pings to geocode here.
+function homeCTEs(side: DatasetSide, tableName: string): string {
   const hourFrom = side.hourFrom ?? 0;
   const hourTo = side.hourTo ?? 23;
   let hourWhere = '';
@@ -190,11 +195,8 @@ function homeCoordSQL(side: DatasetSide, tableName: string): string {
       hourWhere = `AND (HOUR(utc_timestamp) >= ${hourFrom} OR HOUR(utc_timestamp) <= ${hourTo})`;
     }
   }
-
-  // POI visitors + valid pings + first-ping-of-day (MIN_BY) → aggregate by rounded coord,
-  // keep ad_ids where the coord is the first-ping home for 2+ distinct days.
   return `
-    WITH poi_visitors AS (
+    poi_visitors AS (
       SELECT DISTINCT ad_id FROM ${tableName}
       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
       WHERE poi_id IS NOT NULL AND poi_id != ''
@@ -221,20 +223,42 @@ function homeCoordSQL(side: DatasetSide, tableName: string): string {
     ad_home AS (
       SELECT ad_id,
         ROUND(origin_lat, ${HOME_COORD_PRECISION}) as home_lat,
-        ROUND(origin_lng, ${HOME_COORD_PRECISION}) as home_lng,
-        COUNT(DISTINCT date) as day_count
+        ROUND(origin_lng, ${HOME_COORD_PRECISION}) as home_lng
       FROM first_pings
       GROUP BY ad_id,
         ROUND(origin_lat, ${HOME_COORD_PRECISION}),
         ROUND(origin_lng, ${HOME_COORD_PRECISION})
       HAVING COUNT(DISTINCT date) >= 2
-    )
-    SELECT ad_id,
-      home_lat,
-      home_lng,
-      day_count
+    )`;
+}
+
+/**
+ * Phase 1 query: returns ONLY unique rounded home coords (not per-device).
+ * This is what JS fetches & geocodes — size bounded by country geography (~50k coords).
+ * CRITICAL: must NOT return per-device rows — that's what OOMed previously.
+ */
+function homeCoordsUniqueSQL(side: DatasetSide, tableName: string): string {
+  return `
+    WITH ${homeCTEs(side, tableName)}
+    SELECT home_lat, home_lng, COUNT(DISTINCT ad_id) AS devices
     FROM ad_home
-    LIMIT 5000000
+    GROUP BY home_lat, home_lng
+    ORDER BY devices DESC
+    LIMIT 500000
+  `;
+}
+
+/**
+ * Phase 3 query: uses the kept-coords table to materialize the ad_id list.
+ * Output lands in Athena results S3; we wrap it with an external table later.
+ */
+function keptDevicesSQL(side: DatasetSide, tableName: string, keptCoordsTable: string): string {
+  return `
+    WITH ${homeCTEs(side, tableName)}
+    SELECT DISTINCT h.ad_id
+    FROM ad_home h
+    INNER JOIN ${keptCoordsTable} k
+      ON h.home_lat = k.home_lat AND h.home_lng = k.home_lng
   `;
 }
 
@@ -265,16 +289,24 @@ async function createTempTableFromCsv(exportFile: string, _stateId: string, side
 }
 
 /**
- * Write a kept-ad_ids set to S3 as a one-column CSV and create an external Athena table over it.
- * Used to avoid giant IN-lists after ZIP geocoding.
+ * Write kept (home_lat, home_lng) rows to S3 as CSV and create an external Athena
+ * table. Tiny (< a few thousand rows even for a whole country).
  */
-async function createKeptTable(adIds: string[], side: string): Promise<string> {
-  const tempName = `compare_kept_${side}_${Date.now()}`;
+async function createKeptCoordsTable(coords: Array<{ lat: number; lng: number }>, side: string): Promise<string> {
+  const tempName = `compare_kcrd_${side}_${Date.now()}`;
   const tempFolder = `compare-temp/${tempName}/`;
 
-  // Build CSV body. Skip empties.
-  const unique = Array.from(new Set(adIds.filter(Boolean)));
-  const body = 'ad_id\n' + unique.map(id => id.replace(/"/g, '""')).join('\n') + '\n';
+  // Deduplicate and stringify at HOME_COORD_PRECISION so Athena DOUBLE equality holds.
+  const seen = new Set<string>();
+  const lines: string[] = ['home_lat,home_lng'];
+  for (const c of coords) {
+    if (!Number.isFinite(c.lat) || !Number.isFinite(c.lng)) continue;
+    const key = `${c.lat.toFixed(HOME_COORD_PRECISION)},${c.lng.toFixed(HOME_COORD_PRECISION)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(key);
+  }
+  const body = lines.join('\n') + '\n';
 
   const { PutObjectCommand } = await import('@aws-sdk/client-s3');
   await s3Client.send(new PutObjectCommand({
@@ -282,6 +314,38 @@ async function createKeptTable(adIds: string[], side: string): Promise<string> {
     Key: `${tempFolder}data.csv`,
     Body: body,
     ContentType: 'text/csv',
+  }));
+
+  const createSql = `
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${tempName} (
+      home_lat DOUBLE,
+      home_lng DOUBLE
+    )
+    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+    LOCATION 's3://${BUCKET}/${tempFolder}'
+    TBLPROPERTIES ('skip.header.line.count'='1')
+  `;
+  await runQuery(createSql);
+  console.log(`[COMPARE] Created kept-coords table ${tempName} with ${seen.size} coords`);
+  return tempName;
+}
+
+/**
+ * Copy an Athena result CSV (the output of a `SELECT DISTINCT ad_id` query) into
+ * its own S3 folder and create an external table over it. This is our "kept ad_ids"
+ * set, used as keptTable in the main queries.
+ */
+async function createKeptAdIdsTableFromQuery(queryId: string, side: string): Promise<string> {
+  const tempName = `compare_kadi_${side}_${Date.now()}`;
+  const tempFolder = `compare-temp/${tempName}/`;
+
+  // Athena writes query outputs to s3://<bucket>/athena-results/<queryId>.csv by default.
+  const { CopyObjectCommand } = await import('@aws-sdk/client-s3');
+  await s3Client.send(new CopyObjectCommand({
+    Bucket: BUCKET,
+    CopySource: `${BUCKET}/athena-results/${queryId}.csv`,
+    Key: `${tempFolder}data.csv`,
   }));
 
   const createSql = `
@@ -294,7 +358,7 @@ async function createKeptTable(adIds: string[], side: string): Promise<string> {
     TBLPROPERTIES ('skip.header.line.count'='1')
   `;
   await runQuery(createSql);
-  console.log(`[COMPARE] Created kept table ${tempName} with ${unique.length} ad_ids`);
+  console.log(`[COMPARE] Created kept-ad_ids table ${tempName} from query ${queryId}`);
   return tempName;
 }
 
@@ -313,8 +377,9 @@ async function cleanupTempTables(tables: string[]): Promise<void> {
   }
 }
 
-/** Find job.country for a dataset — matches by s3DestPath folder. */
+/** Find job.country for a dataset — matches by s3DestPath folder. Lazy-loads jobs lib. */
 async function findDatasetCountry(datasetName: string): Promise<string | undefined> {
+  const { getAllJobs } = await import('@/lib/jobs');
   const jobs = await getAllJobs();
   const job = jobs.find((j: any) => {
     if (!j.s3DestPath) return false;
@@ -413,6 +478,15 @@ export async function POST(request: NextRequest) {
           progress: { step: 'done', percent: 100, message: 'Comparison complete' },
         });
       }
+
+      // Reject states from older deploys — their phase semantics differ and can OOM.
+      if (state && (state.schemaVersion || 0) < CURRENT_SCHEMA_VERSION) {
+        console.warn(`[COMPARE] Rejecting stale state ${stateId} (schema v${state.schemaVersion || 0} < v${CURRENT_SCHEMA_VERSION})`);
+        return NextResponse.json({
+          phase: 'error', stateId,
+          error: 'This comparison was started before a code update — please retry from scratch.',
+        });
+      }
     }
 
     if (state?.phase === 'error' || isNewRequest) state = null;
@@ -472,16 +546,17 @@ export async function POST(request: NextRequest) {
       }
 
       if (useZipFilter) {
-        // Phase A: fire home-coord queries for side(s) with source='all'
+        // Phase 1: fire home-coords-UNIQUE queries (small result, safe to fetch in JS)
         let homeA: string | undefined;
         let homeB: string | undefined;
         const toFire: Array<Promise<string>> = [];
-        if (datasetA.source === 'all') toFire.push(startQueryAsync(homeCoordSQL(datasetA, tableA)).then(id => { homeA = id; return id; }));
-        if (datasetB.source === 'all') toFire.push(startQueryAsync(homeCoordSQL(datasetB, tableB)).then(id => { homeB = id; return id; }));
+        if (datasetA.source === 'all') toFire.push(startQueryAsync(homeCoordsUniqueSQL(datasetA, tableA)).then(id => { homeA = id; return id; }));
+        if (datasetB.source === 'all') toFire.push(startQueryAsync(homeCoordsUniqueSQL(datasetB, tableB)).then(id => { homeB = id; return id; }));
         await Promise.all(toFire);
 
         console.log(`[COMPARE] Home-coord queries fired: homeA=${homeA} homeB=${homeB}`);
         state = {
+          schemaVersion: CURRENT_SCHEMA_VERSION,
           phase: 'home_polling',
           stateId: newStateId,
           datasetA, datasetB,
@@ -504,6 +579,7 @@ export async function POST(request: NextRequest) {
       console.log(`[COMPARE] 5 main queries started (no zip filter)`);
 
       state = {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         phase: 'main_polling', stateId: newStateId, datasetA, datasetB,
         zipCodes: [],
         queryIds: ids, done: {},
@@ -569,96 +645,163 @@ export async function POST(request: NextRequest) {
     }
 
     // ── Phase: geocoding ─────────────────────────────────────────
+    // Fetch tiny coord set per side, geocode in JS, keep matching coords,
+    // then fire an Athena query per side that materializes the ad_id list.
     if (state.phase === 'geocoding') {
       const zipSet = new Set((state.zipCodes || []).map(z => z.toUpperCase()));
 
-      // Ensure country filter covers any country we'll geocode
+      const { setCountryFilter, batchReverseGeocode } = await import('@/lib/reverse-geocode');
       const countries: string[] = [];
       if (state.countryA) countries.push(state.countryA);
       if (state.countryB) countries.push(state.countryB);
       setCountryFilter(countries.length ? countries : null);
 
-      const keptTables: { keptA?: string; keptB?: string } = {};
-      const keptCounts: { keptA?: number; keptB?: number } = {};
+      const keptCoordsTables: { keptCoordsA?: string; keptCoordsB?: string } = {};
+      const keptDevicesQueryIds: { keptDevicesA?: string; keptDevicesB?: string } = {};
       const newTempTables: string[] = [];
 
-      // Helper: process one side's home-coord query
-      const processSide = async (sideLabel: 'A' | 'B', qId: string | undefined) => {
+      const datasetA = state.datasetA;
+      const datasetB = state.datasetB;
+      const tableA = datasetA.source === 'all' ? getTableName(datasetA.name) : (state.tempTables || []).find(n => n.startsWith('compare_tmp_a_'))!;
+      const tableB = datasetB.source === 'all' ? getTableName(datasetB.name) : (state.tempTables || []).find(n => n.startsWith('compare_tmp_b_'))!;
+
+      const processSide = async (sideLabel: 'A' | 'B', qId: string | undefined, side: DatasetSide, tableName: string) => {
         if (!qId) return;
+        // Phase-1 results are SMALL: unique rounded coords with device counts.
         const res = await fetchQueryResults(qId);
-        // Rows: { ad_id, home_lat, home_lng, day_count }
-        const rows = res.rows as Array<{ ad_id?: string; home_lat?: string; home_lng?: string; day_count?: string }>;
+        const rows = res.rows as Array<{ home_lat?: string; home_lng?: string; devices?: string }>;
+        console.log(`[COMPARE] side=${sideLabel}: ${rows.length} unique home coords`);
 
-        // Aggregate unique (lat,lng) → geocode once
-        const coordKey = (lat: number, lng: number) => `${lat.toFixed(HOME_COORD_PRECISION)}|${lng.toFixed(HOME_COORD_PRECISION)}`;
         const coordList: Array<{ lat: number; lng: number; deviceCount: number }> = [];
-        const coordIndex = new Map<string, number>();
-        const rowCoords: Array<{ adId: string; key: string }> = [];
-
         for (const r of rows) {
-          const adId = (r.ad_id || '').trim();
           const lat = Number(r.home_lat);
           const lng = Number(r.home_lng);
-          if (!adId || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-          const k = coordKey(lat, lng);
-          if (!coordIndex.has(k)) {
-            coordIndex.set(k, coordList.length);
-            coordList.push({ lat, lng, deviceCount: 0 });
-          }
-          coordList[coordIndex.get(k)!].deviceCount += 1;
-          rowCoords.push({ adId, key: k });
+          const devices = Number(r.devices) || 0;
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+          coordList.push({ lat, lng, deviceCount: devices });
         }
 
-        console.log(`[COMPARE] side=${sideLabel}: ${rows.length} device-home rows, ${coordList.length} unique coords`);
-
         const classified = await batchReverseGeocode(coordList);
-        // Map key → postcode (or null)
-        const keyToPostcode = new Map<string, string | null>();
+        // Keep only coords whose postcode is in the requested ZIP set
+        const kept: Array<{ lat: number; lng: number }> = [];
         for (let i = 0; i < coordList.length; i++) {
           const cls = classified[i];
           const pc = cls && cls.type === 'geojson_local' && cls.postcode ? String(cls.postcode).toUpperCase() : null;
-          keyToPostcode.set(coordKey(coordList[i].lat, coordList[i].lng), pc);
+          if (pc && zipSet.has(pc)) kept.push({ lat: coordList[i].lat, lng: coordList[i].lng });
         }
+        console.log(`[COMPARE] side=${sideLabel}: ${kept.length}/${coordList.length} coords match ZIP filter`);
 
-        // Keep ad_ids whose postcode is in the requested set
-        const keptIds = new Set<string>();
-        for (const rc of rowCoords) {
-          const pc = keyToPostcode.get(rc.key);
-          if (pc && zipSet.has(pc)) keptIds.add(rc.adId);
+        // Materialize kept coords as an external table (tiny CSV — Athena-safe)
+        const keptCoordsTable = await createKeptCoordsTable(kept, sideLabel.toLowerCase());
+        newTempTables.push(keptCoordsTable);
+
+        // Fire the kept-devices Athena query (uses the kept_coords table).
+        const keptDevicesId = await startQueryAsync(keptDevicesSQL(side, tableName, keptCoordsTable));
+        console.log(`[COMPARE] side=${sideLabel}: kept-devices query ${keptDevicesId} started`);
+
+        if (sideLabel === 'A') {
+          keptCoordsTables.keptCoordsA = keptCoordsTable;
+          keptDevicesQueryIds.keptDevicesA = keptDevicesId;
+        } else {
+          keptCoordsTables.keptCoordsB = keptCoordsTable;
+          keptDevicesQueryIds.keptDevicesB = keptDevicesId;
         }
-
-        console.log(`[COMPARE] side=${sideLabel}: ${keptIds.size} ad_ids match ZIP filter`);
-
-        if (keptIds.size === 0) {
-          // Materialize an empty table (so the INNER JOIN yields zero rows naturally)
-          const t = await createKeptTable([], sideLabel.toLowerCase());
-          newTempTables.push(t);
-          if (sideLabel === 'A') { keptTables.keptA = t; keptCounts.keptA = 0; }
-          else { keptTables.keptB = t; keptCounts.keptB = 0; }
-          return;
-        }
-
-        const t = await createKeptTable(Array.from(keptIds), sideLabel.toLowerCase());
-        newTempTables.push(t);
-        if (sideLabel === 'A') { keptTables.keptA = t; keptCounts.keptA = keptIds.size; }
-        else { keptTables.keptB = t; keptCounts.keptB = keptIds.size; }
       };
 
       try {
-        await processSide('A', state.homeQueryIds?.homeA);
-        await processSide('B', state.homeQueryIds?.homeB);
+        await processSide('A', state.homeQueryIds?.homeA, datasetA, tableA);
+        await processSide('B', state.homeQueryIds?.homeB, datasetB, tableB);
       } finally {
         setCountryFilter(null);
       }
 
-      // Fire the 5 main queries with refilter joins
+      state = {
+        ...state,
+        phase: 'devices_polling',
+        keptCoordsTables,
+        keptDevicesQueryIds,
+        keptDevicesDone: {},
+        tempTables: [...(state.tempTables || []), ...newTempTables],
+      };
+      await putConfig(STATE_KEY(state.stateId), state, { compact: true });
+      return NextResponse.json({
+        phase: 'devices_polling', stateId: state.stateId,
+        progress: { step: 'devices_polling', percent: 45, message: 'Resolving ZIP-matched devices in Athena...' },
+      });
+    }
+
+    // ── Phase: devices_polling ───────────────────────────────────
+    // Poll the 2 kept-devices Athena queries. When both done, copy their outputs
+    // into compare-temp tables and fire the 5 main queries.
+    if (state.phase === 'devices_polling') {
+      let allDone = true;
+      let anyFailed = false;
+      let errorMsg = '';
+      let scannedGB = 0;
+
+      for (const key of ['keptDevicesA', 'keptDevicesB'] as const) {
+        const qId = state.keptDevicesQueryIds?.[key];
+        if (!qId || state.keptDevicesDone?.[key]) continue;
+        try {
+          const status = await checkQueryStatus(qId);
+          if (status.state === 'RUNNING' || status.state === 'QUEUED') {
+            allDone = false;
+            scannedGB += (status.statistics?.dataScannedBytes || 0) / 1e9;
+          } else if (status.state === 'FAILED' || status.state === 'CANCELLED') {
+            anyFailed = true;
+            errorMsg = `${key} failed: ${status.error || 'unknown'}`;
+          } else {
+            state.keptDevicesDone = { ...state.keptDevicesDone, [key]: true };
+          }
+        } catch (err: any) {
+          if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
+            anyFailed = true; errorMsg = `${key} expired — please retry`;
+          } else throw err;
+        }
+      }
+
+      if (anyFailed) {
+        if (state.tempTables?.length) await cleanupTempTables(state.tempTables).catch(() => {});
+        state = { ...state, phase: 'error', error: errorMsg };
+        await putConfig(STATE_KEY(state.stateId), state, { compact: true });
+        return NextResponse.json({ phase: 'error', stateId: state.stateId, error: errorMsg });
+      }
+
+      if (!allDone) {
+        await putConfig(STATE_KEY(state.stateId), state, { compact: true });
+        return NextResponse.json({
+          phase: 'devices_polling', stateId: state.stateId,
+          progress: { step: 'devices_polling', percent: 55, message: `Resolving ZIP-matched devices (${scannedGB.toFixed(1)}GB scanned)` },
+        });
+      }
+
+      // Materialize kept ad_ids and fire main queries
+      const keptTables: { keptA?: string; keptB?: string } = {};
+      const keptCounts: { keptA?: number; keptB?: number } = {};
+      const newTempTables: string[] = [];
+
+      for (const key of ['keptDevicesA', 'keptDevicesB'] as const) {
+        const qId = state.keptDevicesQueryIds?.[key];
+        if (!qId) continue;
+        const sideLabel = key === 'keptDevicesA' ? 'a' : 'b';
+        const keptTable = await createKeptAdIdsTableFromQuery(qId, sideLabel);
+        newTempTables.push(keptTable);
+
+        // Count kept ad_ids (small query)
+        const countQ = await runQuery(`SELECT COUNT(*) as total FROM ${keptTable}`);
+        const countRow = countQ.rows?.[0] as any;
+        const count = parseInt(countRow?.total || countRow?.Total || '0', 10) || 0;
+        if (key === 'keptDevicesA') { keptTables.keptA = keptTable; keptCounts.keptA = count; }
+        else { keptTables.keptB = keptTable; keptCounts.keptB = count; }
+      }
+
       const datasetA = state.datasetA;
       const datasetB = state.datasetB;
       const tableA = datasetA.source === 'all' ? getTableName(datasetA.name) : (state.tempTables || []).find(n => n.startsWith('compare_tmp_a_'))!;
       const tableB = datasetB.source === 'all' ? getTableName(datasetB.name) : (state.tempTables || []).find(n => n.startsWith('compare_tmp_b_'))!;
 
       const ids = await fireMainQueries(datasetA, datasetB, tableA, tableB, keptTables.keptA, keptTables.keptB);
-      console.log(`[COMPARE] 5 refilter queries started after ZIP geocoding`);
+      console.log(`[COMPARE] 5 main queries started with kept ad_ids tables`);
 
       state = {
         ...state,
@@ -672,7 +815,7 @@ export async function POST(request: NextRequest) {
       await putConfig(STATE_KEY(state.stateId), state, { compact: true });
       return NextResponse.json({
         phase: 'main_polling', stateId: state.stateId,
-        progress: { step: 'refilter', percent: 50, message: `Running Athena queries with ZIP-filtered sets (${keptCounts.keptA ?? '-'}/${keptCounts.keptB ?? '-'} devices)...` },
+        progress: { step: 'main_polling', percent: 60, message: `Running Athena queries (ZIP-matched ${keptCounts.keptA ?? '-'}/${keptCounts.keptB ?? '-'})...` },
       });
     }
 
