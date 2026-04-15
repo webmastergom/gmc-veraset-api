@@ -10,8 +10,10 @@ import {
 } from '@/lib/athena';
 import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
 import { getAllJobs } from '@/lib/jobs';
-import { getPOIPositionsForDataset } from '@/lib/poi-storage';
 import { setCountryFilter, batchReverseGeocode } from '@/lib/reverse-geocode';
+// NOTE: @/lib/poi-storage is imported dynamically in the reading phase — it pulls in
+// `fs` and triggers Next.js File Tracing on the POIs/ directory, which blows up the
+// Lambda bundle for this route at cold-start. Keep it behind a lazy import.
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -743,10 +745,12 @@ export async function POST(request: NextRequest) {
       // POI overlap: rows have { side: 'A'|'B', poi_id, overlap_devices }
       const poiRows = (poiOvlRes.rows || []) as Array<{ side?: string; poi_id?: string; overlap_devices?: string }>;
 
-      // Fetch POI positions for both datasets (parallel)
+      // Fetch POI positions for both datasets (parallel) — dynamic import to keep
+      // poi-storage (and its fs-traced POIs/ dir) out of this route's cold-start bundle.
+      const { getPOIPositionsForDataset } = await import('@/lib/poi-storage');
       const [posA, posB] = await Promise.all([
-        state.datasetA.source === 'all' ? getPOIPositionsForDataset(state.datasetA.name) : Promise.resolve([]),
-        state.datasetB.source === 'all' ? getPOIPositionsForDataset(state.datasetB.name) : Promise.resolve([]),
+        state.datasetA.source === 'all' ? getPOIPositionsForDataset(state.datasetA.name) : Promise.resolve([] as Awaited<ReturnType<typeof getPOIPositionsForDataset>>),
+        state.datasetB.source === 'all' ? getPOIPositionsForDataset(state.datasetB.name) : Promise.resolve([] as Awaited<ReturnType<typeof getPOIPositionsForDataset>>),
       ]);
       const indexA = new Map(posA.map(p => [p.poiId, p]));
       const indexB = new Map(posB.map(p => [p.poiId, p]));
