@@ -303,17 +303,10 @@ async function cleanupTempTables(tables: string[]): Promise<void> {
   }
 }
 
-/** Find job.country for a dataset — matches by s3DestPath folder. Lazy-loads jobs lib. */
+/** Find job.country for a dataset — matches by s3DestPath folder. Uses targeted lookup (1 index + 1 file read). */
 async function findDatasetCountry(datasetName: string): Promise<string | undefined> {
-  const { getAllJobs } = await import('@/lib/jobs');
-  const jobs = await getAllJobs();
-  const job = jobs.find((j: any) => {
-    if (!j.s3DestPath) return false;
-    const s3Path = String(j.s3DestPath).replace('s3://', '').replace(`${BUCKET}/`, '').trim();
-    const parts = s3Path.split('/').filter(Boolean);
-    const jobFolderName = parts[0] || parts.pop() || s3Path.replace(/\/$/, '');
-    return jobFolderName === datasetName;
-  });
+  const { getJobByDatasetName } = await import('@/lib/jobs');
+  const job = await getJobByDatasetName(datasetName);
   return (job as any)?.country || undefined;
 }
 
@@ -700,7 +693,9 @@ export async function POST(request: NextRequest) {
       const overlapCount = parseInt(countOvlRes.rows[0]?.total, 10) || 0;
       const poiRows = (poiOvlRes.rows || []) as Array<{ side?: string; poi_id?: string; overlap_devices?: string }>;
 
-      // Lazy-load poi-storage (heavy NFT trace — see top-of-file note)
+      // Lazy-load poi-storage (heavy NFT trace — see top-of-file note).
+      // Uses getJobByDatasetName internally (index + 1 job file) instead of
+      // getAllJobs (N parallel S3 GETs → socket pool exhaustion).
       const { getPOIPositionsForDataset } = await import('@/lib/poi-storage');
       const [posA, posB] = await Promise.all([
         state.datasetA.source === 'all' ? getPOIPositionsForDataset(state.datasetA.name) : Promise.resolve([] as Awaited<ReturnType<typeof getPOIPositionsForDataset>>),

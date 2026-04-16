@@ -14,7 +14,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import { s3Client, BUCKET, getConfig } from './s3-config';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-import { getAllJobs } from './jobs';
+import { getJobByDatasetName } from './jobs';
 
 /**
  * Get POI collection GeoJSON from S3, with fallback to local files.
@@ -118,15 +118,16 @@ export interface DatasetPoiPosition {
   name?: string;
 }
 
-export async function getPOIPositionsForDataset(datasetName: string): Promise<DatasetPoiPosition[]> {
-  const jobs = await getAllJobs();
-  const job = jobs.find((j: any) => {
-    if (!j.s3DestPath) return false;
-    const s3Path = String(j.s3DestPath).replace('s3://', '').replace(`${BUCKET}/`, '').trim();
-    const parts = s3Path.split('/').filter(Boolean);
-    const jobFolderName = parts[0] || parts.pop() || s3Path.replace(/\/$/, '');
-    return jobFolderName === datasetName;
-  });
+/**
+ * @param prefetchedJob Optional job object the caller already has. If omitted,
+ *                      looks up the job via getJobByDatasetName (index + 1 file).
+ *                      Avoids the N-parallel-S3-GET pattern of getAllJobs.
+ */
+export async function getPOIPositionsForDataset(
+  datasetName: string,
+  prefetchedJob?: any | null,
+): Promise<DatasetPoiPosition[]> {
+  const job = prefetchedJob ?? await getJobByDatasetName(datasetName);
 
   const positions: DatasetPoiPosition[] = [];
   if (!job) return positions;

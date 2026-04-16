@@ -170,6 +170,30 @@ async function upsertIndex(jobId: string, entry: Partial<Job>): Promise<void> {
 // ── Public API ──────────────────────────────────────────────────────────
 
 /**
+ * Find a single job whose s3DestPath folder matches the given dataset name.
+ * Uses the lightweight index (~100KB) to locate the jobId, then fetches
+ * just that one full job file. Avoids the N-parallel-S3-GET pattern of
+ * getAllJobs when the caller only needs one specific job.
+ */
+export async function getJobByDatasetName(datasetName: string): Promise<Job | null> {
+  const index = await getIndex();
+  const BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
+  const matchesDataset = (s3DestPath?: string | null): boolean => {
+    if (!s3DestPath) return false;
+    const s3Path = String(s3DestPath).replace('s3://', '').replace(`${BUCKET}/`, '').trim();
+    const parts = s3Path.split('/').filter(Boolean);
+    const jobFolderName = parts[0] || parts.pop() || s3Path.replace(/\/$/, '');
+    return jobFolderName === datasetName;
+  };
+  for (const [jobId, entry] of Object.entries(index)) {
+    if (matchesDataset(entry?.s3DestPath)) {
+      return await getConfig<Job>(jobKey(jobId));
+    }
+  }
+  return null;
+}
+
+/**
  * Get all jobs sorted by creation date (newest first).
  * Reads individual per-job files in parallel.
  */
