@@ -131,9 +131,9 @@ export async function getPOIPositionsForDataset(
   if (!job) return [];
 
   // Build a name lookup from EVERY source we have — names can live in:
-  //   - job.poiNames[poiId]              (set by sync/enrichment)
-  //   - job.externalPois[].{id,name}     (external API uploads)
-  //   - job.poiCollectionId GeoJSON      (POI collections)
+  //   - job.poiNames[poiId]                              (set by sync/enrichment)
+  //   - job.externalPois[].{id,name}                     (external API uploads)
+  //   - job.poiCollectionId GeoJSON → properties.name    (POI collections)
   // Merge them all so whichever path produces the positions gets a name.
   const nameById = new Map<string, string>();
 
@@ -147,19 +147,49 @@ export async function getPOIPositionsForDataset(
     if (p?.id && p?.name) nameById.set(String(p.id), String(p.name));
   }
 
+  // Pull names from the POI collection GeoJSON upfront too — otherwise path 1
+  // (geo_radius) emits positions and path 3 (GeoJSON) never runs, leaving names
+  // unresolved for jobs whose names live only in the collection's properties.
+  const poiCollectionId = (job as any)?.poiCollectionId;
+  const poiMapping: Record<string, string> = (job as any)?.poiMapping || {};
+  let collectionGeojson: any = null;
+  if (poiCollectionId) {
+    try {
+      collectionGeojson = await getPOICollection(poiCollectionId);
+      const features = collectionGeojson?.features || [];
+      // poiMapping: verasetId (e.g. geo_radius_0) → originalId (e.g. poi-1).
+      // Build reverse: originalId → verasetId for cross-indexing.
+      const originalToVeraset: Record<string, string> = {};
+      for (const [vid, oid] of Object.entries(poiMapping)) {
+        if (oid) originalToVeraset[String(oid)] = vid;
+      }
+      for (const f of features) {
+        const props = f.properties || {};
+        const originalId = props.id || props.name || f.id || '';
+        const name = props.name;
+        if (!name) continue;
+        const key = String(originalId);
+        nameById.set(key, String(name));
+        const verasetId = originalToVeraset[key];
+        if (verasetId) nameById.set(verasetId, String(name));
+      }
+    } catch {
+      // ignore — fall back to whatever nameById has
+    }
+  }
+
   const positions: DatasetPoiPosition[] = [];
 
   // Path 1: verasetPayload.geo_radius has authoritative lat/lng + poi_id
   const geoRadius = (job as any)?.verasetPayload?.geo_radius || (job as any)?.auditTrail?.userInput?.verasetConfig?.geo_radius;
   if (geoRadius && Array.isArray(geoRadius)) {
-    const poiMapping = (job as any)?.poiMapping || {};
     for (const poi of geoRadius) {
       const lat = Number(poi.latitude);
       const lng = Number(poi.longitude);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
       const poiId = poi.poi_id || '';
       // poiMapping maps Veraset-side ids (geo_radius_X) → original ids (poi-1, etc.)
-      const originalId = (poiMapping as Record<string, string>)[poiId];
+      const originalId = poiMapping[poiId];
       const name = nameById.get(poiId) || (originalId ? nameById.get(originalId) : undefined);
       positions.push({ poiId, lat, lng, name });
     }
@@ -174,12 +204,11 @@ export async function getPOIPositionsForDataset(
     }
   }
 
-  // Path 3: POI collection GeoJSON
-  if (positions.length === 0 && (job as any)?.poiCollectionId) {
+  // Path 3: POI collection GeoJSON (reuse already-loaded collectionGeojson if we have it)
+  if (positions.length === 0 && poiCollectionId) {
     try {
-      const geojson = await getPOICollection((job as any).poiCollectionId);
+      const geojson = collectionGeojson || await getPOICollection(poiCollectionId);
       const features = geojson?.features || [];
-      const poiMapping = (job as any).poiMapping || {};
       for (const f of features) {
         const geom = f.geometry;
         const props = f.properties || {};
