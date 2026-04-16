@@ -128,36 +128,58 @@ export async function getPOIPositionsForDataset(
   prefetchedJob?: any | null,
 ): Promise<DatasetPoiPosition[]> {
   const job = prefetchedJob ?? await getJobByDatasetName(datasetName);
+  if (!job) return [];
+
+  // Build a name lookup from EVERY source we have — names can live in:
+  //   - job.poiNames[poiId]              (set by sync/enrichment)
+  //   - job.externalPois[].{id,name}     (external API uploads)
+  //   - job.poiCollectionId GeoJSON      (POI collections)
+  // Merge them all so whichever path produces the positions gets a name.
+  const nameById = new Map<string, string>();
+
+  const poiNames = (job as any)?.poiNames || {};
+  for (const [id, n] of Object.entries(poiNames)) {
+    if (n) nameById.set(String(id), String(n));
+  }
+
+  const externalPois: any[] = (job as any)?.externalPois || [];
+  for (const p of externalPois) {
+    if (p?.id && p?.name) nameById.set(String(p.id), String(p.name));
+  }
 
   const positions: DatasetPoiPosition[] = [];
-  if (!job) return positions;
 
+  // Path 1: verasetPayload.geo_radius has authoritative lat/lng + poi_id
   const geoRadius = (job as any)?.verasetPayload?.geo_radius || (job as any)?.auditTrail?.userInput?.verasetConfig?.geo_radius;
   if (geoRadius && Array.isArray(geoRadius)) {
+    const poiMapping = (job as any)?.poiMapping || {};
     for (const poi of geoRadius) {
       const lat = Number(poi.latitude);
       const lng = Number(poi.longitude);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
       const poiId = poi.poi_id || '';
-      const name = (job as any)?.poiNames?.[poiId];
+      // poiMapping maps Veraset-side ids (geo_radius_X) → original ids (poi-1, etc.)
+      const originalId = (poiMapping as Record<string, string>)[poiId];
+      const name = nameById.get(poiId) || (originalId ? nameById.get(originalId) : undefined);
       positions.push({ poiId, lat, lng, name });
     }
   }
 
-  if (positions.length === 0 && (job as any)?.externalPois?.length) {
-    for (const p of (job as any).externalPois) {
+  // Path 2: externalPois as primary source when geo_radius is absent
+  if (positions.length === 0 && externalPois.length) {
+    for (const p of externalPois) {
       if (Number.isFinite(p.latitude) && Number.isFinite(p.longitude)) {
         positions.push({ poiId: p.id, lat: p.latitude, lng: p.longitude, name: p.name });
       }
     }
   }
 
+  // Path 3: POI collection GeoJSON
   if (positions.length === 0 && (job as any)?.poiCollectionId) {
     try {
       const geojson = await getPOICollection((job as any).poiCollectionId);
       const features = geojson?.features || [];
       const poiMapping = (job as any).poiMapping || {};
-      const poiNames = (job as any).poiNames || {};
       for (const f of features) {
         const geom = f.geometry;
         const props = f.properties || {};
@@ -176,7 +198,7 @@ export async function getPOIPositionsForDataset(
         if (coords.length >= 2) {
           const lng = coords[0];
           const lat = coords[1];
-          const name = props.name || poiNames[verasetId as string] || originalId;
+          const name = props.name || nameById.get(verasetId as string) || nameById.get(String(originalId)) || undefined;
           positions.push({ poiId: (verasetId as string) || originalId, lat, lng, name });
         }
       }
