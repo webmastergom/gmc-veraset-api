@@ -11,8 +11,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Loader2, Play, Download, GitCompareArrows } from 'lucide-react';
+import { Loader2, Play, Download, GitCompareArrows, FileSpreadsheet, FileText } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+import { downloadComparePoisCsv, downloadCompareXlsx } from '@/lib/compare-export';
 
 const CompareMap = dynamic(() => import('@/components/compare/compare-map-inner'), { ssr: false });
 const ComparePenetrationChart = dynamic(() => import('@/components/compare/compare-penetration-chart'), { ssr: false });
@@ -609,7 +610,7 @@ export default function ComparePage() {
                 {/* POI list + penetration chart (shared A/B tabs) */}
                 {result.pois.length > 0 && (
                   <div className="border rounded-lg overflow-hidden">
-                    <div className="flex border-b">
+                    <div className="flex items-center border-b">
                       <button
                         onClick={() => setPoiTab('A')}
                         className={`px-4 py-2 text-sm font-semibold ${poiTab === 'A' ? 'bg-blue-500/10 border-b-2 border-blue-500' : 'text-muted-foreground hover:bg-muted/30'}`}
@@ -622,6 +623,48 @@ export default function ComparePage() {
                       >
                         {dsBLabel} POIs ({result.pois.filter(p => p.side === 'B').length})
                       </button>
+                      <div className="ml-auto flex items-center gap-2 pr-3">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8"
+                          onClick={() => downloadComparePoisCsv(result.pois, poiTab, {
+                            datasetALabel: dsALabel,
+                            datasetBLabel: dsBLabel,
+                            totalA: result.totalA,
+                            totalB: result.totalB,
+                            overlap: result.overlap,
+                            overlapPctA: result.overlapPctA,
+                            overlapPctB: result.overlapPctB,
+                            zipCodes: result.zipFilter?.zipCodes,
+                            countryA: result.zipFilter?.countryA,
+                            countryB: result.zipFilter?.countryB,
+                          })}
+                          title={`Download ${poiTab === 'A' ? dsALabel : dsBLabel} POIs as CSV`}
+                        >
+                          <FileText className="mr-1 h-3.5 w-3.5" /> CSV
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8"
+                          onClick={() => downloadCompareXlsx(result.pois, {
+                            datasetALabel: dsALabel,
+                            datasetBLabel: dsBLabel,
+                            totalA: result.totalA,
+                            totalB: result.totalB,
+                            overlap: result.overlap,
+                            overlapPctA: result.overlapPctA,
+                            overlapPctB: result.overlapPctB,
+                            zipCodes: result.zipFilter?.zipCodes,
+                            countryA: result.zipFilter?.countryA,
+                            countryB: result.zipFilter?.countryB,
+                          })}
+                          title="Download full comparison as XLSX (Summary + both sides)"
+                        >
+                          <FileSpreadsheet className="mr-1 h-3.5 w-3.5" /> XLSX
+                        </Button>
+                      </div>
                     </div>
 
                     {/* Penetration chart */}
