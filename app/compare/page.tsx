@@ -15,6 +15,7 @@ import { Loader2, Play, Download, GitCompareArrows } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 const CompareMap = dynamic(() => import('@/components/compare/compare-map-inner'), { ssr: false });
+const ComparePenetrationChart = dynamic(() => import('@/components/compare/compare-penetration-chart'), { ssr: false });
 
 interface Dataset {
   id: string;
@@ -605,7 +606,7 @@ export default function ComparePage() {
                   </div>
                 )}
 
-                {/* POI list */}
+                {/* POI list + penetration chart (shared A/B tabs) */}
                 {result.pois.length > 0 && (
                   <div className="border rounded-lg overflow-hidden">
                     <div className="flex border-b">
@@ -622,7 +623,17 @@ export default function ComparePage() {
                         {dsBLabel} POIs ({result.pois.filter(p => p.side === 'B').length})
                       </button>
                     </div>
-                    <div className="max-h-[400px] overflow-y-auto">
+
+                    {/* Penetration chart */}
+                    <ComparePenetrationChart
+                      pois={poisForSide}
+                      side={poiTab}
+                      totalForSide={poiTab === 'A' ? result.totalA : result.totalB}
+                      overlap={result.overlap}
+                    />
+
+                    {/* POI list table */}
+                    <div className="max-h-[400px] overflow-y-auto border-t">
                       {poisForSide.length === 0 ? (
                         <p className="p-4 text-xs italic text-muted-foreground">No POIs with overlap matches for this side.</p>
                       ) : (
@@ -632,16 +643,25 @@ export default function ComparePage() {
                               <th className="text-left px-3 py-2">POI</th>
                               <th className="text-left px-3 py-2">ID</th>
                               <th className="text-right px-3 py-2">Overlap devices</th>
+                              <th className="text-right px-3 py-2">% of sample</th>
+                              <th className="text-right px-3 py-2">% of match</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {poisForSide.map((p, i) => (
-                              <tr key={`${p.side}-${p.poiId}-${i}`} className="border-t hover:bg-muted/30">
-                                <td className="px-3 py-2">{p.name || <span className="text-muted-foreground italic">(unnamed)</span>}</td>
-                                <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{p.poiId}</td>
-                                <td className="px-3 py-2 text-right font-semibold">{p.overlapDevices.toLocaleString()}</td>
-                              </tr>
-                            ))}
+                            {poisForSide.map((p, i) => {
+                              const denomSample = poiTab === 'A' ? result.totalA : result.totalB;
+                              const pctSample = denomSample > 0 ? (p.overlapDevices / denomSample) * 100 : 0;
+                              const pctMatch = result.overlap > 0 ? (p.overlapDevices / result.overlap) * 100 : 0;
+                              return (
+                                <tr key={`${p.side}-${p.poiId}-${i}`} className="border-t hover:bg-muted/30">
+                                  <td className="px-3 py-2">{p.name || <span className="text-muted-foreground italic">(unnamed)</span>}</td>
+                                  <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{p.poiId}</td>
+                                  <td className="px-3 py-2 text-right font-semibold">{p.overlapDevices.toLocaleString()}</td>
+                                  <td className="px-3 py-2 text-right">{pctSample.toFixed(2)}%</td>
+                                  <td className="px-3 py-2 text-right">{pctMatch.toFixed(2)}%</td>
+                                </tr>
+                              );
+                            })}
                           </tbody>
                         </table>
                       )}
