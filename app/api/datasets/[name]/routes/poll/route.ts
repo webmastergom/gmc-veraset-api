@@ -122,62 +122,83 @@ function hourWhere(hourFrom: number, hourTo: number, col = 'utc_timestamp'): str
 
 /**
  * CTE: target_daily — one row per (ad_id, date) with arrival/departure times.
- * Identifies devices that visited the target POIs with optional dwell/hour/minVisits filters.
+ *
+ * Uses SPATIAL proximity to target POI coordinates (not poi_ids) to identify
+ * at-POI pings. This is critical for cohort datasets where poi_ids is populated
+ * on ALL pings (including ambient ones far from the POI).
+ *
+ * arrival = first spatially-confirmed at-POI ping of the day
+ * departure = last spatially-confirmed at-POI ping of the day
  */
-function targetDailyCTE(table: string, f: Filters): string {
+function targetDailyCTE(table: string, f: Filters, poiCoords: Array<{ lat: number; lng: number; radiusM: number }>): string {
   const hWhere = hourWhere(f.hourFrom, f.hourTo);
   const dwellParts: string[] = [];
   if (f.minDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${f.minDwell}`);
   if (f.maxDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${f.maxDwell}`);
   const having = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
+  const poiValues = poiCoords.map(p => `(${p.lat}, ${p.lng}, ${p.radiusM})`).join(', ');
 
   const visitFilter = f.minVisits > 1 ? `
     visit_day_filter AS (
       SELECT ad_id FROM (
         SELECT ad_id, COUNT(DISTINCT date) as vd
-        FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-        WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        GROUP BY ad_id HAVING COUNT(DISTINCT date) >= ${f.minVisits}
+        FROM at_poi_pings GROUP BY ad_id HAVING COUNT(DISTINCT date) >= ${f.minVisits}
       )
     ),` : '';
   const visitWhere = f.minVisits > 1 ? `AND ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
 
-  return `${visitFilter}
-    all_target_visits AS (
+  return `
+    target_poi_list AS (
+      SELECT * FROM (VALUES ${poiValues}) AS t(poi_lat, poi_lng, poi_radius_m)
+    ),
+    target_poi_grid AS (
+      SELECT poi_lat, poi_lng, poi_radius_m,
+        CAST(FLOOR(poi_lat / ${GRID}) AS BIGINT) + dlat as lat_b,
+        CAST(FLOOR(poi_lng / ${GRID}) AS BIGINT) + dlng as lng_b
+      FROM target_poi_list
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t2(dlng)
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp
+      FROM ${table} p
+      INNER JOIN target_poi_grid tg
+        ON CAST(FLOOR(TRY_CAST(p.latitude AS DOUBLE) / ${GRID}) AS BIGINT) = tg.lat_b
+        AND CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID}) AS BIGINT) = tg.lng_b
+      WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
+        AND p.ad_id IS NOT NULL AND TRIM(p.ad_id) != ''
+        ${hWhere}
+        AND 111320 * SQRT(
+          POW(TRY_CAST(p.latitude AS DOUBLE) - tg.poi_lat, 2) +
+          POW((TRY_CAST(p.longitude AS DOUBLE) - tg.poi_lng) * COS(RADIANS((TRY_CAST(p.latitude AS DOUBLE) + tg.poi_lat) / 2)), 2)
+        ) <= tg.poi_radius_m
+    ),${visitFilter}
+    target_daily AS (
       SELECT ad_id, date,
         MIN(utc_timestamp) as arrival,
         MAX(utc_timestamp) as departure,
         DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell
-      FROM ${table}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        ${hWhere} ${visitWhere}
-      GROUP BY ad_id, date, poi_id
-      ${having}
-    ),
-    target_daily AS (
-      SELECT ad_id, date,
-        MIN(arrival) as arrival,
-        MAX(departure) as departure,
-        MAX(dwell) as dwell
-      FROM all_target_visits
+      FROM at_poi_pings
+      ${visitWhere ? 'WHERE ' + visitWhere.replace('AND ', '') : ''}
       GROUP BY ad_id, date
+      ${having}
     )`;
 }
 
 /**
  * Build Sankey query: aggregate before/after POI category visits across ALL visitors.
  *
- * "before/after" = pings where poi_ids is empty (device is NOT at the target POI).
- * Direction is determined by timestamp relative to the visit block.
- * This avoids the problem where arrival=00:07 (device lives near POI) which would
- * make ALL pings "during" under a timestamp-only approach.
+ * "during" = ping is within geo_radius of ANY target POI (spatial check).
+ * "before/after" = ping is OUTSIDE all target POI radii, classified by timestamp.
+ *
+ * For cohort datasets, ALL pings have poi_ids populated (it marks cohort membership,
+ * not physical proximity), so we MUST use spatial distance to the target POI coords.
  */
-function buildSankeySQL(table: string, f: Filters): string {
+function buildSankeySQL(table: string, f: Filters, poiCoords: Array<{ lat: number; lng: number; radiusM: number }>): string {
   return `
     WITH
-    ${targetDailyCTE(table, f)},
+    ${targetDailyCTE(table, f, poiCoords)},
     before_after_pings AS (
       SELECT
         p.ad_id, p.date,
@@ -191,7 +212,7 @@ function buildSankeySQL(table: string, f: Filters): string {
       WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        AND (p.poi_ids IS NULL OR CARDINALITY(p.poi_ids) = 0)
+        AND (p.utc_timestamp < td.arrival OR p.utc_timestamp > td.departure)
     ),
     poi_grid AS (
       SELECT category,
@@ -230,10 +251,10 @@ function buildSankeySQL(table: string, f: Filters): string {
 /**
  * Build Sample query: detailed stops for SAMPLE_SIZE random devices.
  */
-function buildSampleSQL(table: string, f: Filters): string {
+function buildSampleSQL(table: string, f: Filters, poiCoords: Array<{ lat: number; lng: number; radiusM: number }>): string {
   return `
     WITH
-    ${targetDailyCTE(table, f)},
+    ${targetDailyCTE(table, f, poiCoords)},
     sampled AS (
       SELECT ad_id FROM (
         SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
@@ -254,7 +275,7 @@ function buildSampleSQL(table: string, f: Filters): string {
       WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        AND (p.poi_ids IS NULL OR CARDINALITY(p.poi_ids) = 0)
+        AND (p.utc_timestamp < td.arrival OR p.utc_timestamp > td.departure)
     ),
     poi_grid AS (
       SELECT category,
@@ -373,10 +394,26 @@ export async function POST(
         if (!e.message?.includes('already exists')) console.warn(`[ROUTES] lab_pois_gmc:`, e.message);
       }
 
+      // Load target POI coordinates from job
+      const { getJobByDatasetName } = await import('@/lib/jobs');
+      const job = await getJobByDatasetName(datasetName);
+      const geoRadius = (job as any)?.verasetPayload?.geo_radius || (job as any)?.auditTrail?.userInput?.verasetConfig?.geo_radius || [];
+      const poiCoords: Array<{ lat: number; lng: number; radiusM: number }> = [];
+      for (const poi of geoRadius) {
+        const lat = Number(poi.latitude);
+        const lng = Number(poi.longitude);
+        const r = Number(poi.distance_in_meters) || 200;
+        if (Number.isFinite(lat) && Number.isFinite(lng)) poiCoords.push({ lat, lng, radiusM: r });
+      }
+      if (poiCoords.length === 0) {
+        return NextResponse.json({ phase: 'error', error: 'No POI coordinates found on this job. Routes requires geo_radius data.' });
+      }
+      console.log(`[ROUTES] ${poiCoords.length} target POI coords loaded`);
+
       // Fire both queries
       const [sankeyQId, sampleQId] = await Promise.all([
-        startQueryAsync(buildSankeySQL(table, filters)).catch(e => { console.error('[ROUTES] Sankey:', e.message); return undefined; }),
-        startQueryAsync(buildSampleSQL(table, filters)).catch(e => { console.error('[ROUTES] Sample:', e.message); return undefined; }),
+        startQueryAsync(buildSankeySQL(table, filters, poiCoords)).catch(e => { console.error('[ROUTES] Sankey:', e.message); return undefined; }),
+        startQueryAsync(buildSampleSQL(table, filters, poiCoords)).catch(e => { console.error('[ROUTES] Sample:', e.message); return undefined; }),
       ]);
 
       console.log(`[ROUTES] 2 queries launched: sankey=${sankeyQId}, sample=${sampleQId}`);
