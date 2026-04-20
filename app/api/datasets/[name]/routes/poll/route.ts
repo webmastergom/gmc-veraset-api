@@ -154,7 +154,7 @@ function spatialJoinCTEs(
         CAST(FLOOR(CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lng_b
       FROM lab_pois_gmc
       WHERE category IS NOT NULL
-        AND country = '${cc}'
+        /* no country filter — visitors travel across borders */
     ),
     poi_buckets AS (
       SELECT poi_id, category, poi_lat, poi_lng,
@@ -489,20 +489,16 @@ export async function POST(
         }
       }
 
-      // Verify data exists for this country
+      // Quick sanity check: does the table have any data?
       try {
-        const checkResult = await runQuery(`SELECT COUNT(*) as cnt FROM lab_pois_gmc WHERE country = '${cc}' LIMIT 1`);
+        const checkResult = await runQuery(`SELECT COUNT(*) as cnt FROM lab_pois_gmc LIMIT 1`);
         const poiCount = parseInt(checkResult.rows[0]?.cnt, 10) || 0;
-        console.log(`[ROUTES] lab_pois_gmc has ${poiCount} POIs for country=${cc}`);
+        console.log(`[ROUTES] lab_pois_gmc has ${poiCount} total POIs`);
         if (poiCount === 0) {
-          return NextResponse.json({
-            phase: 'error',
-            error: `No Overture POIs found for country "${cc}". Check that pois_gmc/ parquets exist in S3 and contain data for this country.`,
-          });
+          return NextResponse.json({ phase: 'error', error: 'lab_pois_gmc table is empty. Upload Overture POI parquets to pois_gmc/.' });
         }
       } catch (e: any) {
         console.error(`[ROUTES] lab_pois_gmc check failed:`, e.message);
-        return NextResponse.json({ phase: 'error', error: `Failed to query lab_pois_gmc: ${e.message}` });
       }
 
       const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
