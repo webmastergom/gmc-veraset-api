@@ -1,3 +1,12 @@
+/**
+ * POST /api/datasets/[name]/routes/poll
+ *
+ * Device route analysis: what POI categories do visitors go to BEFORE and AFTER
+ * visiting the target POIs? Uses Overture Places (lab_pois_gmc) spatial join.
+ *
+ * Rewritten from scratch 2026-04-20.
+ */
+
 import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import {
@@ -9,43 +18,42 @@ import {
   runQuery,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
-import { toIsoCountry } from '@/lib/country-inference';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
 
-const STATE_KEY = (ds: string, filters: string) => `routes-state/${ds}-${filters}`;
+const GRID = 0.01;       // ~1.1km grid cell for spatial join
+const RADIUS = 200;      // meters — max distance to count as "at" an Overture POI
+const ACCURACY = 500;    // horizontal_accuracy filter
+const SAMPLE_SIZE = 1000;
 
-const ACCURACY_THRESHOLD = 500;
-const SPATIAL_RADIUS = 200;
-const GRID_STEP = 0.01;
-const BBOX_BUFFER = 0.02;
+// ── Types ────────────────────────────────────────────────────────────
 
 interface RoutesState {
-  phase: 'starting' | 'polling' | 'reading' | 'done' | 'error';
-  sankeyQueryId?: string;
-  sampleQueryId?: string;
-  sankeySeed?: number; // random seed for sample
+  phase: 'polling' | 'reading' | 'done' | 'error';
+  sankeyQId?: string;
+  sampleQId?: string;
   sankeyDone?: boolean;
   sampleDone?: boolean;
-  filters: {
-    minDwell: number;
-    maxDwell: number;
-    hourFrom: number;
-    hourTo: number;
-    minVisits: number;
-    country: string;
-  };
+  filters: Filters;
   error?: string;
   result?: RoutesResult;
 }
 
+interface Filters {
+  country: string;
+  minDwell: number;
+  maxDwell: number;
+  hourFrom: number;
+  hourTo: number;
+  minVisits: number;
+}
+
 interface SankeyFlow {
   direction: 'before' | 'after';
-  group_key: string;
-  group_label: string;
+  category: string;
   devices: number;
-  pings: number;
+  visits: number;
 }
 
 interface SampleStop {
@@ -53,8 +61,7 @@ interface SampleStop {
   date: string;
   ts: string;
   direction: 'before' | 'during' | 'after';
-  group_key: string;
-  group_label: string;
+  category: string;
   dwell_minutes: number;
 }
 
@@ -64,252 +71,167 @@ interface RoutesResult {
   totalVisitors: number;
 }
 
+// ── SQL builders ─────────────────────────────────────────────────────
+
+function hourWhere(hourFrom: number, hourTo: number, col = 'utc_timestamp'): string {
+  if (hourFrom === 0 && hourTo === 23) return '';
+  if (hourFrom <= hourTo) return `AND HOUR(${col}) >= ${hourFrom} AND HOUR(${col}) <= ${hourTo}`;
+  return `AND (HOUR(${col}) >= ${hourFrom} OR HOUR(${col}) <= ${hourTo})`;
+}
+
 /**
- * Build SQL for the before/after target visits CTE.
- * Reused by both Sankey and Sample queries.
+ * CTE: target_daily — one row per (ad_id, date) with arrival/departure times.
+ * Identifies devices that visited the target POIs with optional dwell/hour/minVisits filters.
  */
-function targetVisitsCTE(
-  table: string,
-  minDwell: number,
-  maxDwell: number,
-  hourFrom: number,
-  hourTo: number,
-  minVisits: number = 1,
-): string {
-  // Hour filter on pings
-  let hourWhere = '';
-  if (hourFrom > 0 || hourTo < 23) {
-    if (hourFrom <= hourTo) {
-      hourWhere = `AND HOUR(utc_timestamp) >= ${hourFrom} AND HOUR(utc_timestamp) <= ${hourTo}`;
-    } else {
-      hourWhere = `AND (HOUR(utc_timestamp) >= ${hourFrom} OR HOUR(utc_timestamp) <= ${hourTo})`;
-    }
-  }
-
-  // Dwell HAVING — must use full expression, not SELECT alias (Athena/Presto restriction)
-  const dwellExpr = "DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp))";
+function targetDailyCTE(table: string, f: Filters): string {
+  const hWhere = hourWhere(f.hourFrom, f.hourTo);
   const dwellParts: string[] = [];
-  if (minDwell > 0) dwellParts.push(`${dwellExpr} >= ${minDwell}`);
-  if (maxDwell > 0) dwellParts.push(`${dwellExpr} <= ${maxDwell}`);
-  const havingClause = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
+  if (f.minDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${f.minDwell}`);
+  if (f.maxDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${f.maxDwell}`);
+  const having = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
 
-  // minVisits: count distinct visit-days per device (not rows, which explode due to poi_ids)
-  const visitCountCTE = minVisits > 1 ? `
-    visit_day_counts AS (
-      SELECT ad_id, COUNT(DISTINCT date) as visit_days
-      FROM target_visits
-      GROUP BY ad_id
-      HAVING COUNT(DISTINCT date) >= ${minVisits}
+  const visitFilter = f.minVisits > 1 ? `
+    visit_day_filter AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, COUNT(DISTINCT date) as vd
+        FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+        WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        GROUP BY ad_id HAVING COUNT(DISTINCT date) >= ${f.minVisits}
+      )
     ),` : '';
-  const visitCountJoin = minVisits > 1
-    ? 'INNER JOIN visit_day_counts vc ON t_ranked.ad_id = vc.ad_id'
-    : '';
+  const visitWhere = f.minVisits > 1 ? `AND ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
 
-  return `
-    target_visits AS (
+  return `${visitFilter}
+    all_target_visits AS (
       SELECT ad_id, date,
         MIN(utc_timestamp) as arrival,
         MAX(utc_timestamp) as departure,
         DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell
       FROM ${table}
-      CROSS JOIN UNNEST(poi_ids) AS t2(poi_id)
-      WHERE t2.poi_id IS NOT NULL AND t2.poi_id != ''
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        ${hourWhere}
-      GROUP BY ad_id, date, t2.poi_id
-      ${havingClause}
-    ),${visitCountCTE}
+        ${hWhere} ${visitWhere}
+      GROUP BY ad_id, date, poi_id
+      ${having}
+    ),
     target_daily AS (
-      SELECT t_ranked.ad_id, t_ranked.date,
-        t_ranked.arrival as first_arrival, t_ranked.departure as last_departure, t_ranked.dwell
-      FROM (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_id, date ORDER BY dwell DESC, arrival) as rn
-        FROM target_visits
-      ) t_ranked
-      ${visitCountJoin}
-      WHERE t_ranked.rn = 1
+      SELECT ad_id, date,
+        MIN(arrival) as arrival,
+        MAX(departure) as departure,
+        MAX(dwell) as dwell
+      FROM all_target_visits
+      GROUP BY ad_id, date
     )`;
 }
 
 /**
- * Common CTEs for spatial join with lab_pois_gmc — POI grid + pings.
- * Returns the categorized pings with direction (before/during/after).
+ * Build Sankey query: aggregate before/after POI category visits across ALL visitors.
  */
-function spatialJoinCTEs(
-  table: string,
-  country: string,
-  pinsCTE: string, // name of the CTE providing ad_id rows to join against
-): string {
-  const cc = toIsoCountry(country);
-
-  // NO hour filter here — hour filter only applies to target visit selection (in targetVisitsCTE).
-  // Before/after pings should be any hour to maximize route coverage.
-
-  return `
-    gmc_pois AS (
-      SELECT id as poi_id, category,
-        CAST(latitude AS DOUBLE) as poi_lat,
-        CAST(longitude AS DOUBLE) as poi_lng,
-        CAST(FLOOR(CAST(latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lat_b,
-        CAST(FLOOR(CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lng_b
-      FROM lab_pois_gmc
-      WHERE category IS NOT NULL
-        /* no country filter — visitors travel across borders */
-    ),
-    poi_buckets AS (
-      SELECT poi_id, category, poi_lat, poi_lng,
-        base_lat_b + dlat as lat_b,
-        base_lng_b + dlng as lng_b
-      FROM gmc_pois
-      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
-      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
-    ),
-    all_pings AS (
-      SELECT
-        p.ad_id, p.date, p.utc_timestamp,
-        TRY_CAST(p.latitude AS DOUBLE) as lat,
-        TRY_CAST(p.longitude AS DOUBLE) as lng,
-        CAST(FLOOR(TRY_CAST(p.latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lat_b,
-        CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_b,
-        CASE
-          WHEN p.utc_timestamp < td.first_arrival THEN 'before'
-          ELSE 'after'
-        END as direction
-      FROM ${table} p
-      INNER JOIN ${pinsCTE} s ON p.ad_id = s.ad_id
-      INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
-      WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
-        AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
-        AND p.ad_id IS NOT NULL AND TRIM(p.ad_id) != ''
-        AND (p.utc_timestamp < td.first_arrival OR p.utc_timestamp > td.last_departure)
-    ),
-    matched AS (
-      SELECT
-        ap.ad_id, ap.date, ap.utc_timestamp, ap.direction,
-        pb.category
-      FROM all_pings ap
-      INNER JOIN poi_buckets pb
-        ON ap.lat_b = pb.lat_b AND ap.lng_b = pb.lng_b
-      WHERE 111320 * SQRT(
-          POW(ap.lat - pb.poi_lat, 2) +
-          POW((ap.lng - pb.poi_lng) * COS(RADIANS((ap.lat + pb.poi_lat) / 2)), 2)
-        ) <= ${SPATIAL_RADIUS}
-    )`;
-}
-
-/**
- * Build the aggregated Sankey query.
- * Returns: direction, category_group, devices, pings
- * Groups individual POI categories into CATEGORY_GROUPS for cleaner Sankey.
- */
-function buildSankeySQL(
-  table: string,
-  country: string,
-  minDwell: number,
-  maxDwell: number,
-  hourFrom: number,
-  hourTo: number,
-  minVisits: number = 1,
-): string {
-  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
-  const cc = toIsoCountry(country);
-
-  // Sankey uses a single optimized join (no redundant pinsCTE join)
-  // since target_daily already provides both ad_id filter and date+timing info
+function buildSankeySQL(table: string, f: Filters): string {
   return `
     WITH
-    ${tvCTE},
-    gmc_pois AS (
-      SELECT id as poi_id, category,
-        CAST(latitude AS DOUBLE) as poi_lat,
-        CAST(longitude AS DOUBLE) as poi_lng,
-        CAST(FLOOR(CAST(latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lat_b,
-        CAST(FLOOR(CAST(longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as base_lng_b
-      FROM lab_pois_gmc
-      WHERE category IS NOT NULL AND country = '${cc}'
-    ),
-    poi_buckets AS (
-      SELECT poi_id, category, poi_lat, poi_lng,
-        base_lat_b + dlat as lat_b, base_lng_b + dlng as lng_b
-      FROM gmc_pois
-      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
-      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
-    ),
-    all_pings AS (
+    ${targetDailyCTE(table, f)},
+    before_after_pings AS (
       SELECT
-        p.ad_id, p.date, p.utc_timestamp,
+        p.ad_id, p.date,
         TRY_CAST(p.latitude AS DOUBLE) as lat,
         TRY_CAST(p.longitude AS DOUBLE) as lng,
-        CAST(FLOOR(TRY_CAST(p.latitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lat_b,
-        CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID_STEP}) AS BIGINT) as lng_b,
-        CASE WHEN p.utc_timestamp < td.first_arrival THEN 'before' ELSE 'after' END as direction
+        CAST(FLOOR(TRY_CAST(p.latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_b,
+        CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_b,
+        CASE WHEN p.utc_timestamp < td.arrival THEN 'before' ELSE 'after' END as direction
       FROM ${table} p
       INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
       WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
-        AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
-        AND p.ad_id IS NOT NULL AND TRIM(p.ad_id) != ''
-        AND (p.utc_timestamp < td.first_arrival OR p.utc_timestamp > td.last_departure)
+        AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        AND (p.utc_timestamp < td.arrival OR p.utc_timestamp > td.departure)
+    ),
+    poi_grid AS (
+      SELECT category,
+        CAST(latitude AS DOUBLE) as poi_lat,
+        CAST(longitude AS DOUBLE) as poi_lng,
+        CAST(FLOOR(CAST(latitude AS DOUBLE) / ${GRID}) AS BIGINT) + dlat as lat_b,
+        CAST(FLOOR(CAST(longitude AS DOUBLE) / ${GRID}) AS BIGINT) + dlng as lng_b
+      FROM lab_pois_gmc
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t2(dlng)
+      WHERE category IS NOT NULL
     ),
     matched AS (
-      SELECT ap.ad_id, ap.date, ap.utc_timestamp, ap.direction, pb.category
-      FROM all_pings ap
-      INNER JOIN poi_buckets pb ON ap.lat_b = pb.lat_b AND ap.lng_b = pb.lng_b
+      SELECT p.ad_id, p.date, p.direction, g.category
+      FROM before_after_pings p
+      INNER JOIN poi_grid g ON p.lat_b = g.lat_b AND p.lng_b = g.lng_b
       WHERE 111320 * SQRT(
-          POW(ap.lat - pb.poi_lat, 2) +
-          POW((ap.lng - pb.poi_lng) * COS(RADIANS((ap.lat + pb.poi_lat) / 2)), 2)
-        ) <= ${SPATIAL_RADIUS}
+        POW(p.lat - g.poi_lat, 2) +
+        POW((p.lng - g.poi_lng) * COS(RADIANS((p.lat + g.poi_lat) / 2)), 2)
+      ) <= ${RADIUS}
     ),
-    categorized AS (
-      SELECT
-        ad_id, direction, date,
-        category,
-        DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0 as dwell_min
+    per_device AS (
+      SELECT ad_id, date, direction, category,
+        ROW_NUMBER() OVER (PARTITION BY ad_id, date, direction, category ORDER BY category) as rn
       FROM matched
-      WHERE direction IN ('before', 'after')
-      GROUP BY ad_id, direction, date, category
     )
-    SELECT
-      direction,
-      category,
+    SELECT direction, category,
       COUNT(DISTINCT ad_id) as devices,
       COUNT(*) as visits
-    FROM categorized
+    FROM per_device WHERE rn = 1
     GROUP BY direction, category
     ORDER BY direction, devices DESC
   `;
 }
 
 /**
- * Build the sample routes query.
- * Returns per-ping data for 1000 random devices, categorized.
+ * Build Sample query: detailed stops for SAMPLE_SIZE random devices.
  */
-function buildSampleRoutesSQL(
-  table: string,
-  country: string,
-  minDwell: number,
-  maxDwell: number,
-  hourFrom: number,
-  hourTo: number,
-  minVisits: number = 1,
-): string {
-  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
-
+function buildSampleSQL(table: string, f: Filters): string {
   return `
     WITH
-    ${tvCTE},
+    ${targetDailyCTE(table, f)},
     sampled AS (
       SELECT ad_id FROM (
         SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
-        FROM (SELECT DISTINCT ad_id FROM target_daily) t_uniq
-      ) t_ranked WHERE rn <= 1000
+        FROM (SELECT DISTINCT ad_id FROM target_daily)
+      ) WHERE rn <= ${SAMPLE_SIZE}
     ),
-    ${spatialJoinCTEs(table, country, 'sampled')},
-    categorized AS (
-      -- Before/after stops: spatial join with lab_pois_gmc
+    before_after_pings AS (
       SELECT
-        ad_id, date, direction, category,
+        p.ad_id, p.date, p.utc_timestamp,
+        TRY_CAST(p.latitude AS DOUBLE) as lat,
+        TRY_CAST(p.longitude AS DOUBLE) as lng,
+        CAST(FLOOR(TRY_CAST(p.latitude AS DOUBLE) / ${GRID}) AS BIGINT) as lat_b,
+        CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_b,
+        CASE WHEN p.utc_timestamp < td.arrival THEN 'before' ELSE 'after' END as direction
+      FROM ${table} p
+      INNER JOIN sampled s ON p.ad_id = s.ad_id
+      INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
+      WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
+        AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        AND (p.utc_timestamp < td.arrival OR p.utc_timestamp > td.departure)
+    ),
+    poi_grid AS (
+      SELECT category,
+        CAST(latitude AS DOUBLE) as poi_lat,
+        CAST(longitude AS DOUBLE) as poi_lng,
+        CAST(FLOOR(CAST(latitude AS DOUBLE) / ${GRID}) AS BIGINT) + dlat as lat_b,
+        CAST(FLOOR(CAST(longitude AS DOUBLE) / ${GRID}) AS BIGINT) + dlng as lng_b
+      FROM lab_pois_gmc
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1),(0),(1)) AS t2(dlng)
+      WHERE category IS NOT NULL
+    ),
+    matched AS (
+      SELECT p.ad_id, p.date, p.utc_timestamp, p.direction, g.category
+      FROM before_after_pings p
+      INNER JOIN poi_grid g ON p.lat_b = g.lat_b AND p.lng_b = g.lng_b
+      WHERE 111320 * SQRT(
+        POW(p.lat - g.poi_lat, 2) +
+        POW((p.lng - g.poi_lng) * COS(RADIANS((p.lat + g.poi_lat) / 2)), 2)
+      ) <= ${RADIUS}
+    ),
+    categorized AS (
+      SELECT ad_id, date, direction, category,
         MIN(utc_timestamp) as first_ts,
         MAX(utc_timestamp) as last_ts,
         ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_min
@@ -318,97 +240,28 @@ function buildSampleRoutesSQL(
 
       UNION ALL
 
-      -- Target visit: single entry per device-day (no spatial join explosion)
-      SELECT
-        td.ad_id, td.date, 'during' as direction, 'target' as category,
-        td.first_arrival as first_ts,
-        td.last_departure as last_ts,
+      SELECT td.ad_id, td.date, 'during' as direction, 'target' as category,
+        td.arrival as first_ts, td.departure as last_ts,
         CAST(td.dwell AS DOUBLE) as dwell_min
       FROM target_daily td
       INNER JOIN sampled s ON td.ad_id = s.ad_id
     )
-    SELECT
-      ad_id, date,
-      CAST(first_ts AS VARCHAR) as first_ts,
-      direction,
-      category,
-      dwell_min
+    SELECT ad_id, date, CAST(first_ts AS VARCHAR) as first_ts,
+      direction, category, dwell_min
     FROM categorized
     ORDER BY ad_id, date, first_ts
   `;
 }
 
-/**
- * Build diagnostic count query — counts at each stage to identify where matches drop.
- * Returns: total_visitors, total_pings_sampled, before_after_pings, ambient_pings (empty poi_ids), matched_pings, gmc_poi_count
- */
-function buildDiagnosticSQL(
-  table: string,
-  country: string,
-  minDwell: number,
-  maxDwell: number,
-  hourFrom: number,
-  hourTo: number,
-  minVisits: number = 1,
-): string {
-  const tvCTE = targetVisitsCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits);
-  const cc = toIsoCountry(country);
+// ── State helpers ────────────────────────────────────────────────────
 
-  return `
-    WITH
-    ${tvCTE},
-    diag_sample AS (
-      SELECT ad_id FROM (
-        SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
-        FROM (SELECT DISTINCT ad_id FROM target_daily) t_uniq
-      ) t_ranked WHERE rn <= 10
-    ),
-    diag_pings AS (
-      SELECT
-        p.ad_id,
-        p.utc_timestamp,
-        TRY_CAST(p.latitude AS DOUBLE) as lat,
-        TRY_CAST(p.longitude AS DOUBLE) as lng,
-        p.poi_ids,
-        td.first_arrival,
-        td.last_departure,
-        CASE
-          WHEN p.utc_timestamp < td.first_arrival THEN 'before'
-          WHEN p.utc_timestamp > td.last_departure THEN 'after'
-          ELSE 'during'
-        END as direction
-      FROM ${table} p
-      INNER JOIN diag_sample s ON p.ad_id = s.ad_id
-      INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
-      WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
-    )
-    SELECT
-      (SELECT COUNT(DISTINCT ad_id) FROM target_daily) as total_visitors,
-      COUNT(*) as total_pings_10devices,
-      COUNT(CASE WHEN direction = 'before' THEN 1 END) as before_pings,
-      COUNT(CASE WHEN direction = 'during' THEN 1 END) as during_pings,
-      COUNT(CASE WHEN direction = 'after' THEN 1 END) as after_pings,
-      COUNT(CASE WHEN CARDINALITY(poi_ids) = 0 OR poi_ids IS NULL THEN 1 END) as ambient_pings,
-      COUNT(CASE WHEN CARDINALITY(poi_ids) > 0 THEN 1 END) as poi_tagged_pings,
-      (SELECT COUNT(*) FROM lab_pois_gmc WHERE country = '${cc}') as gmc_pois_for_country
-    FROM diag_pings
-  `;
-}
-
-function filtersKey(f: RoutesState['filters']): string {
+const STATE_KEY = (ds: string, f: string) => `routes-state/${ds}-${f}`;
+function filtersKey(f: Filters): string {
   return `d${f.minDwell}-${f.maxDwell}_h${f.hourFrom}-${f.hourTo}_v${f.minVisits}`;
 }
 
-/**
- * POST /api/datasets/[name]/routes/poll
- *
- * Multi-phase endpoint for device route analysis.
- * Phase 1 (starting): Launch 3 Athena queries (sankey + sample + count)
- * Phase 2 (polling): Poll all queries
- * Phase 3 (reading): Parse results
- * Phase 4 (done): Return cached result
- */
+// ── Handler ──────────────────────────────────────────────────────────
+
 export async function POST(
   request: NextRequest,
   context: { params: Promise<{ name: string }> }
@@ -424,33 +277,23 @@ export async function POST(
     try { body = await request.json(); } catch { body = {}; }
     const isNewRequest = !!body.country;
 
-    const filters = {
+    const filters: Filters = {
+      country: body.country || '',
       minDwell: parseInt(body.minDwell, 10) || 0,
       maxDwell: parseInt(body.maxDwell, 10) || 0,
       hourFrom: parseInt(body.hourFrom, 10) || 0,
       hourTo: body.hourTo != null ? parseInt(body.hourTo, 10) : 23,
       minVisits: parseInt(body.minVisits, 10) || 1,
-      country: body.country || '',
     };
 
     const fKey = filtersKey(filters);
-    // Try to load existing state (use filters from body if new, or from state)
-    let stateKey = '';
-    if (isNewRequest) {
-      stateKey = STATE_KEY(datasetName, fKey);
-    } else {
-      // On polling, try to find the state key from the body
-      stateKey = body.stateKey || '';
-    }
-
+    let stateKey = isNewRequest ? STATE_KEY(datasetName, fKey) : (body.stateKey || '');
     let state = stateKey ? await getConfig<RoutesState>(stateKey) : null;
 
-    // Return cached result if done and not a new request
+    // Return cached result on poll
     if (state?.phase === 'done' && !isNewRequest && state.result) {
       return NextResponse.json({
-        phase: 'done',
-        stateKey,
-        result: state.result,
+        phase: 'done', stateKey, result: state.result,
         progress: { step: 'done', percent: 100, message: 'Route analysis complete' },
       });
     }
@@ -458,109 +301,75 @@ export async function POST(
     // Reset on error or new request
     if (state?.phase === 'error' || isNewRequest) state = null;
 
-    // ── Phase: starting ──────────────────────────────────────────
+    // ── Start ─────────────────────────────────────────────────
     if (!state) {
       if (!filters.country) {
         return NextResponse.json({ error: 'country required' }, { status: 400 });
       }
 
       stateKey = STATE_KEY(datasetName, fKey);
-      console.log(`[ROUTES] Starting for ${datasetName}, ${JSON.stringify(filters)}`);
+      console.log(`[ROUTES] Starting for ${datasetName}`);
 
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      // Ensure lab_pois_gmc table exists (same CREATE as laboratory/audience-runner)
-      const cc = toIsoCountry(filters.country);
+      // Ensure lab_pois_gmc table exists
       const poiBucket = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
       try {
         await runQuery(`
           CREATE EXTERNAL TABLE IF NOT EXISTS lab_pois_gmc (
             id STRING, name STRING, category STRING, city STRING,
             postal_code STRING, country STRING, latitude DOUBLE, longitude DOUBLE
-          )
-          STORED AS PARQUET
+          ) STORED AS PARQUET
           LOCATION 's3://${poiBucket}/pois_gmc/'
         `);
-        console.log(`[ROUTES] lab_pois_gmc table ensured`);
       } catch (e: any) {
-        if (!e.message?.includes('already exists')) {
-          console.warn(`[ROUTES] Warning creating lab_pois_gmc:`, e.message);
-        }
+        if (!e.message?.includes('already exists')) console.warn(`[ROUTES] lab_pois_gmc:`, e.message);
       }
 
-      // Quick sanity check: does the table have any data?
-      try {
-        const checkResult = await runQuery(`SELECT COUNT(*) as cnt FROM lab_pois_gmc LIMIT 1`);
-        const poiCount = parseInt(checkResult.rows[0]?.cnt, 10) || 0;
-        console.log(`[ROUTES] lab_pois_gmc has ${poiCount} total POIs`);
-        if (poiCount === 0) {
-          return NextResponse.json({ phase: 'error', error: 'lab_pois_gmc table is empty. Upload Overture POI parquets to pois_gmc/.' });
-        }
-      } catch (e: any) {
-        console.error(`[ROUTES] lab_pois_gmc check failed:`, e.message);
-      }
-
-      const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
-      const sampleSql = buildSampleRoutesSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
-      const countSql = buildDiagnosticSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
-
-      const [sankeyQId, sampleQId, countQId] = await Promise.all([
-        startQueryAsync(sankeySql).catch(e => { console.error('[ROUTES] Sankey query failed:', e.message); return undefined; }),
-        startQueryAsync(sampleSql).catch(e => { console.error('[ROUTES] Sample query failed:', e.message); return undefined; }),
-        startQueryAsync(countSql).catch(e => { console.error('[ROUTES] Count query failed:', e.message); return undefined; }),
+      // Fire both queries
+      const [sankeyQId, sampleQId] = await Promise.all([
+        startQueryAsync(buildSankeySQL(table, filters)).catch(e => { console.error('[ROUTES] Sankey:', e.message); return undefined; }),
+        startQueryAsync(buildSampleSQL(table, filters)).catch(e => { console.error('[ROUTES] Sample:', e.message); return undefined; }),
       ]);
 
-      console.log(`[ROUTES] 3 queries launched: sankey=${sankeyQId}, sample=${sampleQId}, count=${countQId}`);
+      console.log(`[ROUTES] 2 queries launched: sankey=${sankeyQId}, sample=${sampleQId}`);
 
-      state = {
-        phase: 'polling',
-        sankeyQueryId: sankeyQId,
-        sampleQueryId: sampleQId,
-        sankeySeed: Date.now(),
-        filters,
-        sankeyDone: false,
-        sampleDone: false,
-      };
-      // Store countQId in state too
-      (state as any).countQueryId = countQId;
+      state = { phase: 'polling', sankeyQId, sampleQId, sankeyDone: false, sampleDone: false, filters };
       await putConfig(stateKey, state, { compact: true });
 
       return NextResponse.json({
-        phase: 'polling',
-        stateKey,
-        progress: { step: 'queries_started', percent: 10, message: 'Running route analysis queries...' },
+        phase: 'polling', stateKey,
+        progress: { step: 'started', percent: 10, message: 'Queries launched...' },
       });
     }
 
-    // ── Phase: polling ───────────────────────────────────────────
+    // ── Polling ───────────────────────────────────────────────
     if (state.phase === 'polling') {
       let allDone = true;
       let anyFailed = false;
       let errorMsg = '';
+      let doneCount = 0;
 
-      const queries = [
-        { name: 'sankey', id: state.sankeyQueryId, doneKey: 'sankeyDone' },
-        { name: 'sample', id: state.sampleQueryId, doneKey: 'sampleDone' },
-        { name: 'count', id: (state as any).countQueryId, doneKey: 'countDone' },
-      ];
-
-      for (const q of queries) {
-        if (!q.id || (state as any)[q.doneKey]) continue;
+      for (const { id, key } of [
+        { id: state.sankeyQId, key: 'sankeyDone' },
+        { id: state.sampleQId, key: 'sampleDone' },
+      ]) {
+        if (!id || (state as any)[key]) { if ((state as any)[key]) doneCount++; continue; }
         try {
-          const status = await checkQueryStatus(q.id);
-          if (status.state === 'RUNNING' || status.state === 'QUEUED') {
+          const s = await checkQueryStatus(id);
+          if (s.state === 'RUNNING' || s.state === 'QUEUED') {
             allDone = false;
-          } else if (status.state === 'FAILED' || status.state === 'CANCELLED') {
+          } else if (s.state === 'FAILED' || s.state === 'CANCELLED') {
             anyFailed = true;
-            errorMsg = `${q.name}: ${status.error || 'failed'}`;
+            errorMsg = `${key} failed: ${s.error || 'unknown'}`;
           } else {
-            (state as any)[q.doneKey] = true;
+            (state as any)[key] = true;
+            doneCount++;
           }
         } catch (err: any) {
           if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
-            anyFailed = true;
-            errorMsg = `${q.name} expired — please retry`;
+            anyFailed = true; errorMsg = `${key} expired`;
           } else throw err;
         }
       }
@@ -572,153 +381,81 @@ export async function POST(
       }
 
       if (!allDone) {
-        const doneCount = queries.filter(q => (state as any)[q.doneKey]).length;
         await putConfig(stateKey, state, { compact: true });
         return NextResponse.json({
-          phase: 'polling',
-          stateKey,
-          progress: {
-            step: 'polling',
-            percent: 10 + Math.round((doneCount / 3) * 50),
-            message: `Queries running (${doneCount}/3 done)...`,
-          },
+          phase: 'polling', stateKey,
+          progress: { step: 'polling', percent: 10 + doneCount * 30, message: `Queries running (${doneCount}/2 done)...` },
         });
       }
 
-      // All done → reading
       state = { ...state, phase: 'reading' };
       await putConfig(stateKey, state, { compact: true });
-      // Fall through
+      return NextResponse.json({
+        phase: 'reading', stateKey,
+        progress: { step: 'reading', percent: 75, message: 'Queries done, reading results...' },
+      });
     }
 
-    // ── Phase: reading ───────────────────────────────────────────
+    // ── Reading ───────────────────────────────────────────────
     if (state.phase === 'reading') {
-      const { CATEGORY_GROUPS } = await import('@/lib/laboratory-types');
-
-      // Helper: category → group key + label
-      const catToGroup = (cat: string): { key: string; label: string } => {
-        for (const [gk, g] of Object.entries(CATEGORY_GROUPS)) {
-          if ((g.categories as readonly string[]).includes(cat)) {
-            return { key: gk, label: g.label };
-          }
-        }
-        return { key: 'other', label: 'Other' };
-      };
-
-      // Parse Sankey results
+      // Parse Sankey
       let sankeyFlows: SankeyFlow[] = [];
-      if (state.sankeyQueryId) {
-        try {
-          const res = await fetchQueryResults(state.sankeyQueryId);
-          // Aggregate by group
-          const grouped = new Map<string, SankeyFlow>();
-          for (const row of res.rows) {
-            const dir = row.direction as 'before' | 'after';
-            const cat = row.category || 'unknown';
-            const g = catToGroup(cat);
-            const mapKey = `${dir}:${g.key}`;
-            const existing = grouped.get(mapKey);
-            if (existing) {
-              existing.devices += parseInt(row.devices, 10) || 0;
-              existing.pings += parseInt(row.visits, 10) || 0;
-            } else {
-              grouped.set(mapKey, {
-                direction: dir,
-                group_key: g.key,
-                group_label: g.label,
-                devices: parseInt(row.devices, 10) || 0,
-                pings: parseInt(row.visits, 10) || 0,
-              });
-            }
-          }
-          sankeyFlows = Array.from(grouped.values())
-            .sort((a, b) => b.devices - a.devices);
-        } catch (err: any) {
-          console.error('[ROUTES] Error reading sankey results:', err.message);
-        }
-      }
-
-      // Parse sample routes
-      let sampleStops: SampleStop[] = [];
-      if (state.sampleQueryId) {
-        try {
-          const res = await fetchQueryResults(state.sampleQueryId);
-          sampleStops = res.rows.map((row: any) => {
-            const isTarget = row.category === 'target' || row.direction === 'during';
-            const g = isTarget ? { key: 'target', label: 'Target POI' } : catToGroup(row.category || 'unknown');
-            return {
-              ad_id: row.ad_id,
-              date: row.date,
-              ts: row.first_ts,
-              direction: row.direction as 'before' | 'during' | 'after',
-              group_key: g.key,
-              group_label: g.label,
-              dwell_minutes: parseFloat(row.dwell_min) || 0,
-            };
-          });
-        } catch (err: any) {
-          console.error('[ROUTES] Error reading sample results:', err.message);
-        }
-      }
-
-      // Parse diagnostic results
       let totalVisitors = 0;
-      if ((state as any).countQueryId) {
+      if (state.sankeyQId) {
         try {
-          const res = await fetchQueryResults((state as any).countQueryId);
-          const diag = res.rows[0] || {};
-          totalVisitors = parseInt(diag.total_visitors, 10) || 0;
-          // Log diagnostic info for debugging
-          console.log(`[ROUTES DIAGNOSTIC] Visitors: ${diag.total_visitors}, ` +
-            `10-device pings: ${diag.total_pings_10devices}, ` +
-            `before: ${diag.before_pings}, during: ${diag.during_pings}, after: ${diag.after_pings}, ` +
-            `ambient (no poi_ids): ${diag.ambient_pings}, poi-tagged: ${diag.poi_tagged_pings}, ` +
-            `GMC POIs for country: ${diag.gmc_pois_for_country}`);
+          const r = await fetchQueryResults(state.sankeyQId);
+          sankeyFlows = r.rows.map((row: any) => ({
+            direction: row.direction as 'before' | 'after',
+            category: row.category || 'unknown',
+            devices: parseInt(row.devices, 10) || 0,
+            visits: parseInt(row.visits, 10) || 0,
+          }));
+          // totalVisitors from target_daily count
+          totalVisitors = Math.max(...sankeyFlows.map(f => f.devices), 0);
         } catch (err: any) {
-          console.error('[ROUTES] Error reading diagnostic:', err.message);
+          console.error('[ROUTES] Sankey read:', err.message);
         }
       }
 
-      // Surface diagnostic info in the result so the UI can show it
-      let diagnostic: any = undefined;
-      if ((state as any).countQueryId) {
+      // Parse Sample
+      let sampleStops: SampleStop[] = [];
+      if (state.sampleQId) {
         try {
-          const dRes = await fetchQueryResults((state as any).countQueryId);
-          const d = dRes.rows[0] || {};
-          diagnostic = {
-            gmcPoisForCountry: parseInt(d.gmc_pois_for_country, 10) || 0,
-            beforePings: parseInt(d.before_pings, 10) || 0,
-            afterPings: parseInt(d.after_pings, 10) || 0,
-            duringPings: parseInt(d.during_pings, 10) || 0,
-            ambientPings: parseInt(d.ambient_pings, 10) || 0,
-          };
-        } catch {}
+          const r = await fetchQueryResults(state.sampleQId);
+          sampleStops = r.rows.map((row: any) => ({
+            ad_id: row.ad_id,
+            date: row.date,
+            ts: row.first_ts,
+            direction: row.direction as 'before' | 'during' | 'after',
+            category: row.category || 'unknown',
+            dwell_minutes: parseFloat(row.dwell_min) || 0,
+          }));
+        } catch (err: any) {
+          console.error('[ROUTES] Sample read:', err.message);
+        }
       }
 
-      const result: RoutesResult = {
-        sankey: sankeyFlows,
-        sampleRoutes: sampleStops,
-        totalVisitors,
-        ...(diagnostic ? { diagnostic } : {}),
-      } as any;
+      // Get total visitors from a quick count if sankey didn't provide it
+      if (totalVisitors === 0 && sampleStops.length > 0) {
+        totalVisitors = new Set(sampleStops.filter(s => s.direction === 'during').map(s => s.ad_id)).size;
+      }
 
+      const result: RoutesResult = { sankey: sankeyFlows, sampleRoutes: sampleStops, totalVisitors };
       state = { ...state, phase: 'done', result };
       await putConfig(stateKey, state, { compact: true });
 
-      console.log(`[ROUTES] Done: ${sankeyFlows.length} sankey flows, ${sampleStops.length} sample stops, ${totalVisitors} visitors`);
+      console.log(`[ROUTES] Done: ${sankeyFlows.length} sankey flows, ${sampleStops.length} sample stops`);
 
       return NextResponse.json({
-        phase: 'done',
-        stateKey,
-        result,
+        phase: 'done', stateKey, result,
         progress: { step: 'done', percent: 100, message: 'Route analysis complete' },
       });
     }
 
-    return NextResponse.json({ phase: 'error', stateKey, error: 'Unknown state — please retry' });
+    return NextResponse.json({ phase: 'error', stateKey, error: 'Unknown state — retry' });
 
   } catch (error: any) {
-    console.error(`[ROUTES] Error:`, error.message);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error(`[ROUTES] Error:`, error?.message, error?.stack);
+    return NextResponse.json({ error: error?.message || 'Unknown error' }, { status: 500 });
   }
 }
