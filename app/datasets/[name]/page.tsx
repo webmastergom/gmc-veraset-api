@@ -870,7 +870,8 @@ export default function DatasetAnalysisPage() {
               title="Catchment by Zip Code"
               icon={<MapPin className="h-4 w-4" />}
             >
-              <div className="flex items-center justify-between mb-4">
+              <div className="space-y-2 mb-4">
+                <div className="flex items-center justify-between">
                 <p className="text-sm text-muted-foreground">
                   {catchmentReport.totalDeviceDays?.toLocaleString()} total device-days across{' '}
                   {catchmentReport.byZipCode.length} zip codes
@@ -900,6 +901,10 @@ export default function DatasetAnalysisPage() {
                   <Download className="mr-2 h-4 w-4" />
                   Download Zipcodes
                 </Button>
+                </div>
+                <p className="text-xs text-muted-foreground/70 border-l-2 border-muted pl-3">
+                  Methodology: residence assigned by first ping of the day per device. A device is counted at a location only if its first daily signal appears at the same rounded coordinate (~11km) on 3 or more distinct days. Reverse-geocoded to postal code via local GeoJSON.
+                </p>
               </div>
               <CatchmentPie data={catchmentReport.byZipCode} />
             </CollapsibleCard>
