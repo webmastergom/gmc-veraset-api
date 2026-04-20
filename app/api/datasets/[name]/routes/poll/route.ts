@@ -6,6 +6,7 @@ import {
   fetchQueryResults,
   ensureTableForDataset,
   getTableName,
+  runQuery,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
 import { toIsoCountry } from '@/lib/country-inference';
@@ -469,28 +470,39 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
-      // Quick check: does lab_pois_gmc have data for this country?
+      // Ensure lab_pois_gmc table exists (same CREATE as laboratory/audience-runner)
       const cc = toIsoCountry(filters.country);
+      const poiBucket = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
       try {
-        const { runQuery } = await import('@/lib/athena');
+        await runQuery(`
+          CREATE EXTERNAL TABLE IF NOT EXISTS lab_pois_gmc (
+            id STRING, name STRING, category STRING, city STRING,
+            postal_code STRING, country STRING, latitude DOUBLE, longitude DOUBLE
+          )
+          STORED AS PARQUET
+          LOCATION 's3://${poiBucket}/pois_gmc/'
+        `);
+        console.log(`[ROUTES] lab_pois_gmc table ensured`);
+      } catch (e: any) {
+        if (!e.message?.includes('already exists')) {
+          console.warn(`[ROUTES] Warning creating lab_pois_gmc:`, e.message);
+        }
+      }
+
+      // Verify data exists for this country
+      try {
         const checkResult = await runQuery(`SELECT COUNT(*) as cnt FROM lab_pois_gmc WHERE country = '${cc}' LIMIT 1`);
         const poiCount = parseInt(checkResult.rows[0]?.cnt, 10) || 0;
         console.log(`[ROUTES] lab_pois_gmc has ${poiCount} POIs for country=${cc}`);
         if (poiCount === 0) {
           return NextResponse.json({
             phase: 'error',
-            error: `No Overture POIs found in lab_pois_gmc for country "${cc}". The table may need to be recreated — run a Laboratory analysis first to rebuild it.`,
+            error: `No Overture POIs found for country "${cc}". Check that pois_gmc/ parquets exist in S3 and contain data for this country.`,
           });
         }
       } catch (e: any) {
         console.error(`[ROUTES] lab_pois_gmc check failed:`, e.message);
-        // Table might not exist — give a clear error
-        if (e.message?.includes('does not exist') || e.message?.includes('TABLE_NOT_FOUND')) {
-          return NextResponse.json({
-            phase: 'error',
-            error: `Table lab_pois_gmc does not exist. Run a Laboratory analysis first to create it.`,
-          });
-        }
+        return NextResponse.json({ phase: 'error', error: `Failed to query lab_pois_gmc: ${e.message}` });
       }
 
       const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
