@@ -469,6 +469,30 @@ export async function POST(
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
 
+      // Quick check: does lab_pois_gmc have data for this country?
+      const cc = toIsoCountry(filters.country);
+      try {
+        const { runQuery } = await import('@/lib/athena');
+        const checkResult = await runQuery(`SELECT COUNT(*) as cnt FROM lab_pois_gmc WHERE country = '${cc}' LIMIT 1`);
+        const poiCount = parseInt(checkResult.rows[0]?.cnt, 10) || 0;
+        console.log(`[ROUTES] lab_pois_gmc has ${poiCount} POIs for country=${cc}`);
+        if (poiCount === 0) {
+          return NextResponse.json({
+            phase: 'error',
+            error: `No Overture POIs found in lab_pois_gmc for country "${cc}". The table may need to be recreated — run a Laboratory analysis first to rebuild it.`,
+          });
+        }
+      } catch (e: any) {
+        console.error(`[ROUTES] lab_pois_gmc check failed:`, e.message);
+        // Table might not exist — give a clear error
+        if (e.message?.includes('does not exist') || e.message?.includes('TABLE_NOT_FOUND')) {
+          return NextResponse.json({
+            phase: 'error',
+            error: `Table lab_pois_gmc does not exist. Run a Laboratory analysis first to create it.`,
+          });
+        }
+      }
+
       const sankeySql = buildSankeySQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
       const sampleSql = buildSampleRoutesSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
       const countSql = buildDiagnosticSQL(table, filters.country, filters.minDwell, filters.maxDwell, filters.hourFrom, filters.hourTo, filters.minVisits);
