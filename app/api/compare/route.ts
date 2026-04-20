@@ -164,7 +164,7 @@ function homeCTEs(side: DatasetSide, tableName: string, aliasSuffix = ''): strin
       GROUP BY ad_id,
         ROUND(origin_lat, ${HOME_COORD_PRECISION}),
         ROUND(origin_lng, ${HOME_COORD_PRECISION})
-      HAVING COUNT(DISTINCT date) >= 2
+      HAVING COUNT(DISTINCT date) >= 3
     )`;
 }
 

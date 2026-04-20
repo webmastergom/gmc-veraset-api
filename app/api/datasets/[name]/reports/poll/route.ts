@@ -270,15 +270,24 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
         HOUR(MIN(utc_timestamp)) as departure_hour
       FROM valid_pings
       GROUP BY ad_id, date
+    ),
+    device_homes AS (
+      SELECT ad_id,
+        ROUND(origin_lat, ${PREC}) as home_lat,
+        ROUND(origin_lng, ${PREC}) as home_lng,
+        COUNT(DISTINCT date) as days_at_loc
+      FROM first_pings
+      WHERE origin_lat IS NOT NULL
+      GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
+      HAVING COUNT(DISTINCT date) >= 3
     )
     SELECT
-      ROUND(origin_lat, ${PREC}) as origin_lat,
-      ROUND(origin_lng, ${PREC}) as origin_lng,
-      departure_hour,
+      home_lat as origin_lat,
+      home_lng as origin_lng,
+      0 as departure_hour,
       COUNT(*) as device_days
-    FROM first_pings
-    WHERE origin_lat IS NOT NULL
-    GROUP BY 1,2,3
+    FROM device_homes
+    GROUP BY home_lat, home_lng
     ORDER BY device_days DESC
     LIMIT 100000`;
 }

@@ -457,17 +457,25 @@ export async function startConsolidatedCatchmentQuery(
       FROM valid_pings vp
       INNER JOIN poi_visitors v ON vp.ad_id = v.ad_id
       GROUP BY v.ad_id, vp.date
+    ),
+    device_homes AS (
+      SELECT ad_id,
+        ROUND(origin_lat, ${COORDINATE_PRECISION}) as home_lat,
+        ROUND(origin_lng, ${COORDINATE_PRECISION}) as home_lng,
+        COUNT(DISTINCT date) as days_at_loc
+      FROM first_pings
+      GROUP BY ad_id,
+        ROUND(origin_lat, ${COORDINATE_PRECISION}),
+        ROUND(origin_lng, ${COORDINATE_PRECISION})
+      HAVING COUNT(DISTINCT date) >= 3
     )
     SELECT
-      ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
-      ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
-      departure_hour,
+      home_lat as origin_lat,
+      home_lng as origin_lng,
+      0 as departure_hour,
       COUNT(*) as device_days
-    FROM first_pings
-    GROUP BY
-      ROUND(origin_lat, ${COORDINATE_PRECISION}),
-      ROUND(origin_lng, ${COORDINATE_PRECISION}),
-      departure_hour
+    FROM device_homes
+    GROUP BY home_lat, home_lng
     ORDER BY device_days DESC
     LIMIT 100000
   `;

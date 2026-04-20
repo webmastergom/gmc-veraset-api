@@ -162,15 +162,24 @@ export async function catchmentMultiPhase(
         FROM valid_pings
         GROUP BY ad_id, date
         ${havingClause}
+      ),
+      device_homes AS (
+        SELECT ad_id,
+          ROUND(origin_lat, ${COORDINATE_PRECISION}) as home_lat,
+          ROUND(origin_lng, ${COORDINATE_PRECISION}) as home_lng,
+          COUNT(DISTINCT date) as days_at_loc
+        FROM first_pings
+        GROUP BY ad_id,
+          ROUND(origin_lat, ${COORDINATE_PRECISION}),
+          ROUND(origin_lng, ${COORDINATE_PRECISION})
+        HAVING COUNT(DISTINCT date) >= 3
       )
       SELECT
-        ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
-        ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+        home_lat as origin_lat,
+        home_lng as origin_lng,
         COUNT(*) as device_days
-      FROM first_pings
-      GROUP BY
-        ROUND(origin_lat, ${COORDINATE_PRECISION}),
-        ROUND(origin_lng, ${COORDINATE_PRECISION})
+      FROM device_homes
+      GROUP BY home_lat, home_lng
       ORDER BY device_days DESC
       LIMIT 100000
     `;
