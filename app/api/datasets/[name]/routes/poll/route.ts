@@ -195,10 +195,18 @@ function targetDailyCTE(table: string, f: Filters, poiCoords: Array<{ lat: numbe
  * For cohort datasets, ALL pings have poi_ids populated (it marks cohort membership,
  * not physical proximity), so we MUST use spatial distance to the target POI coords.
  */
+const SANKEY_SAMPLE = 10000; // sample for Sankey — full 500K+ is too expensive with spatial join
+
 function buildSankeySQL(table: string, f: Filters, poiCoords: Array<{ lat: number; lng: number; radiusM: number }>): string {
   return `
     WITH
     ${targetDailyCTE(table, f, poiCoords)},
+    sankey_sample AS (
+      SELECT ad_id FROM (
+        SELECT ad_id, ROW_NUMBER() OVER (ORDER BY XXHASH64(CAST(ad_id AS VARBINARY))) as rn
+        FROM (SELECT DISTINCT ad_id FROM target_daily)
+      ) WHERE rn <= ${SANKEY_SAMPLE}
+    ),
     before_after_pings AS (
       SELECT
         p.ad_id, p.date,
@@ -208,6 +216,7 @@ function buildSankeySQL(table: string, f: Filters, poiCoords: Array<{ lat: numbe
         CAST(FLOOR(TRY_CAST(p.longitude AS DOUBLE) / ${GRID}) AS BIGINT) as lng_b,
         CASE WHEN p.utc_timestamp < td.arrival THEN 'before' ELSE 'after' END as direction
       FROM ${table} p
+      INNER JOIN sankey_sample ss ON p.ad_id = ss.ad_id
       INNER JOIN target_daily td ON p.ad_id = td.ad_id AND p.date = td.date
       WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
