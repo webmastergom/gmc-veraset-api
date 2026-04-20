@@ -280,14 +280,21 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
       WHERE origin_lat IS NOT NULL
       GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
       HAVING COUNT(DISTINCT date) >= 3
+    ),
+    home_hours AS (
+      SELECT dh.ad_id, dh.home_lat, dh.home_lng,
+        HOUR(MIN(fp.utc_timestamp)) as departure_hour
+      FROM device_homes dh
+      INNER JOIN valid_pings fp ON dh.ad_id = fp.ad_id
+      GROUP BY dh.ad_id, dh.home_lat, dh.home_lng, fp.date
     )
     SELECT
       home_lat as origin_lat,
       home_lng as origin_lng,
-      0 as departure_hour,
+      departure_hour,
       COUNT(*) as device_days
-    FROM device_homes
-    GROUP BY home_lat, home_lng
+    FROM home_hours
+    GROUP BY home_lat, home_lng, departure_hour
     ORDER BY device_days DESC
     LIMIT 100000`;
 }
@@ -317,28 +324,37 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
       INNER JOIN (SELECT DISTINCT ad_id FROM at_poi) v ON p.ad_id = v.ad_id
       GROUP BY p.ad_id, p.date
     ),
+    device_homes AS (
+      SELECT ad_id,
+        ROUND(origin_lat, ${PREC}) as home_lat,
+        ROUND(origin_lng, ${PREC}) as home_lng,
+        COUNT(DISTINCT date) as days_at_loc
+      FROM first_pings
+      WHERE origin_lat IS NOT NULL
+      GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
+      HAVING COUNT(DISTINCT date) >= 3
+    ),
     device_stats AS (
       SELECT
         a.ad_id,
-        fp.origin_lat,
-        fp.origin_lng,
+        dh.home_lat as origin_lat,
+        dh.home_lng as origin_lng,
         COUNT(DISTINCT a.date) as visit_days,
         AVG(a.dwell_minutes) as avg_dwell,
         SUM(a.ping_count) as total_pings
       FROM at_poi a
-      INNER JOIN first_pings fp ON a.ad_id = fp.ad_id AND a.date = fp.date
-      GROUP BY a.ad_id, fp.origin_lat, fp.origin_lng
+      INNER JOIN device_homes dh ON a.ad_id = dh.ad_id
+      GROUP BY a.ad_id, dh.home_lat, dh.home_lng
     )
     SELECT
-      ROUND(origin_lat, ${PREC}) as origin_lat,
-      ROUND(origin_lng, ${PREC}) as origin_lng,
+      origin_lat,
+      origin_lng,
       COUNT(DISTINCT ad_id) as unique_devices,
       SUM(visit_days) as total_visit_days,
       AVG(avg_dwell) as avg_dwell_minutes,
       AVG(visit_days) as avg_frequency
     FROM device_stats
-    WHERE origin_lat IS NOT NULL
-    GROUP BY 1, 2
+    GROUP BY origin_lat, origin_lng
     ORDER BY unique_devices DESC
     LIMIT 50000`;
 }
