@@ -168,6 +168,11 @@ function targetDailyCTE(table: string, f: Filters): string {
 
 /**
  * Build Sankey query: aggregate before/after POI category visits across ALL visitors.
+ *
+ * "before/after" = pings where poi_ids is empty (device is NOT at the target POI).
+ * Direction is determined by timestamp relative to the visit block.
+ * This avoids the problem where arrival=00:07 (device lives near POI) which would
+ * make ALL pings "during" under a timestamp-only approach.
  */
 function buildSankeySQL(table: string, f: Filters): string {
   return `
@@ -186,7 +191,7 @@ function buildSankeySQL(table: string, f: Filters): string {
       WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        AND (p.utc_timestamp < td.arrival OR p.utc_timestamp > td.departure)
+        AND (p.poi_ids IS NULL OR CARDINALITY(p.poi_ids) = 0)
     ),
     poi_grid AS (
       SELECT category,
@@ -249,7 +254,7 @@ function buildSampleSQL(table: string, f: Filters): string {
       WHERE TRY_CAST(p.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        AND (p.utc_timestamp < td.arrival OR p.utc_timestamp > td.departure)
+        AND (p.poi_ids IS NULL OR CARDINALITY(p.poi_ids) = 0)
     ),
     poi_grid AS (
       SELECT category,
