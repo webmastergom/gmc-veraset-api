@@ -647,11 +647,28 @@ export async function POST(
         }
       }
 
+      // Surface diagnostic info in the result so the UI can show it
+      let diagnostic: any = undefined;
+      if ((state as any).countQueryId) {
+        try {
+          const dRes = await fetchQueryResults((state as any).countQueryId);
+          const d = dRes.rows[0] || {};
+          diagnostic = {
+            gmcPoisForCountry: parseInt(d.gmc_pois_for_country, 10) || 0,
+            beforePings: parseInt(d.before_pings, 10) || 0,
+            afterPings: parseInt(d.after_pings, 10) || 0,
+            duringPings: parseInt(d.during_pings, 10) || 0,
+            ambientPings: parseInt(d.ambient_pings, 10) || 0,
+          };
+        } catch {}
+      }
+
       const result: RoutesResult = {
         sankey: sankeyFlows,
         sampleRoutes: sampleStops,
         totalVisitors,
-      };
+        ...(diagnostic ? { diagnostic } : {}),
+      } as any;
 
       state = { ...state, phase: 'done', result };
       await putConfig(stateKey, state, { compact: true });
