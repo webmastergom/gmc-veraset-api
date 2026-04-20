@@ -51,9 +51,10 @@ interface Filters {
 
 interface SankeyFlow {
   direction: 'before' | 'after';
-  category: string;
+  group_key: string;
+  group_label: string;
   devices: number;
-  visits: number;
+  pings: number;
 }
 
 interface SampleStop {
@@ -61,7 +62,8 @@ interface SampleStop {
   date: string;
   ts: string;
   direction: 'before' | 'during' | 'after';
-  category: string;
+  group_key: string;
+  group_label: string;
   dwell_minutes: number;
 }
 
@@ -69,6 +71,45 @@ interface RoutesResult {
   sankey: SankeyFlow[];
   sampleRoutes: SampleStop[];
   totalVisitors: number;
+}
+
+// ── Category → group mapping (must match GROUP_COLORS in sankey-chart + route-timeline)
+
+const CATEGORY_GROUPS: Record<string, { key: string; label: string }> = {};
+const GROUP_DEFS: Array<{ key: string; label: string; prefixes: string[] }> = [
+  { key: 'food_and_beverage', label: 'Food & Beverage', prefixes: ['restaurant', 'cafe', 'coffee', 'bar', 'pub', 'bakery', 'fast_food', 'food', 'pizza', 'ice_cream', 'juice', 'deli', 'brewery', 'winery', 'donut', 'bagel', 'sandwich', 'burrito', 'sushi', 'ramen', 'thai', 'chinese', 'italian', 'mexican', 'indian', 'steak', 'seafood', 'bbq', 'brunch', 'breakfast', 'lunch', 'dinner', 'tapas', 'bistro', 'brasserie', 'cerveceria', 'tavern'] },
+  { key: 'retail', label: 'Retail & Shopping', prefixes: ['store', 'shop', 'mall', 'supermarket', 'grocery', 'market', 'boutique', 'outlet', 'clothing', 'fashion', 'shoe', 'jewel', 'gift', 'book', 'toy', 'hardware', 'florist', 'department_store', 'convenience', 'discount', 'thrift', 'antique', 'retail'] },
+  { key: 'automotive', label: 'Automotive', prefixes: ['gas_station', 'fuel', 'car_wash', 'car_dealer', 'car_repair', 'auto', 'parking', 'ev_charging', 'tire', 'motor', 'vehicle'] },
+  { key: 'beauty', label: 'Beauty & Personal Care', prefixes: ['beauty', 'salon', 'spa', 'barber', 'hair', 'nail', 'cosmetic', 'tattoo', 'massage', 'wellness'] },
+  { key: 'healthcare', label: 'Healthcare', prefixes: ['hospital', 'clinic', 'doctor', 'dentist', 'pharmacy', 'optician', 'veterinar', 'medical', 'health', 'urgent_care', 'lab'] },
+  { key: 'finance', label: 'Finance', prefixes: ['bank', 'atm', 'insurance', 'accounting', 'tax', 'financial', 'credit_union', 'money'] },
+  { key: 'sports', label: 'Sports & Fitness', prefixes: ['gym', 'fitness', 'sport', 'yoga', 'swimming', 'tennis', 'golf', 'stadium', 'arena', 'athletic'] },
+  { key: 'entertainment', label: 'Entertainment', prefixes: ['cinema', 'movie', 'theater', 'theatre', 'museum', 'gallery', 'amusement', 'zoo', 'aquarium', 'nightclub', 'karaoke', 'bowling', 'arcade', 'escape_room', 'concert', 'casino'] },
+  { key: 'accommodation', label: 'Accommodation', prefixes: ['hotel', 'motel', 'hostel', 'resort', 'inn', 'bed_and_breakfast', 'lodging', 'campground', 'airbnb'] },
+  { key: 'education', label: 'Education', prefixes: ['school', 'university', 'college', 'library', 'tutor', 'academy', 'kindergarten', 'preschool', 'training'] },
+  { key: 'transport', label: 'Transport', prefixes: ['airport', 'train_station', 'bus_station', 'subway', 'metro', 'ferry', 'taxi', 'transit', 'rail', 'port'] },
+  { key: 'attractions', label: 'Attractions', prefixes: ['park', 'garden', 'beach', 'monument', 'landmark', 'temple', 'church', 'mosque', 'synagogue', 'cathedral', 'castle', 'palace', 'fountain', 'plaza', 'square', 'viewpoint', 'trail', 'national_park'] },
+  { key: 'government', label: 'Government', prefixes: ['government', 'post_office', 'police', 'fire_station', 'courthouse', 'embassy', 'consulate', 'city_hall', 'municipal'] },
+];
+
+// Build lookup
+for (const g of GROUP_DEFS) {
+  for (const p of g.prefixes) {
+    CATEGORY_GROUPS[p] = { key: g.key, label: g.label };
+  }
+}
+
+function catToGroup(category: string): { key: string; label: string } {
+  const lower = (category || '').toLowerCase().trim();
+  // Direct match
+  if (CATEGORY_GROUPS[lower]) return CATEGORY_GROUPS[lower];
+  // Prefix match
+  for (const g of GROUP_DEFS) {
+    for (const p of g.prefixes) {
+      if (lower.includes(p)) return { key: g.key, label: g.label };
+    }
+  }
+  return { key: 'other', label: category || 'Other' };
 }
 
 // ── SQL builders ─────────────────────────────────────────────────────
@@ -398,44 +439,62 @@ export async function POST(
 
     // ── Reading ───────────────────────────────────────────────
     if (state.phase === 'reading') {
-      // Parse Sankey
+      // Parse Sankey — aggregate raw categories into groups
       let sankeyFlows: SankeyFlow[] = [];
       let totalVisitors = 0;
       if (state.sankeyQId) {
         try {
           const r = await fetchQueryResults(state.sankeyQId);
-          sankeyFlows = r.rows.map((row: any) => ({
-            direction: row.direction as 'before' | 'after',
-            category: row.category || 'unknown',
-            devices: parseInt(row.devices, 10) || 0,
-            visits: parseInt(row.visits, 10) || 0,
-          }));
-          // totalVisitors from target_daily count
+          const grouped = new Map<string, SankeyFlow>();
+          for (const row of r.rows) {
+            const dir = row.direction as 'before' | 'after';
+            const g = catToGroup(row.category || 'unknown');
+            const mk = `${dir}:${g.key}`;
+            const ex = grouped.get(mk);
+            if (ex) {
+              ex.devices += parseInt(row.devices, 10) || 0;
+              ex.pings += parseInt(row.visits, 10) || 0;
+            } else {
+              grouped.set(mk, {
+                direction: dir,
+                group_key: g.key,
+                group_label: g.label,
+                devices: parseInt(row.devices, 10) || 0,
+                pings: parseInt(row.visits, 10) || 0,
+              });
+            }
+          }
+          sankeyFlows = Array.from(grouped.values()).sort((a, b) => b.devices - a.devices);
           totalVisitors = Math.max(...sankeyFlows.map(f => f.devices), 0);
+          console.log(`[ROUTES] Sankey: ${r.rows.length} raw categories → ${sankeyFlows.length} groups`);
         } catch (err: any) {
           console.error('[ROUTES] Sankey read:', err.message);
         }
       }
 
-      // Parse Sample
+      // Parse Sample — map categories to groups for timeline colors
       let sampleStops: SampleStop[] = [];
       if (state.sampleQId) {
         try {
           const r = await fetchQueryResults(state.sampleQId);
-          sampleStops = r.rows.map((row: any) => ({
-            ad_id: row.ad_id,
-            date: row.date,
-            ts: row.first_ts,
-            direction: row.direction as 'before' | 'during' | 'after',
-            category: row.category || 'unknown',
-            dwell_minutes: parseFloat(row.dwell_min) || 0,
-          }));
+          sampleStops = r.rows.map((row: any) => {
+            const isTarget = row.category === 'target' || row.direction === 'during';
+            const g = isTarget ? { key: 'target', label: 'Target POI' } : catToGroup(row.category || 'unknown');
+            return {
+              ad_id: row.ad_id,
+              date: row.date,
+              ts: row.first_ts,
+              direction: row.direction as 'before' | 'during' | 'after',
+              group_key: g.key,
+              group_label: g.label,
+              dwell_minutes: parseFloat(row.dwell_min) || 0,
+            };
+          });
         } catch (err: any) {
           console.error('[ROUTES] Sample read:', err.message);
         }
       }
 
-      // Get total visitors from a quick count if sankey didn't provide it
       if (totalVisitors === 0 && sampleStops.length > 0) {
         totalVisitors = new Set(sampleStops.filter(s => s.direction === 'during').map(s => s.ad_id)).size;
       }
