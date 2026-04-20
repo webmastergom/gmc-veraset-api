@@ -352,6 +352,23 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
   // 5. Aggregate by timing (before/after) + category
 
   const GRID_STEP = 0.01; // ~1.1km geohash grid
+  const BBOX_MARGIN = 0.5; // ~55km margin around POIs for nearby-activity search
+
+  // Compute geographic bounding box from POI coords to limit the Overture POI
+  // table scan and the all_pings scan. Without this, we join millions of global
+  // POIs × millions of pings → billions of Haversine computations → 1400s+ queries.
+  let bboxFilter = '';
+  let bboxFilterPings = '';
+  if (poiCoords?.length) {
+    const lats = poiCoords.map(p => p.lat);
+    const lngs = poiCoords.map(p => p.lng);
+    const minLat = Math.min(...lats) - BBOX_MARGIN;
+    const maxLat = Math.max(...lats) + BBOX_MARGIN;
+    const minLng = Math.min(...lngs) - BBOX_MARGIN;
+    const maxLng = Math.max(...lngs) + BBOX_MARGIN;
+    bboxFilter = `AND latitude BETWEEN ${minLat} AND ${maxLat} AND longitude BETWEEN ${minLng} AND ${maxLng}`;
+    bboxFilterPings = `AND lat BETWEEN ${minLat} AND ${maxLat} AND lng BETWEEN ${minLng} AND ${maxLng}`;
+  }
 
   // Optional min-visits filter CTE
   const mobilityVisitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
@@ -481,6 +498,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
       INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
       WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
         AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
+        ${bboxFilterPings}
     ),
     poi_buckets AS (
       SELECT
@@ -494,6 +512,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
       WHERE category IS NOT NULL
+        ${bboxFilter}
     ),
     matched AS (
       SELECT
