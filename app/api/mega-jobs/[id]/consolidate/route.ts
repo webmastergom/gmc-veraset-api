@@ -660,16 +660,54 @@ export async function POST(
 
         // MAIDs: kick off a non-blocking SELECT to materialize the CTAS Parquet data as CSV
         // in athena-results/. Store the new queryId so the download endpoint can serve the CSV.
-        // For typical sizes (<10M MAIDs) this finishes within seconds — by the time the user
-        // clicks "Download MAIDs" it's ready. If not, the download endpoint will 404 and
-        // the user can retry.
+        // ALSO register the maids CTAS table as a 'plain' contribution to Master MAIDs for
+        // the megajob's country, so it appears alongside dataset/category contributions.
         if (state.queries?.maids) {
+          const maidsTable = state.queries.maids.ctasTable;
           try {
-            const selectQueryId = await startQueryAsync(`SELECT ad_id FROM ${state.queries.maids.ctasTable}`);
+            const selectQueryId = await startQueryAsync(`SELECT ad_id FROM ${maidsTable}`);
             const csvKey = `athena-results/${selectQueryId}.csv`;
             reportKeys.maids = csvKey;
             state.maidsCsvKey = csvKey;
             console.log(`[MEGA] MAIDs CSV materialization started: queryId=${selectQueryId}, csv=${csvKey}`);
+
+            // Register with Master MAIDs (skip if no country set on megajob)
+            if (megaJob.country) {
+              try {
+                const { runQuery } = await import('@/lib/athena');
+                const { registerAthenaContribution } = await import('@/lib/master-maids');
+                const countResult = await runQuery(`SELECT COUNT(DISTINCT ad_id) as cnt FROM ${maidsTable}`);
+                const maidCount = parseInt(String(countResult.rows[0]?.cnt)) || 0;
+
+                // Aggregate date range across synced sub-jobs
+                const fromDates: string[] = [];
+                const toDates: string[] = [];
+                for (const j of syncedJobs) {
+                  const r: any = (j as any).actualDateRange || (j as any).dateRange;
+                  if (r?.from) fromDates.push(r.from);
+                  if (r?.to) toDates.push(r.to);
+                }
+                const dateRange = fromDates.length && toDates.length
+                  ? { from: fromDates.sort()[0], to: toDates.sort().slice(-1)[0] }
+                  : { from: 'unknown', to: 'unknown' };
+
+                await registerAthenaContribution(
+                  megaJob.country,
+                  `mega-${id}`,        // distinct sourceDataset so it doesn't collide with dataset contributions
+                  'plain',              // attribute type — same as dataset 'plain' MAIDs
+                  '',                   // attribute value (empty for plain)
+                  maidsTable,
+                  `athena-temp/${maidsTable}/`,
+                  maidCount,
+                  dateRange,
+                );
+                console.log(`[MEGA] Registered Master MAIDs contribution: ${maidsTable} (${maidCount.toLocaleString()} MAIDs) for ${megaJob.country}`);
+              } catch (err: any) {
+                console.error('[MEGA] Failed to register Master MAIDs contribution:', err.message);
+              }
+            } else {
+              console.log(`[MEGA] Skipping Master MAIDs registration: no country set on megajob ${id}`);
+            }
           } catch (err: any) {
             console.error('[MEGA] Error starting MAIDs CSV materialization:', err.message);
           }
