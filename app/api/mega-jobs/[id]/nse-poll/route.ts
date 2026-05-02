@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { getMegaJob } from '@/lib/mega-jobs';
 import { getJob } from '@/lib/jobs';
-import { checkQueryStatus, ensureTableForDataset, runQueryViaS3, dropTempTable, cleanupTempS3 } from '@/lib/athena';
+import { checkQueryStatus, ensureTableForDataset, runQueryViaS3, dropTempTable, cleanupTempS3, startQueryAsync } from '@/lib/athena';
 import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import {
@@ -47,7 +47,7 @@ interface BracketResult {
 }
 
 interface NseExportState {
-  phase: 'querying' | 'polling' | 'geocoding' | 'done' | 'error';
+  phase: 'querying' | 'polling' | 'reading' | 'geocoding' | 'done' | 'error';
   queryId?: string;
   /** CTAS table name (Parquet results) — set when query is started via CTAS path. */
   ctasTable?: string;
@@ -55,6 +55,14 @@ interface NseExportState {
   runId?: string;
   /** External POI table (when poiCoords > MAX_INLINE_POIS). Cleaned up at the end. */
   poiTableRef?: string;
+  /**
+   * QueryId of the SELECT * that materializes the CTAS Parquet to a CSV in
+   * athena-results/. Reused across polls so we don't re-execute the SELECT
+   * every 4s (which was the symptom of NSE getting "stuck": each poll
+   * launched a fresh SELECT and ran out of Vercel function time before
+   * geocoding could finish).
+   */
+  selectQueryId?: string;
   country: string;
   megaJobId: string;
   error?: string;
@@ -216,13 +224,13 @@ export async function POST(
           return NextResponse.json({ phase: 'error', error: state.error });
         }
 
-        // SUCCEEDED → move to geocoding
-        state = { ...state, phase: 'geocoding' };
+        // SUCCEEDED → move to reading (kicks off SELECT * to materialize Parquet → CSV)
+        state = { ...state, phase: 'reading' };
         await putConfig(STATE_KEY(id), state, { compact: true });
 
         return NextResponse.json({
-          phase: 'geocoding',
-          progress: { step: 'geocoding', percent: 55, message: 'Query complete, reverse geocoding origins...' },
+          phase: 'reading',
+          progress: { step: 'reading', percent: 55, message: 'Query complete, materializing results...' },
         });
       } catch (err: any) {
         if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
@@ -235,47 +243,78 @@ export async function POST(
     }
 
     // ── Phase: geocoding + bracket matching ──────────────────────────
-    if (state.phase === 'geocoding' && state.queryId) {
-      // Read results: prefer CTAS table (new path), fall back to direct CSV (legacy state).
-      let rows: Array<Record<string, any>> = [];
-      if (state.ctasTable) {
-        console.log(`[MEGA-NSE-POLL] Reading results from CTAS table: ${state.ctasTable}`);
-        const result = await runQueryViaS3(`SELECT * FROM ${state.ctasTable}`);
-        rows = result.rows;
-        console.log(`[MEGA-NSE-POLL] CTAS returned ${rows.length} rows`);
-      } else {
-        // Legacy path: read direct CSV (for in-flight queries from before the CTAS migration)
-        const csvKey = `athena-results/${state.queryId}.csv`;
-        console.log(`[MEGA-NSE-POLL] Downloading results from S3 (legacy): ${csvKey}`);
-        const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-        const csvText = await csvObj.Body!.transformToString('utf-8');
-        const lines = csvText.split('\n');
-        for (let i = 1; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
-          const parts = line.replace(/"/g, '').split(',');
-          if (parts.length < 3) continue;
-          const [adId, lat, lng] = parts;
-          rows.push({ ad_id: adId, origin_lat: lat, origin_lng: lng });
-        }
+    // ── Phase: reading (kicks off SELECT * to materialize CTAS Parquet → CSV) ──
+    // Split out from geocoding so the (re-runnable) SELECT is launched once and
+    // we just poll it. Previously we re-executed runQueryViaS3 on every 4s frontend
+    // poll, hammering Athena and never reaching geocoding within the function timeout.
+    if (state.phase === 'reading' && state.ctasTable) {
+      // First entry: launch the SELECT. Subsequent entries: poll its status.
+      if (!state.selectQueryId) {
+        const qid = await startQueryAsync(`SELECT * FROM ${state.ctasTable}`);
+        console.log(`[MEGA-NSE-POLL] Started SELECT * to materialize CSV: ${qid}`);
+        state = { ...state, selectQueryId: qid };
+        await putConfig(STATE_KEY(id), state, { compact: true });
+        return NextResponse.json({
+          phase: 'reading',
+          progress: { step: 'reading', percent: 60, message: 'Materializing query result to CSV...' },
+        });
       }
+      const status = await checkQueryStatus(state.selectQueryId);
+      if (status.state === 'RUNNING' || status.state === 'QUEUED') {
+        return NextResponse.json({
+          phase: 'reading',
+          progress: { step: 'reading', percent: 65, message: 'Materializing query result to CSV...' },
+        });
+      }
+      if (status.state !== 'SUCCEEDED') {
+        state = { ...state, phase: 'error', error: status.error || 'SELECT failed' };
+        await putConfig(STATE_KEY(id), state, { compact: true });
+        return NextResponse.json({ phase: 'error', error: state.error });
+      }
+      // SUCCEEDED → advance to geocoding
+      state = { ...state, phase: 'geocoding' };
+      await putConfig(STATE_KEY(id), state, { compact: true });
+      return NextResponse.json({
+        phase: 'geocoding',
+        progress: { step: 'geocoding', percent: 70, message: 'Reverse geocoding origins...' },
+      });
+    }
 
-      // Pre-aggregate: group ad_ids by unique (lat,lng) coord
+    if (state.phase === 'geocoding' && state.selectQueryId) {
+      // The SELECT * succeeded — read its CSV directly from athena-results/ (no Athena re-exec).
+      // Each row now has shape: origin_lat, origin_lng, ad_ids (pipe-separated string from
+      // SQL-side ARRAY_AGG). For SV grid that's ~30k rows instead of 2.6M.
+      const csvKey = `athena-results/${state.selectQueryId}.csv`;
+      console.log(`[MEGA-NSE-POLL] Downloading materialized CSV: ${csvKey}`);
+      const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
+      const csvText = await csvObj.Body!.transformToString('utf-8');
+      const lines = csvText.split('\n');
+
+      // Pre-aggregate: coord → ad_ids list. The SQL already grouped by (lat, lng)
+      // so each line is one unique coord with all its ad_ids in column 3.
       const coordToAdIds = new Map<string, string[]>();
       let totalDevices = 0;
-      for (const row of rows) {
-        const adId = String(row.ad_id || '');
-        const lat = String(row.origin_lat ?? '');
-        const lng = String(row.origin_lng ?? '');
-        if (!adId || !lat || !lng) continue;
-        const coordKey = `${lat},${lng}`;
-        let arr = coordToAdIds.get(coordKey);
-        if (!arr) { arr = []; coordToAdIds.set(coordKey, arr); }
-        arr.push(adId);
-        totalDevices++;
+      let totalCoords = 0;
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        // Athena CSV: "lat","lng","ad1|ad2|ad3" — strip outer quotes per field
+        const parts = line.split(',');
+        if (parts.length < 3) continue;
+        const lat = parts[0].replace(/^"|"$/g, '');
+        const lng = parts[1].replace(/^"|"$/g, '');
+        // ad_ids may contain commas? No — uuid format, but the join uses '|' so commas
+        // only come from the CSV separator itself. Anything past index 2 belongs to ad_ids.
+        const adIdsField = parts.slice(2).join(',').replace(/^"|"$/g, '');
+        if (!lat || !lng || !adIdsField) continue;
+        const ids = adIdsField.split('|').filter(Boolean);
+        if (ids.length === 0) continue;
+        coordToAdIds.set(`${lat},${lng}`, ids);
+        totalCoords++;
+        totalDevices += ids.length;
       }
 
-      console.log(`[MEGA-NSE-POLL] ${totalDevices} devices → ${coordToAdIds.size} unique coords`);
+      console.log(`[MEGA-NSE-POLL] ${totalDevices} devices → ${totalCoords} unique coords (pre-aggregated by SQL)`);
 
       // Load NSE data
       const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country));
