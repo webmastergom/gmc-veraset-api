@@ -89,6 +89,10 @@ export interface MegaJob {
   // Consolidated report S3 keys
   consolidatedReports?: ConsolidatedReports;
 
+  // Free-form notes about the consolidation run (e.g. "mobility skipped because too many POIs")
+  // Surfaced in the megajob detail UI as an info banner.
+  consolidationNotes?: string[];
+
   // Error info
   error?: string;
 

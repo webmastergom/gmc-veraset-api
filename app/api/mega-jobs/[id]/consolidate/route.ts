@@ -234,18 +234,38 @@ export async function POST(
           }
         }
 
+        // Mobility query has a second spatial join against the global Overture POI catalog
+        // (lab_pois_gmc) which doesn't scale to country-grid POI counts (>5000).
+        // For dense grids the spatial join produces billions of intermediate rows and
+        // can't finish within Athena's 30-min query limit. Skip it instead of letting it
+        // time out — the other 8 reports give 90% of the analytics value.
+        const MOBILITY_MAX_POIS = 5000;
+        const skipMobility = poiCoords.length > MOBILITY_MAX_POIS;
+        if (skipMobility) {
+          console.log(`[MEGA] Skipping mobility query: ${poiCoords.length} POIs > ${MOBILITY_MAX_POIS} threshold (would exceed Athena 30-min limit)`);
+        }
+
         // Start all queries in parallel as CTAS (no 30-min timeout, results in Parquet at s3://.../athena-temp/{ctasTable}/)
         const [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
           startConsolidatedVisitsQuery(id, runId, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
           startConsolidatedODQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
           startConsolidatedHourlyQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
           startConsolidatedCatchmentQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
-          startConsolidatedMobilityQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          skipMobility
+            ? Promise.resolve(undefined)
+            : startConsolidatedMobilityQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
           startConsolidatedTemporalQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
           startConsolidatedTotalDevicesQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
           startConsolidatedMAIDsQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
           poiCoords.length > 0 ? startConsolidatedAffinityQuery(id, runId, syncedJobs, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
         ]);
+
+        // If mobility was skipped, surface the reason so the UI can show an explanation
+        if (skipMobility) {
+          await updateMegaJob(id, {
+            consolidationNotes: [`Mobility analysis skipped: POI count (${poiCoords.length.toLocaleString()}) exceeds ${MOBILITY_MAX_POIS.toLocaleString()} threshold. For dense grids the spatial join against the global POI catalog can't finish within Athena's query limits.`],
+          } as any);
+        }
 
         state = {
           phase: 'polling',

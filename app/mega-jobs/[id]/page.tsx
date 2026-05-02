@@ -544,7 +544,7 @@ export default function MegaJobDetailPage() {
             )}
 
             {/* 6. Mobility Trends (POI categories ±2h) — Before & After */}
-            {mobilityReport?.categories && (
+            {mobilityReport?.categories ? (
               <CollapsibleCard
                 title="Mobility Trends (±2h of visit)"
                 icon={<Activity className="h-4 w-4" />}
@@ -563,6 +563,16 @@ export default function MegaJobDetailPage() {
                     </p>
                     <MobilityBar data={mobilityReport.after || mobilityReport.categories} />
                   </div>
+                </div>
+              </CollapsibleCard>
+            ) : (megaJob?.consolidationNotes || []).some((n: string) => n.toLowerCase().includes('mobility')) && (
+              <CollapsibleCard
+                title="Mobility Trends (±2h of visit) — not available"
+                icon={<Activity className="h-4 w-4" />}
+                defaultOpen={true}
+              >
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-200">
+                  {(megaJob?.consolidationNotes || []).find((n: string) => n.toLowerCase().includes('mobility'))}
                 </div>
               </CollapsibleCard>
             )}
