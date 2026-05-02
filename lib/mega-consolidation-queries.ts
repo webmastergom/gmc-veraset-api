@@ -781,6 +781,33 @@ export async function startConsolidatedMobilityQuery(
       WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
         AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
     ),
+    -- Restrict the global Overture POI catalog (lab_pois_gmc has POIs from many
+    -- countries) to a bbox around the target POIs + 0.5° buffer (~55 km, enough
+    -- for ±120 min of travel). For a country-scale POI grid this naturally
+    -- limits to that country, dropping the candidate set from millions to
+    -- thousands.
+    ${poiCoords?.length ? `
+    mob_poi_bounds AS (
+      SELECT
+        MIN(poi_lat) - 0.5 as min_lat,
+        MAX(poi_lat) + 0.5 as max_lat,
+        MIN(poi_lng) - 0.5 as min_lng,
+        MAX(poi_lng) + 0.5 as max_lng
+      FROM _atp_target_pois
+    ),
+    mob_poi_filtered AS (
+      SELECT p.id, p.name, p.category, p.latitude, p.longitude
+      FROM ${POI_TABLE} p
+      CROSS JOIN mob_poi_bounds b
+      WHERE p.category IS NOT NULL
+        AND p.latitude  BETWEEN b.min_lat AND b.max_lat
+        AND p.longitude BETWEEN b.min_lng AND b.max_lng
+    ),` : `
+    mob_poi_filtered AS (
+      SELECT id, name, category, latitude, longitude
+      FROM ${POI_TABLE}
+      WHERE category IS NOT NULL
+    ),`}
     poi_buckets AS (
       SELECT
         id as poi_id,
@@ -790,10 +817,9 @@ export async function startConsolidatedMobilityQuery(
         longitude as poi_lng,
         CAST(FLOOR(latitude / ${GRID_STEP}) AS BIGINT) + dlat as lat_bucket,
         CAST(FLOOR(longitude / ${GRID_STEP}) AS BIGINT) + dlng as lng_bucket
-      FROM ${POI_TABLE}
+      FROM mob_poi_filtered
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
-      WHERE category IS NOT NULL
     ),
     matched AS (
       SELECT
