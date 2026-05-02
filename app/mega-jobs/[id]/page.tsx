@@ -26,6 +26,7 @@ import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
 import { MovementMap } from '@/components/analysis/movement-map'
 import { MegaNseModal } from '@/components/mega-jobs/nse-modal'
 import { MegaCategoryMaidModal } from '@/components/mega-jobs/category-maid-modal'
+import { MegaCountrySelector } from '@/components/mega-jobs/country-selector'
 
 const statusColors: Record<string, string> = {
   planning: 'bg-blue-500/20 text-blue-400',
@@ -451,6 +452,14 @@ export default function MegaJobDetailPage() {
               <Button variant="outline" size="sm" onClick={() => setCategoryModalOpen(true)}>
                 <Target className="h-4 w-4 mr-1" /> MAIDs by Category
               </Button>
+              <div className="flex items-center gap-2 ml-2 pl-2 border-l border-border">
+                <span className="text-xs text-muted-foreground">Country:</span>
+                <MegaCountrySelector
+                  megaJobId={id}
+                  initialCountry={megaJob?.country || null}
+                  onChanged={(c) => setMegaJob((prev: any) => prev ? { ...prev, country: c } : prev)}
+                />
+              </div>
             </div>
 
             {/* 2. Daily Activity Chart */}
