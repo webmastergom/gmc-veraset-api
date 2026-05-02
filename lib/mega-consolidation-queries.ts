@@ -1151,10 +1151,10 @@ export async function startConsolidatedNseQuery(
     )`;
   }
 
-  // Pre-aggregate by rounded (lat, lng) so the geocoding phase only has to
-  // process ~30k rows instead of one row per device (~2.6M for SV grid).
-  // ad_ids is emitted as a comma-separated string so we don't need to parse
-  // an Athena ARRAY into JS — keeps the CSV trivial to read.
+  // One row per device. ARRAY_AGG'ing ad_ids per coord exceeds Athena's
+  // 32 MB per-cell limit for dense urban coords (e.g. downtown San Salvador
+  // can have 100k+ devices in one ~11km bucket). The geocoding phase aggregates
+  // by coord in-memory after streaming the CSV, which is cheap.
   const sql = `
     WITH
     ${visitorsCTE},
@@ -1167,13 +1167,11 @@ export async function startConsolidatedNseQuery(
       INNER JOIN poi_visitors v ON vp.ad_id = v.ad_id
       GROUP BY v.ad_id
     )
-    SELECT
+    SELECT DISTINCT ad_id,
       ROUND(origin_lat, 1) as origin_lat,
-      ROUND(origin_lng, 1) as origin_lng,
-      ARRAY_JOIN(ARRAY_AGG(DISTINCT ad_id), '|') as ad_ids
+      ROUND(origin_lng, 1) as origin_lng
     FROM first_pings
     WHERE origin_lat IS NOT NULL
-    GROUP BY ROUND(origin_lat, 1), ROUND(origin_lng, 1)
   `;
 
   console.log(`[MEGA-NSE] Starting NSE query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);

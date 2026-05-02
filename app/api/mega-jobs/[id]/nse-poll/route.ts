@@ -282,39 +282,34 @@ export async function POST(
 
     if (state.phase === 'geocoding' && state.selectQueryId) {
       // The SELECT * succeeded — read its CSV directly from athena-results/ (no Athena re-exec).
-      // Each row now has shape: origin_lat, origin_lng, ad_ids (pipe-separated string from
-      // SQL-side ARRAY_AGG). For SV grid that's ~30k rows instead of 2.6M.
+      // Each row is (ad_id, origin_lat, origin_lng) — we aggregate to unique coords here
+      // (couldn't do it in SQL because the resulting ARRAY_JOIN strings exceeded Athena's
+      // 32 MB per-cell limit for dense urban areas).
       const csvKey = `athena-results/${state.selectQueryId}.csv`;
       console.log(`[MEGA-NSE-POLL] Downloading materialized CSV: ${csvKey}`);
       const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
       const csvText = await csvObj.Body!.transformToString('utf-8');
       const lines = csvText.split('\n');
 
-      // Pre-aggregate: coord → ad_ids list. The SQL already grouped by (lat, lng)
-      // so each line is one unique coord with all its ad_ids in column 3.
+      // Pre-aggregate in-memory: group ad_ids by unique (lat, lng) coord.
       const coordToAdIds = new Map<string, string[]>();
       let totalDevices = 0;
-      let totalCoords = 0;
       for (let i = 1; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
-        // Athena CSV: "lat","lng","ad1|ad2|ad3" — strip outer quotes per field
-        const parts = line.split(',');
+        // Athena CSV format: "ad_id","lat","lng"
+        const parts = line.split(',').map(p => p.replace(/^"|"$/g, ''));
         if (parts.length < 3) continue;
-        const lat = parts[0].replace(/^"|"$/g, '');
-        const lng = parts[1].replace(/^"|"$/g, '');
-        // ad_ids may contain commas? No — uuid format, but the join uses '|' so commas
-        // only come from the CSV separator itself. Anything past index 2 belongs to ad_ids.
-        const adIdsField = parts.slice(2).join(',').replace(/^"|"$/g, '');
-        if (!lat || !lng || !adIdsField) continue;
-        const ids = adIdsField.split('|').filter(Boolean);
-        if (ids.length === 0) continue;
-        coordToAdIds.set(`${lat},${lng}`, ids);
-        totalCoords++;
-        totalDevices += ids.length;
+        const [adId, lat, lng] = parts;
+        if (!adId || !lat || !lng) continue;
+        const coordKey = `${lat},${lng}`;
+        let arr = coordToAdIds.get(coordKey);
+        if (!arr) { arr = []; coordToAdIds.set(coordKey, arr); }
+        arr.push(adId);
+        totalDevices++;
       }
 
-      console.log(`[MEGA-NSE-POLL] ${totalDevices} devices → ${totalCoords} unique coords (pre-aggregated by SQL)`);
+      console.log(`[MEGA-NSE-POLL] ${totalDevices} devices → ${coordToAdIds.size} unique coords`);
 
       // Load NSE data
       const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country));
