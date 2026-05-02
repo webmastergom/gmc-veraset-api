@@ -278,8 +278,16 @@ function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
 }
 
 /**
- * Build the at-POI pings CTE using spatial proximity.
- * Uses a bounding box pre-filter (~0.01° ≈ 1.1km) before Haversine distance calc.
+ * Build the at-POI pings CTE using a grid-bucket spatial join.
+ *
+ * Strategy: bucket both pings and POIs into ~1.1 km grid cells (GRID_STEP=0.01°).
+ * For each POI, expand to 9 surrounding cells (3x3) so radius search up to
+ * ~1.1 km is covered. Then INNER JOIN on (lat_bucket, lng_bucket) — Athena uses
+ * a hash join, which is O(N + M) instead of CROSS JOIN's O(N × M). Haversine
+ * distance is only computed on the small set of bucket-matched candidates.
+ *
+ * For 25k POIs × 12 GB pings, this drops query runtime from ~30 min (timeout)
+ * to a few minutes.
  *
  * If `poiTableRef` is provided, target_pois reads from that external table
  * (used when poiCoords > MAX_INLINE_POIS to avoid Athena's SQL size limit).
@@ -291,18 +299,39 @@ function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTable
     : buildTargetPoisValues(poiCoords);
   return `
     target_pois AS (
-      SELECT * FROM ${targetPoisSource}
+      SELECT
+        poi_lat,
+        poi_lng,
+        poi_radius_m,
+        CAST(FLOOR(poi_lat / ${GRID_STEP}) AS BIGINT) as base_lat_bucket,
+        CAST(FLOOR(poi_lng / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
+      FROM ${targetPoisSource}
+    ),
+    poi_buckets AS (
+      SELECT poi_lat, poi_lng, poi_radius_m,
+        base_lat_bucket + dlat as lat_bucket,
+        base_lng_bucket + dlng as lng_bucket
+      FROM target_pois
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
+      CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
+    ),
+    pings_bucketed AS (
+      SELECT
+        p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng,
+        CAST(FLOOR(p.lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
+        CAST(FLOOR(p.lng / ${GRID_STEP}) AS BIGINT) as lng_bucket
+      FROM ${allPingsCte} p
     ),
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
-      FROM ${allPingsCte} p
-      CROSS JOIN target_pois tp
-      WHERE ABS(p.lat - tp.poi_lat) < 0.01
-        AND ABS(p.lng - tp.poi_lng) < 0.02
-        AND 111320 * SQRT(
-          POW(p.lat - tp.poi_lat, 2) +
-          POW((p.lng - tp.poi_lng) * COS(RADIANS((p.lat + tp.poi_lat) / 2)), 2)
-        ) <= tp.poi_radius_m
+      FROM pings_bucketed p
+      INNER JOIN poi_buckets pb
+        ON p.lat_bucket = pb.lat_bucket
+        AND p.lng_bucket = pb.lng_bucket
+      WHERE 111320 * SQRT(
+          POW(p.lat - pb.poi_lat, 2) +
+          POW((p.lng - pb.poi_lng) * COS(RADIANS((p.lat + pb.poi_lat) / 2)), 2)
+        ) <= pb.poi_radius_m
     )`;
 }
 
