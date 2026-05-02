@@ -226,6 +226,9 @@ const geocodeCache = new Map<string, { country: string; result: NormalizedProps 
 const MAX_CACHE_SIZE = 50000;
 
 // ── GeoJSON loading ────────────────────────────────────────────────────
+// Cache version bump (2026-05-02): SV.geojson updated to 266 features with
+// 6-digit postal codes (was 48 features w/ 5-digit). Forces lambda redeploy
+// so any in-process feature cache from previous invocations gets discarded.
 
 const GEOJSON_DIR = path.join(process.cwd(), 'data', 'geojson');
 const S3_BUCKET = process.env.S3_BUCKET || 'garritz-veraset-data-us-west-2';
