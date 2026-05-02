@@ -821,36 +821,33 @@ export async function startConsolidatedMobilityQuery(
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
     ),
+    -- Match nearby pings to POIs via grid bucket join + inline distance filter.
+    -- DISTINCT collapses repeated matches per (ad_id, date, timing, category)
+    -- before the final GROUP BY — this avoids the expensive ROW_NUMBER window
+    -- function over millions of rows that the previous version used to pick
+    -- the "closest POI" per match (the closest-POI info was never surfaced
+    -- in the UI, so picking it was wasted work).
     matched AS (
-      SELECT
+      SELECT DISTINCT
         p.ad_id,
         p.date,
         p.timing,
-        b.category,
-        b.poi_name,
-        111320 * SQRT(
-          POW(p.lat - b.poi_lat, 2) +
-          POW((p.lng - b.poi_lng) * COS(RADIANS((p.lat + b.poi_lat) / 2)), 2)
-        ) as distance_m
+        b.category
       FROM nearby_pings p
       INNER JOIN poi_buckets b
         ON p.lat_bucket = b.lat_bucket
         AND p.lng_bucket = b.lng_bucket
-    ),
-    closest AS (
-      SELECT
-        ad_id, date, timing, category, poi_name, distance_m,
-        ROW_NUMBER() OVER (PARTITION BY ad_id, date, timing, category ORDER BY distance_m) as rn
-      FROM matched
-      WHERE distance_m <= 200
+      WHERE 111320 * SQRT(
+          POW(p.lat - b.poi_lat, 2) +
+          POW((p.lng - b.poi_lng) * COS(RADIANS((p.lat + b.poi_lat) / 2)), 2)
+        ) <= 200
     )
     SELECT
       timing,
       category,
       COUNT(DISTINCT CONCAT(ad_id, '-', date)) as device_days,
-      COUNT(*) as hits
-    FROM closest
-    WHERE rn = 1
+      COUNT(*) as hits  -- one hit per (device, day, timing, category); UI ignores this field
+    FROM matched
     GROUP BY timing, category
     ORDER BY timing, device_days DESC
   `;
