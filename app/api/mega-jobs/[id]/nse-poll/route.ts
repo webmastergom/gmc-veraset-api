@@ -8,6 +8,10 @@ import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import {
   startConsolidatedNseQuery,
   extractPoiCoords,
+  materializePoiCoordsTable,
+  dropPoiCoordsTable,
+  poiCoordsTablePrefix,
+  MAX_INLINE_POIS,
   type DwellFilter,
 } from '@/lib/mega-consolidation-queries';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
@@ -47,6 +51,10 @@ interface NseExportState {
   queryId?: string;
   /** CTAS table name (Parquet results) — set when query is started via CTAS path. */
   ctasTable?: string;
+  /** Per-run id used to namespace CTAS tables (avoids collisions on retry). */
+  runId?: string;
+  /** External POI table (when poiCoords > MAX_INLINE_POIS). Cleaned up at the end. */
+  poiTableRef?: string;
   country: string;
   megaJobId: string;
   error?: string;
@@ -137,14 +145,40 @@ export async function POST(
 
       console.log(`[MEGA-NSE-POLL] Starting for mega-job ${id}, country=${country}, ${syncedJobs.length} sub-jobs, ${poiCoords.length} POI coords`);
 
+      // Per-run id so CTAS tables never collide with leftover ones
+      const runId = Date.now().toString(36);
+
+      // Materialize POIs as external table when over inline limit (e.g. 25k POI grid)
+      let poiTableRef: string | undefined;
+      if (poiCoords.length > MAX_INLINE_POIS) {
+        try {
+          poiTableRef = await materializePoiCoordsTable(id, runId, poiCoords);
+          console.log(`[MEGA-NSE-POLL] Materialized ${poiCoords.length} POIs to ${poiTableRef}`);
+        } catch (err: any) {
+          console.error('[MEGA-NSE-POLL] Failed to materialize POI table:', err.message);
+          // Continue without it — query will fail gracefully if POIs were needed
+        }
+      }
+
       const handle = await startConsolidatedNseQuery(
         id,
+        runId,
         syncedJobs,
         undefined, // poiIds
         poiCoords.length > 0 ? poiCoords : undefined,
+        undefined, // dwell
+        poiTableRef,
       );
 
-      state = { phase: 'polling', queryId: handle.queryId, ctasTable: handle.ctasTable, country, megaJobId: id };
+      state = {
+        phase: 'polling',
+        queryId: handle.queryId,
+        ctasTable: handle.ctasTable,
+        runId,
+        poiTableRef,
+        country,
+        megaJobId: id,
+      };
       await putConfig(STATE_KEY(id), state, { compact: true });
 
       return NextResponse.json({
@@ -337,10 +371,15 @@ export async function POST(
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[MEGA-NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
 
-      // Cleanup CTAS temp table + S3 Parquet files (fire-and-forget)
+      // Cleanup CTAS temp table + POI temp table + their S3 artifacts (fire-and-forget)
       if (state.ctasTable) {
         const t = state.ctasTable;
         Promise.all([dropTempTable(t), cleanupTempS3(t)]).catch(() => {});
+      }
+      if (state.poiTableRef && state.runId) {
+        const ref = state.poiTableRef;
+        const prefix = poiCoordsTablePrefix(id, state.runId);
+        dropPoiCoordsTable(ref, prefix).catch(() => {});
       }
 
       state = { ...state, phase: 'done', brackets };

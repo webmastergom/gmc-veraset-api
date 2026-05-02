@@ -12,8 +12,10 @@
  * POI coords come from job.verasetPayload.geo_radius[] or job.externalPois[].
  */
 
-import { getTableName, startQueryAsync, startCTASAsync, tempTableName } from './athena';
+import { getTableName, startQueryAsync, startCTASAsync, tempTableName, runQuery, dropTempTable, cleanupTempS3 } from './athena';
 import { type Job } from './jobs';
+import { PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { s3Client, BUCKET } from './s3-config';
 
 /**
  * Result returned by every consolidated query: the running queryId and the
@@ -33,15 +35,128 @@ export interface ConsolidatedQueryHandle {
  * Wrap a SELECT statement in CTAS and start it asynchronously.
  * Returns both the queryId (for polling) and the ctasTable (for fetching results
  * after the CTAS finishes).
+ *
+ * `runId` makes table names unique per consolidation run so re-consolidations
+ * never collide with leftover tables (Athena would reject CREATE TABLE if it
+ * already exists in the catalog).
  */
 async function startAsCTAS(
   megaJobId: string,
+  runId: string,
   queryName: string,
   selectSql: string,
 ): Promise<ConsolidatedQueryHandle> {
-  const ctasTable = tempTableName(`mc_${queryName}`, megaJobId);
+  const ctasTable = tempTableName(`mc_${queryName}`, `${megaJobId}_${runId}`);
   const queryId = await startCTASAsync(selectSql, ctasTable);
   return { queryId, ctasTable };
+}
+
+// ── POI materialization (for queries with > MAX_INLINE_POIS coords) ──────
+
+/**
+ * Athena's max query size is ~256 KB. Inlining 25k POIs as VALUES generates
+ * a >1 MB SQL string, so we materialize them as an external CSV-backed table
+ * once per consolidation run and reference it by name in spatial joins.
+ *
+ * Threshold of 1000 keeps small jobs on the cheap inline path (~50 KB SQL).
+ */
+export const MAX_INLINE_POIS = 1000;
+
+const POI_TEMP_PREFIX = 'poi-temp';
+
+/**
+ * Build the S3 prefix where the POI CSV for a given run lives.
+ * Caller uses this prefix for cleanup at the end of consolidation.
+ */
+export function poiCoordsTablePrefix(megaJobId: string, runId: string): string {
+  return `${POI_TEMP_PREFIX}/${megaJobId}_${runId}`;
+}
+
+/**
+ * Build the Athena table name that backs the materialized POI CSV.
+ */
+export function poiCoordsTableName(megaJobId: string, runId: string): string {
+  return tempTableName('mc_pois', `${megaJobId}_${runId}`);
+}
+
+/**
+ * Materialize POI coordinates as an Athena external table backed by a CSV in
+ * S3. Returns the table name to use in spatial joins (instead of inline VALUES).
+ *
+ * Used when poiCoords.length > MAX_INLINE_POIS to avoid Athena's 256 KB SQL limit.
+ */
+export async function materializePoiCoordsTable(
+  megaJobId: string,
+  runId: string,
+  poiCoords: PoiCoord[],
+): Promise<string> {
+  const tableName = poiCoordsTableName(megaJobId, runId);
+  const s3Prefix = poiCoordsTablePrefix(megaJobId, runId);
+  const csvKey = `${s3Prefix}/pois.csv`;
+
+  // Build CSV in memory (header + rows). For 25k POIs this is ~1 MB.
+  const lines = ['poi_lat,poi_lng,poi_radius_m'];
+  for (const c of poiCoords) {
+    lines.push(`${c.lat},${c.lng},${c.radiusM}`);
+  }
+  const csv = lines.join('\n');
+
+  await s3Client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: csvKey,
+    Body: csv,
+    ContentType: 'text/csv',
+  }));
+
+  // Drop any leftover table from a previous run with same name (idempotent)
+  try { await dropTempTable(tableName); } catch {}
+
+  // Create external table over the CSV. DDL is fast (<5s).
+  const ddl = `
+    CREATE EXTERNAL TABLE ${tableName} (
+      poi_lat DOUBLE,
+      poi_lng DOUBLE,
+      poi_radius_m DOUBLE
+    )
+    ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+    LOCATION 's3://${BUCKET}/${s3Prefix}/'
+    TBLPROPERTIES ('skip.header.line.count'='1')
+  `;
+
+  await runQuery(ddl);
+  console.log(`[POI-MATERIALIZE] Created external table ${tableName} with ${poiCoords.length} POIs at s3://${BUCKET}/${s3Prefix}/`);
+  return tableName;
+}
+
+/**
+ * Drop the POI temp table + delete the underlying CSV in S3.
+ * Best-effort: failures (e.g., IAM denied for glue:DeleteTable) are logged but not thrown.
+ */
+export async function dropPoiCoordsTable(tableName: string, s3Prefix: string): Promise<void> {
+  await dropTempTable(tableName);
+
+  // Delete CSV objects under the prefix
+  try {
+    const fullPrefix = `${s3Prefix}/`;
+    let continuationToken: string | undefined;
+    do {
+      const listRes = await s3Client.send(new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: fullPrefix,
+        ContinuationToken: continuationToken,
+      }));
+      const objects = listRes.Contents || [];
+      if (objects.length > 0) {
+        await s3Client.send(new DeleteObjectsCommand({
+          Bucket: BUCKET,
+          Delete: { Objects: objects.map(o => ({ Key: o.Key! })), Quiet: true },
+        }));
+      }
+      continuationToken = listRes.IsTruncated ? listRes.NextContinuationToken : undefined;
+    } while (continuationToken);
+  } catch (e: any) {
+    console.warn(`[POI-MATERIALIZE] Failed to delete S3 prefix ${s3Prefix}:`, e.message);
+  }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -165,11 +280,18 @@ function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
 /**
  * Build the at-POI pings CTE using spatial proximity.
  * Uses a bounding box pre-filter (~0.01° ≈ 1.1km) before Haversine distance calc.
+ *
+ * If `poiTableRef` is provided, target_pois reads from that external table
+ * (used when poiCoords > MAX_INLINE_POIS to avoid Athena's SQL size limit).
+ * Otherwise falls back to inlining the coords as VALUES.
  */
-function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[]): string {
+function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTableRef?: string): string {
+  const targetPoisSource = poiTableRef
+    ? `(SELECT poi_lat, poi_lng, poi_radius_m FROM ${poiTableRef})`
+    : buildTargetPoisValues(poiCoords);
   return `
     target_pois AS (
-      SELECT * FROM ${buildTargetPoisValues(poiCoords)}
+      SELECT * FROM ${targetPoisSource}
     ),
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
@@ -195,10 +317,12 @@ function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[]): string 
  */
 export async function startConsolidatedODQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for OD query');
@@ -228,7 +352,7 @@ export async function startConsolidatedODQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs},
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs},
     poi_visits AS (
       SELECT
         ${useDwell ? 'a.' : ''}ad_id,
@@ -321,8 +445,8 @@ export async function startConsolidatedODQuery(
     `;
   }
 
-  console.log(`[MEGA-OD] Starting OD query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startAsCTAS(megaJobId, 'od', sql);
+  console.log(`[MEGA-OD] Starting OD query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'od', sql);
 }
 
 // ── Q2: POI Activity by Hour ────────────────────────────────────────────
@@ -334,10 +458,12 @@ export async function startConsolidatedODQuery(
  */
 export async function startConsolidatedHourlyQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for hourly query');
@@ -366,7 +492,7 @@ export async function startConsolidatedHourlyQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT
       HOUR(${useDwell ? 'a.' : ''}utc_timestamp) as touch_hour,
       COUNT(*) as pings,
@@ -398,8 +524,8 @@ export async function startConsolidatedHourlyQuery(
     `;
   }
 
-  console.log(`[MEGA-HOURLY] Starting POI hourly query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startAsCTAS(megaJobId, 'hourly', sql);
+  console.log(`[MEGA-HOURLY] Starting POI hourly query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'hourly', sql);
 }
 
 // ── Q3: Catchment Origins (first-ping-of-day) ──────────────────────────
@@ -415,10 +541,12 @@ export async function startConsolidatedHourlyQuery(
  */
 export async function startConsolidatedCatchmentQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for catchment query');
@@ -443,7 +571,7 @@ export async function startConsolidatedCatchmentQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)}${dwellCTEs},
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords, poiTableRef)}${dwellCTEs},
     poi_visitors AS (
       ${useDwell
         ? `SELECT DISTINCT ad_id FROM dwell_filtered`
@@ -512,8 +640,8 @@ export async function startConsolidatedCatchmentQuery(
     LIMIT 100000
   `;
 
-  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startAsCTAS(megaJobId, 'catchment', sql);
+  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'catchment', sql);
 }
 
 // ── Q4: Mobility Trends (nearby POI categories ±2h) ────────────────────
@@ -529,10 +657,12 @@ export async function startConsolidatedCatchmentQuery(
  */
 export async function startConsolidatedMobilityQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for mobility query');
@@ -560,7 +690,7 @@ export async function startConsolidatedMobilityQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)}${dwellCTEs},
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords, poiTableRef)}${dwellCTEs},
     target_visits AS (
       SELECT
         ${useDwell ? 'a.' : ''}ad_id,
@@ -667,8 +797,8 @@ export async function startConsolidatedMobilityQuery(
     ORDER BY timing, device_days DESC
   `;
 
-  console.log(`[MEGA-MOBILITY] Starting mobility trends query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startAsCTAS(megaJobId, 'mobility', sql);
+  console.log(`[MEGA-MOBILITY] Starting mobility trends query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'mobility', sql);
 }
 
 // ── Q5: Temporal (daily pings / devices) ────────────────────────────────
@@ -683,10 +813,12 @@ export async function startConsolidatedMobilityQuery(
  */
 export async function startConsolidatedTemporalQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for temporal query');
@@ -711,7 +843,7 @@ export async function startConsolidatedTemporalQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT
       a.date,
       COUNT(*) as pings,
@@ -744,8 +876,8 @@ export async function startConsolidatedTemporalQuery(
     `;
   }
 
-  console.log(`[MEGA-TEMPORAL] Starting temporal query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startAsCTAS(megaJobId, 'temporal', sql);
+  console.log(`[MEGA-TEMPORAL] Starting temporal query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell}, poiTableRef=${poiTableRef ?? 'none'})`);
+  return await startAsCTAS(megaJobId, runId, 'temporal', sql);
 }
 
 // ── Q5b: Total unique devices (global COUNT DISTINCT) ─────────────────
@@ -756,10 +888,12 @@ export async function startConsolidatedTemporalQuery(
  */
 export async function startConsolidatedTotalDevicesQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for total devices query');
@@ -784,7 +918,7 @@ export async function startConsolidatedTotalDevicesQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT COUNT(DISTINCT ad_id) as total_unique_devices
     FROM dwell_filtered
     `;
@@ -806,8 +940,8 @@ export async function startConsolidatedTotalDevicesQuery(
     `;
   }
 
-  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startAsCTAS(megaJobId, 'total_devices', sql);
+  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell}, poiTableRef=${poiTableRef ?? 'none'})`);
+  return await startAsCTAS(megaJobId, runId, 'total_devices', sql);
 }
 
 // ── Q6: MAIDs (unique device IDs) ──────────────────────────────────────
@@ -820,10 +954,12 @@ export async function startConsolidatedTotalDevicesQuery(
  */
 export async function startConsolidatedMAIDsQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for MAIDs query');
@@ -848,7 +984,7 @@ export async function startConsolidatedMAIDsQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs}
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT DISTINCT ad_id
     FROM dwell_filtered
     ORDER BY ad_id
@@ -872,8 +1008,8 @@ export async function startConsolidatedMAIDsQuery(
     `;
   }
 
-  console.log(`[MEGA-MAIDS] Starting MAIDs query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startAsCTAS(megaJobId, 'maids', sql);
+  console.log(`[MEGA-MAIDS] Starting MAIDs query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell}, poiTableRef=${poiTableRef ?? 'none'})`);
+  return await startAsCTAS(megaJobId, runId, 'maids', sql);
 }
 
 // ── Q7: NSE (ad_id + origin coords for socioeconomic segmentation) ──────
@@ -886,10 +1022,12 @@ export async function startConsolidatedMAIDsQuery(
  */
 export async function startConsolidatedNseQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for NSE query');
@@ -914,7 +1052,7 @@ export async function startConsolidatedNseQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords)}${dwellCTEs},
+    ${buildAtPoiPingsCTE('all_pings_raw', poiCoords, poiTableRef)}${dwellCTEs},
     poi_visitors AS (
       ${useDwell
         ? `SELECT DISTINCT ad_id FROM dwell_filtered`
@@ -966,8 +1104,8 @@ export async function startConsolidatedNseQuery(
     WHERE origin_lat IS NOT NULL
   `;
 
-  console.log(`[MEGA-NSE] Starting NSE query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startAsCTAS(megaJobId, 'nse', sql);
+  console.log(`[MEGA-NSE] Starting NSE query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'nse', sql);
 }
 
 // ── Q8: Affinity data (per-origin visit metrics) ────────────────────────
@@ -980,9 +1118,11 @@ export async function startConsolidatedNseQuery(
  */
 export async function startConsolidatedAffinityQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[],
   poiCoords: PoiCoord[],
   dwell?: DwellFilter,
+  poiTableRef?: string,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for affinity query');
@@ -1010,7 +1150,7 @@ export async function startConsolidatedAffinityQuery(
         ${allPingsUnion}
       )
     ),
-    ${buildAtPoiPingsCTE('all_pings', poiCoords)}${dwellCTEs},
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs},
     visit_metrics AS (
       SELECT
         ${visitMetricsPrefix}ad_id,
@@ -1043,6 +1183,6 @@ export async function startConsolidatedAffinityQuery(
     LIMIT 100000
   `;
 
-  console.log(`[MEGA-AFFINITY] Starting affinity query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startAsCTAS(megaJobId, 'affinity', sql);
+  console.log(`[MEGA-AFFINITY] Starting affinity query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'affinity', sql);
 }

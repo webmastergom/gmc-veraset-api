@@ -22,6 +22,10 @@ import {
   startConsolidatedMAIDsQuery,
   startConsolidatedAffinityQuery,
   extractPoiCoords,
+  materializePoiCoordsTable,
+  dropPoiCoordsTable,
+  poiCoordsTablePrefix,
+  MAX_INLINE_POIS,
   type PoiCoord,
   type DwellFilter,
   type ConsolidatedQueryHandle,
@@ -47,6 +51,10 @@ export const maxDuration = 60;
  */
 interface ConsolidationState {
   phase: 'starting' | 'launching' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'cleanup' | 'done';
+  /** Unique per-consolidation run identifier — prevents CTAS table name collisions on re-consolidate. */
+  runId?: string;
+  /** When poiCoords > MAX_INLINE_POIS, the spatial-join queries reference this external table instead of inlining VALUES. */
+  poiTableRef?: string;
   /**
    * For each report type: the CTAS queryId (for polling) and the
    * resulting Parquet table name (for fetching results once it succeeds).
@@ -209,21 +217,40 @@ export async function POST(
         // Get dwell filter from state (persisted across polls)
         const dwell = state.dwellFilter || dwellFilter;
 
+        // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
+        const runId = (state as any).runId || Date.now().toString(36);
+
+        // For megajobs with many POIs (e.g. 25k-grid), inlining VALUES would exceed
+        // Athena's 256 KB SQL limit. Materialize them once as an external CSV-backed
+        // table and reference it from each spatial join.
+        let poiTableRef: string | undefined;
+        if (poiCoords.length > MAX_INLINE_POIS) {
+          try {
+            poiTableRef = await materializePoiCoordsTable(id, runId, poiCoords);
+            console.log(`[MEGA] Materialized ${poiCoords.length} POIs to external table ${poiTableRef}`);
+          } catch (err: any) {
+            console.error('[MEGA] Failed to materialize POI table:', err.message);
+            // Continue — small queries (visits, no-dwell paths) still work without poiTableRef
+          }
+        }
+
         // Start all queries in parallel as CTAS (no 30-min timeout, results in Parquet at s3://.../athena-temp/{ctasTable}/)
         const [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
-          startConsolidatedVisitsQuery(id, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
-          startConsolidatedODQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
-          startConsolidatedHourlyQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
-          startConsolidatedCatchmentQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
-          startConsolidatedMobilityQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
-          startConsolidatedTemporalQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
-          startConsolidatedTotalDevicesQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
-          startConsolidatedMAIDsQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
-          poiCoords.length > 0 ? startConsolidatedAffinityQuery(id, syncedJobs, poiCoords, dwell).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
+          startConsolidatedVisitsQuery(id, runId, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
+          startConsolidatedODQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
+          startConsolidatedHourlyQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedCatchmentQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
+          startConsolidatedMobilityQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedTemporalQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
+          startConsolidatedTotalDevicesQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
+          startConsolidatedMAIDsQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
+          poiCoords.length > 0 ? startConsolidatedAffinityQuery(id, runId, syncedJobs, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
         ]);
 
         state = {
           phase: 'polling',
+          runId,
+          poiTableRef,
           poiIds: effectivePoiIds,
           dwellFilter: dwell,
           queries: {
@@ -244,7 +271,7 @@ export async function POST(
         const startedCount = [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
-          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena CTAS queries...` },
+          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount}/9 Athena CTAS queries${poiTableRef ? ` (${poiCoords.length} POIs in external table)` : ''}...` },
         });
       } catch (err: any) {
         state = { phase: 'launching', error: err.message };
@@ -658,7 +685,7 @@ export async function POST(
       }
     }
 
-    // ── Phase 5: Cleanup CTAS temp tables and S3 Parquet artifacts ───
+    // ── Phase 5: Cleanup CTAS temp tables, POI temp table, and S3 artifacts ───
     // We DROP the Glue catalog entries (free) and delete the underlying S3
     // objects (costs $/GB/month if left). The MAIDs table is kept around
     // because the CSV materialization SELECT is reading from it — it'll be
@@ -672,12 +699,16 @@ export async function POST(
         tablesToDrop.push(handle.ctasTable);
       }
 
-      console.log(`[MEGA] Cleanup: dropping ${tablesToDrop.length} CTAS tables...`);
+      console.log(`[MEGA] Cleanup: dropping ${tablesToDrop.length} CTAS tables${state.poiTableRef ? ' + POI temp table' : ''}...`);
       // Drop tables + clean S3 in parallel; failures are non-fatal (logged in helpers)
-      await Promise.all([
+      const cleanupOps: Promise<unknown>[] = [
         ...tablesToDrop.map(t => dropTempTable(t)),
         ...tablesToDrop.map(t => cleanupTempS3(t)),
-      ]);
+      ];
+      if (state.poiTableRef && state.runId) {
+        cleanupOps.push(dropPoiCoordsTable(state.poiTableRef, poiCoordsTablePrefix(id, state.runId)));
+      }
+      await Promise.all(cleanupOps);
 
       state = { phase: 'done' };
       await putConf(CONSOLIDATION_KEY(id), state);

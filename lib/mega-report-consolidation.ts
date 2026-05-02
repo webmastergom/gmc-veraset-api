@@ -149,6 +149,7 @@ export interface ConsolidatedMobilityReport {
  */
 export async function startConsolidatedVisitsQuery(
   megaJobId: string,
+  runId: string,
   subJobs: Job[]
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
@@ -173,7 +174,7 @@ export async function startConsolidatedVisitsQuery(
   `;
 
   console.log(`[MEGA-CONSOLIDATION] Starting visits query (CTAS) across ${syncedJobs.length} tables`);
-  const ctasTable = tempTableName('mc_visits', megaJobId);
+  const ctasTable = tempTableName('mc_visits', `${megaJobId}_${runId}`);
   const queryId = await startCTASAsync(sql, ctasTable);
   return { queryId, ctasTable };
 }
