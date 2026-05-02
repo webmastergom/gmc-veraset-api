@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { getMegaJob } from '@/lib/mega-jobs';
 import { getJob } from '@/lib/jobs';
-import { checkQueryStatus, ensureTableForDataset } from '@/lib/athena';
+import { checkQueryStatus, ensureTableForDataset, runQueryViaS3, dropTempTable, cleanupTempS3 } from '@/lib/athena';
 import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import {
@@ -45,6 +45,8 @@ interface BracketResult {
 interface NseExportState {
   phase: 'querying' | 'polling' | 'geocoding' | 'done' | 'error';
   queryId?: string;
+  /** CTAS table name (Parquet results) — set when query is started via CTAS path. */
+  ctasTable?: string;
   country: string;
   megaJobId: string;
   error?: string;
@@ -135,13 +137,14 @@ export async function POST(
 
       console.log(`[MEGA-NSE-POLL] Starting for mega-job ${id}, country=${country}, ${syncedJobs.length} sub-jobs, ${poiCoords.length} POI coords`);
 
-      const queryId = await startConsolidatedNseQuery(
+      const handle = await startConsolidatedNseQuery(
+        id,
         syncedJobs,
         undefined, // poiIds
         poiCoords.length > 0 ? poiCoords : undefined,
       );
 
-      state = { phase: 'polling', queryId, country, megaJobId: id };
+      state = { phase: 'polling', queryId: handle.queryId, ctasTable: handle.ctasTable, country, megaJobId: id };
       await putConfig(STATE_KEY(id), state, { compact: true });
 
       return NextResponse.json({
@@ -199,25 +202,38 @@ export async function POST(
 
     // ── Phase: geocoding + bracket matching ──────────────────────────
     if (state.phase === 'geocoding' && state.queryId) {
-      // Download CSV from S3
-      const csvKey = `athena-results/${state.queryId}.csv`;
-      console.log(`[MEGA-NSE-POLL] Downloading results from S3: ${csvKey}`);
-      const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-      const csvText = await csvObj.Body!.transformToString('utf-8');
-
-      // Parse CSV: header is "ad_id","origin_lat","origin_lng"
-      const lines = csvText.split('\n');
-      console.log(`[MEGA-NSE-POLL] CSV: ${lines.length - 1} data lines`);
+      // Read results: prefer CTAS table (new path), fall back to direct CSV (legacy state).
+      let rows: Array<Record<string, any>> = [];
+      if (state.ctasTable) {
+        console.log(`[MEGA-NSE-POLL] Reading results from CTAS table: ${state.ctasTable}`);
+        const result = await runQueryViaS3(`SELECT * FROM ${state.ctasTable}`);
+        rows = result.rows;
+        console.log(`[MEGA-NSE-POLL] CTAS returned ${rows.length} rows`);
+      } else {
+        // Legacy path: read direct CSV (for in-flight queries from before the CTAS migration)
+        const csvKey = `athena-results/${state.queryId}.csv`;
+        console.log(`[MEGA-NSE-POLL] Downloading results from S3 (legacy): ${csvKey}`);
+        const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
+        const csvText = await csvObj.Body!.transformToString('utf-8');
+        const lines = csvText.split('\n');
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const parts = line.replace(/"/g, '').split(',');
+          if (parts.length < 3) continue;
+          const [adId, lat, lng] = parts;
+          rows.push({ ad_id: adId, origin_lat: lat, origin_lng: lng });
+        }
+      }
 
       // Pre-aggregate: group ad_ids by unique (lat,lng) coord
       const coordToAdIds = new Map<string, string[]>();
       let totalDevices = 0;
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        const parts = line.replace(/"/g, '').split(',');
-        if (parts.length < 3) continue;
-        const [adId, lat, lng] = parts;
+      for (const row of rows) {
+        const adId = String(row.ad_id || '');
+        const lat = String(row.origin_lat ?? '');
+        const lng = String(row.origin_lng ?? '');
+        if (!adId || !lat || !lng) continue;
         const coordKey = `${lat},${lng}`;
         let arr = coordToAdIds.get(coordKey);
         if (!arr) { arr = []; coordToAdIds.set(coordKey, arr); }
@@ -320,6 +336,12 @@ export async function POST(
 
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[MEGA-NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
+
+      // Cleanup CTAS temp table + S3 Parquet files (fire-and-forget)
+      if (state.ctasTable) {
+        const t = state.ctasTable;
+        Promise.all([dropTempTable(t), cleanupTempS3(t)]).catch(() => {});
+      }
 
       state = { ...state, phase: 'done', brackets };
       await putConfig(STATE_KEY(id), state, { compact: true });

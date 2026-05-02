@@ -24,8 +24,18 @@ import {
   extractPoiCoords,
   type PoiCoord,
   type DwellFilter,
+  type ConsolidatedQueryHandle,
 } from '@/lib/mega-consolidation-queries';
-import { checkQueryStatus, fetchQueryResults, ensureTableForDataset, createMegaDatasetView, megaJobNameToDatasetId } from '@/lib/athena';
+import {
+  checkQueryStatus,
+  ensureTableForDataset,
+  createMegaDatasetView,
+  megaJobNameToDatasetId,
+  runQueryViaS3,
+  startQueryAsync,
+  dropTempTable,
+  cleanupTempS3,
+} from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
@@ -36,18 +46,25 @@ export const maxDuration = 60;
  * Tracks parallel Athena queries across phases.
  */
 interface ConsolidationState {
-  phase: 'starting' | 'launching' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'done';
-  /** Query IDs for each report type */
+  phase: 'starting' | 'launching' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'cleanup' | 'done';
+  /**
+   * For each report type: the CTAS queryId (for polling) and the
+   * resulting Parquet table name (for fetching results once it succeeds).
+   *
+   * Old runs may have stored just `string` (legacy queryId-only). The
+   * polling/parsing phases handle both shapes for backward compatibility,
+   * but the cleanup phase only drops tables it knows about.
+   */
   queries?: {
-    visits?: string;
-    od?: string;
-    hourly?: string;
-    catchment?: string;
-    mobility?: string;
-    temporal?: string;
-    totalDevices?: string;
-    maids?: string;
-    affinity?: string;
+    visits?: ConsolidatedQueryHandle;
+    od?: ConsolidatedQueryHandle;
+    hourly?: ConsolidatedQueryHandle;
+    catchment?: ConsolidatedQueryHandle;
+    mobility?: ConsolidatedQueryHandle;
+    temporal?: ConsolidatedQueryHandle;
+    totalDevices?: ConsolidatedQueryHandle;
+    maids?: ConsolidatedQueryHandle;
+    affinity?: ConsolidatedQueryHandle;
   };
   /** Track which queries have been parsed */
   parsed?: {
@@ -60,6 +77,8 @@ interface ConsolidationState {
   poiIds?: string[];
   /** Optional dwell time filter */
   dwellFilter?: DwellFilter;
+  /** Materialized MAIDs CSV key (set during parsing_od) — used as the export download URL. */
+  maidsCsvKey?: string;
   error?: string;
 }
 
@@ -190,17 +209,17 @@ export async function POST(
         // Get dwell filter from state (persisted across polls)
         const dwell = state.dwellFilter || dwellFilter;
 
-        // Start all queries in parallel (pass poiCoords for spatial proximity + dwell filter)
-        const [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId, affinityQId] = await Promise.all([
-          startConsolidatedVisitsQuery(syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
-          startConsolidatedODQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
-          startConsolidatedHourlyQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
-          startConsolidatedCatchmentQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
-          startConsolidatedMobilityQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
-          startConsolidatedTemporalQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
-          startConsolidatedTotalDevicesQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
-          startConsolidatedMAIDsQuery(syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
-          poiCoords.length > 0 ? startConsolidatedAffinityQuery(syncedJobs, poiCoords, dwell).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
+        // Start all queries in parallel as CTAS (no 30-min timeout, results in Parquet at s3://.../athena-temp/{ctasTable}/)
+        const [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
+          startConsolidatedVisitsQuery(id, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
+          startConsolidatedODQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
+          startConsolidatedHourlyQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedCatchmentQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
+          startConsolidatedMobilityQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedTemporalQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
+          startConsolidatedTotalDevicesQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
+          startConsolidatedMAIDsQuery(id, syncedJobs, effectivePoiIds, poiCoords, dwell).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
+          poiCoords.length > 0 ? startConsolidatedAffinityQuery(id, syncedJobs, poiCoords, dwell).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
         ]);
 
         state = {
@@ -208,24 +227,24 @@ export async function POST(
           poiIds: effectivePoiIds,
           dwellFilter: dwell,
           queries: {
-            visits: visitsQId,
-            od: odQId,
-            hourly: hourlyQId,
-            catchment: catchmentQId,
-            mobility: mobilityQId,
-            temporal: temporalQId,
-            totalDevices: totalDevicesQId,
-            maids: maidsQId,
-            affinity: affinityQId,
+            visits,
+            od,
+            hourly,
+            catchment,
+            mobility,
+            temporal,
+            totalDevices,
+            maids,
+            affinity,
           },
           parsed: {},
         };
         await putConf(CONSOLIDATION_KEY(id), state);
 
-        const startedCount = [visitsQId, odQId, hourlyQId, catchmentQId, mobilityQId, temporalQId, totalDevicesQId, maidsQId, affinityQId].filter(Boolean).length;
+        const startedCount = [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
-          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena queries...` },
+          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount} Athena CTAS queries...` },
         });
       } catch (err: any) {
         state = { phase: 'launching', error: err.message };
@@ -241,11 +260,11 @@ export async function POST(
       let allDone = true;
       let anyFailed = false;
 
-      // Check each query status
-      const queryEntries = Object.entries(queries).filter(([, qid]) => qid);
+      // Check each CTAS query status
+      const queryEntries = Object.entries(queries).filter(([, q]) => q);
       const statusResults = await Promise.all(
-        queryEntries.map(async ([name, qid]) => {
-          const s = await checkQueryStatus(qid!);
+        queryEntries.map(async ([name, q]) => {
+          const s = await checkQueryStatus((q as ConsolidatedQueryHandle).queryId);
           return { name, state: s.state, error: s.error };
         })
       );
@@ -286,17 +305,18 @@ export async function POST(
       const reportKeys: Record<string, string> = {};
       const errors: string[] = [];
 
-      // Helper: parse one query result and save report
+      // Helper: parse one CTAS-materialized query result and save report.
+      // Reads from the CTAS table via SELECT * (data is small Parquet — fast).
       const parseAndSave = async (
         name: string,
-        queryId: string | undefined,
+        handle: ConsolidatedQueryHandle | undefined,
         parser: (rows: any[]) => any,
         reportType: string
       ) => {
-        if (!queryId) return;
+        if (!handle) return;
         try {
-          console.log(`[MEGA] Phase 3: fetching ${name} query ${queryId}...`);
-          const queryResult = await fetchQueryResults(queryId);
+          console.log(`[MEGA] Phase 3: fetching ${name} from CTAS table ${handle.ctasTable}...`);
+          const queryResult = await runQueryViaS3(`SELECT * FROM ${handle.ctasTable}`);
           console.log(`[MEGA] Phase 3: ${name} returned ${queryResult.rows?.length ?? 0} rows`);
           const report = parser(queryResult.rows);
           const key = await saveConsolidatedReport(id, reportType, report);
@@ -352,7 +372,7 @@ export async function POST(
       let totalUniqueDevices: number | undefined;
       if (state.queries.totalDevices) {
         try {
-          const totalResult = await fetchQueryResults(state.queries.totalDevices);
+          const totalResult = await runQueryViaS3(`SELECT * FROM ${state.queries.totalDevices.ctasTable}`);
           totalUniqueDevices = parseInt(totalResult.rows[0]?.total_unique_devices, 10) || 0;
           console.log(`[MEGA] Total unique devices: ${totalUniqueDevices}`);
         } catch (err: any) {
@@ -431,10 +451,10 @@ export async function POST(
         // Collect all coordinates that need geocoding
         const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
 
-        // Fetch OD results
+        // Fetch OD results from CTAS table
         if (state.queries.od) {
           try {
-            const queryResult = await fetchQueryResults(state.queries.od);
+            const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.od.ctasTable}`);
             const odClusters = parseConsolidatedOD(queryResult.rows);
             for (const c of odClusters.clusters) {
               const oKey = `${c.originLat},${c.originLng}`;
@@ -449,10 +469,10 @@ export async function POST(
           }
         }
 
-        // Fetch catchment results
+        // Fetch catchment results from CTAS table
         if (state.queries.catchment) {
           try {
-            const queryResult = await fetchQueryResults(state.queries.catchment);
+            const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.catchment.ctasTable}`);
             for (const row of queryResult.rows) {
               const lat = parseFloat(row.origin_lat) || 0;
               const lng = parseFloat(row.origin_lng) || 0;
@@ -556,10 +576,10 @@ export async function POST(
         const coordToZip = new Map(coordToZipEntries);
         console.log(`[MEGA] Loaded ${coordToZip.size} geocoded coords from S3`);
 
-        // Re-fetch and build OD report
+        // Re-fetch and build OD report (from CTAS table)
         if (state.queries.od) {
           try {
-            const queryResult = await fetchQueryResults(state.queries.od);
+            const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.od.ctasTable}`);
             const odClusters = parseConsolidatedOD(queryResult.rows);
             const odReport = buildODReport(id, odClusters.clusters, coordToZip);
             reportKeys.od = await saveConsolidatedReport(id, 'od', odReport);
@@ -568,10 +588,10 @@ export async function POST(
           }
         }
 
-        // Re-fetch and build catchment report
+        // Re-fetch and build catchment report (from CTAS table)
         if (state.queries.catchment) {
           try {
-            const queryResult = await fetchQueryResults(state.queries.catchment);
+            const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.catchment.ctasTable}`);
             const catchmentReport = buildCatchmentReport(id, queryResult.rows, coordToZip);
             reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
           } catch (err: any) {
@@ -579,10 +599,10 @@ export async function POST(
           }
         }
 
-        // Build affinity report
+        // Build affinity report (from CTAS table)
         if (state.queries?.affinity) {
           try {
-            const affinityResult = await fetchQueryResults(state.queries.affinity);
+            const affinityResult = await runQueryViaS3(`SELECT * FROM ${state.queries.affinity.ctasTable}`);
             const { buildAffinityReport } = await import('@/lib/mega-report-consolidation');
             const affinityReport = buildAffinityReport(id, affinityResult.rows, coordToZip);
             reportKeys.affinity = await saveConsolidatedReport(id, 'affinity', affinityReport);
@@ -591,9 +611,21 @@ export async function POST(
           }
         }
 
-        // Save MAIDs query output key (CSV served directly from Athena output)
+        // MAIDs: kick off a non-blocking SELECT to materialize the CTAS Parquet data as CSV
+        // in athena-results/. Store the new queryId so the download endpoint can serve the CSV.
+        // For typical sizes (<10M MAIDs) this finishes within seconds — by the time the user
+        // clicks "Download MAIDs" it's ready. If not, the download endpoint will 404 and
+        // the user can retry.
         if (state.queries?.maids) {
-          reportKeys.maids = `athena-results/${state.queries.maids}.csv`;
+          try {
+            const selectQueryId = await startQueryAsync(`SELECT ad_id FROM ${state.queries.maids.ctasTable}`);
+            const csvKey = `athena-results/${selectQueryId}.csv`;
+            reportKeys.maids = csvKey;
+            state.maidsCsvKey = csvKey;
+            console.log(`[MEGA] MAIDs CSV materialization started: queryId=${selectQueryId}, csv=${csvKey}`);
+          } catch (err: any) {
+            console.error('[MEGA] Error starting MAIDs CSV materialization:', err.message);
+          }
         }
 
         // Merge Phase 3 report keys with Phase 4 report keys
@@ -606,12 +638,13 @@ export async function POST(
           consolidatedReports: allReportKeys,
         });
 
-        state = { phase: 'done' };
+        // Move to cleanup phase (drops temp Athena tables + S3 Parquet files)
+        state = { ...state, phase: 'cleanup' };
         await putConf(CONSOLIDATION_KEY(id), state);
 
         return NextResponse.json({
-          phase: 'done',
-          progress: { step: 'complete', percent: 100, message: 'Consolidation complete' },
+          phase: 'cleanup',
+          progress: { step: 'cleanup', percent: 95, message: 'Reports saved. Cleaning up temp tables...' },
         });
       } catch (err: any) {
         console.error('[MEGA] Error in report building:', err.message);
@@ -623,6 +656,36 @@ export async function POST(
           progress: { step: 'error', percent: 0, message: `Consolidation failed: ${err.message}. Click Re-consolidate to retry.` },
         }, { status: 500 });
       }
+    }
+
+    // ── Phase 5: Cleanup CTAS temp tables and S3 Parquet artifacts ───
+    // We DROP the Glue catalog entries (free) and delete the underlying S3
+    // objects (costs $/GB/month if left). The MAIDs table is kept around
+    // because the CSV materialization SELECT is reading from it — it'll be
+    // garbage-collected by S3 lifecycle policy on athena-temp/ prefix.
+    if (state.phase === 'cleanup' && state.queries) {
+      const tablesToDrop: string[] = [];
+      for (const [name, handle] of Object.entries(state.queries)) {
+        if (!handle) continue;
+        // Skip MAIDs — its Parquet may still be feeding the CSV SELECT
+        if (name === 'maids') continue;
+        tablesToDrop.push(handle.ctasTable);
+      }
+
+      console.log(`[MEGA] Cleanup: dropping ${tablesToDrop.length} CTAS tables...`);
+      // Drop tables + clean S3 in parallel; failures are non-fatal (logged in helpers)
+      await Promise.all([
+        ...tablesToDrop.map(t => dropTempTable(t)),
+        ...tablesToDrop.map(t => cleanupTempS3(t)),
+      ]);
+
+      state = { phase: 'done' };
+      await putConf(CONSOLIDATION_KEY(id), state);
+
+      return NextResponse.json({
+        phase: 'done',
+        progress: { step: 'complete', percent: 100, message: 'Consolidation complete' },
+      });
     }
 
     // Already done

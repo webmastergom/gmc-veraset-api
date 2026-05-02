@@ -12,8 +12,37 @@
  * POI coords come from job.verasetPayload.geo_radius[] or job.externalPois[].
  */
 
-import { getTableName, startQueryAsync } from './athena';
+import { getTableName, startQueryAsync, startCTASAsync, tempTableName } from './athena';
 import { type Job } from './jobs';
+
+/**
+ * Result returned by every consolidated query: the running queryId and the
+ * CTAS table name where Parquet results land. CTAS is used so queries are
+ * NOT subject to Athena's 30-minute regular-query timeout — critical when
+ * spatial joins involve thousands of POIs (e.g., 25k POI grid).
+ *
+ * After polling shows the CTAS query SUCCEEDED, downstream phases read
+ * results via `SELECT * FROM ctasTable` (or `runQueryViaS3` for big rowsets).
+ */
+export interface ConsolidatedQueryHandle {
+  queryId: string;
+  ctasTable: string;
+}
+
+/**
+ * Wrap a SELECT statement in CTAS and start it asynchronously.
+ * Returns both the queryId (for polling) and the ctasTable (for fetching results
+ * after the CTAS finishes).
+ */
+async function startAsCTAS(
+  megaJobId: string,
+  queryName: string,
+  selectSql: string,
+): Promise<ConsolidatedQueryHandle> {
+  const ctasTable = tempTableName(`mc_${queryName}`, megaJobId);
+  const queryId = await startCTASAsync(selectSql, ctasTable);
+  return { queryId, ctasTable };
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -165,11 +194,12 @@ function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[]): string 
  * Falls back to poi_ids-based approach when no coordinates available.
  */
 export async function startConsolidatedODQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for OD query');
 
@@ -291,8 +321,8 @@ export async function startConsolidatedODQuery(
     `;
   }
 
-  console.log(`[MEGA-OD] Starting OD query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-OD] Starting OD query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
+  return await startAsCTAS(megaJobId, 'od', sql);
 }
 
 // ── Q2: POI Activity by Hour ────────────────────────────────────────────
@@ -303,11 +333,12 @@ export async function startConsolidatedODQuery(
  * Returns Athena queryId for polling.
  */
 export async function startConsolidatedHourlyQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for hourly query');
 
@@ -367,8 +398,8 @@ export async function startConsolidatedHourlyQuery(
     `;
   }
 
-  console.log(`[MEGA-HOURLY] Starting POI hourly query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-HOURLY] Starting POI hourly query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
+  return await startAsCTAS(megaJobId, 'hourly', sql);
 }
 
 // ── Q3: Catchment Origins (first-ping-of-day) ──────────────────────────
@@ -383,11 +414,12 @@ export async function startConsolidatedHourlyQuery(
  * we use spatial proximity for more accurate visitor identification.
  */
 export async function startConsolidatedCatchmentQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for catchment query');
 
@@ -480,8 +512,8 @@ export async function startConsolidatedCatchmentQuery(
     LIMIT 100000
   `;
 
-  console.log(`[MEGA-CATCHMENT] Starting catchment query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
+  return await startAsCTAS(megaJobId, 'catchment', sql);
 }
 
 // ── Q4: Mobility Trends (nearby POI categories ±2h) ────────────────────
@@ -496,11 +528,12 @@ export async function startConsolidatedCatchmentQuery(
  * Returns Athena queryId for polling.
  */
 export async function startConsolidatedMobilityQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for mobility query');
 
@@ -634,8 +667,8 @@ export async function startConsolidatedMobilityQuery(
     ORDER BY timing, device_days DESC
   `;
 
-  console.log(`[MEGA-MOBILITY] Starting mobility trends query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-MOBILITY] Starting mobility trends query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
+  return await startAsCTAS(megaJobId, 'mobility', sql);
 }
 
 // ── Q5: Temporal (daily pings / devices) ────────────────────────────────
@@ -649,11 +682,12 @@ export async function startConsolidatedMobilityQuery(
  * volume of visitors (not claiming pings are at the POI).
  */
 export async function startConsolidatedTemporalQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for temporal query');
 
@@ -710,8 +744,8 @@ export async function startConsolidatedTemporalQuery(
     `;
   }
 
-  console.log(`[MEGA-TEMPORAL] Starting temporal query across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-TEMPORAL] Starting temporal query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
+  return await startAsCTAS(megaJobId, 'temporal', sql);
 }
 
 // ── Q5b: Total unique devices (global COUNT DISTINCT) ─────────────────
@@ -721,11 +755,12 @@ export async function startConsolidatedTemporalQuery(
  * Needed because summing daily COUNT(DISTINCT) gives device-days, not unique devices.
  */
 export async function startConsolidatedTotalDevicesQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for total devices query');
 
@@ -771,8 +806,8 @@ export async function startConsolidatedTotalDevicesQuery(
     `;
   }
 
-  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-TOTAL-DEVICES] Starting total unique devices query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
+  return await startAsCTAS(megaJobId, 'total_devices', sql);
 }
 
 // ── Q6: MAIDs (unique device IDs) ──────────────────────────────────────
@@ -784,11 +819,12 @@ export async function startConsolidatedTotalDevicesQuery(
  * Note: Uses poi_ids which is ✅ correct for identifying visitors.
  */
 export async function startConsolidatedMAIDsQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for MAIDs query');
 
@@ -836,8 +872,8 @@ export async function startConsolidatedMAIDsQuery(
     `;
   }
 
-  console.log(`[MEGA-MAIDS] Starting MAIDs query across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-MAIDS] Starting MAIDs query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
+  return await startAsCTAS(megaJobId, 'maids', sql);
 }
 
 // ── Q7: NSE (ad_id + origin coords for socioeconomic segmentation) ──────
@@ -849,11 +885,12 @@ export async function startConsolidatedMAIDsQuery(
  * Coordinates rounded to 1 decimal (~11km) at SQL level to reduce geocoding workload.
  */
 export async function startConsolidatedNseQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiIds?: string[],
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for NSE query');
 
@@ -929,8 +966,8 @@ export async function startConsolidatedNseQuery(
     WHERE origin_lat IS NOT NULL
   `;
 
-  console.log(`[MEGA-NSE] Starting NSE query across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-NSE] Starting NSE query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length})`);
+  return await startAsCTAS(megaJobId, 'nse', sql);
 }
 
 // ── Q8: Affinity data (per-origin visit metrics) ────────────────────────
@@ -942,10 +979,11 @@ export async function startConsolidatedNseQuery(
  * Requires spatial path (poiCoords) since dwell time computation needs at_poi_pings.
  */
 export async function startConsolidatedAffinityQuery(
+  megaJobId: string,
   subJobs: Job[],
   poiCoords: PoiCoord[],
   dwell?: DwellFilter,
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for affinity query');
 
@@ -1005,6 +1043,6 @@ export async function startConsolidatedAffinityQuery(
     LIMIT 100000
   `;
 
-  console.log(`[MEGA-AFFINITY] Starting affinity query across ${syncedJobs.length} tables (dwell=${useDwell})`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-AFFINITY] Starting affinity query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell})`);
+  return await startAsCTAS(megaJobId, 'affinity', sql);
 }

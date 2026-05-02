@@ -112,10 +112,20 @@ export function MegaNseModal({ open, onClose, megaJobId, megaJobCountry }: MegaN
     loadNseData(cc);
   };
 
-  // Upload CSV
+  // Upload CSV (also used to replace existing data)
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Always reset the input so the same file can be re-selected after a failed upload
+    e.target.value = '';
     if (!file || !country) return;
+
+    // If data already exists, ask for confirmation before overwriting
+    if (nseData && nseData.length > 0) {
+      const ok = window.confirm(
+        `Replace existing NSE data for ${country}? This will overwrite ${nseData.length.toLocaleString()} postal codes.`
+      );
+      if (!ok) return;
+    }
 
     setUploading(true);
     try {
@@ -133,6 +143,7 @@ export function MegaNseModal({ open, onClose, megaJobId, megaJobCountry }: MegaN
 
       setNotFound(false);
       setBrackets(null);
+      setTotalMaids(0);
       const nseRes = await fetch(`/api/nse/${country}`, { credentials: 'include' });
       if (nseRes.ok) {
         const nseJson = await nseRes.json();
@@ -230,11 +241,22 @@ export function MegaNseModal({ open, onClose, megaJobId, megaJobCountry }: MegaN
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Users className="h-5 w-5" />
-            MAIDs by NSE {country ? `— ${country}` : ''}
-            {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-          </DialogTitle>
+          <div className="flex items-center justify-between gap-2">
+            <DialogTitle className="flex items-center gap-2">
+              <Users className="h-5 w-5" />
+              MAIDs by NSE {country ? `— ${country}` : ''}
+              {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+            </DialogTitle>
+            {country && !loading && nseData && nseData.length > 0 && (
+              <Button variant="outline" size="sm" disabled={uploading} asChild className="mr-6">
+                <label className="cursor-pointer">
+                  {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+                  {uploading ? 'Uploading...' : 'Replace CSV'}
+                  <input type="file" accept=".csv" className="hidden" onChange={handleUpload} disabled={uploading} />
+                </label>
+              </Button>
+            )}
+          </div>
         </DialogHeader>
 
         {/* Country selector when no country is set */}

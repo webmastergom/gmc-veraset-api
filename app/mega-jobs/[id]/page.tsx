@@ -11,7 +11,7 @@ import {
   Layers, ExternalLink, Loader2, Play, Download, Users,
   CheckCircle2, XCircle, Clock, Map,
   BarChart3, TrendingUp, MapPin, Navigation,
-  Compass, Timer, Activity,
+  Compass, Timer, Activity, Target,
 } from 'lucide-react'
 
 import { CollapsibleCard } from '@/components/mega-jobs/collapsible-card'
@@ -25,6 +25,7 @@ import { MobilityBar } from '@/components/mega-jobs/mobility-bar'
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
 import { MovementMap } from '@/components/analysis/movement-map'
 import { MegaNseModal } from '@/components/mega-jobs/nse-modal'
+import { MegaCategoryMaidModal } from '@/components/mega-jobs/category-maid-modal'
 
 const statusColors: Record<string, string> = {
   planning: 'bg-blue-500/20 text-blue-400',
@@ -69,6 +70,8 @@ export default function MegaJobDetailPage() {
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
+  // MAIDs by Category modal
+  const [categoryModalOpen, setCategoryModalOpen] = useState(false)
 
   // POI filter
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([])
@@ -445,6 +448,9 @@ export default function MegaJobDetailPage() {
               <Button variant="outline" size="sm" onClick={() => setNseModalOpen(true)}>
                 <Users className="h-4 w-4 mr-1" /> MAIDs by NSE
               </Button>
+              <Button variant="outline" size="sm" onClick={() => setCategoryModalOpen(true)}>
+                <Target className="h-4 w-4 mr-1" /> MAIDs by Category
+              </Button>
             </div>
 
             {/* 2. Daily Activity Chart */}
@@ -599,6 +605,101 @@ export default function MegaJobDetailPage() {
               </CollapsibleCard>
             )}
 
+            {/* 9. Affinity Heatmap */}
+            {affinityReport?.byZipCode?.length > 0 && (
+              <CollapsibleCard
+                title="Affinity Heatmap"
+                icon={<Target className="h-4 w-4" />}
+                defaultOpen={false}
+              >
+                <CatchmentMap
+                  data={affinityReport.byZipCode.map((z: any) => ({
+                    zipCode: z.zipCode,
+                    city: z.city,
+                    country: z.country,
+                    lat: z.lat,
+                    lng: z.lng,
+                    deviceDays: z.affinityIndex,
+                  }))}
+                />
+              </CollapsibleCard>
+            )}
+
+            {/* 10. Affinity Index by Postal Code */}
+            {affinityReport?.byZipCode?.length > 0 && (
+              <CollapsibleCard
+                title="Affinity Index by Postal Code"
+                icon={<Target className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=affinity`}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  Affinity = 50% dwell time + 50% visit frequency. Scale 0-100.
+                  {' '}{affinityReport.byZipCode.length} postal codes analyzed.
+                </p>
+                <div className="flex justify-end mb-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const sorted = [...affinityReport.byZipCode].sort((a: any, b: any) => b.affinityIndex - a.affinityIndex);
+                      const csv = 'zip_code,city,country,affinity_index,avg_dwell_min,avg_frequency,unique_devices,total_visit_days\n' +
+                        sorted.map((z: any) => `${z.zipCode},${z.city},${z.country},${z.affinityIndex},${z.avgDwellMinutes},${z.avgFrequency},${z.uniqueDevices},${z.totalVisitDays}`).join('\n');
+                      const blob = new Blob([csv], { type: 'text/csv' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url; a.download = `mega-${id}-affinity-index.csv`; a.click();
+                    }}
+                  >
+                    <Download className="h-3 w-3 mr-1" /> Download CSV
+                  </Button>
+                </div>
+                <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 bg-background border-b">
+                      <tr>
+                        <th className="text-left py-2 px-3">Postal Code</th>
+                        <th className="text-left py-2 px-3">City</th>
+                        <th className="text-right py-2 px-3">Affinity</th>
+                        <th className="text-right py-2 px-3">Avg Dwell (min)</th>
+                        <th className="text-right py-2 px-3">Avg Frequency</th>
+                        <th className="text-right py-2 px-3">Devices</th>
+                        <th className="text-right py-2 px-3">Visit-Days</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...affinityReport.byZipCode]
+                        .sort((a: any, b: any) => b.affinityIndex - a.affinityIndex)
+                        .slice(0, 100)
+                        .map((z: any) => (
+                          <tr key={z.zipCode} className="border-b border-border/50 hover:bg-muted/30">
+                            <td className="py-2 px-3 font-mono">{z.zipCode}</td>
+                            <td className="py-2 px-3 text-muted-foreground">{z.city}</td>
+                            <td className="py-2 px-3 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <div className="w-16 h-2 bg-muted rounded-full overflow-hidden">
+                                  <div
+                                    className="h-full rounded-full"
+                                    style={{
+                                      width: `${z.affinityIndex}%`,
+                                      backgroundColor: z.affinityIndex >= 70 ? '#22c55e' : z.affinityIndex >= 40 ? '#eab308' : '#ef4444',
+                                    }}
+                                  />
+                                </div>
+                                <span className="font-semibold w-8 text-right">{z.affinityIndex}</span>
+                              </div>
+                            </td>
+                            <td className="py-2 px-3 text-right text-muted-foreground">{z.avgDwellMinutes}</td>
+                            <td className="py-2 px-3 text-right text-muted-foreground">{z.avgFrequency}</td>
+                            <td className="py-2 px-3 text-right">{z.uniqueDevices?.toLocaleString()}</td>
+                            <td className="py-2 px-3 text-right text-muted-foreground">{z.totalVisitDays?.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              </CollapsibleCard>
+            )}
+
             {/* Visits by POI table */}
             {visitsReport && (
               <CollapsibleCard
@@ -649,6 +750,15 @@ export default function MegaJobDetailPage() {
         onClose={() => setNseModalOpen(false)}
         megaJobId={id}
         megaJobCountry={megaJob?.country || null}
+      />
+
+      <MegaCategoryMaidModal
+        open={categoryModalOpen}
+        onClose={() => setCategoryModalOpen(false)}
+        megaJobId={id}
+        megaJobCountry={megaJob?.country || null}
+        dwellMin={parseInt(dwellMin, 10) || 0}
+        dwellMax={parseInt(dwellMax, 10) || 0}
       />
     </MainLayout>
   )

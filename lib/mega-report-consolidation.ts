@@ -3,8 +3,9 @@
  * Merges analysis results from multiple sub-jobs into unified reports.
  */
 
-import { getTableName, startQueryAsync, fetchQueryResults } from './athena';
+import { getTableName, startQueryAsync, fetchQueryResults, startCTASAsync, tempTableName } from './athena';
 import { type Job } from './jobs';
+import type { ConsolidatedQueryHandle } from './mega-consolidation-queries';
 import { getConfig, putConfig } from './s3-config';
 import { megaReportKey } from './mega-jobs';
 
@@ -147,8 +148,9 @@ export interface ConsolidatedMobilityReport {
  * Returns the Athena queryId (caller must poll for completion).
  */
 export async function startConsolidatedVisitsQuery(
+  megaJobId: string,
   subJobs: Job[]
-): Promise<string> {
+): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs');
 
@@ -170,8 +172,10 @@ export async function startConsolidatedVisitsQuery(
     ORDER BY visits DESC
   `;
 
-  console.log(`[MEGA-CONSOLIDATION] Starting visits query across ${syncedJobs.length} tables`);
-  return await startQueryAsync(sql);
+  console.log(`[MEGA-CONSOLIDATION] Starting visits query (CTAS) across ${syncedJobs.length} tables`);
+  const ctasTable = tempTableName('mc_visits', megaJobId);
+  const queryId = await startCTASAsync(sql, ctasTable);
+  return { queryId, ctasTable };
 }
 
 /**
