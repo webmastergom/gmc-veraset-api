@@ -297,8 +297,11 @@ function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTable
   const targetPoisSource = poiTableRef
     ? `(SELECT poi_lat, poi_lng, poi_radius_m FROM ${poiTableRef})`
     : buildTargetPoisValues(poiCoords);
+  // Prefix internal CTEs with `_atp_` to avoid collisions with caller CTEs
+  // (e.g., mobility query has its own `poi_buckets` CTE for the Overture POI join).
+  // Only `at_poi_pings` is the public name callers reference.
   return `
-    target_pois AS (
+    _atp_target_pois AS (
       SELECT
         poi_lat,
         poi_lng,
@@ -307,15 +310,15 @@ function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTable
         CAST(FLOOR(poi_lng / ${GRID_STEP}) AS BIGINT) as base_lng_bucket
       FROM ${targetPoisSource}
     ),
-    poi_buckets AS (
+    _atp_poi_buckets AS (
       SELECT poi_lat, poi_lng, poi_radius_m,
         base_lat_bucket + dlat as lat_bucket,
         base_lng_bucket + dlng as lng_bucket
-      FROM target_pois
+      FROM _atp_target_pois
       CROSS JOIN (VALUES (-1), (0), (1)) AS t1(dlat)
       CROSS JOIN (VALUES (-1), (0), (1)) AS t2(dlng)
     ),
-    pings_bucketed AS (
+    _atp_pings_bucketed AS (
       SELECT
         p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng,
         CAST(FLOOR(p.lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
@@ -324,8 +327,8 @@ function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTable
     ),
     at_poi_pings AS (
       SELECT DISTINCT p.ad_id, p.date, p.utc_timestamp, p.lat, p.lng
-      FROM pings_bucketed p
-      INNER JOIN poi_buckets pb
+      FROM _atp_pings_bucketed p
+      INNER JOIN _atp_poi_buckets pb
         ON p.lat_bucket = pb.lat_bucket
         AND p.lng_bucket = pb.lng_bucket
       WHERE 111320 * SQRT(
