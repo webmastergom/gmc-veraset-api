@@ -766,20 +766,31 @@ export async function startConsolidatedMobilityQuery(
   const sql = `
     WITH
     ${visitTimeCTE},
+    -- Pre-aggregate pings per (ad_id, date, timing, lat_bucket, lng_bucket)
+    -- before the spatial join. For dense data (every-minute pings during
+    -- ±2h around a visit, ~240 pings per device-day), this collapses to
+    -- maybe 5-20 unique buckets per device-day — drops the JOIN input by
+    -- ~2 orders of magnitude. AVG(lat/lng) keeps the distance filter
+    -- accurate enough to determine which POI bucket the device was in
+    -- (sub-bucket precision doesn't matter for category-level mobility).
     nearby_pings AS (
       SELECT
         a.ad_id,
         a.date,
-        a.utc_timestamp,
-        a.lat,
-        a.lng,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing,
         CAST(FLOOR(a.lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
         CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT) as lng_bucket,
-        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing
+        AVG(a.lat) as lat,
+        AVG(a.lng) as lng
       FROM all_pings a
       INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
       WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
         AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
+      GROUP BY
+        a.ad_id, a.date,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END,
+        CAST(FLOOR(a.lat / ${GRID_STEP}) AS BIGINT),
+        CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT)
     ),
     -- Restrict the global Overture POI catalog (lab_pois_gmc has POIs from many
     -- countries) to a bbox around the target POIs + 0.5° buffer (~55 km, enough
