@@ -145,16 +145,23 @@ export async function POST(
       state = null;
     }
 
-    // If a previous consolidation already completed (state.phase === 'done' AND
-    // megajob.status === 'completed'), short-circuit: don't re-start automatically.
-    // Otherwise the frontend's status polling could repeatedly POST and clobber
-    // status from 'completed' back to 'consolidating' on every request, then
-    // crash mid-launch leaving things stuck.
-    if (state?.phase === 'done' && megaJob.status === 'completed' && !resetRequested) {
-      return NextResponse.json({
-        phase: 'done',
-        progress: { step: 'complete', percent: 100, message: 'Consolidation complete (use ?reset=true to re-run)' },
-      });
+    // If a previous consolidation already completed, short-circuit: don't re-start
+    // automatically. Self-healing: if reports are saved and state.phase=done but
+    // megajob.status got clobbered back to 'consolidating' (a race condition where
+    // a stray POST hit between phase 4b's status update and cleanup write), repair
+    // the status before returning.
+    if (state?.phase === 'done' && !resetRequested) {
+      const hasReports = megaJob.consolidatedReports && Object.keys(megaJob.consolidatedReports).length > 0;
+      if (hasReports) {
+        if (megaJob.status !== 'completed') {
+          console.log(`[MEGA] Self-healing status: ${megaJob.status} → completed (state.phase=done with ${Object.keys(megaJob.consolidatedReports!).length} reports)`);
+          await updateMegaJob(id, { status: 'completed' });
+        }
+        return NextResponse.json({
+          phase: 'done',
+          progress: { step: 'complete', percent: 100, message: 'Consolidation complete (use ?reset=true to re-run)' },
+        });
+      }
     }
 
     if (!state || state.phase === 'done') {
