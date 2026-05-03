@@ -140,15 +140,28 @@ export async function POST(
 
     // Reset if requested
     const url = new URL(_request.url);
-    if (url.searchParams.get('reset') === 'true') {
+    const resetRequested = url.searchParams.get('reset') === 'true';
+    if (resetRequested) {
       state = null;
+    }
+
+    // If a previous consolidation already completed (state.phase === 'done' AND
+    // megajob.status === 'completed'), short-circuit: don't re-start automatically.
+    // Otherwise the frontend's status polling could repeatedly POST and clobber
+    // status from 'completed' back to 'consolidating' on every request, then
+    // crash mid-launch leaving things stuck.
+    if (state?.phase === 'done' && megaJob.status === 'completed' && !resetRequested) {
+      return NextResponse.json({
+        phase: 'done',
+        progress: { step: 'complete', percent: 100, message: 'Consolidation complete (use ?reset=true to re-run)' },
+      });
     }
 
     if (!state || state.phase === 'done') {
       state = { phase: 'starting', poiIds, dwellFilter };
     }
 
-    // Update mega-job status — always set to consolidating (even for re-consolidation)
+    // Update mega-job status — only set to consolidating when starting fresh work.
     if (megaJob.status !== 'consolidating') {
       await updateMegaJob(id, { status: 'consolidating' });
     }
