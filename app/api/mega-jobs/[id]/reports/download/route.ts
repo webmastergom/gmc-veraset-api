@@ -180,22 +180,70 @@ export async function GET(
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-affinity.csv`);
     }
 
-    // ── NSE bracket CSV (from exports/ in S3) ────────────────────────
+    // ── NSE bracket CSV ──────────────────────────────────────────────
+    // Two formats supported:
+    //   ?file=<filename>       → legacy single-file (JS-built CSVs from old flow)
+    //   ?prefix=<s3-prefix>    → new flow: Athena UNLOAD writes one or more
+    //                            CSV part files at <prefix>/. We list and
+    //                            stream-concatenate them into one response.
     if (reportType === 'nse') {
+      const { ListObjectsV2Command } = await import('@aws-sdk/client-s3');
+      const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-west-2' });
+
       const fileName = request.nextUrl.searchParams.get('file');
-      if (!fileName || !fileName.startsWith(`mega-${id}-maids-nse-`)) {
-        return NextResponse.json({ error: 'Invalid NSE file parameter' }, { status: 400 });
+      if (fileName) {
+        if (!fileName.startsWith(`mega-${id}-maids-nse-`)) {
+          return NextResponse.json({ error: 'Invalid NSE file parameter' }, { status: 400 });
+        }
+        try {
+          const resp = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: `exports/${fileName}` }));
+          const csv = await resp.Body?.transformToString() || '';
+          return csvResponse(csv, fileName);
+        } catch (err: any) {
+          console.error('[MEGA-NSE DOWNLOAD file]', err.message);
+          return NextResponse.json({ error: `Failed to fetch NSE CSV: ${err.message}` }, { status: 500 });
+        }
       }
 
-      try {
-        const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-west-2' });
-        const resp = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: `exports/${fileName}` }));
-        const csv = await resp.Body?.transformToString() || '';
-        return csvResponse(csv, fileName);
-      } catch (err: any) {
-        console.error('[MEGA-NSE DOWNLOAD]', err.message);
-        return NextResponse.json({ error: `Failed to fetch NSE CSV: ${err.message}` }, { status: 500 });
+      const prefix = request.nextUrl.searchParams.get('prefix');
+      if (prefix) {
+        // Sanity: must be under exports/mega-{id}-maids-nse-
+        if (!prefix.startsWith(`exports/mega-${id}-maids-nse-`)) {
+          return NextResponse.json({ error: 'Invalid NSE prefix parameter' }, { status: 400 });
+        }
+        try {
+          // List all part files under the UNLOAD prefix
+          const listRes = await s3.send(new ListObjectsV2Command({
+            Bucket: BUCKET,
+            Prefix: prefix.endsWith('/') ? prefix : prefix + '/',
+          }));
+          const parts = (listRes.Contents || [])
+            .filter(o => o.Key && !o.Key.endsWith('_metadata') && !o.Key.endsWith('manifest'))
+            .sort((a, b) => (a.Key || '').localeCompare(b.Key || ''));
+          if (parts.length === 0) {
+            return NextResponse.json({ error: 'No NSE files found at prefix (UNLOAD may not be done yet)' }, { status: 404 });
+          }
+
+          // Concatenate part files. Each Athena UNLOAD TEXTFILE part has no header
+          // (single column ad_id), so just concat with newlines.
+          const chunks: string[] = ['ad_id'];
+          for (const p of parts) {
+            const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: p.Key! }));
+            const text = await obj.Body?.transformToString() || '';
+            for (const line of text.split('\n')) {
+              const t = line.trim();
+              if (t) chunks.push(t);
+            }
+          }
+          const fileName = `${prefix.split('/').slice(-1)[0]}.csv`;
+          return csvResponse(chunks.join('\n'), fileName);
+        } catch (err: any) {
+          console.error('[MEGA-NSE DOWNLOAD prefix]', err.message);
+          return NextResponse.json({ error: `Failed to fetch NSE CSV: ${err.message}` }, { status: 500 });
+        }
       }
+
+      return NextResponse.json({ error: 'NSE download requires ?file= or ?prefix=' }, { status: 400 });
     }
 
     return NextResponse.json({ error: 'Invalid type' }, { status: 400 });

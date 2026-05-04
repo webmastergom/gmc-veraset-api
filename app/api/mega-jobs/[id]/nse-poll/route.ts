@@ -4,7 +4,6 @@ import { getMegaJob } from '@/lib/mega-jobs';
 import { getJob } from '@/lib/jobs';
 import { checkQueryStatus, ensureTableForDataset, runQueryViaS3, dropTempTable, cleanupTempS3, startQueryAsync } from '@/lib/athena';
 import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
-import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import {
   startConsolidatedNseQuery,
   extractPoiCoords,
@@ -14,7 +13,14 @@ import {
   MAX_INLINE_POIS,
   type DwellFilter,
 } from '@/lib/mega-consolidation-queries';
-import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import {
+  materializeNseBracketMap,
+  startBracketUnloads,
+  startBracketCountQuery,
+  dropNseBracketMap,
+  type BracketUnloadHandle,
+} from '@/lib/nse-athena';
+import { ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
@@ -47,7 +53,13 @@ interface BracketResult {
 }
 
 interface NseExportState {
-  phase: 'querying' | 'polling' | 'reading' | 'geocoding' | 'done' | 'error';
+  /**
+   * - querying / polling: NSE CTAS pipeline (per-device ad_id + origin coords)
+   * - bracket_setup: build bracket map table, launch UNLOAD + COUNT queries
+   * - bracket_running: poll the UNLOADs and COUNT until all SUCCEEDED
+   * - done: brackets[] populated, downloads ready
+   */
+  phase: 'querying' | 'polling' | 'bracket_setup' | 'bracket_running' | 'done' | 'error';
   queryId?: string;
   /** CTAS table name (Parquet results) — set when query is started via CTAS path. */
   ctasTable?: string;
@@ -55,14 +67,14 @@ interface NseExportState {
   runId?: string;
   /** External POI table (when poiCoords > MAX_INLINE_POIS). Cleaned up at the end. */
   poiTableRef?: string;
-  /**
-   * QueryId of the SELECT * that materializes the CTAS Parquet to a CSV in
-   * athena-results/. Reused across polls so we don't re-execute the SELECT
-   * every 4s (which was the symptom of NSE getting "stuck": each poll
-   * launched a fresh SELECT and ran out of Vercel function time before
-   * geocoding could finish).
-   */
-  selectQueryId?: string;
+  /** Bracket-map external table created from country geocode-cache + NSE config. */
+  bracketMapTable?: string;
+  /** S3 prefix backing the bracket map table — for cleanup. */
+  bracketMapS3Prefix?: string;
+  /** Per-bracket UNLOAD handles (queryId + S3 prefix where the CSV lands). */
+  unloads?: BracketUnloadHandle[];
+  /** Single GROUP BY query that returns COUNT(DISTINCT ad_id) per bracket. */
+  countQueryId?: string;
   country: string;
   megaJobId: string;
   error?: string;
@@ -224,13 +236,13 @@ export async function POST(
           return NextResponse.json({ phase: 'error', error: state.error });
         }
 
-        // SUCCEEDED → move to reading (kicks off SELECT * to materialize Parquet → CSV)
-        state = { ...state, phase: 'reading' };
+        // SUCCEEDED → move to bracket_setup (build bracket map + launch UNLOADs)
+        state = { ...state, phase: 'bracket_setup' };
         await putConfig(STATE_KEY(id), state, { compact: true });
 
         return NextResponse.json({
-          phase: 'reading',
-          progress: { step: 'reading', percent: 55, message: 'Query complete, materializing results...' },
+          phase: 'bracket_setup',
+          progress: { step: 'bracket_setup', percent: 55, message: 'Building bracket map for server-side bracket assignment...' },
         });
       } catch (err: any) {
         if (err?.message?.includes('not found') || err?.message?.includes('InvalidRequestException')) {
@@ -242,170 +254,110 @@ export async function POST(
       }
     }
 
-    // ── Phase: geocoding + bracket matching ──────────────────────────
-    // ── Phase: reading (kicks off SELECT * to materialize CTAS Parquet → CSV) ──
-    // Split out from geocoding so the (re-runnable) SELECT is launched once and
-    // we just poll it. Previously we re-executed runQueryViaS3 on every 4s frontend
-    // poll, hammering Athena and never reaching geocoding within the function timeout.
-    if (state.phase === 'reading' && state.ctasTable) {
-      // First entry: launch the SELECT. Subsequent entries: poll its status.
-      if (!state.selectQueryId) {
-        const qid = await startQueryAsync(`SELECT * FROM ${state.ctasTable}`);
-        console.log(`[MEGA-NSE-POLL] Started SELECT * to materialize CSV: ${qid}`);
-        state = { ...state, selectQueryId: qid };
-        await putConfig(STATE_KEY(id), state, { compact: true });
-        return NextResponse.json({
-          phase: 'reading',
-          progress: { step: 'reading', percent: 60, message: 'Materializing query result to CSV...' },
-        });
-      }
-      const status = await checkQueryStatus(state.selectQueryId);
-      if (status.state === 'RUNNING' || status.state === 'QUEUED') {
-        return NextResponse.json({
-          phase: 'reading',
-          progress: { step: 'reading', percent: 65, message: 'Materializing query result to CSV...' },
-        });
-      }
-      if (status.state !== 'SUCCEEDED') {
-        state = { ...state, phase: 'error', error: status.error || 'SELECT failed' };
-        await putConfig(STATE_KEY(id), state, { compact: true });
-        return NextResponse.json({ phase: 'error', error: state.error });
-      }
-      // SUCCEEDED → advance to geocoding
-      state = { ...state, phase: 'geocoding' };
+    // ── Phase: bracket_setup ──────────────────────────────────────────
+    // Build the bracket-assignment map (lat_key,lng_key → bracket_label) as an
+    // Athena external table, then launch 5 UNLOAD queries (one per bracket) +
+    // 1 COUNT-by-bracket query in parallel. Athena does the JOIN+aggregation
+    // server-side so we never need to download the per-device CSV (which is
+    // up to 1+ GB for 50k-POI megajobs).
+    if (state.phase === 'bracket_setup' && state.ctasTable && state.runId) {
+      console.log(`[MEGA-NSE-POLL] bracket_setup for ${state.country}, runId=${state.runId}`);
+
+      // Build + register the bracket map external table
+      const { tableName: bracketMapTable, s3Prefix: bracketMapS3Prefix, perBracket } =
+        await materializeNseBracketMap(id, state.runId, state.country, NSE_BRACKETS);
+      console.log(`[MEGA-NSE-POLL] Bracket map table: ${bracketMapTable}, perBracket grid cells: ${JSON.stringify(perBracket)}`);
+
+      // Launch 5 UNLOADs + 1 COUNT in parallel
+      const unloads = await startBracketUnloads(id, state.runId, state.ctasTable, bracketMapTable, NSE_BRACKETS);
+      const countQueryId = await startBracketCountQuery(state.ctasTable, bracketMapTable);
+      console.log(`[MEGA-NSE-POLL] Launched ${unloads.length} UNLOADs + 1 COUNT query=${countQueryId}`);
+
+      state = {
+        ...state,
+        phase: 'bracket_running',
+        bracketMapTable,
+        bracketMapS3Prefix,
+        unloads,
+        countQueryId,
+      };
       await putConfig(STATE_KEY(id), state, { compact: true });
+
       return NextResponse.json({
-        phase: 'geocoding',
-        progress: { step: 'geocoding', percent: 70, message: 'Reverse geocoding origins...' },
+        phase: 'bracket_running',
+        progress: { step: 'bracket_running', percent: 70, message: `Computing per-bracket MAIDs (${unloads.length} bracket queries running)...` },
       });
     }
 
-    if (state.phase === 'geocoding' && state.selectQueryId) {
-      // The SELECT * succeeded — read its CSV directly from athena-results/ (no Athena re-exec).
-      // Each row is (ad_id, origin_lat, origin_lng) — we aggregate to unique coords here
-      // (couldn't do it in SQL because the resulting ARRAY_JOIN strings exceeded Athena's
-      // 32 MB per-cell limit for dense urban areas).
-      const csvKey = `athena-results/${state.selectQueryId}.csv`;
-      console.log(`[MEGA-NSE-POLL] Downloading materialized CSV: ${csvKey}`);
-      const csvObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: csvKey }));
-      const csvText = await csvObj.Body!.transformToString('utf-8');
-      const lines = csvText.split('\n');
-
-      // Pre-aggregate in-memory: group ad_ids by unique (lat, lng) coord.
-      const coordToAdIds = new Map<string, string[]>();
-      let totalDevices = 0;
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        // Athena CSV format: "ad_id","lat","lng"
-        const parts = line.split(',').map(p => p.replace(/^"|"$/g, ''));
-        if (parts.length < 3) continue;
-        const [adId, lat, lng] = parts;
-        if (!adId || !lat || !lng) continue;
-        const coordKey = `${lat},${lng}`;
-        let arr = coordToAdIds.get(coordKey);
-        if (!arr) { arr = []; coordToAdIds.set(coordKey, arr); }
-        arr.push(adId);
-        totalDevices++;
-      }
-
-      console.log(`[MEGA-NSE-POLL] ${totalDevices} devices → ${coordToAdIds.size} unique coords`);
-
-      // Load NSE data
-      const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country));
-      if (!nseData?.length) {
-        state = { ...state, phase: 'error', error: 'NSE data disappeared' };
+    // ── Phase: bracket_running ────────────────────────────────────────
+    // Poll all 5 UNLOADs + the 1 COUNT query. When all SUCCEEDED, build the
+    // brackets[] result with maidCount (from COUNT) and downloadUrl (from
+    // listing the UNLOAD output prefix in S3).
+    if (state.phase === 'bracket_running' && state.unloads && state.countQueryId) {
+      // Check status of all queries
+      const allQueryIds = [...state.unloads.map(u => u.unloadQueryId), state.countQueryId];
+      const statuses = await Promise.all(
+        allQueryIds.map(qid => checkQueryStatus(qid).catch(() => ({ state: 'FAILED' as const, error: 'status check failed' })))
+      );
+      const failed = statuses.find(s => s.state === 'FAILED' || s.state === 'CANCELLED');
+      if (failed) {
+        state = { ...state, phase: 'error', error: (failed as any).error || 'Bracket query failed' };
         await putConfig(STATE_KEY(id), state, { compact: true });
         return NextResponse.json({ phase: 'error', error: state.error });
       }
 
-      // Geocode unique coords
-      setCountryFilter([state.country]);
-      const coordKeys = Array.from(coordToAdIds.keys());
-      const uniquePoints = coordKeys.map(k => {
-        const [lat, lng] = k.split(',').map(Number);
-        return { lat, lng, deviceCount: 1 };
-      });
-
-      console.log(`[MEGA-NSE-POLL] Reverse geocoding ${uniquePoints.length} unique coords...`);
-      const geocoded = await batchReverseGeocode(uniquePoints);
-
-      // Build postal code → ad_ids mapping
-      const cpToAdIds = new Map<string, string[]>();
-      for (let i = 0; i < coordKeys.length; i++) {
-        const geo = geocoded[i];
-        if (geo.type === 'geojson_local') {
-          const cp = geo.postcode?.replace(/^[A-Z]{2}[-\s]/, '') || '';
-          if (cp) {
-            const existing = cpToAdIds.get(cp) || [];
-            const adIds = coordToAdIds.get(coordKeys[i])!;
-            for (const aid of adIds) existing.push(aid);
-            cpToAdIds.set(cp, existing);
-          }
-        }
+      const doneCount = statuses.filter(s => s.state === 'SUCCEEDED').length;
+      if (doneCount < statuses.length) {
+        return NextResponse.json({
+          phase: 'bracket_running',
+          progress: { step: 'bracket_running', percent: 75, message: `Bracket queries: ${doneCount}/${statuses.length} done...` },
+        });
       }
 
-      setCountryFilter(null);
-
-      // Build NSE bracket → postal codes lookup
-      const bracketCPs: Map<string, Set<string>> = new Map();
-      for (const b of NSE_BRACKETS) {
-        bracketCPs.set(b.label, new Set(
-          nseData.filter(r => r.nse >= b.min && r.nse <= b.max).map(r => r.postal_code)
-        ));
+      // All done — pull the count results from the count query's CSV
+      const countCsvKey = `athena-results/${state.countQueryId}.csv`;
+      const countObj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: countCsvKey }));
+      const countBody = countObj.Body as { transformToString: (encoding: string) => Promise<string> } | undefined;
+      const countCsv = countBody ? await countBody.transformToString('utf-8') : '';
+      const labelToCount = new Map<string, number>();
+      for (const line of countCsv.split('\n').slice(1)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const parts = trimmed.split(',').map((p: string) => p.replace(/^"|"$/g, ''));
+        if (parts.length < 2) continue;
+        labelToCount.set(parts[0], parseInt(parts[1], 10) || 0);
       }
 
-      // Compute per-bracket MAIDs and save CSVs
-      const brackets: BracketResult[] = [];
-      const timestamp = Date.now();
+      // Load NSE data once for postal code count + population per bracket
+      const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country)) || [];
+      const stateUnloads = state.unloads;
 
-      for (const b of NSE_BRACKETS) {
-        const cps = bracketCPs.get(b.label)!;
+      // Build brackets array
+      const brackets: BracketResult[] = NSE_BRACKETS.map(b => {
         const inBracket = nseData.filter(r => r.nse >= b.min && r.nse <= b.max);
         const population = inBracket.reduce((s, r) => s + r.population, 0);
-
-        // Collect unique MAIDs for this bracket
-        const maidSet = new Set<string>();
-        for (const cp of cps) {
-          const adIds = cpToAdIds.get(cp);
-          if (adIds) {
-            for (const aid of adIds) maidSet.add(aid);
-          }
-        }
-
-        let downloadUrl: string | null = null;
-        if (maidSet.size > 0) {
-          const csvContent = 'ad_id\n' + Array.from(maidSet).join('\n');
-          const fileName = `mega-${id}-maids-nse-${b.min}-${b.max}-${timestamp}.csv`;
-          const key = `exports/${fileName}`;
-
-          await s3Client.send(new PutObjectCommand({
-            Bucket: BUCKET,
-            Key: key,
-            Body: csvContent,
-            ContentType: 'text/csv',
-          }));
-
-          downloadUrl = `/api/mega-jobs/${id}/reports/download?type=nse&file=${encodeURIComponent(fileName)}`;
-        }
-
-        brackets.push({
+        const handle = stateUnloads.find(u => u.label === b.label);
+        const maidCount = labelToCount.get(b.label) || 0;
+        return {
           label: b.label,
           min: b.min,
           max: b.max,
           postalCodes: inBracket.length,
           population,
-          maidCount: maidSet.size,
-          downloadUrl,
-        });
-
-        console.log(`[MEGA-NSE-POLL] Bracket ${b.label}: ${maidSet.size} MAIDs from ${cps.size} CPs`);
-      }
+          maidCount,
+          // Frontend hits the download endpoint which lists + concatenates
+          // the UNLOAD output files under unloadS3Prefix.
+          downloadUrl: handle && maidCount > 0
+            ? `/api/mega-jobs/${id}/reports/download?type=nse&prefix=${encodeURIComponent(handle.unloadS3Prefix)}`
+            : null,
+        };
+      });
 
       const totalMaids = brackets.reduce((s, b) => s + b.maidCount, 0);
       console.log(`[MEGA-NSE-POLL] Done: ${totalMaids} total MAIDs across ${brackets.length} brackets`);
 
-      // Cleanup CTAS temp table + POI temp table + their S3 artifacts (fire-and-forget)
+      // Cleanup temp tables (fire-and-forget). The UNLOAD output stays in
+      // exports/ for the user to download.
       if (state.ctasTable) {
         const t = state.ctasTable;
         Promise.all([dropTempTable(t), cleanupTempS3(t)]).catch(() => {});
@@ -414,6 +366,10 @@ export async function POST(
         const ref = state.poiTableRef;
         const prefix = poiCoordsTablePrefix(id, state.runId);
         dropPoiCoordsTable(ref, prefix).catch(() => {});
+      }
+      if (state.bracketMapTable && state.bracketMapS3Prefix) {
+        const t = state.bracketMapTable; const p = state.bracketMapS3Prefix;
+        dropNseBracketMap(t, p).catch(() => {});
       }
 
       state = { ...state, phase: 'done', brackets };
