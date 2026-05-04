@@ -35,13 +35,22 @@ const SELECTED_BORDER = '#ffffff';
 
 function FitBounds({ pois }: { pois: ComparePoi[] }) {
   const map = useMap();
+  // Re-fit only when the SET of POIs changes (different comparison run),
+  // not on every parent re-render — clicking a bar to highlight a marker
+  // mustn't reset the user's pan/zoom. Identity = sorted side+poiId list.
+  const idKey = pois
+    .filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lng))
+    .map(p => `${p.side}-${p.poiId}`)
+    .sort()
+    .join('|');
   useEffect(() => {
     const pts: LatLngExpression[] = pois
       .filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lng))
       .map(p => [p.lat as number, p.lng as number] as LatLngExpression);
     if (pts.length === 0) return;
     map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 14 });
-  }, [map, pois]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, idKey]);
   return null;
 }
 
