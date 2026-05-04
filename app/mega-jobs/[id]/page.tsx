@@ -695,8 +695,11 @@ export default function MegaJobDetailPage() {
                 defaultOpen={false}
               >
                 <CatchmentMap
+                  // Megajob ConsolidatedAffinityReport uses `postalCode` (not `zipCode`),
+                  // `avgDwell`/`totalVisits` (not `avgDwellMinutes`/`totalVisitDays`).
+                  // Map to the field names CatchmentMap expects.
                   data={affinityReport.byZipCode.map((z: any) => ({
-                    zipCode: z.zipCode,
+                    zipCode: z.postalCode,
                     city: z.city,
                     country: z.country,
                     lat: z.lat,
@@ -724,8 +727,8 @@ export default function MegaJobDetailPage() {
                     size="sm"
                     onClick={() => {
                       const sorted = [...affinityReport.byZipCode].sort((a: any, b: any) => b.affinityIndex - a.affinityIndex);
-                      const csv = 'zip_code,city,country,affinity_index,avg_dwell_min,avg_frequency,unique_devices,total_visit_days\n' +
-                        sorted.map((z: any) => `${z.zipCode},${z.city},${z.country},${z.affinityIndex},${z.avgDwellMinutes},${z.avgFrequency},${z.uniqueDevices},${z.totalVisitDays}`).join('\n');
+                      const csv = 'postal_code,city,country,affinity_index,avg_dwell_min,avg_frequency,unique_devices,total_visits\n' +
+                        sorted.map((z: any) => `${z.postalCode},${z.city},${z.country},${z.affinityIndex},${z.avgDwell},${z.avgFrequency},${z.uniqueDevices},${z.totalVisits}`).join('\n');
                       const blob = new Blob([csv], { type: 'text/csv' });
                       const url = URL.createObjectURL(blob);
                       const a = document.createElement('a');
@@ -745,7 +748,7 @@ export default function MegaJobDetailPage() {
                         <th className="text-right py-2 px-3">Avg Dwell (min)</th>
                         <th className="text-right py-2 px-3">Avg Frequency</th>
                         <th className="text-right py-2 px-3">Devices</th>
-                        <th className="text-right py-2 px-3">Visit-Days</th>
+                        <th className="text-right py-2 px-3">Total Visits</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -753,8 +756,9 @@ export default function MegaJobDetailPage() {
                         .sort((a: any, b: any) => b.affinityIndex - a.affinityIndex)
                         .slice(0, 100)
                         .map((z: any) => (
-                          <tr key={z.zipCode} className="border-b border-border/50 hover:bg-muted/30">
-                            <td className="py-2 px-3 font-mono">{z.zipCode}</td>
+                          // Megajob report uses postalCode/avgDwell/totalVisits (vs dataset's zipCode/avgDwellMinutes/totalVisitDays)
+                          <tr key={z.postalCode} className="border-b border-border/50 hover:bg-muted/30">
+                            <td className="py-2 px-3 font-mono">{z.postalCode}</td>
                             <td className="py-2 px-3 text-muted-foreground">{z.city}</td>
                             <td className="py-2 px-3 text-right">
                               <div className="flex items-center justify-end gap-2">
@@ -770,10 +774,10 @@ export default function MegaJobDetailPage() {
                                 <span className="font-semibold w-8 text-right">{z.affinityIndex}</span>
                               </div>
                             </td>
-                            <td className="py-2 px-3 text-right text-muted-foreground">{z.avgDwellMinutes}</td>
+                            <td className="py-2 px-3 text-right text-muted-foreground">{z.avgDwell}</td>
                             <td className="py-2 px-3 text-right text-muted-foreground">{z.avgFrequency}</td>
                             <td className="py-2 px-3 text-right">{z.uniqueDevices?.toLocaleString()}</td>
-                            <td className="py-2 px-3 text-right text-muted-foreground">{z.totalVisitDays?.toLocaleString()}</td>
+                            <td className="py-2 px-3 text-right text-muted-foreground">{z.totalVisits?.toLocaleString()}</td>
                           </tr>
                         ))}
                     </tbody>
