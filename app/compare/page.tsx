@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import { MainLayout } from '@/components/layout/main-layout';
 import { Button } from '@/components/ui/button';
@@ -291,6 +291,22 @@ export default function ComparePage() {
   const [compareProgress, setCompareProgress] = useState<string | null>(null);
   const [result, setResult] = useState<CompareResult | null>(null);
   const [poiTab, setPoiTab] = useState<'A' | 'B'>('A');
+  // POI selection shared between bar chart and map. Keys: `${side}-${poiId}`.
+  // Selecting works only from the chart; the map can only deselect via click
+  // on an already-highlighted marker. Clearing happens on result reset (new
+  // comparison run) or via the explicit "Clear selection" button.
+  const [selectedPoiKeys, setSelectedPoiKeys] = useState<Set<string>>(new Set());
+  // Reset selection whenever the result is replaced or cleared.
+  useEffect(() => { setSelectedPoiKeys(new Set()); }, [result]);
+  const togglePoi = useCallback((key: string) => {
+    setSelectedPoiKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+  const clearPoiSelection = useCallback(() => setSelectedPoiKeys(new Set()), []);
   const { toast } = useToast();
 
   useEffect(() => {
@@ -602,7 +618,13 @@ export default function ComparePage() {
                       </span>
                     </div>
                     <div style={{ height: 420 }}>
-                      <CompareMap pois={placedPois} dsALabel={dsALabel} dsBLabel={dsBLabel} />
+                      <CompareMap
+                        pois={placedPois}
+                        dsALabel={dsALabel}
+                        dsBLabel={dsBLabel}
+                        selectedPoiKeys={selectedPoiKeys}
+                        onTogglePoi={togglePoi}
+                      />
                     </div>
                   </div>
                 )}
@@ -673,6 +695,9 @@ export default function ComparePage() {
                       side={poiTab}
                       totalForSide={poiTab === 'A' ? result.totalA : result.totalB}
                       overlap={result.overlap}
+                      selectedPoiKeys={selectedPoiKeys}
+                      onTogglePoi={togglePoi}
+                      onClearSelection={clearPoiSelection}
                     />
 
                     {/* POI list table */}

@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import {
   BarChart,
   Bar,
+  Cell,
   XAxis,
   YAxis,
   Tooltip,
@@ -26,6 +27,14 @@ interface Props {
   totalForSide: number;         // totalA or totalB — denominator for "% of sample"
   overlap: number;              // overlap count — denominator for "% of match"
   maxBars?: number;             // top-N bars shown (default 20)
+  /**
+   * Selection keys of the form `${side}-${poiId}` shared with the map. When
+   * present, clicking a bar toggles its key. Selected bars stand out and
+   * unselected bars dim (only when there's at least one selection).
+   */
+  selectedPoiKeys?: Set<string>;
+  onTogglePoi?: (key: string) => void;
+  onClearSelection?: () => void;
 }
 
 type Metric = 'sample' | 'match';
@@ -34,9 +43,13 @@ const COLOR_BY_SIDE: Record<'A' | 'B', string> = {
   A: '#3b82f6',
   B: '#f97316',
 };
+// Selected bars/markers use the same accent color across sides so the eye
+// can pick them out at a glance regardless of which tab they came from.
+const SELECTED_COLOR = '#facc15'; // yellow-400
 
-export default function ComparePenetrationChart({ pois, side, totalForSide, overlap, maxBars = 20 }: Props) {
+export default function ComparePenetrationChart({ pois, side, totalForSide, overlap, maxBars = 20, selectedPoiKeys, onTogglePoi, onClearSelection }: Props) {
   const [metric, setMetric] = useState<Metric>('sample');
+  const hasSelection = !!selectedPoiKeys && selectedPoiKeys.size > 0;
 
   const data = useMemo(() => {
     const denom = metric === 'sample' ? totalForSide : overlap;
@@ -88,10 +101,29 @@ export default function ComparePenetrationChart({ pois, side, totalForSide, over
         {data.length >= maxBars && pois.length > maxBars && (
           <span className="text-xs text-muted-foreground ml-auto">Top {maxBars} of {pois.length}</span>
         )}
+        {hasSelection && onClearSelection && (
+          <button
+            onClick={onClearSelection}
+            className={`text-xs px-2 py-1 rounded bg-yellow-400/20 text-yellow-300 hover:bg-yellow-400/30 ${data.length >= maxBars && pois.length > maxBars ? 'ml-2' : 'ml-auto'}`}
+            title="Clear selection (works across both tabs)"
+          >
+            Clear selection ({selectedPoiKeys!.size})
+          </button>
+        )}
       </div>
       <div style={{ height }} className="p-2">
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={data} layout="vertical" margin={{ top: 8, right: 40, left: 8, bottom: 8 }}>
+          <BarChart
+            data={data}
+            layout="vertical"
+            margin={{ top: 8, right: 40, left: 8, bottom: 8 }}
+            onClick={(e: any) => {
+              const payload = e?.activePayload?.[0]?.payload;
+              if (payload?.poiId && onTogglePoi) {
+                onTogglePoi(`${side}-${payload.poiId}`);
+              }
+            }}
+          >
             <CartesianGrid strokeDasharray="3 3" horizontal={false} opacity={0.3} />
             <XAxis
               type="number"
@@ -124,7 +156,16 @@ export default function ComparePenetrationChart({ pois, side, totalForSide, over
                 return p ? `${p.fullLabel} (${p.poiId})` : '';
               }}
             />
-            <Bar dataKey="value" fill={color} radius={[0, 4, 4, 0]} />
+            <Bar dataKey="value" radius={[0, 4, 4, 0]} cursor="pointer">
+              {data.map((entry) => {
+                const key = `${side}-${entry.poiId}`;
+                const isSel = selectedPoiKeys?.has(key) ?? false;
+                const fill = isSel ? SELECTED_COLOR : color;
+                // Dim other bars only when there is at least one selection
+                const opacity = hasSelection && !isSel ? 0.35 : 1;
+                return <Cell key={key} fill={fill} fillOpacity={opacity} />;
+              })}
+            </Bar>
           </BarChart>
         </ResponsiveContainer>
       </div>
