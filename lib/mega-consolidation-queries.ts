@@ -658,12 +658,12 @@ export async function startConsolidatedDayHourQuery(
     ),
     ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT
-      DAY_OF_WEEK(${aPrefix}date) as dow,
+      DAY_OF_WEEK(${aPrefix}utc_timestamp) as dow,
       HOUR(${aPrefix}utc_timestamp) as hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ${aPrefix}ad_id) as devices
     FROM ${dhSource}
-    GROUP BY DAY_OF_WEEK(${aPrefix}date), HOUR(${aPrefix}utc_timestamp)
+    GROUP BY DAY_OF_WEEK(${aPrefix}utc_timestamp), HOUR(${aPrefix}utc_timestamp)
     ORDER BY dow, hour
     `;
   } else {
@@ -672,20 +672,20 @@ export async function startConsolidatedDayHourQuery(
     const unionParts = syncedJobs
       .map((job) => {
         const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-        return `SELECT ad_id, date, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+        return `SELECT ad_id, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
       })
       .join('\n      UNION ALL\n      ');
 
     sql = `
     SELECT
-      DAY_OF_WEEK(date) as dow,
+      DAY_OF_WEEK(utc_timestamp) as dow,
       HOUR(utc_timestamp) as hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ad_id) as devices
     FROM (
       ${unionParts}
     )
-    GROUP BY DAY_OF_WEEK(date), HOUR(utc_timestamp)
+    GROUP BY DAY_OF_WEEK(utc_timestamp), HOUR(utc_timestamp)
     ORDER BY dow, hour
     `;
   }

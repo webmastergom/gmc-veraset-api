@@ -199,12 +199,13 @@ function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0,
 }
 
 /**
- * Day-of-week × hour heatmap. DAY_OF_WEEK returns 1..7 with 1=Monday..7=Sunday
- * (ISO 8601 — what we want for the Mon-first heatmap).
+ * Day-of-week × hour heatmap. DAY_OF_WEEK on the timestamp returns 1..7
+ * (1=Monday..7=Sunday, ISO 8601). Using utc_timestamp directly avoids
+ * casting the varchar `date` partition column.
  */
 function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
   return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
-    SELECT DAY_OF_WEEK(date) as dow,
+    SELECT DAY_OF_WEEK(utc_timestamp) as dow,
       HOUR(utc_timestamp) as hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ad_id) as devices
