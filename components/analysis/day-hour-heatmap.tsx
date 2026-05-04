@@ -32,22 +32,10 @@ const PALETTE: Array<[number, [number, number, number]]> = [
 ];
 
 /**
- * Cell colour using min-max normalization across the visible grid. With
- * real-world POI data the absolute range can be narrow (e.g. min=1064,
- * max=1957 — only 1.8× spread); a 0-anchored or log scale flattens the
- * variation, so we anchor the palette at the grid's actual (min, max).
- *
- * @param value cell value
- * @param min   smallest non-zero value across the grid
- * @param max   largest value across the grid
- * @param hasData whether any cell has value > 0
+ * Convert a normalized value t∈[0,1] to a CSS rgb() colour by interpolating
+ * through the viridis palette stops.
  */
-function cellColor(value: number, min: number, max: number, hasData: boolean): string {
-  if (!hasData) return 'rgba(255,255,255,0.04)';
-  if (value <= 0) return 'rgba(255,255,255,0.04)';
-  const span = max - min;
-  // All cells equal — use the mid colour rather than a flat dark/bright
-  const t = span > 0 ? (value - min) / span : 0.5;
+function paletteAt(t: number): string {
   const clamped = Math.max(0, Math.min(1, t));
   let lo = PALETTE[0], hi = PALETTE[PALETTE.length - 1];
   for (let i = 0; i < PALETTE.length - 1; i++) {
@@ -64,6 +52,10 @@ function cellColor(value: number, min: number, max: number, hasData: boolean): s
 export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
   const [selectedMetric, setSelectedMetric] = useState<'devices' | 'pings'>(metric);
   const [hover, setHover] = useState<DayHourCell | null>(null);
+  // 0 = linear min-max (true magnitudes), 100 = histogram equalization
+  // (every cell ordered by rank; tiny absolute differences map to big
+  // colour jumps). Intermediate values blend between the two.
+  const [contrast, setContrast] = useState<number>(0);
 
   // Build a 7×24 grid (7 days × 24 hours), pre-filled with zeros for missing combos.
   const grid = useMemo(() => {
@@ -79,22 +71,44 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
   }, [cells]);
 
   // Compute (min, max) over non-zero cells so the palette uses the grid's
-  // actual range. With narrow spreads this is what makes the contrast pop.
-  const { min, max, hasData } = useMemo(() => {
-    let mn = Infinity, mx = 0, any = false;
+  // actual range, plus a sorted value list so we can compute each cell's
+  // rank (used by the contrast slider for histogram equalization).
+  const { min, max, hasData, sorted } = useMemo(() => {
+    const values: number[] = [];
     for (const row of grid) for (const c of row) {
       const v = selectedMetric === 'devices' ? c.devices : c.pings;
-      if (v <= 0) continue;
-      any = true;
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
+      if (v > 0) values.push(v);
     }
-    return { min: any ? mn : 0, max: mx, hasData: any };
+    if (values.length === 0) return { min: 0, max: 0, hasData: false, sorted: [] as number[] };
+    values.sort((a, b) => a - b);
+    return { min: values[0], max: values[values.length - 1], hasData: true, sorted: values };
   }, [grid, selectedMetric]);
+
+  /**
+   * Convert a cell value to a normalized t∈[0,1], blending between linear
+   * (contrast=0) and histogram-equalization (contrast=100) based on the
+   * current slider position.
+   */
+  const valueToT = (value: number): number => {
+    if (!hasData || value <= 0) return -1; // flag for "no data" — caller renders dim
+    const span = max - min;
+    const linearT = span > 0 ? (value - min) / span : 0.5;
+    if (contrast <= 0 || sorted.length < 2) return linearT;
+    // Rank-based normalization: cell's position in the sorted distribution.
+    // Use lower-bound binary search.
+    let lo = 0, hi = sorted.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid] < value) lo = mid + 1; else hi = mid;
+    }
+    const rankT = lo / (sorted.length - 1);
+    const c = contrast / 100;
+    return (1 - c) * linearT + c * rankT;
+  };
 
   return (
     <div>
-      <div className="flex items-center gap-2 mb-3 text-xs">
+      <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
         <span className="text-muted-foreground uppercase tracking-wider">Metric:</span>
         <button
           onClick={() => setSelectedMetric('devices')}
@@ -108,6 +122,19 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
         >
           Pings
         </button>
+        <div className="flex items-center gap-2 ml-2 pl-2 border-l border-border" title="0 = true magnitudes (linear). 100 = colours by rank — even tiny variations become hyper-visible.">
+          <span className="text-muted-foreground uppercase tracking-wider">Contrast:</span>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={contrast}
+            onChange={(e) => setContrast(parseInt(e.target.value, 10))}
+            className="w-24 accent-yellow-400"
+          />
+          <span className="tabular-nums w-8 text-right">{contrast}%</span>
+        </div>
         {hover && (
           <span className="ml-auto text-muted-foreground tabular-nums">
             {DAY_LABELS[hover.dow - 1]} {String(hover.hour).padStart(2, '0')}h
@@ -140,6 +167,8 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
               </div>
               {row.map((cell) => {
                 const value = selectedMetric === 'devices' ? cell.devices : cell.pings;
+                const t = valueToT(value);
+                const bg = t < 0 ? 'rgba(255,255,255,0.04)' : paletteAt(t);
                 return (
                   <div
                     key={`c-${dIdx}-${cell.hour}`}
@@ -147,7 +176,7 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
                     onMouseLeave={() => setHover(null)}
                     title={`${DAY_LABELS[dIdx]} ${String(cell.hour).padStart(2, '0')}h — ${cell.devices.toLocaleString()} devices, ${cell.pings.toLocaleString()} pings`}
                     className="h-7 rounded-[2px] cursor-default"
-                    style={{ backgroundColor: cellColor(value, min, max, hasData) }}
+                    style={{ backgroundColor: bg }}
                   />
                 );
               })}
