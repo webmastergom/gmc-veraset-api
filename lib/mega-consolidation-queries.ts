@@ -180,6 +180,48 @@ export interface DwellFilter {
 }
 
 /**
+ * Visitor-level filters that mirror the dataset page controls so megajob
+ * consolidation can be scoped the same way: hour-of-day and minimum number
+ * of distinct visit-days per ad_id.
+ *
+ * - hourFrom/hourTo (0..23): only count pings whose HOUR(utc_timestamp) falls
+ *   in [hourFrom, hourTo]. When hourFrom > hourTo the window wraps midnight
+ *   (e.g. 22..6 = 22:00–06:00). Both undefined / 0..23 = no filter.
+ * - minVisits: only count ad_ids whose distinct visit-days at POI(s) meets
+ *   this threshold. Applied via an extra `qualified_visitors` CTE so the
+ *   downstream metrics naturally exclude one-off bouncers.
+ */
+export interface VisitorFilter {
+  hourFrom?: number;
+  hourTo?: number;
+  minVisits?: number;
+}
+
+/**
+ * Build SQL fragment for hour-of-day filter on `utc_timestamp`. Returns
+ * a fragment starting with `AND ` (or empty string when no filter applies).
+ */
+export function buildHourFilterClause(filter?: VisitorFilter, tsCol: string = 'utc_timestamp'): string {
+  if (!filter) return '';
+  const from = filter.hourFrom ?? 0;
+  const to = filter.hourTo ?? 23;
+  if (from === 0 && to === 23) return '';
+  if (from <= to) {
+    return `AND HOUR(${tsCol}) >= ${from} AND HOUR(${tsCol}) <= ${to}`;
+  }
+  // Wrap-around window (e.g. 22..6)
+  return `AND (HOUR(${tsCol}) >= ${from} OR HOUR(${tsCol}) <= ${to})`;
+}
+
+/**
+ * Returns true when minVisits requires a HAVING / JOIN against a
+ * qualified-visitors CTE.
+ */
+export function hasMinVisitsFilter(filter?: VisitorFilter): boolean {
+  return !!(filter && typeof filter.minVisits === 'number' && filter.minVisits > 1);
+}
+
+/**
  * Build dwell time filter CTEs.
  * Computes dwell = time between first and last ping at POI per (ad_id, date).
  * Returns SQL fragment with visit_dwell + dwell_filtered CTEs.
@@ -243,16 +285,21 @@ export function extractPoiCoords(jobs: Job[]): PoiCoord[] {
 /**
  * Build the UNION ALL across all synced sub-job tables.
  * Returns the SQL fragment (no outer parens).
+ *
+ * `visitorFilter` (optional): when present, appends a hour-of-day predicate
+ * to every per-table SELECT so the filter is pushed down to scan time.
  */
 function buildUnionAll(
   syncedJobs: Job[],
   columns: string,
   whereExtra = '',
+  visitorFilter?: VisitorFilter,
 ): string {
+  const hourClause = buildHourFilterClause(visitorFilter);
   return syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra}`;
+      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause}`;
     })
     .join('\n    UNION ALL\n    ');
 }
@@ -355,6 +402,7 @@ export async function startConsolidatedODQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for OD query');
@@ -364,6 +412,7 @@ export async function startConsolidatedODQuery(
     syncedJobs,
     'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    visitorFilter,
   );
 
   let sql: string;
@@ -496,6 +545,7 @@ export async function startConsolidatedHourlyQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for hourly query');
@@ -508,6 +558,7 @@ export async function startConsolidatedHourlyQuery(
       syncedJobs,
       'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
       `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+      visitorFilter,
     );
 
     const dwellCTEs = buildDwellFilterCTEs(dwell);
@@ -579,6 +630,7 @@ export async function startConsolidatedCatchmentQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for catchment query');
@@ -588,6 +640,7 @@ export async function startConsolidatedCatchmentQuery(
     syncedJobs,
     'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    visitorFilter,
   );
 
   let visitorsCTE: string;
@@ -695,6 +748,7 @@ export async function startConsolidatedMobilityQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for mobility query');
@@ -704,6 +758,7 @@ export async function startConsolidatedMobilityQuery(
     syncedJobs,
     'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    visitorFilter,
   );
 
   let visitTimeCTE: string;
@@ -885,6 +940,7 @@ export async function startConsolidatedTemporalQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for temporal query');
@@ -898,6 +954,7 @@ export async function startConsolidatedTemporalQuery(
       syncedJobs,
       'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
       `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+      visitorFilter,
     );
     const dwellCTEs = buildDwellFilterCTEs(dwell);
 
@@ -960,6 +1017,7 @@ export async function startConsolidatedTotalDevicesQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for total devices query');
@@ -973,6 +1031,7 @@ export async function startConsolidatedTotalDevicesQuery(
       syncedJobs,
       'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
       `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+      visitorFilter,
     );
     const dwellCTEs = buildDwellFilterCTEs(dwell);
 
@@ -1026,6 +1085,7 @@ export async function startConsolidatedMAIDsQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for MAIDs query');
@@ -1039,6 +1099,7 @@ export async function startConsolidatedMAIDsQuery(
       syncedJobs,
       'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
       `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+      visitorFilter,
     );
     const dwellCTEs = buildDwellFilterCTEs(dwell);
 
@@ -1094,6 +1155,7 @@ export async function startConsolidatedNseQuery(
   poiCoords?: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for NSE query');
@@ -1103,6 +1165,7 @@ export async function startConsolidatedNseQuery(
     syncedJobs,
     'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    visitorFilter,
   );
 
   let visitorsCTE: string;
@@ -1193,6 +1256,7 @@ export async function startConsolidatedAffinityQuery(
   poiCoords: PoiCoord[],
   dwell?: DwellFilter,
   poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for affinity query');
@@ -1201,6 +1265,7 @@ export async function startConsolidatedAffinityQuery(
     syncedJobs,
     'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+    visitorFilter,
   );
 
   const dwellCTEs = buildDwellFilterCTEs(dwell);

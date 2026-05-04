@@ -85,6 +85,11 @@ interface ConsolidationState {
   poiIds?: string[];
   /** Optional dwell time filter */
   dwellFilter?: DwellFilter;
+  /** Optional hour-of-day filter (0..23 inclusive). Both default to full day. */
+  hourFrom?: number;
+  hourTo?: number;
+  /** Optional minimum number of distinct visit-days per ad_id (1 = no filter). */
+  minVisits?: number;
   /** Materialized MAIDs CSV key (set during parsing_od) — used as the export download URL. */
   maidsCsvKey?: string;
   error?: string;
@@ -115,13 +120,19 @@ export async function POST(
       return NextResponse.json({ error: 'Mega-job not found' }, { status: 404 });
     }
 
-    // Parse optional POI filter and dwell filter from body
+    // Parse optional filters from body
     let poiIds: string[] | undefined;
     let dwellFilter: DwellFilter | undefined;
+    let hourFrom: number | undefined;
+    let hourTo: number | undefined;
+    let minVisits: number | undefined;
     try {
       const body = await _request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
       if (body?.dwellFilter) dwellFilter = body.dwellFilter;
+      if (typeof body?.hourFrom === 'number' && body.hourFrom >= 0 && body.hourFrom <= 23) hourFrom = body.hourFrom;
+      if (typeof body?.hourTo === 'number' && body.hourTo >= 0 && body.hourTo <= 23) hourTo = body.hourTo;
+      if (typeof body?.minVisits === 'number' && body.minVisits > 1) minVisits = body.minVisits;
     } catch { }
 
     // Load sub-jobs
@@ -165,7 +176,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting', poiIds, dwellFilter };
+      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits };
     }
 
     // Update mega-job status — only set to consolidating when starting fresh work.
@@ -234,8 +245,15 @@ export async function POST(
         const poiCoords = extractPoiCoords(syncedJobs);
         console.log(`[MEGA] Extracted ${poiCoords.length} POI coordinates from ${syncedJobs.length} sub-jobs`);
 
-        // Get dwell filter from state (persisted across polls)
+        // Get filters from state (persisted across polls)
         const dwell = state.dwellFilter || dwellFilter;
+        const hFrom = state.hourFrom ?? hourFrom;
+        const hTo = state.hourTo ?? hourTo;
+        const mVisits = state.minVisits ?? minVisits;
+        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1))
+          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits }
+          : undefined;
+        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}`);
 
         // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
         const runId = (state as any).runId || Date.now().toString(36);
@@ -268,16 +286,16 @@ export async function POST(
         // Start all queries in parallel as CTAS (no 30-min timeout, results in Parquet at s3://.../athena-temp/{ctasTable}/)
         const [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
           startConsolidatedVisitsQuery(id, runId, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
-          startConsolidatedODQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
-          startConsolidatedHourlyQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
-          startConsolidatedCatchmentQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
+          startConsolidatedODQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
+          startConsolidatedHourlyQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedCatchmentQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
           skipMobility
             ? Promise.resolve(undefined)
-            : startConsolidatedMobilityQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
-          startConsolidatedTemporalQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
-          startConsolidatedTotalDevicesQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
-          startConsolidatedMAIDsQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
-          poiCoords.length > 0 ? startConsolidatedAffinityQuery(id, runId, syncedJobs, poiCoords, dwell, poiTableRef).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
+            : startConsolidatedMobilityQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] mobility query failed to start:', e.message); return undefined; }),
+          startConsolidatedTemporalQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] temporal query failed to start:', e.message); return undefined; }),
+          startConsolidatedTotalDevicesQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] totalDevices query failed to start:', e.message); return undefined; }),
+          startConsolidatedMAIDsQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] MAIDs query failed to start:', e.message); return undefined; }),
+          poiCoords.length > 0 ? startConsolidatedAffinityQuery(id, runId, syncedJobs, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] affinity query failed to start:', e.message); return undefined; }) : Promise.resolve(undefined),
         ]);
 
         // If mobility was skipped, surface the reason so the UI can show an explanation
