@@ -285,7 +285,7 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
       FROM valid_pings
       GROUP BY ad_id, date
     ),
-    device_homes AS (
+    device_homes_agg AS (
       SELECT ad_id,
         ROUND(origin_lat, ${PREC}) as home_lat,
         ROUND(origin_lng, ${PREC}) as home_lng,
@@ -293,7 +293,21 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
       FROM first_pings
       WHERE origin_lat IS NOT NULL
       GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
-      HAVING COUNT(DISTINCT date) >= 3
+    ),
+    -- One home per device — the rounded coord with the most visit-days.
+    -- Previously HAVING >= 3 silently dropped any visitor whose top home
+    -- didn't accumulate 3+ days, which made catchment under-count by 80%+.
+    device_homes AS (
+      SELECT ad_id, home_lat, home_lng, days_at_loc
+      FROM (
+        SELECT ad_id, home_lat, home_lng, days_at_loc,
+          ROW_NUMBER() OVER (
+            PARTITION BY ad_id
+            ORDER BY days_at_loc DESC, home_lat, home_lng
+          ) as rn
+        FROM device_homes_agg
+      )
+      WHERE rn = 1
     ),
     home_hours AS (
       SELECT dh.ad_id, dh.home_lat, dh.home_lng,
@@ -338,7 +352,7 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
       INNER JOIN (SELECT DISTINCT ad_id FROM at_poi) v ON p.ad_id = v.ad_id
       GROUP BY p.ad_id, p.date
     ),
-    device_homes AS (
+    device_homes_agg AS (
       SELECT ad_id,
         ROUND(origin_lat, ${PREC}) as home_lat,
         ROUND(origin_lng, ${PREC}) as home_lng,
@@ -346,7 +360,22 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
       FROM first_pings
       WHERE origin_lat IS NOT NULL
       GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
-      HAVING COUNT(DISTINCT date) >= 3
+    ),
+    -- Pick exactly one home per device (top by days_at_loc) so every POI
+    -- visitor contributes to the affinity stats. The previous HAVING >= 3
+    -- silently filtered out short-stay visitors and made affinity disagree
+    -- with the visits/temporal totals.
+    device_homes AS (
+      SELECT ad_id, home_lat, home_lng, days_at_loc
+      FROM (
+        SELECT ad_id, home_lat, home_lng, days_at_loc,
+          ROW_NUMBER() OVER (
+            PARTITION BY ad_id
+            ORDER BY days_at_loc DESC, home_lat, home_lng
+          ) as rn
+        FROM device_homes_agg
+      )
+      WHERE rn = 1
     ),
     device_stats AS (
       SELECT

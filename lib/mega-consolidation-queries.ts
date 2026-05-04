@@ -772,6 +772,14 @@ export async function startConsolidatedCatchmentQuery(
     )`;
   }
 
+  // Pick exactly ONE home location per device — the rounded origin coord
+  // with the most distinct visit-days (ties broken by the lower-bounded coord
+  // for determinism). This guarantees every POI visitor is counted exactly
+  // once, so the catchment totals match the visitor population from visits/
+  // temporal/OD reports. The previous implementation HAD `HAVING COUNT(DISTINCT
+  // date) >= 3`, which silently dropped any visitor whose top home didn't
+  // accumulate 3+ days — for the GDL megajob that filtered out 87% of
+  // visitors and made catchment look like a different population.
   const sql = `
     WITH
     ${visitorsCTE},
@@ -786,7 +794,7 @@ export async function startConsolidatedCatchmentQuery(
       INNER JOIN poi_visitors v ON vp.ad_id = v.ad_id
       GROUP BY v.ad_id, vp.date
     ),
-    device_homes AS (
+    device_homes_agg AS (
       SELECT ad_id,
         ROUND(origin_lat, ${COORDINATE_PRECISION}) as home_lat,
         ROUND(origin_lng, ${COORDINATE_PRECISION}) as home_lng,
@@ -795,7 +803,18 @@ export async function startConsolidatedCatchmentQuery(
       GROUP BY ad_id,
         ROUND(origin_lat, ${COORDINATE_PRECISION}),
         ROUND(origin_lng, ${COORDINATE_PRECISION})
-      HAVING COUNT(DISTINCT date) >= 3
+    ),
+    device_homes AS (
+      SELECT ad_id, home_lat, home_lng, days_at_loc
+      FROM (
+        SELECT ad_id, home_lat, home_lng, days_at_loc,
+          ROW_NUMBER() OVER (
+            PARTITION BY ad_id
+            ORDER BY days_at_loc DESC, home_lat, home_lng
+          ) as rn
+        FROM device_homes_agg
+      )
+      WHERE rn = 1
     )
     SELECT
       home_lat as origin_lat,
