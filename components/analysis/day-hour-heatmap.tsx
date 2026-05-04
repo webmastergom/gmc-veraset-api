@@ -20,27 +20,41 @@ interface Props {
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 /**
- * Cell colour scale: dark slate when 0, ramping through teal → bright cyan
- * as the value approaches the grid max. Returns a CSS background colour.
+ * Viridis-inspired sequential palette — wide perceptual contrast across the
+ * full range so even cells with similar values are visually distinct.
  */
-function cellColor(value: number, max: number): string {
-  if (max <= 0 || value <= 0) return 'rgba(255,255,255,0.04)';
-  // Log-scale so a few high cells don't crush the rest
-  const t = Math.log(value + 1) / Math.log(max + 1);
+const PALETTE: Array<[number, [number, number, number]]> = [
+  [0.00, [38, 6, 80]],       // dark purple
+  [0.25, [50, 75, 140]],     // indigo
+  [0.50, [27, 158, 158]],    // teal
+  [0.75, [120, 200, 90]],    // green
+  [1.00, [253, 231, 37]],    // yellow
+];
+
+/**
+ * Cell colour using min-max normalization across the visible grid. With
+ * real-world POI data the absolute range can be narrow (e.g. min=1064,
+ * max=1957 — only 1.8× spread); a 0-anchored or log scale flattens the
+ * variation, so we anchor the palette at the grid's actual (min, max).
+ *
+ * @param value cell value
+ * @param min   smallest non-zero value across the grid
+ * @param max   largest value across the grid
+ * @param hasData whether any cell has value > 0
+ */
+function cellColor(value: number, min: number, max: number, hasData: boolean): string {
+  if (!hasData) return 'rgba(255,255,255,0.04)';
+  if (value <= 0) return 'rgba(255,255,255,0.04)';
+  const span = max - min;
+  // All cells equal — use the mid colour rather than a flat dark/bright
+  const t = span > 0 ? (value - min) / span : 0.5;
   const clamped = Math.max(0, Math.min(1, t));
-  // Mix from #0f172a (slate-900) through #0e7490 (cyan-700) to #67e8f9 (cyan-300)
-  const stops: Array<[number, [number, number, number]]> = [
-    [0.00, [15, 23, 42]],     // slate-900
-    [0.35, [14, 116, 144]],   // cyan-700
-    [0.70, [34, 211, 238]],   // cyan-400
-    [1.00, [165, 243, 252]],  // cyan-200
-  ];
-  let lo = stops[0], hi = stops[stops.length - 1];
-  for (let i = 0; i < stops.length - 1; i++) {
-    if (clamped >= stops[i][0] && clamped <= stops[i + 1][0]) { lo = stops[i]; hi = stops[i + 1]; break; }
+  let lo = PALETTE[0], hi = PALETTE[PALETTE.length - 1];
+  for (let i = 0; i < PALETTE.length - 1; i++) {
+    if (clamped >= PALETTE[i][0] && clamped <= PALETTE[i + 1][0]) { lo = PALETTE[i]; hi = PALETTE[i + 1]; break; }
   }
-  const span = hi[0] - lo[0] || 1;
-  const f = (clamped - lo[0]) / span;
+  const segSpan = hi[0] - lo[0] || 1;
+  const f = (clamped - lo[0]) / segSpan;
   const r = Math.round(lo[1][0] + (hi[1][0] - lo[1][0]) * f);
   const g = Math.round(lo[1][1] + (hi[1][1] - lo[1][1]) * f);
   const b = Math.round(lo[1][2] + (hi[1][2] - lo[1][2]) * f);
@@ -64,10 +78,18 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
     return g;
   }, [cells]);
 
-  const max = useMemo(() => {
-    let m = 0;
-    for (const row of grid) for (const c of row) m = Math.max(m, selectedMetric === 'devices' ? c.devices : c.pings);
-    return m;
+  // Compute (min, max) over non-zero cells so the palette uses the grid's
+  // actual range. With narrow spreads this is what makes the contrast pop.
+  const { min, max, hasData } = useMemo(() => {
+    let mn = Infinity, mx = 0, any = false;
+    for (const row of grid) for (const c of row) {
+      const v = selectedMetric === 'devices' ? c.devices : c.pings;
+      if (v <= 0) continue;
+      any = true;
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+    return { min: any ? mn : 0, max: mx, hasData: any };
   }, [grid, selectedMetric]);
 
   return (
@@ -125,7 +147,7 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
                     onMouseLeave={() => setHover(null)}
                     title={`${DAY_LABELS[dIdx]} ${String(cell.hour).padStart(2, '0')}h — ${cell.devices.toLocaleString()} devices, ${cell.pings.toLocaleString()} pings`}
                     className="h-7 rounded-[2px] cursor-default"
-                    style={{ backgroundColor: cellColor(value, max) }}
+                    style={{ backgroundColor: cellColor(value, min, max, hasData) }}
                   />
                 );
               })}
@@ -134,11 +156,13 @@ export function DayHourHeatmap({ cells, metric = 'devices' }: Props) {
         </div>
       </div>
       <div className="flex items-center gap-2 mt-3 text-[10px] text-muted-foreground">
-        <span>0</span>
+        <span className="tabular-nums">{min.toLocaleString()}</span>
         <div
           className="h-2 flex-1 rounded"
           style={{
-            background: `linear-gradient(to right, ${cellColor(0, max)}, ${cellColor(max * 0.35, max)}, ${cellColor(max * 0.7, max)}, ${cellColor(max, max)})`,
+            // Render the gradient from the actual palette stops so the legend
+            // matches what the cells use.
+            background: `linear-gradient(to right, ${PALETTE.map(([_, [r, g, b]]) => `rgb(${r},${g},${b})`).join(', ')})`,
           }}
         />
         <span className="tabular-nums">{max.toLocaleString()} {selectedMetric}</span>
