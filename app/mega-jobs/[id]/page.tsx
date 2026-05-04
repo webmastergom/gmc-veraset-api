@@ -27,6 +27,7 @@ import { MovementMap } from '@/components/analysis/movement-map'
 import { MegaNseModal } from '@/components/mega-jobs/nse-modal'
 import { MegaCategoryMaidModal } from '@/components/mega-jobs/category-maid-modal'
 import { MegaCountrySelector } from '@/components/mega-jobs/country-selector'
+import { DayHourHeatmap } from '@/components/analysis/day-hour-heatmap'
 
 /** Dwell time options (in minutes) — kept in sync with the dataset page list */
 const DWELL_OPTIONS = [
@@ -79,6 +80,7 @@ export default function MegaJobDetailPage() {
   const [temporalReport, setTemporalReport] = useState<any>(null)
   const [odReport, setODReport] = useState<any>(null)
   const [hourlyReport, setHourlyReport] = useState<any>(null)
+  const [dayhourReport, setDayhourReport] = useState<any>(null)
   const [catchmentReport, setCatchmentReport] = useState<any>(null)
   const [mobilityReport, setMobilityReport] = useState<any>(null)
   const [affinityReport, setAffinityReport] = useState<any>(null)
@@ -171,12 +173,13 @@ export default function MegaJobDetailPage() {
   useEffect(() => {
     if (megaJob?.status !== 'completed') return
 
-    const reportTypes = ['visits', 'temporal', 'od', 'hourly', 'catchment', 'mobility', 'affinity']
+    const reportTypes = ['visits', 'temporal', 'od', 'hourly', 'dayhour', 'catchment', 'mobility', 'affinity']
     const setters: Record<string, (d: any) => void> = {
       visits: setVisitsReport,
       temporal: setTemporalReport,
       od: setODReport,
       hourly: setHourlyReport,
+      dayhour: setDayhourReport,
       catchment: setCatchmentReport,
       mobility: setMobilityReport,
       affinity: setAffinityReport,
@@ -684,6 +687,20 @@ export default function MegaJobDetailPage() {
                   label="Devices"
                   color="#3b82f6"
                 />
+              </CollapsibleCard>
+            )}
+
+            {/* 8b. POI Activity by Day × Hour heatmap */}
+            {dayhourReport?.cells?.length > 0 && (
+              <CollapsibleCard
+                title="POI Activity by Day × Hour"
+                icon={<BarChart3 className="h-4 w-4" />}
+                downloadHref={`/api/mega-jobs/${id}/reports/download?type=dayhour`}
+              >
+                <p className="text-sm text-muted-foreground mb-4">
+                  Heatmap of unique devices (or pings) by day-of-week and hour-of-day. Darker = quieter, brighter cyan = busier.
+                </p>
+                <DayHourHeatmap cells={dayhourReport.cells} />
               </CollapsibleCard>
             )}
 

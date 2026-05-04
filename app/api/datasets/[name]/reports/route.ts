@@ -13,7 +13,7 @@ function REPORT_KEY_FULL(ds: string, type: string, dwellMin: number, dwellMax: n
 }
 const REPORT_KEY_LEGACY = (ds: string, type: string) =>
   `dataset-reports/${ds}/${type}`;
-const VALID_TYPES = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
+const VALID_TYPES = ['od', 'hourly', 'dayhour', 'catchment', 'mobility', 'temporal', 'affinity'];
 
 /**
  * GET /api/datasets/[name]/reports?type=od&dwellMin=5&dwellMax=60&hourFrom=8&hourTo=18

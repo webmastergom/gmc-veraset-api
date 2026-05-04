@@ -94,6 +94,15 @@ export async function GET(
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-hourly.csv`);
     }
 
+    // ── Day-of-week × Hour heatmap ───────────────────────────────────
+    if (reportType === 'dayhour') {
+      const report = await getConsolidatedReport<{ cells: Array<{ dow: number; hour: number; pings: number; devices: number }> }>(id, 'dayhour');
+      if (!report) return NextResponse.json({ error: 'Day-Hour report not found' }, { status: 404 });
+      const header = 'day_of_week,hour,pings,devices';
+      const rows = (report.cells || []).map((c) => `${c.dow},${c.hour},${c.pings},${c.devices}`);
+      return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-dayhour.csv`);
+    }
+
     // ── Catchment ────────────────────────────────────────────────────
     if (reportType === 'catchment') {
       const report = await getConsolidatedReport<ConsolidatedCatchmentReport>(id, 'catchment');

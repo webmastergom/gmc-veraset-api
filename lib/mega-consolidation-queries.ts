@@ -611,6 +611,89 @@ export async function startConsolidatedHourlyQuery(
   return await startAsCTAS(megaJobId, runId, 'hourly', sql);
 }
 
+// ── Q2b: POI Activity by Day-of-Week × Hour ────────────────────────────
+
+/**
+ * Build and start the consolidated day-of-week × hour heatmap query.
+ * Returns 7×24 cells (DAY_OF_WEEK 1=Mon..7=Sun + HOUR 0..23) with pings + devices.
+ * Mirrors the hourly query shape but adds the DAY_OF_WEEK group key.
+ */
+export async function startConsolidatedDayHourQuery(
+  megaJobId: string,
+  runId: string,
+  subJobs: Job[],
+  poiIds?: string[],
+  poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
+  poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
+): Promise<ConsolidatedQueryHandle> {
+  const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
+  if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for dayhour query');
+
+  let sql: string;
+
+  if (poiCoords?.length) {
+    const allPingsUnion = buildUnionAll(
+      syncedJobs,
+      'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+      `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
+      visitorFilter,
+    );
+
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    const useDwell = hasDwellFilter(dwell);
+    const dhSource = useDwell
+      ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
+      : `at_poi_pings`;
+    const aPrefix = useDwell ? 'a.' : '';
+
+    sql = `
+    WITH
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng
+      FROM (
+        ${allPingsUnion}
+      )
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
+    SELECT
+      DAY_OF_WEEK(${aPrefix}date) as dow,
+      HOUR(${aPrefix}utc_timestamp) as hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ${aPrefix}ad_id) as devices
+    FROM ${dhSource}
+    GROUP BY DAY_OF_WEEK(${aPrefix}date), HOUR(${aPrefix}utc_timestamp)
+    ORDER BY dow, hour
+    `;
+  } else {
+    // Fallback: poi_ids approach
+    const poiFilter = buildPoiFilter(poiIds);
+    const unionParts = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        return `SELECT ad_id, date, utc_timestamp FROM ${table} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != '' ${poiFilter}`;
+      })
+      .join('\n      UNION ALL\n      ');
+
+    sql = `
+    SELECT
+      DAY_OF_WEEK(date) as dow,
+      HOUR(utc_timestamp) as hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM (
+      ${unionParts}
+    )
+    GROUP BY DAY_OF_WEEK(date), HOUR(utc_timestamp)
+    ORDER BY dow, hour
+    `;
+  }
+
+  console.log(`[MEGA-DAYHOUR] Starting day-hour heatmap query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  return await startAsCTAS(megaJobId, runId, 'dayhour', sql);
+}
+
 // ── Q3: Catchment Origins (first-ping-of-day) ──────────────────────────
 
 /**

@@ -198,6 +198,19 @@ function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0,
     FROM at_poi GROUP BY 1 ORDER BY 1`;
 }
 
+/**
+ * Day-of-week × hour heatmap. DAY_OF_WEEK returns 1..7 with 1=Monday..7=Sunday
+ * (ISO 8601 — what we want for the Mon-first heatmap).
+ */
+function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
+    SELECT DAY_OF_WEEK(date) as dow,
+      HOUR(utc_timestamp) as hour,
+      COUNT(*) as pings,
+      COUNT(DISTINCT ad_id) as devices
+    FROM at_poi GROUP BY 1, 2 ORDER BY 1, 2`;
+}
+
 function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
   return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
     SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
@@ -836,11 +849,12 @@ export async function POST(
         console.warn(`[DS-REPORT] Could not load POI coords: ${e.message}`);
       }
 
-      // Launch all 7 queries in parallel
+      // Launch all 8 queries in parallel
       const queries: Record<string, string> = {};
       await Promise.all([
         startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
         startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
+        startQueryAsync(buildDayHourSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.dayhour = id; }).catch(e => console.error('[DS-REPORT] dayhour:', e.message)),
         startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
         startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
         startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
@@ -975,6 +989,24 @@ export async function POST(
           const r = await fetchQueryResults(queries.hourly);
           await putConfig(`${rk('hourly')}`, parseConsolidatedHourly(datasetName, r.rows), { compact: true });
         } catch (e: any) { console.error('[DS-REPORT] hourly parse:', e.message); }
+      }
+
+      // Parse dayhour (day-of-week × hour heatmap; 7×24 cells, dow 1=Mon..7=Sun)
+      if (queries.dayhour) {
+        try {
+          const r = await fetchQueryResults(queries.dayhour);
+          const cells = (r.rows || []).map((row: any) => ({
+            dow: parseInt(row.dow, 10) || 0,
+            hour: parseInt(row.hour, 10) || 0,
+            pings: parseInt(row.pings, 10) || 0,
+            devices: parseInt(row.devices, 10) || 0,
+          }));
+          await putConfig(`${rk('dayhour')}`, {
+            datasetName,
+            analyzedAt: new Date().toISOString(),
+            cells,
+          }, { compact: true });
+        } catch (e: any) { console.error('[DS-REPORT] dayhour parse:', e.message); }
       }
 
       // Parse temporal + totalDevices

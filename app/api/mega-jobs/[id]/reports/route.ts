@@ -21,7 +21,7 @@ export async function GET(
     }
 
     const reportType = request.nextUrl.searchParams.get('type') || 'visits';
-    const validTypes = ['visits', 'temporal', 'catchment', 'od', 'hourly', 'mobility', 'affinity'];
+    const validTypes = ['visits', 'temporal', 'catchment', 'od', 'hourly', 'dayhour', 'mobility', 'affinity'];
 
     if (!validTypes.includes(reportType)) {
       return NextResponse.json(

@@ -15,6 +15,7 @@ import {
 import {
   startConsolidatedODQuery,
   startConsolidatedHourlyQuery,
+  startConsolidatedDayHourQuery,
   startConsolidatedCatchmentQuery,
   startConsolidatedMobilityQuery,
   startConsolidatedTemporalQuery,
@@ -67,6 +68,7 @@ interface ConsolidationState {
     visits?: ConsolidatedQueryHandle;
     od?: ConsolidatedQueryHandle;
     hourly?: ConsolidatedQueryHandle;
+    dayhour?: ConsolidatedQueryHandle;
     catchment?: ConsolidatedQueryHandle;
     mobility?: ConsolidatedQueryHandle;
     temporal?: ConsolidatedQueryHandle;
@@ -284,10 +286,11 @@ export async function POST(
         }
 
         // Start all queries in parallel as CTAS (no 30-min timeout, results in Parquet at s3://.../athena-temp/{ctasTable}/)
-        const [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
+        const [visits, od, hourly, dayhour, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
           startConsolidatedVisitsQuery(id, runId, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
           startConsolidatedODQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
           startConsolidatedHourlyQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
+          startConsolidatedDayHourQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] dayhour query failed to start:', e.message); return undefined; }),
           startConsolidatedCatchmentQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] catchment query failed to start:', e.message); return undefined; }),
           skipMobility
             ? Promise.resolve(undefined)
@@ -315,6 +318,7 @@ export async function POST(
             visits,
             od,
             hourly,
+            dayhour,
             catchment,
             mobility,
             temporal,
@@ -326,10 +330,10 @@ export async function POST(
         };
         await putConf(CONSOLIDATION_KEY(id), state);
 
-        const startedCount = [visits, od, hourly, catchment, mobility, temporal, totalDevices, maids, affinity].filter(Boolean).length;
+        const startedCount = [visits, od, hourly, dayhour, catchment, mobility, temporal, totalDevices, maids, affinity].filter(Boolean).length;
         return NextResponse.json({
           phase: state.phase,
-          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount}/9 Athena CTAS queries${poiTableRef ? ` (${poiCoords.length} POIs in external table)` : ''}...` },
+          progress: { step: 'queries_started', percent: 10, message: `Started ${startedCount}/10 Athena CTAS queries${poiTableRef ? ` (${poiCoords.length} POIs in external table)` : ''}...` },
         });
       } catch (err: any) {
         state = { phase: 'launching', error: err.message };
@@ -447,6 +451,17 @@ export async function POST(
       await parseAndSave('hourly', state.queries.hourly, (rows) => {
         return parseConsolidatedHourly(id, rows);
       }, 'hourly');
+
+      // Parse dayhour heatmap (7×24 cells, dow 1=Mon..7=Sun)
+      await parseAndSave('dayhour', state.queries.dayhour, (rows) => {
+        const cells = (rows || []).map((row: any) => ({
+          dow: parseInt(row.dow, 10) || 0,
+          hour: parseInt(row.hour, 10) || 0,
+          pings: parseInt(row.pings, 10) || 0,
+          devices: parseInt(row.devices, 10) || 0,
+        }));
+        return { megaJobId: id, analyzedAt: new Date().toISOString(), cells };
+      }, 'dayhour');
 
       // Parse mobility
       await parseAndSave('mobility', state.queries.mobility, (rows) => {

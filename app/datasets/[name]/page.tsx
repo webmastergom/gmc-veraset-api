@@ -47,6 +47,7 @@ import {
 } from '@/components/ui/dialog';
 import type { DailyData, VisitByPoi } from '@/lib/dataset-analysis';
 import { MovementMap } from '@/components/analysis/movement-map';
+import { DayHourHeatmap } from '@/components/analysis/day-hour-heatmap';
 import { Progress } from '@/components/ui/progress';
 import { useToast } from '@/hooks/use-toast';
 
@@ -150,6 +151,7 @@ export default function DatasetAnalysisPage() {
   const [minVisits, setMinVisits] = useState<number>(1);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
+  const [dayhourReport, setDayhourReport] = useState<any>(null);
   const [catchmentReport, setCatchmentReport] = useState<any>(null);
   const [mobilityReport, setMobilityReport] = useState<any>(null);
   const [temporalReport, setTemporalReport] = useState<any>(null);
@@ -181,10 +183,11 @@ export default function DatasetAnalysisPage() {
 
   // Load reports for specific dwell interval + hour range
   const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits) => {
-    const types = ['od', 'hourly', 'catchment', 'mobility', 'temporal', 'affinity'];
+    const types = ['od', 'hourly', 'dayhour', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
       hourly: setHourlyReport,
+      dayhour: setDayhourReport,
       catchment: setCatchmentReport,
       mobility: setMobilityReport,
       temporal: setTemporalReport,
@@ -1087,6 +1090,19 @@ export default function DatasetAnalysisPage() {
                 label="Devices"
                 color="#3b82f6"
               />
+            </CollapsibleCard>
+          )}
+
+          {/* POI Activity by Day × Hour heatmap */}
+          {dayhourReport?.cells?.length > 0 && (
+            <CollapsibleCard
+              title="POI Activity by Day × Hour"
+              icon={<BarChart3 className="h-4 w-4" />}
+            >
+              <p className="text-sm text-muted-foreground mb-4">
+                Heatmap of unique devices (or pings) by day-of-week and hour-of-day. Darker = quieter, brighter cyan = busier.
+              </p>
+              <DayHourHeatmap cells={dayhourReport.cells} />
             </CollapsibleCard>
           )}
         </div>
