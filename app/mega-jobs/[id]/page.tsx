@@ -28,6 +28,24 @@ import { MegaNseModal } from '@/components/mega-jobs/nse-modal'
 import { MegaCategoryMaidModal } from '@/components/mega-jobs/category-maid-modal'
 import { MegaCountrySelector } from '@/components/mega-jobs/country-selector'
 
+/** Dwell time options (in minutes) — kept in sync with the dataset page list */
+const DWELL_OPTIONS = [
+  { value: 0, label: 'No limit' },
+  { value: 2, label: '2 min' },
+  { value: 5, label: '5 min' },
+  { value: 10, label: '10 min' },
+  { value: 15, label: '15 min' },
+  { value: 30, label: '30 min' },
+  { value: 45, label: '45 min' },
+  { value: 60, label: '1 hr' },
+  { value: 90, label: '1.5 hr' },
+  { value: 120, label: '2 hr' },
+  { value: 180, label: '3 hr' },
+  { value: 240, label: '4 hr' },
+  { value: 360, label: '6 hr' },
+  { value: 480, label: '8 hr' },
+];
+
 const statusColors: Record<string, string> = {
   planning: 'bg-blue-500/20 text-blue-400',
   creating: 'bg-yellow-500/20 text-yellow-400',
@@ -65,9 +83,14 @@ export default function MegaJobDetailPage() {
   const [mobilityReport, setMobilityReport] = useState<any>(null)
   const [affinityReport, setAffinityReport] = useState<any>(null)
 
-  // Dwell filter
-  const [dwellMin, setDwellMin] = useState<string>('')
-  const [dwellMax, setDwellMax] = useState<string>('')
+  // Dwell filter (numeric minutes, 0 = no limit) — matches dataset page UX
+  const [dwellMin, setDwellMin] = useState<number>(0)
+  const [dwellMax, setDwellMax] = useState<number>(0)
+  // Hour-of-day filter (0..23 inclusive)
+  const [hourFrom, setHourFrom] = useState<number>(0)
+  const [hourTo, setHourTo] = useState<number>(23)
+  // Minimum number of distinct visit-days per ad_id
+  const [minVisits, setMinVisits] = useState<number>(1)
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
@@ -184,12 +207,14 @@ export default function MegaJobDetailPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             ...(selectedPoiIds.length > 0 ? { poiIds: selectedPoiIds } : {}),
-            ...(dwellMin || dwellMax ? {
+            ...(dwellMin > 0 || dwellMax > 0 ? {
               dwellFilter: {
-                ...(dwellMin ? { minMinutes: parseFloat(dwellMin) } : {}),
-                ...(dwellMax ? { maxMinutes: parseFloat(dwellMax) } : {}),
+                ...(dwellMin > 0 ? { minMinutes: dwellMin } : {}),
+                ...(dwellMax > 0 ? { maxMinutes: dwellMax } : {}),
               }
             } : {}),
+            ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
+            ...(minVisits > 1 ? { minVisits } : {}),
           }),
         })
         if (!res.ok) {
@@ -292,24 +317,62 @@ export default function MegaJobDetailPage() {
           </div>
 
           {canConsolidate && (
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell (min):</label>
-                <input
-                  type="number"
-                  placeholder="Min"
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-1">
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell:</label>
+                <select
                   value={dwellMin}
-                  onChange={(e) => setDwellMin(e.target.value)}
-                  className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
-                />
-                <span className="text-xs text-muted-foreground">-</span>
-                <input
-                  type="number"
-                  placeholder="Max"
+                  onChange={(e) => setDwellMin(parseInt(e.target.value, 10))}
+                  className="h-8 w-20 rounded-md border border-input bg-background px-1 text-sm text-center"
+                >
+                  {DWELL_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.value === 0 ? 'Min' : opt.label}</option>
+                  ))}
+                </select>
+                <span className="text-xs text-muted-foreground">to</span>
+                <select
                   value={dwellMax}
-                  onChange={(e) => setDwellMax(e.target.value)}
-                  className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm"
-                />
+                  onChange={(e) => setDwellMax(parseInt(e.target.value, 10))}
+                  className="h-8 w-20 rounded-md border border-input bg-background px-1 text-sm text-center"
+                >
+                  {DWELL_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.value === 0 ? 'Max' : opt.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-1">
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Hours:</label>
+                <select
+                  value={hourFrom}
+                  onChange={(e) => setHourFrom(parseInt(e.target.value, 10))}
+                  className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+                >
+                  {Array.from({ length: 24 }, (_, i) => (
+                    <option key={i} value={i}>{String(i).padStart(2, '0')}h</option>
+                  ))}
+                </select>
+                <span className="text-xs text-muted-foreground">to</span>
+                <select
+                  value={hourTo}
+                  onChange={(e) => setHourTo(parseInt(e.target.value, 10))}
+                  className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+                >
+                  {Array.from({ length: 24 }, (_, i) => (
+                    <option key={i} value={i}>{String(i).padStart(2, '0')}h</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-1">
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Min Visits:</label>
+                <select
+                  value={minVisits}
+                  onChange={(e) => setMinVisits(parseInt(e.target.value, 10))}
+                  className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+                >
+                  {[1, 2, 3, 5, 10, 15, 20].map((n) => (
+                    <option key={n} value={n}>{n}+</option>
+                  ))}
+                </select>
               </div>
               <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
                 {consolidating ? (
@@ -776,8 +839,10 @@ export default function MegaJobDetailPage() {
         onClose={() => setCategoryModalOpen(false)}
         megaJobId={id}
         megaJobCountry={megaJob?.country || null}
-        dwellMin={parseInt(dwellMin, 10) || 0}
-        dwellMax={parseInt(dwellMax, 10) || 0}
+        dwellMin={dwellMin}
+        dwellMax={dwellMax}
+        hourFrom={hourFrom}
+        hourTo={hourTo}
       />
     </MainLayout>
   )
