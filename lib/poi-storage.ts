@@ -128,7 +128,11 @@ export async function getPOIPositionsForDataset(
   prefetchedJob?: any | null,
 ): Promise<DatasetPoiPosition[]> {
   const job = prefetchedJob ?? await getJobByDatasetName(datasetName);
-  if (!job) return [];
+  if (!job) {
+    // Could be a megajob "integrated" dataset (Athena view, no single owning job).
+    // Resolve by sanitized name and aggregate POIs across all sub-jobs.
+    return await getPOIPositionsForMegaDataset(datasetName);
+  }
 
   // Build a name lookup from EVERY source we have — names can live in:
   //   - job.poiNames[poiId]                              (set by sync/enrichment)
@@ -237,4 +241,57 @@ export async function getPOIPositionsForDataset(
   }
 
   return positions;
+}
+
+/**
+ * Resolve POI positions for a mega-job "integrated" dataset.
+ *
+ * Mega-job integrated datasets are Athena VIEWs (UNION ALL of the sub-job
+ * tables) and don't correspond to a single Job, so getJobByDatasetName
+ * returns null. The dataset name is the sanitized mega-job name, e.g.
+ * "competencia-six-guadalajara-jul-abril-2026".
+ *
+ * Strategy: scan the mega-jobs index, find the megajob whose sanitized
+ * name matches, then aggregate POI positions from all its sub-jobs (with
+ * de-dup by poiId — same poi may appear in many sub-jobs of an auto-split).
+ */
+async function getPOIPositionsForMegaDataset(datasetName: string): Promise<DatasetPoiPosition[]> {
+  try {
+    const { getAllMegaJobs, getMegaJob } = await import('./mega-jobs');
+    const { megaJobNameToDatasetId } = await import('./athena');
+
+    const megaJobs = await getAllMegaJobs();
+    const match = megaJobs.find((mj: any) => {
+      const nm = mj?.name || mj?.megaJobId || '';
+      return megaJobNameToDatasetId(nm) === datasetName;
+    });
+    if (!match || !match.megaJobId) return [];
+
+    // Need full megajob (subJobIds isn't always in the index)
+    const fullMega = await getMegaJob(match.megaJobId);
+    if (!fullMega?.subJobIds?.length) return [];
+
+    const { getJob } = await import('./jobs');
+    const subJobs = await Promise.all(fullMega.subJobIds.map((jid: string) => getJob(jid)));
+
+    const seen = new Set<string>();
+    const merged: DatasetPoiPosition[] = [];
+    for (const sj of subJobs) {
+      if (!sj || !sj.s3DestPath) continue;
+      const subDsName = sj.s3DestPath.replace(/\/$/, '').split('/').pop();
+      if (!subDsName) continue;
+      // Reuse the per-job path with the prefetched sub-job — avoids another
+      // getJobByDatasetName lookup per sub-job.
+      const positions = await getPOIPositionsForDataset(subDsName, sj);
+      for (const p of positions) {
+        if (!p.poiId || seen.has(p.poiId)) continue;
+        seen.add(p.poiId);
+        merged.push(p);
+      }
+    }
+    return merged;
+  } catch (e: any) {
+    console.warn(`[getPOIPositionsForMegaDataset] failed for ${datasetName}: ${e?.message || e}`);
+    return [];
+  }
 }
