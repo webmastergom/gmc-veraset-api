@@ -17,6 +17,7 @@ import { downloadComparePoisCsv, downloadCompareXlsx } from '@/lib/compare-expor
 
 const CompareMap = dynamic(() => import('@/components/compare/compare-map-inner'), { ssr: false });
 const ComparePenetrationChart = dynamic(() => import('@/components/compare/compare-penetration-chart'), { ssr: false });
+const CompareReach = dynamic(() => import('@/components/compare/compare-reach'), { ssr: false });
 
 interface Dataset {
   id: string;
@@ -291,6 +292,8 @@ export default function ComparePage() {
   const [compareProgress, setCompareProgress] = useState<string | null>(null);
   const [result, setResult] = useState<CompareResult | null>(null);
   const [poiTab, setPoiTab] = useState<'A' | 'B'>('A');
+  // Top-level subtab between MAID overlap (default) and Potential Reach.
+  const [mainTab, setMainTab] = useState<'overlap' | 'reach'>('overlap');
   // POI selection shared between bar chart and map. Keys: `${side}-${poiId}`.
   // Selecting works only from the chart; the map can only deselect via click
   // on an already-highlighted marker. Clearing happens on result reset (new
@@ -545,7 +548,35 @@ export default function ComparePage() {
               )}
             </Button>
 
-            {result && (
+            {/* Subtab toggle: Overlap (default) vs Potential Reach */}
+            {datasetA && datasetB && (
+              <div className="flex gap-1 border-b">
+                <button
+                  onClick={() => setMainTab('overlap')}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${mainTab === 'overlap' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+                >
+                  MAID overlap
+                </button>
+                <button
+                  onClick={() => setMainTab('reach')}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${mainTab === 'reach' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+                >
+                  Potential reach
+                </button>
+              </div>
+            )}
+
+            {/* Reach subtab — independent of basic compare result */}
+            {mainTab === 'reach' && datasetA && datasetB && (
+              <CompareReach
+                datasetA={datasetA}
+                datasetB={datasetB}
+                dsALabel={dsALabel}
+                dsBLabel={dsBLabel}
+              />
+            )}
+
+            {mainTab === 'overlap' && result && (
               <div className="border rounded-lg p-6 space-y-6">
                 <div className="flex items-center justify-center gap-0">
                   <div className="relative">
