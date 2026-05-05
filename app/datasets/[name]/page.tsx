@@ -71,6 +71,8 @@ interface DatasetInfo {
   dateRange?: { from: string; to: string } | null;
   external?: boolean;
   country?: string | null;
+  /** Veraset job type — `pings` is the default; `devices` only contains a MAID list (no movement data). */
+  type?: 'pings' | 'devices' | 'aggregate' | 'cohort' | 'pings_by_device' | string;
 }
 
 interface AnalysisResult {
@@ -175,6 +177,7 @@ export default function DatasetAnalysisPage() {
             dateRange: ds.dateRange,
             external: ds.external,
             country: ds.country,
+            type: ds.type,
           });
         }
       })
@@ -509,6 +512,25 @@ export default function DatasetAnalysisPage() {
           <p className="mt-2 font-mono text-sm text-gray-500">{datasetInfo.id}</p>
         )}
       </div>
+
+      {/* Devices-only job notice — these datasets contain just MAIDs, no
+          lat/lng/utc_timestamp/poi_ids, so the Athena pipeline has nothing
+          to aggregate. Surface this prominently so the user doesn't waste a
+          run on empty reports. */}
+      {datasetInfo?.type === 'devices' && (
+        <div className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+          <p className="font-semibold text-amber-200">
+            This dataset is type <code className="font-mono">devices</code> — only a list of MAIDs, no movement data.
+          </p>
+          <p className="text-amber-100/80 mt-1">
+            The Veraset <code className="font-mono">/v1/movement/job/devices</code> endpoint returns just the unique device IDs that
+            visited the POIs, with no <code className="font-mono">lat</code>, <code className="font-mono">lng</code>,{' '}
+            <code className="font-mono">utc_timestamp</code> or <code className="font-mono">poi_ids</code> per ping. Reports below
+            will be empty. Re-run the job as <code className="font-mono">pings</code> for the full dataset analysis, or as{' '}
+            <code className="font-mono">cohort</code> if you already have the device list and want their movement patterns.
+          </p>
+        </div>
+      )}
 
       {/* Action buttons */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
