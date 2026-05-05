@@ -550,23 +550,32 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
     )`;
   }
 
+  // Pre-aggregate nearby_pings per (ad_id, date, timing, lat_bucket, lng_bucket)
+  // and collapse the matched set with DISTINCT instead of ROW_NUMBER.
+  // Same two-step optimization the megajob mobility query already uses (commits
+  // ad0d178 + 4f3c98a). For typical 20-50 GB datasets this drops mobility from
+  // ~30 min (timeout) down to a few minutes.
   return `WITH
     ${mobilityVisitFilterCTE}${visitTimeCTE},
     nearby_pings AS (
       SELECT
         a.ad_id,
         a.date,
-        a.utc_timestamp,
-        a.lat,
-        a.lng,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing,
         CAST(FLOOR(a.lat / ${GRID_STEP}) AS BIGINT) as lat_bucket,
         CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT) as lng_bucket,
-        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END as timing
+        AVG(a.lat) as lat,
+        AVG(a.lng) as lng
       FROM all_pings a
       INNER JOIN target_visits t ON a.ad_id = t.ad_id AND a.date = t.date
       WHERE ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) <= 120
         AND ABS(DATE_DIFF('minute', a.utc_timestamp, t.visit_time)) > 0
         ${bboxFilterPings}
+      GROUP BY
+        a.ad_id, a.date,
+        CASE WHEN a.utc_timestamp < t.visit_time THEN 'before' ELSE 'after' END,
+        CAST(FLOOR(a.lat / ${GRID_STEP}) AS BIGINT),
+        CAST(FLOOR(a.lng / ${GRID_STEP}) AS BIGINT)
     ),
     poi_buckets AS (
       SELECT
@@ -583,34 +592,26 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         ${bboxFilter}
     ),
     matched AS (
-      SELECT
+      SELECT DISTINCT
         p.ad_id,
         p.date,
         p.timing,
-        b.category,
-        111320 * SQRT(
-          POW(p.lat - b.poi_lat, 2) +
-          POW((p.lng - b.poi_lng) * COS(RADIANS((p.lat + b.poi_lat) / 2)), 2)
-        ) as distance_m
+        b.category
       FROM nearby_pings p
       INNER JOIN poi_buckets b
         ON p.lat_bucket = b.lat_bucket
         AND p.lng_bucket = b.lng_bucket
-    ),
-    closest AS (
-      SELECT
-        ad_id, date, timing, category, distance_m,
-        ROW_NUMBER() OVER (PARTITION BY ad_id, date, timing, category ORDER BY distance_m) as rn
-      FROM matched
-      WHERE distance_m <= 200
+      WHERE 111320 * SQRT(
+          POW(p.lat - b.poi_lat, 2) +
+          POW((p.lng - b.poi_lng) * COS(RADIANS((p.lat + b.poi_lat) / 2)), 2)
+        ) <= 200
     )
     SELECT
       timing,
       category,
       COUNT(DISTINCT CONCAT(ad_id, '-', date)) as device_days,
       COUNT(*) as hits
-    FROM closest
-    WHERE rn = 1
+    FROM matched
     GROUP BY timing, category
     ORDER BY timing, device_days DESC`;
 }
