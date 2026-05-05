@@ -5,7 +5,17 @@
 
 import { getTableName, startQueryAsync, fetchQueryResults, startCTASAsync, tempTableName } from './athena';
 import { type Job } from './jobs';
-import type { ConsolidatedQueryHandle } from './mega-consolidation-queries';
+import {
+  type ConsolidatedQueryHandle,
+  type DwellFilter,
+  type PoiCoord,
+  type VisitorFilter,
+  buildHourFilterClause,
+  hasMinVisitsFilter,
+  buildAtPoiPingsCTE,
+  buildDwellFilterCTEs,
+  hasDwellFilter,
+} from './mega-consolidation-queries';
 import { getConfig, putConfig } from './s3-config';
 import { megaReportKey } from './mega-jobs';
 
@@ -150,18 +160,38 @@ export interface ConsolidatedMobilityReport {
 export async function startConsolidatedVisitsQuery(
   megaJobId: string,
   runId: string,
-  subJobs: Job[]
+  subJobs: Job[],
+  poiCoords?: PoiCoord[],
+  dwell?: DwellFilter,
+  poiTableRef?: string,
+  visitorFilter?: VisitorFilter,
 ): Promise<ConsolidatedQueryHandle> {
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs');
 
-  // Build UNION ALL of raw (poi_id, ad_id) pairs from all tables
-  const unionParts = syncedJobs.map((job) => {
-    const tableName = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-    return `SELECT poi_id, ad_id FROM ${tableName} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != ''`;
-  });
+  const useDwell = hasDwellFilter(dwell);
+  const useMinVisits = hasMinVisitsFilter(visitorFilter);
+  const hourClause = buildHourFilterClause(visitorFilter);
+  const useHour = hourClause.length > 0;
+  // The visits query historically uses an inline poi_ids approach (UNION ALL of
+  // (poi_id, ad_id) pairs from each sub-job's raw table) which doesn't apply
+  // any filter. That made visits disagree with the rest of the reports
+  // whenever a dwell/hour/minVisits filter was active — the box "total devices"
+  // could end up smaller than visits for a single POI. To keep the megajob
+  // graphs internally consistent, when ANY filter is active we restrict the
+  // poi_ids stream to (ad_id, date) pairs that pass the same filters that
+  // the at_poi_pings-based queries use.
+  const filtersActive = useDwell || useMinVisits || useHour;
 
-  const sql = `
+  let sql: string;
+  if (!filtersActive || !poiCoords?.length) {
+    // No filters → keep the cheap original SQL (also the legacy fallback when
+    // a megajob has no poi coordinates available for the spatial pre-filter).
+    const unionParts = syncedJobs.map((job) => {
+      const tableName = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      return `SELECT poi_id, ad_id FROM ${tableName} CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL AND poi_id != '' AND ad_id IS NOT NULL AND TRIM(ad_id) != ''`;
+    });
+    sql = `
     SELECT
       poi_id,
       COUNT(*) as visits,
@@ -171,9 +201,88 @@ export async function startConsolidatedVisitsQuery(
     )
     GROUP BY poi_id
     ORDER BY visits DESC
-  `;
+    `;
+  } else {
+    // Filters active → JOIN against the same qualified-visitor-day set the
+    // other reports use. We build:
+    //   1. all_pings: union of raw pings (with hour filter pushed down)
+    //   2. at_poi_pings: spatial filter to actual POI proximity
+    //   3. dwell_filtered: at_poi (ad_id, date) pairs whose dwell matches
+    //   4. qualified_visitor_days: dwell_filtered (or at_poi_pings if no
+    //      dwell) further narrowed by minVisits (≥N distinct visit-days)
+    // Then UNION ALL the (poi_id, ad_id, date) stream and INNER JOIN against
+    // qualified_visitor_days. Result mirrors the visits semantics but only
+    // for visits where the device-day passed every active filter.
 
-  console.log(`[MEGA-CONSOLIDATION] Starting visits query (CTAS) across ${syncedJobs.length} tables`);
+    // Build pings union via inline composition (we can't reuse buildUnionAll
+    // here because we need `date` in the row for the dwell + minVisits CTEs).
+    const pingsUnion = syncedJobs.map((job) => {
+      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      return `SELECT ad_id, date, utc_timestamp,
+                TRY_CAST(latitude AS DOUBLE) as lat,
+                TRY_CAST(longitude AS DOUBLE) as lng
+              FROM ${table}
+              WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+                AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+                AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+                AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < 500)
+                ${hourClause}`;
+    }).join('\n      UNION ALL\n      ');
+
+    const poiVisitsUnion = syncedJobs.map((job) => {
+      const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      return `SELECT poi_id, ad_id, date FROM ${table}
+              CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+              WHERE poi_id IS NOT NULL AND poi_id != ''
+                AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+                ${hourClause}`;
+    }).join('\n      UNION ALL\n      ');
+
+    const dwellCTEs = buildDwellFilterCTEs(dwell);
+    // Source for the qualified visitor-day set after dwell filter (if dwell
+    // active) or just at_poi_pings (if only hour/minVisits is active).
+    const baseCTE = useDwell
+      ? `SELECT DISTINCT ad_id, date FROM dwell_filtered`
+      : `SELECT DISTINCT ad_id, date FROM at_poi_pings`;
+
+    // minVisits applies on top: keep only ad_ids whose at-POI visit-day count ≥ N.
+    const minVisits = visitorFilter?.minVisits ?? 1;
+    const minVisitsCTE = useMinVisits ? `,
+    qualified_visitors AS (
+      SELECT ad_id FROM (${baseCTE}) base
+      GROUP BY ad_id
+      HAVING COUNT(DISTINCT date) >= ${minVisits}
+    ),
+    qualified_visitor_days AS (
+      SELECT b.ad_id, b.date FROM (${baseCTE}) b
+      INNER JOIN qualified_visitors qv ON b.ad_id = qv.ad_id
+    )` : `,
+    qualified_visitor_days AS (
+      ${baseCTE}
+    )`;
+
+    sql = `
+    WITH
+    all_pings AS (
+      ${pingsUnion}
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}${minVisitsCTE},
+    poi_visits AS (
+      ${poiVisitsUnion}
+    )
+    SELECT
+      pv.poi_id,
+      COUNT(*) as visits,
+      COUNT(DISTINCT pv.ad_id) as devices
+    FROM poi_visits pv
+    INNER JOIN qualified_visitor_days qvd
+      ON pv.ad_id = qvd.ad_id AND pv.date = qvd.date
+    GROUP BY pv.poi_id
+    ORDER BY visits DESC
+    `;
+  }
+
+  console.log(`[MEGA-CONSOLIDATION] Starting visits query (CTAS) across ${syncedJobs.length} tables (filters: dwell=${useDwell}, hour=${useHour}, minVisits=${useMinVisits})`);
   const ctasTable = tempTableName('mc_visits', `${megaJobId}_${runId}`);
   const queryId = await startCTASAsync(sql, ctasTable);
   return { queryId, ctasTable };

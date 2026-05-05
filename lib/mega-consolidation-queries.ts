@@ -227,7 +227,7 @@ export function hasMinVisitsFilter(filter?: VisitorFilter): boolean {
  * Returns SQL fragment with visit_dwell + dwell_filtered CTEs.
  * If no filter provided, returns empty string (no filtering).
  */
-function buildDwellFilterCTEs(dwell?: DwellFilter): string {
+export function buildDwellFilterCTEs(dwell?: DwellFilter): string {
   if (!dwell || (dwell.minMinutes == null && dwell.maxMinutes == null)) return '';
 
   const conditions: string[] = [];
@@ -251,7 +251,7 @@ function buildDwellFilterCTEs(dwell?: DwellFilter): string {
  * Returns the correct visitor CTE name based on whether dwell filter is active.
  * When dwell filter is active, queries should JOIN against dwell_filtered.
  */
-function hasDwellFilter(dwell?: DwellFilter): boolean {
+export function hasDwellFilter(dwell?: DwellFilter): boolean {
   return !!(dwell && (dwell.minMinutes != null || dwell.maxMinutes != null));
 }
 
@@ -340,7 +340,7 @@ function buildTargetPoisValues(poiCoords: PoiCoord[]): string {
  * (used when poiCoords > MAX_INLINE_POIS to avoid Athena's SQL size limit).
  * Otherwise falls back to inlining the coords as VALUES.
  */
-function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTableRef?: string): string {
+export function buildAtPoiPingsCTE(allPingsCte: string, poiCoords: PoiCoord[], poiTableRef?: string): string {
   const targetPoisSource = poiTableRef
     ? `(SELECT poi_lat, poi_lng, poi_radius_m FROM ${poiTableRef})`
     : buildTargetPoisValues(poiCoords);

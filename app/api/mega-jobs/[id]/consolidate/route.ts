@@ -287,7 +287,7 @@ export async function POST(
 
         // Start all queries in parallel as CTAS (no 30-min timeout, results in Parquet at s3://.../athena-temp/{ctasTable}/)
         const [visits, od, hourly, dayhour, catchment, mobility, temporal, totalDevices, maids, affinity] = await Promise.all([
-          startConsolidatedVisitsQuery(id, runId, syncedJobs).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
+          startConsolidatedVisitsQuery(id, runId, syncedJobs, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] visits query failed to start:', e.message); return undefined; }),
           startConsolidatedODQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] OD query failed to start:', e.message); return undefined; }),
           startConsolidatedHourlyQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] hourly query failed to start:', e.message); return undefined; }),
           startConsolidatedDayHourQuery(id, runId, syncedJobs, effectivePoiIds, poiCoords, dwell, poiTableRef, visitorFilter).catch((e) => { console.error('[MEGA] dayhour query failed to start:', e.message); return undefined; }),
