@@ -95,6 +95,8 @@ export default function MegaJobDetailPage() {
   const [minVisits, setMinVisits] = useState<number>(1)
   // FULL-schema GPS-only filter (no-op on BASIC datasets)
   const [gpsOnly, setGpsOnly] = useState<boolean>(false)
+  // FULL-schema ping_circle_score threshold (0 = off; lower = tighter)
+  const [maxCircleScore, setMaxCircleScore] = useState<number>(0)
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
@@ -221,6 +223,7 @@ export default function MegaJobDetailPage() {
             ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
             ...(minVisits > 1 ? { minVisits } : {}),
             ...(gpsOnly ? { gpsOnly: true } : {}),
+            ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
           }),
         })
         if (!res.ok) {
@@ -389,6 +392,18 @@ export default function MegaJobDetailPage() {
                 />
                 GPS only
               </label>
+              <div className="flex items-center gap-1" title="Drop pings with ping_circle_score above this threshold (lower = tighter uncertainty). 0 = off. Typical: 0.5-1.0. Requires FULL schema; no effect on BASIC.">
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Max score:</label>
+                <select
+                  value={maxCircleScore}
+                  onChange={(e) => setMaxCircleScore(parseFloat(e.target.value))}
+                  className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+                >
+                  {[0, 0.1, 0.25, 0.5, 1, 2].map((v) => (
+                    <option key={v} value={v}>{v === 0 ? 'off' : v}</option>
+                  ))}
+                </select>
+              </div>
               <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
                 {consolidating ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />

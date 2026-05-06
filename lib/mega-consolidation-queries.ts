@@ -202,6 +202,13 @@ export interface VisitorFilter {
    * datasets — the user just sees no effect rather than empty results.
    */
   gpsOnly?: boolean;
+  /**
+   * FULL-schema opt-in: drop pings whose `quality_fields['ping_circle_score']`
+   * exceeds this threshold (lower = tighter uncertainty radius). Typical
+   * values 0.5..1.0. Rows where the field is NULL (BASIC) are kept.
+   * 0 disables the filter.
+   */
+  maxCircleScore?: number;
 }
 
 /**
@@ -228,6 +235,17 @@ export function buildHourFilterClause(filter?: VisitorFilter, tsCol: string = 'u
 export function buildGpsOnlyClause(filter?: VisitorFilter): string {
   if (!filter?.gpsOnly) return '';
   return `AND (TRY(quality_fields['ping_origin_type']) IS NULL OR TRY(quality_fields['ping_origin_type']) = 'gps')`;
+}
+
+/**
+ * Build SQL fragment for FULL-schema ping_circle_score threshold. Pings with
+ * a NULL value (BASIC) or a parse failure are kept (TRY_CAST returns NULL,
+ * which fails the comparison and is OR'd back in via IS NULL). 0 = off.
+ */
+export function buildCircleScoreClause(filter?: VisitorFilter): string {
+  const t = filter?.maxCircleScore;
+  if (!t || t <= 0) return '';
+  return `AND (TRY(quality_fields['ping_circle_score']) IS NULL OR TRY_CAST(quality_fields['ping_circle_score'] AS DOUBLE) IS NULL OR TRY_CAST(quality_fields['ping_circle_score'] AS DOUBLE) <= ${t})`;
 }
 
 /**
@@ -314,10 +332,11 @@ function buildUnionAll(
 ): string {
   const hourClause = buildHourFilterClause(visitorFilter);
   const gpsClause = buildGpsOnlyClause(visitorFilter);
+  const scoreClause = buildCircleScoreClause(visitorFilter);
   return syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause}`;
+      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause}`;
     })
     .join('\n    UNION ALL\n    ');
 }

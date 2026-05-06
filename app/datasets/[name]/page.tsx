@@ -152,6 +152,7 @@ export default function DatasetAnalysisPage() {
   const [hourTo, setHourTo] = useState<number>(23);
   const [minVisits, setMinVisits] = useState<number>(1);
   const [gpsOnly, setGpsOnly] = useState<boolean>(false);
+  const [maxCircleScore, setMaxCircleScore] = useState<number>(0);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [dayhourReport, setDayhourReport] = useState<any>(null);
@@ -186,7 +187,7 @@ export default function DatasetAnalysisPage() {
   }, [datasetName]);
 
   // Load reports for specific dwell interval + hour range
-  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly) => {
+  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly, cScore = maxCircleScore) => {
     const types = ['od', 'hourly', 'dayhour', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -201,8 +202,9 @@ export default function DatasetAnalysisPage() {
     const hourParams = (hFrom > 0 || hTo < 23) ? `&hourFrom=${hFrom}&hourTo=${hTo}` : '';
     const visitParams = mVisits > 1 ? `&minVisits=${mVisits}` : '';
     const gpsParams = gOnly ? `&gpsOnly=true` : '';
+    const scoreParams = cScore > 0 ? `&maxCircleScore=${cScore}` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}${scoreParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -285,6 +287,7 @@ export default function DatasetAnalysisPage() {
               ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
               ...(minVisits > 1 ? { minVisits } : {}),
               ...(gpsOnly ? { gpsOnly: true } : {}),
+              ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
             }),
           });
           consecutiveErrors = 0;
@@ -620,12 +623,28 @@ export default function DatasetAnalysisPage() {
               checked={gpsOnly}
               onChange={(e) => {
                 setGpsOnly(e.target.checked);
-                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, e.target.checked);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, e.target.checked, maxCircleScore);
               }}
               className="h-3.5 w-3.5"
             />
             GPS only
           </label>
+          <div className="flex items-center gap-1 mr-2" title="Drop pings with ping_circle_score above this threshold (lower = tighter uncertainty). 0 = off. Typical: 0.5-1.0. Requires FULL schema; no effect on BASIC.">
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Max score:</label>
+            <select
+              value={maxCircleScore}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setMaxCircleScore(v);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, v);
+              }}
+              className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
+            >
+              {[0, 0.1, 0.25, 0.5, 1, 2].map((v) => (
+                <option key={v} value={v}>{v === 0 ? 'off' : v}</option>
+              ))}
+            </select>
+          </div>
           <Button onClick={runFullAnalysis} disabled={loading || generatingReports}>
             {loading || generatingReports ? (
               <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Analyzing...</>

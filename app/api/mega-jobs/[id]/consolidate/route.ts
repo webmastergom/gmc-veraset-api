@@ -94,6 +94,8 @@ interface ConsolidationState {
   minVisits?: number;
   /** FULL-schema only: drop non-GPS pings (cell-tower / Wi-Fi triangulated). */
   gpsOnly?: boolean;
+  /** FULL-schema only: drop pings whose ping_circle_score exceeds this. 0 = off. */
+  maxCircleScore?: number;
   /** Materialized MAIDs CSV key (set during parsing_od) — used as the export download URL. */
   maidsCsvKey?: string;
   error?: string;
@@ -131,6 +133,7 @@ export async function POST(
     let hourTo: number | undefined;
     let minVisits: number | undefined;
     let gpsOnly: boolean | undefined;
+    let maxCircleScore: number | undefined;
     try {
       const body = await _request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
@@ -139,6 +142,7 @@ export async function POST(
       if (typeof body?.hourTo === 'number' && body.hourTo >= 0 && body.hourTo <= 23) hourTo = body.hourTo;
       if (typeof body?.minVisits === 'number' && body.minVisits > 1) minVisits = body.minVisits;
       if (body?.gpsOnly === true) gpsOnly = true;
+      if (typeof body?.maxCircleScore === 'number' && body.maxCircleScore > 0) maxCircleScore = body.maxCircleScore;
     } catch { }
 
     // Load sub-jobs
@@ -182,7 +186,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly };
+      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore };
     }
 
     // Update mega-job status — only set to consolidating when starting fresh work.
@@ -257,10 +261,11 @@ export async function POST(
         const hTo = state.hourTo ?? hourTo;
         const mVisits = state.minVisits ?? minVisits;
         const gOnly = state.gpsOnly ?? gpsOnly;
-        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly)
-          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly }
+        const cScore = state.maxCircleScore ?? maxCircleScore;
+        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0))
+          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore }
           : undefined;
-        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}`);
+        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}`);
 
         // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
         const runId = (state as any).runId || Date.now().toString(36);
