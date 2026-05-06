@@ -1,100 +1,79 @@
+/**
+ * POST /api/mega-jobs/[id]/repair-chunk
+ *
+ * Surgical sub-job creation for a specific (dateChunkIdx, poiChunkIdx) pair
+ * — used to fill gaps left by the create-poll race condition (where two
+ * concurrent calls both created the same chunk and another chunk was
+ * skipped). Body: `{ dateChunkIdx: number, poiChunkIdx?: number }`.
+ *
+ * Mirrors create-poll's Veraset payload construction but does NOT advance
+ * `progress.created` from the counter — it explicitly creates the chunk
+ * the caller asks for, then appends the resulting jobId to subJobIds.
+ *
+ * Idempotent: if a sub-job for the same megaJobIndex already exists in the
+ * megajob's subJobIds, returns 409 instead of duplicating.
+ */
+
 import { NextRequest, NextResponse } from 'next/server';
-import { getMegaJob, updateMegaJob, getChunkIndices } from '@/lib/mega-jobs';
-import { createJob } from '@/lib/jobs';
+import { getMegaJob, updateMegaJob } from '@/lib/mega-jobs';
+import { createJob, getJob } from '@/lib/jobs';
 import { incrementUsage } from '@/lib/usage';
 import { invalidateCache } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-/**
- * POST /api/mega-jobs/[id]/create-poll
- * Creates ONE sub-job per call via Veraset API.
- * Frontend polls until progress.created === progress.total.
- *
- * On first call: transitions from 'planning' to 'creating'.
- * On last sub-job: transitions to 'running'.
- *
- * Race-condition guard: when the frontend retries because Vercel timed out
- * a previous call, two server instances can race and both read the same
- * `progress.created`, both create the SAME date chunk, producing duplicates.
- * To prevent this we (a) invalidate the local cache before reading and
- * (b) use `subJobIds.length` as the deterministic next-index source — that
- * value only advances after a Veraset success has been written and pushed,
- * so even if `progress.created` got bumped twice by a race, the next call
- * still sees the real number of created sub-jobs.
- */
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   context: { params: Promise<{ id: string }> }
 ): Promise<NextResponse> {
   const t0 = Date.now();
-
   try {
     const { id } = await context.params;
-    // Force fresh read — protects against stale cache when the previous
-    // server instance just wrote and ours hasn't seen it yet.
+    let body: any = {};
+    try { body = await request.json(); } catch {}
+
+    const dateChunkIdx = parseInt(body?.dateChunkIdx, 10);
+    const poiChunkIdx = parseInt(body?.poiChunkIdx ?? '0', 10) || 0;
+    if (isNaN(dateChunkIdx) || dateChunkIdx < 0) {
+      return NextResponse.json({ error: 'dateChunkIdx required (non-negative integer)' }, { status: 400 });
+    }
+
     invalidateCache(`mega-jobs/${id}`);
     const megaJob = await getMegaJob(id);
-
-    if (!megaJob) {
-      return NextResponse.json({ error: 'Mega-job not found' }, { status: 404 });
-    }
-
+    if (!megaJob) return NextResponse.json({ error: 'Mega-job not found' }, { status: 404 });
     if (megaJob.mode !== 'auto-split') {
-      return NextResponse.json({ error: 'Only auto-split mega-jobs need create-poll' }, { status: 400 });
+      return NextResponse.json({ error: 'Only auto-split mega-jobs can be repaired' }, { status: 400 });
     }
-
     if (!megaJob.sourceScope || !megaJob.splits) {
       return NextResponse.json({ error: 'Mega-job has no split plan' }, { status: 400 });
     }
 
-    // Use subJobIds.length as the deterministic next-index. progress.created
-    // can drift in race conditions but subJobIds is only pushed after a
-    // Veraset success, so its length is the real "how many already created".
-    const realCreated = (megaJob.subJobIds || []).length;
-    if (realCreated !== megaJob.progress.created) {
-      console.warn(
-        `[MEGA-JOB ${id}] progress.created drift detected: ${megaJob.progress.created} → ${realCreated} (subJobIds.length). Self-healing.`
-      );
-      megaJob.progress.created = realCreated;
-    }
-
-    // Already done creating?
-    if (realCreated >= megaJob.progress.total) {
-      return NextResponse.json({
-        megaJob,
-        message: 'All sub-jobs already created',
-        done: true,
-      });
-    }
-
-    // Transition from planning → creating on first call
-    if (megaJob.status === 'planning') {
-      await updateMegaJob(id, { status: 'creating' });
-      megaJob.status = 'creating';
-    }
-
-    // Determine which sub-job to create next
-    const nextIndex = realCreated;
-    const { dateChunkIdx, poiChunkIdx } = getChunkIndices(
-      nextIndex,
-      megaJob.splits.poiChunks.length
-    );
-
     const dateChunk = megaJob.splits.dateChunks[dateChunkIdx];
     const poiChunk = megaJob.splits.poiChunks[poiChunkIdx];
+    if (!dateChunk) return NextResponse.json({ error: `dateChunkIdx ${dateChunkIdx} out of range (have ${megaJob.splits.dateChunks.length})` }, { status: 400 });
+    if (!poiChunk) return NextResponse.json({ error: `poiChunkIdx ${poiChunkIdx} out of range` }, { status: 400 });
+
+    const targetMegaJobIndex = dateChunkIdx * megaJob.splits.poiChunks.length + poiChunkIdx;
+
+    // Idempotency: check whether a sub-job for this megaJobIndex already exists.
+    for (const jid of (megaJob.subJobIds || [])) {
+      const existing = await getJob(jid);
+      if (existing && (existing as any).megaJobIndex === targetMegaJobIndex) {
+        return NextResponse.json({
+          error: `Chunk already exists`,
+          existingJobId: jid,
+          megaJobIndex: targetMegaJobIndex,
+        }, { status: 409 });
+      }
+    }
+
     const scope = megaJob.sourceScope;
+    console.log(`[MEGA-REPAIR ${id}] Creating chunk D${dateChunkIdx}-P${poiChunkIdx} (megaJobIndex=${targetMegaJobIndex}): ${dateChunk.from}→${dateChunk.to}`);
 
-    console.log(
-      `[MEGA-JOB ${id}] Creating sub-job ${nextIndex + 1}/${megaJob.progress.total}: ` +
-      `dates=${dateChunk.from}→${dateChunk.to} pois=${poiChunk.startIndex}–${poiChunk.endIndex}`
-    );
-
-    // Load POI GeoJSON from all collections and merge
+    // ── Build geo_radius from POI collections ──
     const { getPOICollection } = await import('@/lib/poi-storage');
     const collectionIds = scope.poiCollectionIds || (scope.poiCollectionId ? [scope.poiCollectionId] : []);
-
     const validFeatures: any[] = [];
     for (const colId of collectionIds) {
       const geojson = await getPOICollection(colId);
@@ -109,18 +88,13 @@ export async function POST(
       );
       validFeatures.push(...features);
     }
-
     const chunkFeatures = validFeatures.slice(poiChunk.startIndex, poiChunk.endIndex);
-
-    // Build geo_radius array
     const geoRadius = chunkFeatures.map((f: any, i: number) => ({
       poi_id: f.properties?.id || f.id || `poi_${poiChunk.startIndex + i}`,
       latitude: f.geometry.coordinates[1],
       longitude: f.geometry.coordinates[0],
       distance_in_meters: scope.radius,
     }));
-
-    // Build POI mapping and names
     const poiMapping: Record<string, string> = {};
     const poiNames: Record<string, string> = {};
     geoRadius.forEach((poi: any, i: number) => {
@@ -130,18 +104,15 @@ export async function POST(
       if (name) poiNames[verasetId] = name;
     });
 
-    // Build Veraset payload
     const verasetPayload = {
       date_range: { from_date: dateChunk.from, to_date: dateChunk.to },
       schema_type: scope.schema,
       geo_radius: geoRadius,
     };
 
-    // Call Veraset API
+    // ── Veraset call ──
     const verasetApiKey = process.env.VERASET_API_KEY?.trim();
-    if (!verasetApiKey) {
-      return NextResponse.json({ error: 'VERASET_API_KEY not configured' }, { status: 500 });
-    }
+    if (!verasetApiKey) return NextResponse.json({ error: 'VERASET_API_KEY not configured' }, { status: 500 });
 
     const endpoints: Record<string, string> = {
       pings: '/v1/movement/job/pings',
@@ -155,14 +126,10 @@ export async function POST(
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 40000);
-
     const response = await fetch(verasetUrl, {
       method: 'POST',
       signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': verasetApiKey,
-      },
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': verasetApiKey },
       body: JSON.stringify(verasetPayload),
     });
     clearTimeout(timeout);
@@ -172,30 +139,16 @@ export async function POST(
     try { verasetData = JSON.parse(responseText); } catch { verasetData = { raw: responseText.substring(0, 500) }; }
 
     if (!response.ok) {
-      console.error(`[MEGA-JOB ${id}] Veraset error ${response.status}:`, responseText.substring(0, 300));
-      // Don't fail the whole mega-job on one sub-job failure — record and continue
-      megaJob.progress.failed += 1;
-      await updateMegaJob(id, {
-        progress: megaJob.progress,
-        error: `Sub-job ${nextIndex + 1} failed: ${verasetData.error_message || response.status}`,
-      });
-      // Skip this sub-job and advance created counter so next poll creates the next one
-      megaJob.progress.created += 1;
-      await updateMegaJob(id, { progress: megaJob.progress });
-
+      console.error(`[MEGA-REPAIR ${id}] Veraset error ${response.status}:`, responseText.substring(0, 300));
       return NextResponse.json({
-        megaJob: await getMegaJob(id),
-        subJobError: `Veraset ${response.status}: ${verasetData.error_message || 'unknown'}`,
-        done: megaJob.progress.created >= megaJob.progress.total,
-      });
+        error: `Veraset ${response.status}: ${verasetData.error_message || 'unknown'}`,
+      }, { status: 502 });
     }
 
     const jobId = verasetData.job_id || verasetData.data?.job_id;
-    if (!jobId) {
-      return NextResponse.json({ error: 'No job_id from Veraset' }, { status: 502 });
-    }
+    if (!jobId) return NextResponse.json({ error: 'No job_id from Veraset' }, { status: 502 });
 
-    // Save sub-job
+    // Job name reflects the chunk position
     const subJobName = megaJob.splits.dateChunks.length > 1 && megaJob.splits.poiChunks.length > 1
       ? `${megaJob.name} [D${dateChunkIdx + 1}-P${poiChunkIdx + 1}]`
       : megaJob.splits.dateChunks.length > 1
@@ -219,7 +172,7 @@ export async function POST(
       poiMapping,
       poiNames,
       megaJobId: id,
-      megaJobIndex: nextIndex,
+      megaJobIndex: targetMegaJobIndex,
       verasetPayload: {
         date_range: verasetPayload.date_range,
         schema_type: verasetPayload.schema_type,
@@ -229,34 +182,29 @@ export async function POST(
 
     await incrementUsage(jobId);
 
-    // Update mega-job progress
-    megaJob.subJobIds.push(jobId);
-    megaJob.progress.created += 1;
-
-    const allCreated = megaJob.progress.created >= megaJob.progress.total;
-    if (allCreated) {
-      megaJob.status = 'running';
+    // Re-read megaJob to avoid clobbering concurrent updates, append + write.
+    invalidateCache(`mega-jobs/${id}`);
+    const fresh = await getMegaJob(id);
+    if (!fresh) return NextResponse.json({ error: 'Mega-job vanished mid-repair' }, { status: 500 });
+    const newSubJobIds = [...(fresh.subJobIds || []), jobId];
+    const newProgress = { ...fresh.progress, created: newSubJobIds.length };
+    if (newProgress.created >= newProgress.total && fresh.status === 'creating') {
+      await updateMegaJob(id, { subJobIds: newSubJobIds, progress: newProgress, status: 'running' });
+    } else {
+      await updateMegaJob(id, { subJobIds: newSubJobIds, progress: newProgress });
     }
 
-    await updateMegaJob(id, {
-      subJobIds: megaJob.subJobIds,
-      progress: megaJob.progress,
-      status: megaJob.status,
-    });
-
-    console.log(
-      `[MEGA-JOB ${id}] Sub-job ${nextIndex + 1}/${megaJob.progress.total} created: ${jobId} [${Date.now() - t0}ms]`
-    );
+    console.log(`[MEGA-REPAIR ${id}] Created ${jobId} for D${dateChunkIdx}-P${poiChunkIdx} [${Date.now() - t0}ms]`);
 
     return NextResponse.json({
-      megaJob: await getMegaJob(id),
       createdJobId: jobId,
       subJobName,
-      done: allCreated,
+      megaJobIndex: targetMegaJobIndex,
+      dateChunk,
     });
   } catch (error: any) {
     const isAbort = error.name === 'AbortError';
-    console.error(`[MEGA-JOB create-poll] ${isAbort ? 'TIMEOUT' : 'ERROR'}:`, error.message);
+    console.error(`[MEGA-REPAIR] ${isAbort ? 'TIMEOUT' : 'ERROR'}:`, error.message);
     return NextResponse.json(
       { error: isAbort ? 'Veraset API timeout' : error.message },
       { status: isAbort ? 504 : 500 }

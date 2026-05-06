@@ -214,29 +214,52 @@ export async function updateMegaJob(
 const MAX_DAYS = 31;
 const MAX_POIS = 25_000;
 
+/** Format a Date as YYYY-MM-DD (UTC). */
+function fmt(d: Date): string {
+  return d.toISOString().split('T')[0];
+}
+
 /**
  * Compute how to split a large scope into sub-jobs that respect Veraset limits.
  * Returns the split plan with date chunks and POI chunks.
+ *
+ * Date splitting policy: align with calendar months. If the range starts mid-
+ * month, the first chunk runs from `from` to the last day of that month; if
+ * the range ends mid-month, the last chunk runs from the 1st of that month
+ * to `to`. All other chunks are full calendar months. This produces 10
+ * clean chunks for "jul 1 → abr 30" instead of 10 drifting 31-day chunks.
+ *
+ * Each chunk is also clamped to MAX_DAYS so we never exceed Veraset's per-
+ * job limit (relevant only for very long months in unusual calendars; for
+ * Gregorian, no calendar month exceeds 31 days).
  */
 export function computeSplitPlan(
   dateRange: { from: string; to: string },
   totalPois: number
 ): SplitPlan {
-  // Date chunks
+  // Date chunks — calendar-month aligned
   const dateChunks: DateChunk[] = [];
   const startDate = new Date(dateRange.from + 'T00:00:00Z');
   const endDate = new Date(dateRange.to + 'T00:00:00Z');
 
   let chunkStart = new Date(startDate);
   while (chunkStart <= endDate) {
-    const chunkEnd = new Date(chunkStart);
-    chunkEnd.setUTCDate(chunkEnd.getUTCDate() + MAX_DAYS - 1);
-    if (chunkEnd > endDate) chunkEnd.setTime(endDate.getTime());
+    // Last day of chunkStart's month (UTC)
+    const monthEnd = new Date(Date.UTC(
+      chunkStart.getUTCFullYear(),
+      chunkStart.getUTCMonth() + 1,
+      0, // day 0 of next month = last day of this month
+    ));
+    let chunkEnd = monthEnd > endDate ? new Date(endDate) : monthEnd;
 
-    dateChunks.push({
-      from: chunkStart.toISOString().split('T')[0],
-      to: chunkEnd.toISOString().split('T')[0],
-    });
+    // Safety clamp: never exceed MAX_DAYS in a single chunk.
+    const span = Math.floor((chunkEnd.getTime() - chunkStart.getTime()) / (24 * 3600 * 1000)) + 1;
+    if (span > MAX_DAYS) {
+      chunkEnd = new Date(chunkStart);
+      chunkEnd.setUTCDate(chunkEnd.getUTCDate() + MAX_DAYS - 1);
+    }
+
+    dateChunks.push({ from: fmt(chunkStart), to: fmt(chunkEnd) });
 
     // Next chunk starts the day after this chunk ends
     chunkStart = new Date(chunkEnd);
