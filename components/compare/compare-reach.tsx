@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import dynamic from 'next/dynamic';
 import { Button } from '@/components/ui/button';
-import { Loader2, Play, Download, Target } from 'lucide-react';
+import { Loader2, Play, Download, Target, MapPin } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 // Reuse the existing compare map for spatial display
@@ -90,6 +90,18 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, f
   const [running, setRunning] = useState(false);
   const [progressMsg, setProgressMsg] = useState<string>('');
   const [result, setResult] = useState<ReachResult | null>(null);
+  // Reach state ID — needed to drive the catchment download per direction.
+  const [reachStateId, setReachStateId] = useState<string>('');
+  // Per-direction catchment status. Keyed by direction.
+  const [catchmentStatus, setCatchmentStatus] = useState<Record<'aToB' | 'bToA', {
+    loading?: boolean;
+    progress?: string;
+    downloadKey?: string;
+    rowCount?: number;
+    nativeZipCount?: number;
+    geocodedCount?: number;
+    error?: string;
+  }>>({ aToB: {}, bToA: {} });
   const { toast } = useToast();
 
   const safePoll = async (url: string, init?: RequestInit) => {
@@ -139,6 +151,8 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, f
       }
       if (data.phase === 'error') throw new Error(data.error || 'Reach analysis failed');
       setResult(data.result);
+      setReachStateId(stateId);
+      setCatchmentStatus({ aToB: {}, bToA: {} });
       toast({ title: 'Reach analysis complete' });
     } catch (e: any) {
       toast({ title: 'Reach failed', description: e.message, variant: 'destructive' });
@@ -159,11 +173,61 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, f
     link.click();
   };
 
+  /**
+   * Trigger the catchment-ZIPs build for a direction. Multi-phase polling
+   * mirrors the main reach analysis. When done, download the CSV via the
+   * `?key=` form of the compare/download endpoint.
+   */
+  const buildCatchmentZips = async (direction: 'aToB' | 'bToA') => {
+    if (!reachStateId) return;
+    setCatchmentStatus((s) => ({ ...s, [direction]: { loading: true, progress: 'Starting…' } }));
+    try {
+      let data = await safePoll('/api/compare/reach-catchment', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stateId: reachStateId, direction }),
+      });
+      const catchmentId = data.catchmentId;
+      while (data.phase !== 'done' && data.phase !== 'error') {
+        setCatchmentStatus((s) => ({ ...s, [direction]: { loading: true, progress: data.progress?.message || data.phase } }));
+        await new Promise((r) => setTimeout(r, 4000));
+        data = await safePoll('/api/compare/reach-catchment', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ catchmentId }),
+        });
+      }
+      if (data.phase === 'error') throw new Error(data.error || 'Catchment build failed');
+      setCatchmentStatus((s) => ({
+        ...s,
+        [direction]: {
+          loading: false,
+          downloadKey: data.downloadKey,
+          rowCount: data.rowCount,
+          nativeZipCount: data.nativeZipCount,
+          geocodedCount: data.geocodedCount,
+        },
+      }));
+      // Auto-trigger the download
+      const link = document.createElement('a');
+      link.href = `/api/compare/download?key=${encodeURIComponent(data.downloadKey)}`;
+      link.click();
+      toast({ title: 'Catchment ZIPs ready', description: `${(data.rowCount || 0).toLocaleString()} devices` });
+    } catch (e: any) {
+      setCatchmentStatus((s) => ({ ...s, [direction]: { loading: false, error: e.message } }));
+      toast({ title: 'Catchment download failed', description: e.message, variant: 'destructive' });
+    }
+  };
+
   const renderDirection = (
     label: string,
     description: string,
     dir: ReachDirectionResult,
+    directionKey: 'aToB' | 'bToA',
   ) => {
+    const catchmentInfo = catchmentStatus[directionKey];
     const sourceVisits = dir.source.visitorCount;
     const reachPct = sourceVisits > 0 ? (dir.totalPotentialVisitors / sourceVisits) * 100 : 0;
     // Map data: highlight target POIs by potentialVisitors as intensity
@@ -208,17 +272,44 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, f
             </div>
           )}
 
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
             <span className="text-sm font-medium">By target POI ({dir.byPoi.length})</span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => downloadMaids(dir.downloadKey, `reach-${label.replace(/\s+/g, '-').toLowerCase()}-maids.csv`)}
-              disabled={!dir.downloadKey}
-            >
-              <Download className="h-3 w-3 mr-1" /> MAIDs CSV
-            </Button>
+            <div className="flex items-center gap-2 flex-wrap">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => downloadMaids(dir.downloadKey, `reach-${label.replace(/\s+/g, '-').toLowerCase()}-maids.csv`)}
+                disabled={!dir.downloadKey}
+              >
+                <Download className="h-3 w-3 mr-1" /> MAIDs CSV
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => buildCatchmentZips(directionKey)}
+                disabled={catchmentInfo.loading || !reachStateId}
+                title="Build a CSV of the home location (lat/lng + ZIP + city) for every qualified device. Uses geo_fields['zipcode'] when present (FULL schema) and reverse-geocodes the rest."
+              >
+                {catchmentInfo.loading ? (
+                  <><Loader2 className="h-3 w-3 mr-1 animate-spin" />{catchmentInfo.progress || 'Working…'}</>
+                ) : catchmentInfo.downloadKey ? (
+                  <><MapPin className="h-3 w-3 mr-1" /> Catchment ZIPs CSV (re-download)</>
+                ) : (
+                  <><MapPin className="h-3 w-3 mr-1" /> Catchment ZIPs CSV</>
+                )}
+              </Button>
+            </div>
           </div>
+          {catchmentInfo.downloadKey && (
+            <div className="text-xs text-muted-foreground -mt-2">
+              {catchmentInfo.rowCount?.toLocaleString()} devices ready
+              {(catchmentInfo.nativeZipCount ?? 0) > 0 && ` · ${catchmentInfo.nativeZipCount} from FULL geo_fields`}
+              {(catchmentInfo.geocodedCount ?? 0) > 0 && ` · ${catchmentInfo.geocodedCount} reverse-geocoded`}
+            </div>
+          )}
+          {catchmentInfo.error && (
+            <div className="text-xs text-red-500 -mt-2">Catchment failed: {catchmentInfo.error}</div>
+          )}
 
           <div className="max-h-80 overflow-y-auto border rounded">
             <table className="w-full text-sm">
@@ -363,11 +454,13 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, f
             `${dsALabel} → ${dsBLabel}`,
             `Of devices that visited ${dsALabel}'s POIs, how many had a meaningful cluster of pings near ${dsBLabel}'s POIs.`,
             result.aToB,
+            'aToB',
           )}
           {result.bToA && renderDirection(
             `${dsBLabel} → ${dsALabel}`,
             `Of devices that visited ${dsBLabel}'s POIs, how many had a meaningful cluster of pings near ${dsALabel}'s POIs.`,
             result.bToA,
+            'bToA',
           )}
         </>
       )}
