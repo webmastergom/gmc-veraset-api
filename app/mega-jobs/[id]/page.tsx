@@ -93,6 +93,8 @@ export default function MegaJobDetailPage() {
   const [hourTo, setHourTo] = useState<number>(23)
   // Minimum number of distinct visit-days per ad_id
   const [minVisits, setMinVisits] = useState<number>(1)
+  // FULL-schema GPS-only filter (no-op on BASIC datasets)
+  const [gpsOnly, setGpsOnly] = useState<boolean>(false)
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
@@ -218,6 +220,7 @@ export default function MegaJobDetailPage() {
             } : {}),
             ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
             ...(minVisits > 1 ? { minVisits } : {}),
+            ...(gpsOnly ? { gpsOnly: true } : {}),
           }),
         })
         if (!res.ok) {
@@ -377,6 +380,15 @@ export default function MegaJobDetailPage() {
                   ))}
                 </select>
               </div>
+              <label className="flex items-center gap-1 text-xs text-muted-foreground select-none cursor-pointer" title="Drop non-GPS pings (cell-tower / Wi-Fi). Requires FULL schema; no effect on BASIC sub-jobs.">
+                <input
+                  type="checkbox"
+                  checked={gpsOnly}
+                  onChange={(e) => setGpsOnly(e.target.checked)}
+                  className="h-3.5 w-3.5"
+                />
+                GPS only
+              </label>
               <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
                 {consolidating ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />

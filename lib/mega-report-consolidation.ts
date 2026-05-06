@@ -559,15 +559,21 @@ export function parseConsolidatedHourly(
 
 /**
  * Parse catchment origins and aggregate by zip code after geocoding.
+ *
+ * FULL-schema bypass: if a row has `native_zip` from `geo_fields['zipcode']`,
+ * use it directly (no Node-side reverse-geocoding needed). The coordToZip map
+ * still backs BASIC-schema rows.
  */
 export function buildCatchmentReport(
   megaJobId: string,
   rows: Record<string, any>[],
   coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
+  defaultCountry?: string,
 ): ConsolidatedCatchmentReport {
   const byZip = new Map<string, { lat: number; lng: number; zip: string; city: string; country: string; deviceDays: number }>();
   const hourMap = new Map<number, number>();
   let totalDeviceDays = 0;
+  const fallbackCountry = defaultCountry || 'UNKNOWN';
 
   for (const row of rows) {
     const lat = parseFloat(row.origin_lat) || 0;
@@ -577,7 +583,14 @@ export function buildCatchmentReport(
     totalDeviceDays += deviceDays;
 
     const key = `${lat},${lng}`;
-    const geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const nativeZip = String(row.native_zip || '').trim();
+    const nativeCity = String(row.native_city || '').trim();
+    let geo: { zipCode: string; city: string; country: string };
+    if (nativeZip) {
+      geo = { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: fallbackCountry };
+    } else {
+      geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    }
     const zipKey = `${geo.zipCode}|${geo.city}|${geo.country}`;
 
     const existing = byZip.get(zipKey);
@@ -677,6 +690,7 @@ export function buildAffinityReport(
   megaJobId: string,
   rows: Record<string, any>[],
   coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
+  defaultCountry?: string,
 ): ConsolidatedAffinityReport {
   // Aggregate by postal code
   const byZip = new Map<string, {
@@ -684,12 +698,20 @@ export function buildAffinityReport(
     totalVisits: number; uniqueDevices: number;
     dwellSum: number; freqSum: number; rowCount: number;
   }>();
+  const fallbackCountry = defaultCountry || 'UNKNOWN';
 
   for (const row of rows) {
     const lat = parseFloat(row.origin_lat) || 0;
     const lng = parseFloat(row.origin_lng) || 0;
     const key = `${lat},${lng}`;
-    const geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const nativeZip = String(row.native_zip || '').trim();
+    const nativeCity = String(row.native_city || '').trim();
+    let geo: { zipCode: string; city: string; country: string };
+    if (nativeZip) {
+      geo = { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: fallbackCountry };
+    } else {
+      geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    }
     const zipKey = `${geo.zipCode}|${geo.city}|${geo.country}`;
 
     const totalVisits = parseInt(row.total_visits, 10) || 0;

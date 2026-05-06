@@ -22,11 +22,12 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
-function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
   let key = `dataset-reports/${ds}/${type}`;
   if (minDwell > 0 || maxDwell > 0) key += `-dwell-${minDwell}-${maxDwell}`;
   if (hourFrom > 0 || hourTo < 23) key += `-h${hourFrom}-${hourTo}`;
   if (minVisits > 1) key += `-v${minVisits}`;
+  if (gpsOnly) key += `-gps`;
   return key;
 }
 
@@ -41,6 +42,7 @@ interface ReportState {
   hourFrom?: number;
   hourTo?: number;
   minVisits?: number;
+  gpsOnly?: boolean;
   error?: string;
 }
 
@@ -70,6 +72,16 @@ function hourFilterSQL(hourFrom: number, hourTo: number, tsCol = 'utc_timestamp'
 }
 
 /**
+ * FULL-schema GPS-only filter. Returns empty string when off; otherwise an
+ * `AND (...)` predicate that keeps NULL rows (BASIC schema) and rows where
+ * `quality_fields['ping_origin_type'] = 'gps'`.
+ */
+function gpsOnlyFilterSQL(gpsOnly: boolean): string {
+  if (!gpsOnly) return '';
+  return `AND (TRY(quality_fields['ping_origin_type']) IS NULL OR TRY(quality_fields['ping_origin_type']) = 'gps')`;
+}
+
+/**
  * Common CTE: filter pings at POIs with dwell calculation.
  * Dwell = time span (minutes) between first and last ping per device-day at POI.
  * Returns per-device-day aggregated rows with dwell_minutes.
@@ -78,12 +90,13 @@ function hourFilterSQL(hourFrom: number, hourTo: number, tsCol = 'utc_timestamp'
  * @param hourFrom - start hour filter (0-23, default 0)
  * @param hourTo - end hour filter (0-23, default 23)
  */
-function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
   const havingParts: string[] = [];
   if (minDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`);
   if (maxDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${maxDwell}`);
   const dwellFilter = havingParts.length > 0 ? `\n    HAVING ${havingParts.join(' AND ')}` : '';
   const hFilter = hourFilterSQL(hourFrom, hourTo);
+  const gFilter = gpsOnlyFilterSQL(gpsOnly);
   const visitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
       SELECT ad_id FROM (
         SELECT ad_id, COUNT(DISTINCT date) as vd
@@ -91,6 +104,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
         CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
         WHERE poi_id IS NOT NULL AND poi_id != ''
           AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          ${gFilter}
         GROUP BY ad_id
         HAVING COUNT(DISTINCT date) >= ${minVisits}
       ) t_vc
@@ -109,6 +123,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
         ${hFilter}
+        ${gFilter}
         ${visitWhere}
     ),
     at_poi AS (
@@ -127,9 +142,16 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
 /** Simple CTE for queries that just need the raw pings (hourly, temporal).
  * When minDwell/maxDwell > 0, only includes device-days with dwell in range.
  * When hourFrom/hourTo specified, only includes pings within the time window. */
-function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
+function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
   const hFilter = hourFilterSQL(hourFrom, hourTo);
   const hFilterT = hourFilterSQL(hourFrom, hourTo, 't.utc_timestamp');
+  const gFilter = gpsOnlyFilterSQL(gpsOnly);
+  // Note: when gpsOnly is on, the predicate references quality_fields directly
+  // on the base table (no alias). The aliased version is needed for the joined
+  // form below.
+  const gFilterT = gpsOnly
+    ? `AND (TRY(t.quality_fields['ping_origin_type']) IS NULL OR TRY(t.quality_fields['ping_origin_type']) = 'gps')`
+    : '';
   const visitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
       SELECT ad_id FROM (
         SELECT ad_id, COUNT(DISTINCT date) as vd
@@ -137,6 +159,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
         WHERE poi_id IS NOT NULL AND poi_id != ''
           AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          ${gFilter}
         GROUP BY ad_id
         HAVING COUNT(DISTINCT date) >= ${minVisits}
       ) t_vc
@@ -157,6 +180,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         ${hFilter}
+        ${gFilter}
         ${visitWhere}
       GROUP BY ad_id, date
       HAVING ${havingParts.join(' AND ')}
@@ -173,6 +197,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
         AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
         ${hFilterT}
+        ${gFilterT}
     )`;
   }
   return `${visitFilterCTE}at_poi AS (
@@ -187,12 +212,13 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
         ${hFilter}
+        ${gFilter}
         ${visitWhere}
     )`;
 }
 
-function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
+function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)}
     SELECT HOUR(utc_timestamp) as touch_hour,
       COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY 1 ORDER BY 1`;
@@ -203,8 +229,8 @@ function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0,
  * (1=Monday..7=Sunday, ISO 8601). Using utc_timestamp directly avoids
  * casting the varchar `date` partition column.
  */
-function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
+function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)}
     SELECT DAY_OF_WEEK(utc_timestamp) as dow,
       HOUR(utc_timestamp) as hour,
       COUNT(*) as pings,
@@ -212,19 +238,20 @@ function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0
     FROM at_poi GROUP BY 1, 2 ORDER BY 1, 2`;
 }
 
-function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
+function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)}
     SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY date ORDER BY date`;
 }
 
-function buildTotalDevicesSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)}
+function buildTotalDevicesSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)}
     SELECT COUNT(DISTINCT ad_id) as total_unique_devices FROM at_poi`;
 }
 
-function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)},
+function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  const gFilter = gpsOnlyFilterSQL(gpsOnly);
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)},
     poi_visits AS (
       SELECT ad_id, date, first_ping as first_poi_visit
       FROM at_poi
@@ -238,6 +265,7 @@ function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hou
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        ${gFilter}
     ),
     device_day AS (
       SELECT p.ad_id, p.date,
@@ -264,23 +292,38 @@ function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hou
     LIMIT 100000`;
 }
 
-function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)},
+function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  // FULL-schema bypass: TRY(geo_fields['zipcode'/'city']) returns NULL on BASIC
+  // (column populated by ALTER TABLE backfill but parquet has no value), so the
+  // query is safe across schemas. When non-NULL we surface it as native_zip /
+  // native_city; the geocoding phase then short-circuits batchReverseGeocode
+  // for those coords.
+  // Catchment uses an aliased `${table} t`, so the gpsOnly predicate must
+  // reference t.quality_fields explicitly.
+  const gFilterT = gpsOnly
+    ? `AND (TRY(t.quality_fields['ping_origin_type']) IS NULL OR TRY(t.quality_fields['ping_origin_type']) = 'gps')`
+    : '';
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)},
     poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
     valid_pings AS (
       SELECT t.ad_id, t.date, t.utc_timestamp,
         TRY_CAST(t.latitude AS DOUBLE) as lat,
-        TRY_CAST(t.longitude AS DOUBLE) as lng
+        TRY_CAST(t.longitude AS DOUBLE) as lng,
+        TRY(t.geo_fields['zipcode']) as native_zip,
+        TRY(t.geo_fields['city']) as native_city
       FROM ${table} t
       INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
       WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
         AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        ${gFilterT}
     ),
     first_pings AS (
       SELECT ad_id, date,
         MIN_BY(lat, utc_timestamp) as origin_lat,
         MIN_BY(lng, utc_timestamp) as origin_lng,
+        MIN_BY(native_zip, utc_timestamp) as origin_native_zip,
+        MIN_BY(native_city, utc_timestamp) as origin_native_city,
         HOUR(MIN(utc_timestamp)) as departure_hour
       FROM valid_pings
       GROUP BY ad_id, date
@@ -289,6 +332,8 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
       SELECT ad_id,
         ROUND(origin_lat, ${PREC}) as home_lat,
         ROUND(origin_lng, ${PREC}) as home_lng,
+        ARBITRARY(origin_native_zip) as native_zip,
+        ARBITRARY(origin_native_city) as native_city,
         COUNT(DISTINCT date) as days_at_loc
       FROM first_pings
       WHERE origin_lat IS NOT NULL
@@ -298,9 +343,9 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
     -- Previously HAVING >= 3 silently dropped any visitor whose top home
     -- didn't accumulate 3+ days, which made catchment under-count by 80%+.
     device_homes AS (
-      SELECT ad_id, home_lat, home_lng, days_at_loc
+      SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc
       FROM (
-        SELECT ad_id, home_lat, home_lng, days_at_loc,
+        SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc,
           ROW_NUMBER() OVER (
             PARTITION BY ad_id
             ORDER BY days_at_loc DESC, home_lat, home_lng
@@ -310,16 +355,18 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
       WHERE rn = 1
     ),
     home_hours AS (
-      SELECT dh.ad_id, dh.home_lat, dh.home_lng,
+      SELECT dh.ad_id, dh.home_lat, dh.home_lng, dh.native_zip, dh.native_city,
         HOUR(MIN(fp.utc_timestamp)) as departure_hour
       FROM device_homes dh
       INNER JOIN valid_pings fp ON dh.ad_id = fp.ad_id
-      GROUP BY dh.ad_id, dh.home_lat, dh.home_lng, fp.date
+      GROUP BY dh.ad_id, dh.home_lat, dh.home_lng, dh.native_zip, dh.native_city, fp.date
     )
     SELECT
       home_lat as origin_lat,
       home_lng as origin_lng,
       departure_hour,
+      MIN(native_zip) as native_zip,
+      MIN(native_city) as native_city,
       COUNT(*) as device_days
     FROM home_hours
     GROUP BY home_lat, home_lng, departure_hour
@@ -332,22 +379,29 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
  * avg dwell, and visit frequency. These feed the affinity index calculation
  * after reverse geocoding groups them by postal code.
  */
-function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1): string {
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)},
+function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
+  // See buildCatchmentSQL — same FULL-schema zipcode bypass strategy.
+  const gFilter = gpsOnlyFilterSQL(gpsOnly);
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)},
     all_pings AS (
       SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
-        TRY_CAST(longitude AS DOUBLE) as lng
+        TRY_CAST(longitude AS DOUBLE) as lng,
+        TRY(geo_fields['zipcode']) as native_zip,
+        TRY(geo_fields['city']) as native_city
       FROM ${table}
       WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        ${gFilter}
     ),
     first_pings AS (
       SELECT p.ad_id, p.date,
         MIN_BY(p.lat, p.utc_timestamp) as origin_lat,
-        MIN_BY(p.lng, p.utc_timestamp) as origin_lng
+        MIN_BY(p.lng, p.utc_timestamp) as origin_lng,
+        MIN_BY(p.native_zip, p.utc_timestamp) as origin_native_zip,
+        MIN_BY(p.native_city, p.utc_timestamp) as origin_native_city
       FROM all_pings p
       INNER JOIN (SELECT DISTINCT ad_id FROM at_poi) v ON p.ad_id = v.ad_id
       GROUP BY p.ad_id, p.date
@@ -356,6 +410,8 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
       SELECT ad_id,
         ROUND(origin_lat, ${PREC}) as home_lat,
         ROUND(origin_lng, ${PREC}) as home_lng,
+        ARBITRARY(origin_native_zip) as native_zip,
+        ARBITRARY(origin_native_city) as native_city,
         COUNT(DISTINCT date) as days_at_loc
       FROM first_pings
       WHERE origin_lat IS NOT NULL
@@ -366,9 +422,9 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
     -- silently filtered out short-stay visitors and made affinity disagree
     -- with the visits/temporal totals.
     device_homes AS (
-      SELECT ad_id, home_lat, home_lng, days_at_loc
+      SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc
       FROM (
-        SELECT ad_id, home_lat, home_lng, days_at_loc,
+        SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc,
           ROW_NUMBER() OVER (
             PARTITION BY ad_id
             ORDER BY days_at_loc DESC, home_lat, home_lng
@@ -382,16 +438,20 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
         a.ad_id,
         dh.home_lat as origin_lat,
         dh.home_lng as origin_lng,
+        dh.native_zip,
+        dh.native_city,
         COUNT(DISTINCT a.date) as visit_days,
         AVG(a.dwell_minutes) as avg_dwell,
         SUM(a.ping_count) as total_pings
       FROM at_poi a
       INNER JOIN device_homes dh ON a.ad_id = dh.ad_id
-      GROUP BY a.ad_id, dh.home_lat, dh.home_lng
+      GROUP BY a.ad_id, dh.home_lat, dh.home_lng, dh.native_zip, dh.native_city
     )
     SELECT
       origin_lat,
       origin_lng,
+      MIN(native_zip) as native_zip,
+      MIN(native_city) as native_city,
       COUNT(DISTINCT ad_id) as unique_devices,
       SUM(visit_days) as total_visit_days,
       AVG(avg_dwell) as avg_dwell_minutes,
@@ -408,7 +468,7 @@ interface PoiCoordForMobility {
   radiusM: number;
 }
 
-function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?: PoiCoordForMobility[], hourFrom = 0, hourTo = 23, minVisits = 1): string {
+function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?: PoiCoordForMobility[], hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false): string {
   // Mobility: POI categories visited before/after target POI visit.
   //
   // Strategy (same as mega-job consolidation):
@@ -421,6 +481,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
 
   const GRID_STEP = 0.01; // ~1.1km geohash grid
   const BBOX_MARGIN = 0.5; // ~55km margin around POIs for nearby-activity search
+  const gFilter = gpsOnlyFilterSQL(gpsOnly);
 
   // Compute geographic bounding box from POI coords to limit the Overture POI
   // table scan and the all_pings scan. Without this, we join millions of global
@@ -446,6 +507,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
         WHERE poi_id IS NOT NULL AND poi_id != ''
           AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          ${gFilter}
         GROUP BY ad_id
         HAVING COUNT(DISTINCT date) >= ${minVisits}
       ) t_vc
@@ -492,6 +554,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        ${gFilter}
     ),
     target_pois AS (
       SELECT * FROM (VALUES ${poiValues}) AS t(poi_lat, poi_lng, poi_radius_m)
@@ -534,6 +597,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
       WHERE poi_id IS NOT NULL AND poi_id != ''
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         ${hourFilterSQL(hourFrom, hourTo)}
+        ${gFilter}
         ${mobilityVisitWhere}
       GROUP BY ad_id, date
       ${dwellHaving}
@@ -547,6 +611,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
         AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
+        ${gFilter}
     )`;
   }
 
@@ -657,11 +722,17 @@ async function computeAffinityReport(
     freqSum: number; freqCount: number;
   }>();
 
+  const fallbackCountry = country || 'UNKNOWN';
   for (const row of rows) {
     const lat = parseFloat(row.origin_lat) || 0;
     const lng = parseFloat(row.origin_lng) || 0;
     const key = `${lat},${lng}`;
-    const geo = coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' };
+    const nativeZip = String(row.native_zip || '').trim();
+    const nativeCity = String(row.native_city || '').trim();
+    // FULL-schema bypass: prefer native_zip from geo_fields when present.
+    const geo = nativeZip
+      ? { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: fallbackCountry }
+      : (coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' });
     const zk = geo.zipCode;
 
     const devices = parseInt(row.unique_devices, 10) || 0;
@@ -814,12 +885,13 @@ export async function POST(
   try {
     let state = await getState(datasetName);
 
-    // Parse request body for dwell interval + hour filters + min visits
+    // Parse request body for dwell interval + hour filters + min visits + gpsOnly
     let minDwell = 0;
     let maxDwell = 0;
     let hourFrom = 0;
     let hourTo = 23;
     let minVisits = 1;
+    let gpsOnly = false;
     try {
       const body = await request.json();
       if (body?.minDwell) minDwell = parseInt(body.minDwell, 10) || 0;
@@ -827,6 +899,7 @@ export async function POST(
       if (body?.hourFrom != null) hourFrom = Math.max(0, Math.min(23, parseInt(body.hourFrom, 10) || 0));
       if (body?.hourTo != null) hourTo = Math.max(0, Math.min(23, parseInt(body.hourTo, 10) || 23));
       if (body?.minVisits) minVisits = parseInt(body.minVisits, 10) || 1;
+      if (body?.gpsOnly === true) gpsOnly = true;
     } catch { /* no body */ }
 
     // Reset if done, error, or filters changed
@@ -841,6 +914,10 @@ export async function POST(
     }
     if (state && (state.minVisits ?? 1) !== minVisits) {
       console.log(`[DS-REPORT] Min visits changed (${state.minVisits ?? 1} → ${minVisits}), resetting`);
+      state = null;
+    }
+    if (state && Boolean(state.gpsOnly) !== gpsOnly) {
+      console.log(`[DS-REPORT] gpsOnly filter changed (${Boolean(state.gpsOnly)} → ${gpsOnly}), resetting`);
       state = null;
     }
 
@@ -883,14 +960,14 @@ export async function POST(
       // Launch all 8 queries in parallel
       const queries: Record<string, string> = {};
       await Promise.all([
-        startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
-        startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
-        startQueryAsync(buildDayHourSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.dayhour = id; }).catch(e => console.error('[DS-REPORT] dayhour:', e.message)),
-        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
-        startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
-        startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo, minVisits)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
-        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
+        startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
+        startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
+        startQueryAsync(buildDayHourSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.dayhour = id; }).catch(e => console.error('[DS-REPORT] dayhour:', e.message)),
+        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
+        startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
+        startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
       // Get dataset size for progress estimation
@@ -916,6 +993,7 @@ export async function POST(
         hourFrom: hourFrom > 0 ? hourFrom : undefined,
         hourTo: hourTo < 23 ? hourTo : undefined,
         minVisits: minVisits > 1 ? minVisits : undefined,
+        gpsOnly: gpsOnly || undefined,
       };
       await saveState(datasetName, state);
 
@@ -1011,7 +1089,8 @@ export async function POST(
       const hFrom = state.hourFrom ?? 0;
       const hTo = state.hourTo ?? 23;
       const mVisits = state.minVisits ?? 1;
-      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo, mVisits);
+      const gOnly = !!state.gpsOnly;
+      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo, mVisits, gOnly);
       const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
 
       // Parse hourly
@@ -1089,6 +1168,15 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] mobility parse:', e.message); }
       }
 
+      // FULL-schema bypass: coords with native_zip from geo_fields skip geocoding.
+      const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
+      let detectedCountry: string | undefined;
+      try {
+        const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
+        detectedCountry = analysis?.country;
+      } catch {}
+      let nativeZipBypassCount = 0;
+
       // Parse OD
       let odClusters: any = null;
       if (queries.od) {
@@ -1102,7 +1190,7 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] od parse:', e.message); }
       }
 
-      // Parse catchment
+      // Parse catchment — pre-populate coordToZip from native_zip when present.
       let catchmentRows: any[] | null = null;
       if (queries.catchment) {
         try {
@@ -1111,12 +1199,20 @@ export async function POST(
           for (const row of r.rows) {
             const lat = parseFloat(row.origin_lat) || 0;
             const lng = parseFloat(row.origin_lng) || 0;
-            coordsToGeocode.set(`${lat},${lng}`, { lat, lng, deviceCount: parseInt(row.device_days, 10) || 0 });
+            const key = `${lat},${lng}`;
+            const nativeZip = String(row.native_zip || '').trim();
+            const nativeCity = String(row.native_city || '').trim();
+            if (nativeZip && !coordToZip.has(key)) {
+              coordToZip.set(key, { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: detectedCountry || 'UNKNOWN' });
+              nativeZipBypassCount++;
+            } else if (!nativeZip) {
+              coordsToGeocode.set(key, { lat, lng, deviceCount: parseInt(row.device_days, 10) || 0 });
+            }
           }
         } catch (e: any) { console.error('[DS-REPORT] catchment parse:', e.message); }
       }
 
-      // Parse affinity rows (geocoded later)
+      // Parse affinity rows — same native_zip bypass.
       let affinityRows: any[] | null = null;
       if (queries.affinity) {
         try {
@@ -1125,18 +1221,26 @@ export async function POST(
           for (const row of r.rows) {
             const lat = parseFloat(row.origin_lat) || 0;
             const lng = parseFloat(row.origin_lng) || 0;
-            coordsToGeocode.set(`${lat},${lng}`, { lat, lng, deviceCount: parseInt(row.unique_devices, 10) || 0 });
+            const key = `${lat},${lng}`;
+            const nativeZip = String(row.native_zip || '').trim();
+            const nativeCity = String(row.native_city || '').trim();
+            if (nativeZip && !coordToZip.has(key)) {
+              coordToZip.set(key, { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: detectedCountry || 'UNKNOWN' });
+              nativeZipBypassCount++;
+            } else if (!nativeZip && !coordToZip.has(key)) {
+              coordsToGeocode.set(key, { lat, lng, deviceCount: parseInt(row.unique_devices, 10) || 0 });
+            }
           }
         } catch (e: any) { console.error('[DS-REPORT] affinity parse:', e.message); }
       }
 
-      // Geocode OD + catchment + affinity coords
-      const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
-      let detectedCountry: string | undefined;
+      if (nativeZipBypassCount > 0) {
+        console.log(`[DS-REPORT] FULL-schema zipcode bypass: ${nativeZipBypassCount} coords resolved natively, ${coordsToGeocode.size} still need geocoding`);
+      }
+
+      // Geocode the remaining (non-native-zip) coords
       if (coordsToGeocode.size > 0) {
         try {
-          const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
-          detectedCountry = analysis?.country;
           if (detectedCountry) setCountryFilter([detectedCountry]);
 
           // Round to 1 decimal for geocoding efficiency
@@ -1154,6 +1258,8 @@ export async function POST(
           const rKeys = Array.from(roundedMap.keys());
 
           for (const [key, p] of coordsToGeocode.entries()) {
+            // Don't overwrite native_zip from FULL schema bypass
+            if (coordToZip.has(key)) continue;
             const roundKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
             const idx = rKeys.indexOf(roundKey);
             if (idx >= 0 && idx < geocoded.length) {

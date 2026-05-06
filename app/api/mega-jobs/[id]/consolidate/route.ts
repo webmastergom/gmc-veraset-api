@@ -92,6 +92,8 @@ interface ConsolidationState {
   hourTo?: number;
   /** Optional minimum number of distinct visit-days per ad_id (1 = no filter). */
   minVisits?: number;
+  /** FULL-schema only: drop non-GPS pings (cell-tower / Wi-Fi triangulated). */
+  gpsOnly?: boolean;
   /** Materialized MAIDs CSV key (set during parsing_od) — used as the export download URL. */
   maidsCsvKey?: string;
   error?: string;
@@ -128,6 +130,7 @@ export async function POST(
     let hourFrom: number | undefined;
     let hourTo: number | undefined;
     let minVisits: number | undefined;
+    let gpsOnly: boolean | undefined;
     try {
       const body = await _request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
@@ -135,6 +138,7 @@ export async function POST(
       if (typeof body?.hourFrom === 'number' && body.hourFrom >= 0 && body.hourFrom <= 23) hourFrom = body.hourFrom;
       if (typeof body?.hourTo === 'number' && body.hourTo >= 0 && body.hourTo <= 23) hourTo = body.hourTo;
       if (typeof body?.minVisits === 'number' && body.minVisits > 1) minVisits = body.minVisits;
+      if (body?.gpsOnly === true) gpsOnly = true;
     } catch { }
 
     // Load sub-jobs
@@ -178,7 +182,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits };
+      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly };
     }
 
     // Update mega-job status — only set to consolidating when starting fresh work.
@@ -252,10 +256,11 @@ export async function POST(
         const hFrom = state.hourFrom ?? hourFrom;
         const hTo = state.hourTo ?? hourTo;
         const mVisits = state.minVisits ?? minVisits;
-        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1))
-          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits }
+        const gOnly = state.gpsOnly ?? gpsOnly;
+        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly)
+          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly }
           : undefined;
-        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}`);
+        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}`);
 
         // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
         const runId = (state as any).runId || Date.now().toString(36);
@@ -569,7 +574,9 @@ export async function POST(
           }
         }
 
-        // Fetch catchment results from CTAS table
+        // Fetch catchment results from CTAS table.
+        // FULL-schema bypass: rows with native_zip skip the batch reverse-geocode.
+        let catchmentNativeZipBypassed = 0;
         if (state.queries.catchment) {
           try {
             const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.catchment.ctasTable}`);
@@ -578,8 +585,16 @@ export async function POST(
               const lng = parseFloat(row.origin_lng) || 0;
               const dd = parseInt(row.device_days, 10) || 0;
               const key = `${lat},${lng}`;
+              const nativeZip = String(row.native_zip || '').trim();
+              if (nativeZip) {
+                catchmentNativeZipBypassed++;
+                continue; // Don't queue for batch geocode — parser will use native_zip directly.
+              }
               const existing = coordsToGeocode.get(key);
               coordsToGeocode.set(key, { lat, lng, deviceCount: (existing?.deviceCount || 0) + dd });
+            }
+            if (catchmentNativeZipBypassed > 0) {
+              console.log(`[MEGA] FULL-schema zipcode bypass: ${catchmentNativeZipBypassed} catchment rows resolved natively`);
             }
           } catch (err: any) {
             console.error('[MEGA] Error fetching catchment results:', err.message);
@@ -689,10 +704,11 @@ export async function POST(
         }
 
         // Re-fetch and build catchment report (from CTAS table)
+        // Pass megaJob.country so FULL-schema native_zip rows get the right country.
         if (state.queries.catchment) {
           try {
             const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.catchment.ctasTable}`);
-            const catchmentReport = buildCatchmentReport(id, queryResult.rows, coordToZip);
+            const catchmentReport = buildCatchmentReport(id, queryResult.rows, coordToZip, megaJob.country);
             reportKeys.catchment = await saveConsolidatedReport(id, 'catchment', catchmentReport);
           } catch (err: any) {
             console.error('[MEGA] Error building catchment report:', err.message);
@@ -704,7 +720,7 @@ export async function POST(
           try {
             const affinityResult = await runQueryViaS3(`SELECT * FROM ${state.queries.affinity.ctasTable}`);
             const { buildAffinityReport } = await import('@/lib/mega-report-consolidation');
-            const affinityReport = buildAffinityReport(id, affinityResult.rows, coordToZip);
+            const affinityReport = buildAffinityReport(id, affinityResult.rows, coordToZip, megaJob.country);
             reportKeys.affinity = await saveConsolidatedReport(id, 'affinity', affinityReport);
           } catch (err: any) {
             console.error('[MEGA] Error building affinity report:', err.message);

@@ -151,6 +151,7 @@ export default function DatasetAnalysisPage() {
   const [hourFrom, setHourFrom] = useState<number>(0);
   const [hourTo, setHourTo] = useState<number>(23);
   const [minVisits, setMinVisits] = useState<number>(1);
+  const [gpsOnly, setGpsOnly] = useState<boolean>(false);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [dayhourReport, setDayhourReport] = useState<any>(null);
@@ -185,7 +186,7 @@ export default function DatasetAnalysisPage() {
   }, [datasetName]);
 
   // Load reports for specific dwell interval + hour range
-  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits) => {
+  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly) => {
     const types = ['od', 'hourly', 'dayhour', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -199,8 +200,9 @@ export default function DatasetAnalysisPage() {
     const dwellParams = (dMin > 0 ? `&dwellMin=${dMin}` : '') + (dMax > 0 ? `&dwellMax=${dMax}` : '');
     const hourParams = (hFrom > 0 || hTo < 23) ? `&hourFrom=${hFrom}&hourTo=${hTo}` : '';
     const visitParams = mVisits > 1 ? `&minVisits=${mVisits}` : '';
+    const gpsParams = gOnly ? `&gpsOnly=true` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -282,6 +284,7 @@ export default function DatasetAnalysisPage() {
               ...(dwellMax > 0 ? { maxDwell: dwellMax } : {}),
               ...(hourFrom > 0 || hourTo < 23 ? { hourFrom, hourTo } : {}),
               ...(minVisits > 1 ? { minVisits } : {}),
+              ...(gpsOnly ? { gpsOnly: true } : {}),
             }),
           });
           consecutiveErrors = 0;
@@ -611,6 +614,18 @@ export default function DatasetAnalysisPage() {
               ))}
             </select>
           </div>
+          <label className="flex items-center gap-1 mr-2 text-xs text-muted-foreground select-none cursor-pointer" title="Drop non-GPS pings (cell-tower / Wi-Fi). Requires FULL schema; no effect on BASIC datasets.">
+            <input
+              type="checkbox"
+              checked={gpsOnly}
+              onChange={(e) => {
+                setGpsOnly(e.target.checked);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, e.target.checked);
+              }}
+              className="h-3.5 w-3.5"
+            />
+            GPS only
+          </label>
           <Button onClick={runFullAnalysis} disabled={loading || generatingReports}>
             {loading || generatingReports ? (
               <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Analyzing...</>

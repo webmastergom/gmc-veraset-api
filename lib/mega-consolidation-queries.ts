@@ -195,6 +195,13 @@ export interface VisitorFilter {
   hourFrom?: number;
   hourTo?: number;
   minVisits?: number;
+  /**
+   * FULL-schema opt-in: drop pings whose `quality_fields['ping_origin_type']`
+   * is not 'gps' (i.e. cell-tower / Wi-Fi triangulated pings). Rows where the
+   * field is NULL (BASIC schema) are kept so the filter is a no-op for those
+   * datasets — the user just sees no effect rather than empty results.
+   */
+  gpsOnly?: boolean;
 }
 
 /**
@@ -211,6 +218,16 @@ export function buildHourFilterClause(filter?: VisitorFilter, tsCol: string = 'u
   }
   // Wrap-around window (e.g. 22..6)
   return `AND (HOUR(${tsCol}) >= ${from} OR HOUR(${tsCol}) <= ${to})`;
+}
+
+/**
+ * Build SQL fragment for FULL-schema GPS-only filter. Returns empty string
+ * when the filter is off; otherwise an `AND (...)` predicate that keeps NULL
+ * rows (BASIC schema fallback) and rows tagged 'gps'.
+ */
+export function buildGpsOnlyClause(filter?: VisitorFilter): string {
+  if (!filter?.gpsOnly) return '';
+  return `AND (TRY(quality_fields['ping_origin_type']) IS NULL OR TRY(quality_fields['ping_origin_type']) = 'gps')`;
 }
 
 /**
@@ -296,10 +313,11 @@ function buildUnionAll(
   visitorFilter?: VisitorFilter,
 ): string {
   const hourClause = buildHourFilterClause(visitorFilter);
+  const gpsClause = buildGpsOnlyClause(visitorFilter);
   return syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause}`;
+      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause}`;
     })
     .join('\n    UNION ALL\n    ');
 }
@@ -718,10 +736,10 @@ export async function startConsolidatedCatchmentQuery(
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for catchment query');
 
-  // All pings with accuracy filter
+  // All pings with accuracy filter — include FULL-schema geo_fields (NULL on BASIC).
   const allPingsUnion = buildUnionAll(
     syncedJobs,
-    'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+    `ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy, TRY(geo_fields['zipcode']) as native_zip, TRY(geo_fields['city']) as native_city`,
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
     visitorFilter,
   );
@@ -734,7 +752,7 @@ export async function startConsolidatedCatchmentQuery(
 
     visitorsCTE = `
     all_pings_raw AS (
-      SELECT ad_id, date, utc_timestamp, lat, lng
+      SELECT ad_id, date, utc_timestamp, lat, lng, native_zip, native_city
       FROM (
         ${allPingsUnion}
       )
@@ -746,7 +764,7 @@ export async function startConsolidatedCatchmentQuery(
         : `SELECT DISTINCT ad_id FROM at_poi_pings`}
     ),
     valid_pings AS (
-      SELECT ad_id, date, utc_timestamp, lat, lng FROM all_pings_raw
+      SELECT ad_id, date, utc_timestamp, lat, lng, native_zip, native_city FROM all_pings_raw
     )`;
   } else {
     // Fallback: poi_ids
@@ -765,7 +783,7 @@ export async function startConsolidatedCatchmentQuery(
       )
     ),
     valid_pings AS (
-      SELECT ad_id, date, utc_timestamp, lat, lng
+      SELECT ad_id, date, utc_timestamp, lat, lng, native_zip, native_city
       FROM (
         ${allPingsUnion}
       )
@@ -780,6 +798,9 @@ export async function startConsolidatedCatchmentQuery(
   // date) >= 3`, which silently dropped any visitor whose top home didn't
   // accumulate 3+ days — for the GDL megajob that filtered out 87% of
   // visitors and made catchment look like a different population.
+  //
+  // FULL-schema bypass: native_zip / native_city flow through aggregations so
+  // the Node-side geocoding phase can short-circuit when present.
   const sql = `
     WITH
     ${visitorsCTE},
@@ -789,6 +810,8 @@ export async function startConsolidatedCatchmentQuery(
         vp.date,
         MIN_BY(vp.lat, vp.utc_timestamp) as origin_lat,
         MIN_BY(vp.lng, vp.utc_timestamp) as origin_lng,
+        MIN_BY(vp.native_zip, vp.utc_timestamp) as origin_native_zip,
+        MIN_BY(vp.native_city, vp.utc_timestamp) as origin_native_city,
         HOUR(MIN(vp.utc_timestamp)) as departure_hour
       FROM valid_pings vp
       INNER JOIN poi_visitors v ON vp.ad_id = v.ad_id
@@ -798,6 +821,8 @@ export async function startConsolidatedCatchmentQuery(
       SELECT ad_id,
         ROUND(origin_lat, ${COORDINATE_PRECISION}) as home_lat,
         ROUND(origin_lng, ${COORDINATE_PRECISION}) as home_lng,
+        ARBITRARY(origin_native_zip) as native_zip,
+        ARBITRARY(origin_native_city) as native_city,
         COUNT(DISTINCT date) as days_at_loc
       FROM first_pings
       GROUP BY ad_id,
@@ -805,9 +830,9 @@ export async function startConsolidatedCatchmentQuery(
         ROUND(origin_lng, ${COORDINATE_PRECISION})
     ),
     device_homes AS (
-      SELECT ad_id, home_lat, home_lng, days_at_loc
+      SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc
       FROM (
-        SELECT ad_id, home_lat, home_lng, days_at_loc,
+        SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc,
           ROW_NUMBER() OVER (
             PARTITION BY ad_id
             ORDER BY days_at_loc DESC, home_lat, home_lng
@@ -820,6 +845,8 @@ export async function startConsolidatedCatchmentQuery(
       home_lat as origin_lat,
       home_lng as origin_lng,
       0 as departure_hour,
+      MIN(native_zip) as native_zip,
+      MIN(native_city) as native_city,
       COUNT(*) as device_days
     FROM device_homes
     GROUP BY home_lat, home_lng
@@ -1363,9 +1390,10 @@ export async function startConsolidatedAffinityQuery(
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for affinity query');
 
+  // FULL-schema bypass: TRY(geo_fields[...]) returns NULL on BASIC.
   const allPingsUnion = buildUnionAll(
     syncedJobs,
-    'ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy',
+    `ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy, TRY(geo_fields['zipcode']) as native_zip, TRY(geo_fields['city']) as native_city`,
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
     visitorFilter,
   );
@@ -1382,7 +1410,7 @@ export async function startConsolidatedAffinityQuery(
   const sql = `
     WITH
     all_pings AS (
-      SELECT ad_id, date, utc_timestamp, lat, lng
+      SELECT ad_id, date, utc_timestamp, lat, lng, native_zip, native_city
       FROM (
         ${allPingsUnion}
       )
@@ -1402,7 +1430,9 @@ export async function startConsolidatedAffinityQuery(
         vm.date,
         vm.dwell_minutes,
         MIN_BY(ap.lat, ap.utc_timestamp) as origin_lat,
-        MIN_BY(ap.lng, ap.utc_timestamp) as origin_lng
+        MIN_BY(ap.lng, ap.utc_timestamp) as origin_lng,
+        MIN_BY(ap.native_zip, ap.utc_timestamp) as origin_native_zip,
+        MIN_BY(ap.native_city, ap.utc_timestamp) as origin_native_city
       FROM visit_metrics vm
       JOIN all_pings ap ON vm.ad_id = ap.ad_id AND vm.date = ap.date
       GROUP BY vm.ad_id, vm.date, vm.dwell_minutes
@@ -1410,6 +1440,8 @@ export async function startConsolidatedAffinityQuery(
     SELECT
       ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
       ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      MIN(origin_native_zip) as native_zip,
+      MIN(origin_native_city) as native_city,
       COUNT(*) as total_visits,
       COUNT(DISTINCT ad_id) as unique_devices,
       AVG(dwell_minutes) as avg_dwell,

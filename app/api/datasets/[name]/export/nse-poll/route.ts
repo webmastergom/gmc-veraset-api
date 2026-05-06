@@ -156,6 +156,8 @@ export async function POST(
         }
       }
 
+      // FULL-schema bypass: TRY(geo_fields['zipcode']) is NULL on BASIC, populated on FULL.
+      // When populated, we skip the Node-side reverse-geocoding for that coord entirely.
       const originsCTE = `
         WITH poi_visitors AS (
           SELECT ad_id, date
@@ -171,7 +173,8 @@ export async function POST(
           SELECT
             pv.ad_id,
             ROUND(MIN_BY(TRY_CAST(t.latitude AS DOUBLE), t.utc_timestamp), 1) as origin_lat,
-            ROUND(MIN_BY(TRY_CAST(t.longitude AS DOUBLE), t.utc_timestamp), 1) as origin_lng
+            ROUND(MIN_BY(TRY_CAST(t.longitude AS DOUBLE), t.utc_timestamp), 1) as origin_lng,
+            MIN_BY(TRY(t.geo_fields['zipcode']), t.utc_timestamp) as native_zip
           FROM poi_visitors pv
           INNER JOIN ${table} t ON pv.ad_id = t.ad_id AND pv.date = t.date
           WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
@@ -191,8 +194,10 @@ export async function POST(
         SELECT DISTINCT ad_id, origin_lat, origin_lng FROM origins WHERE origin_lat IS NOT NULL
       `;
 
-      // Coord query: small (~37K rows) for geocoding
-      const coordSql = `${originsCTE} SELECT origin_lat, origin_lng, COUNT(*) as device_count FROM origins WHERE origin_lat IS NOT NULL GROUP BY origin_lat, origin_lng`;
+      // Coord query: small (~37K rows) for geocoding. Column order is kept
+      // backwards-compatible (lat,lng,count first); native_zip is the optional
+      // 4th column and is consumed by the geocoding phase when present.
+      const coordSql = `${originsCTE} SELECT origin_lat, origin_lng, COUNT(*) as device_count, MIN(native_zip) as native_zip FROM origins WHERE origin_lat IS NOT NULL GROUP BY origin_lat, origin_lng`;
 
       const [queryId, coordQueryId] = await Promise.all([
         startQueryAsync(ctasSql),
@@ -275,6 +280,7 @@ export async function POST(
       const csvText = await csvObj.Body!.transformToString('utf-8');
       const lines = csvText.split('\n');
       const coordDeviceCounts = new Map<string, number>();
+      const coordNativeZip = new Map<string, string>(); // FULL-schema bypass
       let totalDevices = 0;
 
       for (let i = 1; i < lines.length; i++) {
@@ -283,18 +289,23 @@ export async function POST(
         const parts = line.replace(/"/g, '').split(',');
         if (parts.length < 2) continue;
         let lat: string, lng: string, count: number;
+        let nativeZip = '';
         if (parts.length >= 3 && state.coordQueryId) {
           [lat, lng] = parts;
           count = parseInt(parts[2]) || 1;
+          if (parts.length >= 4) nativeZip = (parts[3] || '').trim();
         } else if (parts.length >= 3) {
           lat = parts[1]; lng = parts[2]; count = 1;
         } else continue;
         const coordKey = `${lat},${lng}`;
         coordDeviceCounts.set(coordKey, (coordDeviceCounts.get(coordKey) || 0) + count);
+        if (nativeZip && !coordNativeZip.has(coordKey)) {
+          coordNativeZip.set(coordKey, nativeZip);
+        }
         totalDevices += count;
       }
 
-      console.log(`[NSE-POLL] ${totalDevices} devices → ${coordDeviceCounts.size} unique coords`);
+      console.log(`[NSE-POLL] ${totalDevices} devices → ${coordDeviceCounts.size} unique coords (${coordNativeZip.size} have native_zip)`);
 
       const nseData = await getConfig<NseRecord[]>(NSE_KEY(state.country));
       if (!nseData?.length) {
@@ -303,26 +314,35 @@ export async function POST(
         return NextResponse.json({ phase: 'error', error: state.error });
       }
 
-      // Geocode
-      setCountryFilter([state.country]);
-      const coordKeys = Array.from(coordDeviceCounts.keys());
-      const uniquePoints = coordKeys.map(k => {
-        const [lat, lng] = k.split(',').map(Number);
-        return { lat, lng, deviceCount: coordDeviceCounts.get(k) || 1 };
-      });
-      console.log(`[NSE-POLL] Reverse geocoding ${uniquePoints.length} unique coords...`);
-      const geocoded = await batchReverseGeocode(uniquePoints);
-
-      // Build coord → postal code
+      // Build coord → postal code, starting with FULL-schema native_zip rows.
+      // Strip optional country prefix to match the NSE CSV format ("28001" not "ES-28001").
       const coordToPostalCode: Record<string, string> = {};
-      for (let i = 0; i < coordKeys.length; i++) {
-        const geo = geocoded[i];
-        if (geo.type === 'geojson_local') {
-          const cp = geo.postcode?.replace(/^[A-Z]{2}[-\s]/, '') || '';
-          if (cp) coordToPostalCode[coordKeys[i]] = cp;
-        }
+      for (const [coordKey, nz] of coordNativeZip.entries()) {
+        const cp = nz.replace(/^[A-Z]{2}[-\s]/, '').trim();
+        if (cp) coordToPostalCode[coordKey] = cp;
       }
-      setCountryFilter(null);
+
+      // Geocode the remaining coords (BASIC schema or FULL coords without zipcode)
+      const coordKeysToGeocode = Array.from(coordDeviceCounts.keys()).filter(k => !coordToPostalCode[k]);
+      if (coordKeysToGeocode.length > 0) {
+        setCountryFilter([state.country]);
+        const uniquePoints = coordKeysToGeocode.map(k => {
+          const [lat, lng] = k.split(',').map(Number);
+          return { lat, lng, deviceCount: coordDeviceCounts.get(k) || 1 };
+        });
+        console.log(`[NSE-POLL] Reverse geocoding ${uniquePoints.length} non-native coords (skipped ${coordNativeZip.size} via FULL bypass)...`);
+        const geocoded = await batchReverseGeocode(uniquePoints);
+        for (let i = 0; i < coordKeysToGeocode.length; i++) {
+          const geo = geocoded[i];
+          if (geo.type === 'geojson_local') {
+            const cp = geo.postcode?.replace(/^[A-Z]{2}[-\s]/, '') || '';
+            if (cp) coordToPostalCode[coordKeysToGeocode[i]] = cp;
+          }
+        }
+        setCountryFilter(null);
+      } else {
+        console.log(`[NSE-POLL] All ${coordNativeZip.size} coords resolved via FULL-schema bypass — skipping reverse geocoding`);
+      }
 
       // Build postal code → device count
       const cpDeviceCounts = new Map<string, number>();
