@@ -566,13 +566,26 @@ export default function ComparePage() {
               </div>
             )}
 
-            {/* Reach subtab — independent of basic compare result */}
+            {/* Reach subtab — independent of basic compare result.
+                Filters from the per-side selectors above flow through; only
+                applied when the source is "all" (raw dataset), since export
+                sources have their MAIDs already pre-filtered. */}
             {mainTab === 'reach' && datasetA && datasetB && (
               <CompareReach
                 datasetA={datasetA}
                 datasetB={datasetB}
                 dsALabel={dsALabel}
                 dsBLabel={dsBLabel}
+                filtersA={sourceA === 'all' ? {
+                  minDwell: minDwellA, maxDwell: maxDwellA,
+                  hourFrom: hourFromA, hourTo: hourToA,
+                  minVisits: minVisitsA,
+                } : undefined}
+                filtersB={sourceB === 'all' ? {
+                  minDwell: minDwellB, maxDwell: maxDwellB,
+                  hourFrom: hourFromB, hourTo: hourToB,
+                  minVisits: minVisitsB,
+                } : undefined}
               />
             )}
 

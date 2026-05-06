@@ -33,11 +33,23 @@ interface ReachResult {
   bToA?: ReachDirectionResult;
 }
 
+interface SourceFilters {
+  minDwell?: number;
+  maxDwell?: number;
+  hourFrom?: number;
+  hourTo?: number;
+  minVisits?: number;
+}
+
 interface Props {
   datasetA: string;
   datasetB: string;
   dsALabel: string;
   dsBLabel: string;
+  /** Filters from the A side selector (Dwell/Hour/MinVisits). Applied to A→B source visitors. */
+  filtersA?: SourceFilters;
+  /** Filters from the B side selector. Applied to B→A source visitors. */
+  filtersB?: SourceFilters;
 }
 
 const DIRECTION_OPTIONS: { value: 'both' | 'aToB' | 'bToA'; label: string }[] = [
@@ -46,7 +58,31 @@ const DIRECTION_OPTIONS: { value: 'both' | 'aToB' | 'bToA'; label: string }[] = 
   { value: 'bToA',  label: 'Only B → A (B-visitors near A-POIs)' },
 ];
 
-export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel }: Props) {
+function hasFilters(f?: SourceFilters): boolean {
+  if (!f) return false;
+  return (
+    (f.minDwell ?? 0) > 0 ||
+    (f.maxDwell ?? 0) > 0 ||
+    (f.hourFrom ?? 0) > 0 ||
+    (f.hourTo ?? 23) < 23 ||
+    (f.minVisits ?? 1) > 1
+  );
+}
+
+function summarizeFilters(f?: SourceFilters): string {
+  if (!f) return 'none';
+  const parts: string[] = [];
+  if ((f.minDwell ?? 0) > 0 || (f.maxDwell ?? 0) > 0) {
+    parts.push(`dwell ${f.minDwell || 0}-${f.maxDwell || '∞'}m`);
+  }
+  if ((f.hourFrom ?? 0) > 0 || (f.hourTo ?? 23) < 23) {
+    parts.push(`hours ${String(f.hourFrom ?? 0).padStart(2, '0')}-${String(f.hourTo ?? 23).padStart(2, '0')}`);
+  }
+  if ((f.minVisits ?? 1) > 1) parts.push(`min ${f.minVisits}+ days`);
+  return parts.length ? parts.join(' · ') : 'none';
+}
+
+export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, filtersA, filtersB }: Props) {
   const [maxDistance, setMaxDistance] = useState<number>(200);
   const [minPings, setMinPings] = useState<number>(3);
   const [minDwell, setMinDwell] = useState<number>(5);
@@ -85,6 +121,8 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel }:
           minPings,
           minDwellMinutes: minDwell,
           directions: dirs,
+          filtersA: filtersA || {},
+          filtersB: filtersB || {},
         }),
       });
       const stateId = data.stateId;
@@ -291,6 +329,24 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel }:
           A device counts if it has <strong>≥ {minPings} pings</strong> OR <strong>≥ {minDwell} min</strong> within{' '}
           <strong>{maxDistance} m</strong> of a target POI.
         </div>
+        {(hasFilters(filtersA) || hasFilters(filtersB)) && (
+          <div className="text-xs rounded border bg-muted/30 px-3 py-2 space-y-0.5">
+            <div className="font-medium text-foreground">Source-side filters from the panel above:</div>
+            {hasFilters(filtersA) && (
+              <div className="text-muted-foreground">
+                <span className="text-blue-500 font-semibold">{dsALabel}:</span> {summarizeFilters(filtersA)}
+              </div>
+            )}
+            {hasFilters(filtersB) && (
+              <div className="text-muted-foreground">
+                <span className="text-orange-500 font-semibold">{dsBLabel}:</span> {summarizeFilters(filtersB)}
+              </div>
+            )}
+            <div className="text-muted-foreground italic pt-1">
+              Applied to the &ldquo;visitors of source POIs&rdquo; set per direction. Change them above and re-run to see the effect.
+            </div>
+          </div>
+        )}
         <Button onClick={handleRun} disabled={running || !datasetA || !datasetB}>
           {running ? (
             <><Loader2 className="h-4 w-4 mr-2 animate-spin" />{progressMsg || 'Running…'}</>
