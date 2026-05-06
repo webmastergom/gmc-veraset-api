@@ -835,7 +835,15 @@ export async function createTableForDataset(datasetName: string, progressTracker
   console.log(`📅 Found ${s3Partitions.length} partitions in S3:`, s3Partitions.slice(0, 10).join(', '), s3Partitions.length > 10 ? '...' : '');
 
   // Use STRING for latitude/longitude to handle both DOUBLE and BINARY types in Parquet files
-  // We'll CAST to DOUBLE in queries where needed
+  // We'll CAST to DOUBLE in queries where needed.
+  //
+  // FULL-schema parquets carry two extra MAP columns:
+  //   - quality_fields: ping_origin_type, source_type, ha_type, ping_circle_score,
+  //     ping_lat/long_precision, ping_sink_matches, ping_near_replicate_matches,
+  //     ping_cell_tower
+  //   - geo_fields: region, city, zipcode, h3_res10, h3_res12, geohash
+  // BASIC parquets don't have them — Athena reads by name and returns NULL for
+  // missing columns, so it's safe to declare them on every table.
   const sql = `
     CREATE EXTERNAL TABLE IF NOT EXISTS ${tableName} (
       ad_id STRING,
@@ -846,7 +854,9 @@ export async function createTableForDataset(datasetName: string, progressTracker
       latitude STRING,
       longitude STRING,
       iso_country_code STRING,
-      poi_ids ARRAY<STRING>
+      poi_ids ARRAY<STRING>,
+      quality_fields MAP<STRING,STRING>,
+      geo_fields MAP<STRING,STRING>
     )
     PARTITIONED BY (date STRING)
     STORED AS PARQUET
@@ -1038,6 +1048,35 @@ export async function tableExists(datasetName: string): Promise<boolean> {
 }
 
 /**
+ * Idempotent: tries to ALTER an existing dataset table to add the FULL-schema
+ * MAP columns. Athena throws when a column already exists; we catch & ignore
+ * so this is safe to call on tables created with the older 9-column DDL as
+ * well as on tables that already have the new columns.
+ *
+ * For BASIC parquets the columns will read as NULL. For FULL parquets the
+ * columns light up with quality / geo metadata Veraset emits per ping.
+ */
+async function backfillFullSchemaColumns(tableName: string): Promise<void> {
+  const newCols: Array<[string, string]> = [
+    ['quality_fields', 'MAP<STRING,STRING>'],
+    ['geo_fields', 'MAP<STRING,STRING>'],
+  ];
+  for (const [name, type] of newCols) {
+    try {
+      await runQuery(`ALTER TABLE ${tableName} ADD COLUMNS (${name} ${type})`);
+      console.log(`[ATHENA] Added column ${name} to ${tableName}`);
+    } catch (e: any) {
+      // Athena reports "Column with name X already exists" — that's a no-op for us.
+      // Anything else is unusual but not fatal; surface as warning.
+      const msg = e?.message || String(e);
+      if (!/already exist/i.test(msg)) {
+        console.warn(`[ATHENA] backfill ${name} on ${tableName}:`, msg.slice(0, 150));
+      }
+    }
+  }
+}
+
+/**
  * Lightweight table check: if the table already exists and has data, skip the
  * expensive partition discovery + MSCK REPAIR.  Only falls back to the full
  * createTableForDataset when the table doesn't exist or is empty.
@@ -1055,6 +1094,10 @@ export async function ensureTableForDataset(datasetName: string): Promise<void> 
       const probe = await runQuery(`SELECT 1 FROM ${tableName} LIMIT 1`);
       if (probe.rows.length > 0) {
         console.log(`✅ Table ${tableName} exists and has data — skipping full rebuild`);
+        // Backfill FULL-schema columns for legacy 9-column tables (idempotent).
+        if (!(await isViewDataset(datasetName))) {
+          await backfillFullSchemaColumns(tableName);
+        }
         return; // Table is usable
       }
       // If empty, check if it's a VIEW — don't rebuild views as external tables
