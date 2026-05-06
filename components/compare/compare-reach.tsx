@@ -367,7 +367,7 @@ export default function CompareReach({ datasetA, datasetB, dsALabel, dsBLabel, f
           <p className="text-sm font-medium mb-1">Potential Reach analysis</p>
           <p className="text-xs text-muted-foreground">
             Identifies devices that visited POIs of one dataset and have a meaningful cluster of pings near POIs of the other —
-            &ldquo;potential visitors&rdquo; by mobility proximity. Capped at 500 POIs per side.
+            &ldquo;potential visitors&rdquo; by mobility proximity. Capped at 2000 POIs per side.
           </p>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">

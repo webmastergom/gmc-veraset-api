@@ -8,7 +8,8 @@
  * A→B and B→A run in parallel.
  *
  * Constraints:
- *   - Capped at 500 POIs per side (inlined as VALUES into the SQL).
+ *   - Capped at 2000 POIs per side (inlined as VALUES into the SQL —
+ *     ~180KB worst case, well under Athena's 256KB query limit).
  *   - Uses the same grid-bucket spatial join as the rest of the
  *     consolidation pipeline so the spatial step is O(N) on pings.
  */
@@ -116,7 +117,7 @@ const STATE_KEY = (id: string) => `compare-reach-state/${id}`;
 const ACCURACY = 500;
 const GRID = 0.01;
 
-/** Build the inline VALUES list for B-side POIs (≤500 expected). */
+/** Build the inline VALUES list for target POIs (≤2000 expected). */
 function poisValues(pois: PoiPosition[]): string {
   // Each row: ('poi-id', 'name with single quotes escaped', lat, lng)
   return pois
@@ -436,8 +437,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       if (poisB.length === 0) {
         return NextResponse.json({ phase: 'error', error: `Dataset B (${datasetB}) has no POIs registered` }, { status: 400 });
       }
-      if (poisA.length > 500 || poisB.length > 500) {
-        return NextResponse.json({ phase: 'error', error: `Reach analysis is capped at 500 POIs per side (A=${poisA.length}, B=${poisB.length}). Use a smaller POI collection.` }, { status: 400 });
+      if (poisA.length > 2000 || poisB.length > 2000) {
+        return NextResponse.json({ phase: 'error', error: `Reach analysis is capped at 2000 POIs per side (A=${poisA.length}, B=${poisB.length}). Use a smaller POI collection.` }, { status: 400 });
       }
 
       state = {
