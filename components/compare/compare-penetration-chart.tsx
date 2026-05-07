@@ -139,21 +139,33 @@ export default function ComparePenetrationChart({ pois, side, totalForSide, over
             />
             <Tooltip
               cursor={{ fill: 'rgba(128,128,128,0.1)' }}
-              contentStyle={{ fontSize: 12, background: 'hsl(var(--popover))', border: '1px solid hsl(var(--border))', borderRadius: 6 }}
-              formatter={(_v: any, _name: any, props: any) => {
-                const p = props.payload;
-                return [
-                  <div key="details" className="text-xs">
-                    <div>Devices: <b>{p.overlapDevices.toLocaleString()}</b></div>
-                    <div>% of sample: <b>{p.pctSample}%</b></div>
-                    <div>% of match: <b>{p.pctMatch}%</b></div>
-                  </div>,
-                  '',
-                ];
-              }}
-              labelFormatter={(_label: any, payload: any) => {
-                const p = payload?.[0]?.payload;
-                return p ? `${p.fullLabel} (${p.poiId})` : '';
+              // Custom content avoids Recharts' default `name: value` row
+              // (which left a stray ":" line because we pass an empty name).
+              // Three-column-style layout with high-contrast labels + tabular
+              // numbers so values line up clean.
+              content={({ active, payload }: any) => {
+                if (!active || !payload?.length) return null;
+                const p = payload[0].payload;
+                return (
+                  <div className="rounded-md border bg-popover px-3 py-2 text-xs shadow-lg min-w-[180px]">
+                    <div className="font-semibold text-foreground leading-tight">{p.fullLabel}</div>
+                    <div className="font-mono text-[10px] text-muted-foreground mt-0.5 mb-2">{p.poiId}</div>
+                    <div className="space-y-1 border-t border-border/60 pt-2">
+                      <div className="flex justify-between gap-4">
+                        <span className="text-muted-foreground">Devices</span>
+                        <span className="font-semibold text-foreground tabular-nums">{p.overlapDevices.toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between gap-4">
+                        <span className="text-muted-foreground">% of sample</span>
+                        <span className="font-semibold text-foreground tabular-nums">{p.pctSample}%</span>
+                      </div>
+                      <div className="flex justify-between gap-4">
+                        <span className="text-muted-foreground">% of match</span>
+                        <span className="font-semibold text-foreground tabular-nums">{p.pctMatch}%</span>
+                      </div>
+                    </div>
+                  </div>
+                );
               }}
             />
             <Bar dataKey="value" radius={[0, 4, 4, 0]} cursor="pointer">
