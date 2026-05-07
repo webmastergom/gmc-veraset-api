@@ -37,6 +37,7 @@ import type {
   PersonaInsight,
   RfmCell,
   CohabitationEntry,
+  SourceZipAffinity,
 } from '@/lib/persona-types';
 
 const PERSONA_COLORS = [
@@ -92,7 +93,7 @@ interface Props {
   megaJobNames: string[];
 }
 
-type TabKey = 'overview' | 'personas' | 'rfm' | 'cohabitation' | 'insights';
+type TabKey = 'overview' | 'personas' | 'rfm' | 'cohabitation' | 'zipAffinity' | 'insights';
 
 export default function PersonaResults({ report, megaJobNames }: Props) {
   const [tab, setTab] = useState<TabKey>('overview');
@@ -101,6 +102,13 @@ export default function PersonaResults({ report, megaJobNames }: Props) {
     { key: 'personas', label: `Personas (${report.personas.length})`, show: true },
     { key: 'rfm', label: 'RFM Grid', show: true },
     { key: 'cohabitation', label: 'Brand Cohabitation', show: !!report.cohabitation },
+    {
+      key: 'zipAffinity',
+      label: `Zip Affinity${
+        report.zipAffinity?.length ? ` (${report.zipAffinity.length})` : ''
+      }`,
+      show: !!(report.zipAffinity && report.zipAffinity.length > 0),
+    },
     { key: 'insights', label: `Insights (${report.insights.length})`, show: true },
   ];
 
@@ -127,6 +135,9 @@ export default function PersonaResults({ report, megaJobNames }: Props) {
       {tab === 'rfm' && <RfmTab report={report} />}
       {tab === 'cohabitation' && report.cohabitation && (
         <CohabitationTab entries={report.cohabitation.entries} brands={report.cohabitation.brands} />
+      )}
+      {tab === 'zipAffinity' && report.zipAffinity && (
+        <ZipAffinityTab sources={report.zipAffinity} runId={report.runId} />
       )}
       {tab === 'insights' && <InsightsTab insights={report.insights} />}
     </div>
@@ -474,6 +485,205 @@ function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; br
                 <td className="px-3 py-2 text-right tabular-nums">{pct(e.shareAtoB * 100)}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{pct(e.shareBtoA * 100)}</td>
                 <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{fmtNum(e.intersectionDevices)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Zip Affinity tab ─────────────────────────────────────────────────
+
+type ZipSortKey = 'zip' | 'affinityIndex' | 'count';
+
+function ZipAffinityTab({
+  sources,
+  runId,
+}: {
+  sources: SourceZipAffinity[];
+  runId: string;
+}) {
+  const [activeSourceId, setActiveSourceId] = useState<string>(sources[0]?.sourceId || '');
+  const [search, setSearch] = useState<string>('');
+  const [sortKey, setSortKey] = useState<ZipSortKey>('affinityIndex');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+
+  const active = sources.find((s) => s.sourceId === activeSourceId) || sources[0];
+
+  const filtered = useMemo(() => {
+    if (!active) return [];
+    const q = search.trim().toLowerCase();
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const cmp = (a: typeof active.rows[number], b: typeof active.rows[number]) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * dir;
+      return ((av as number) - (bv as number)) * dir;
+    };
+    let rows = active.rows;
+    if (q) rows = rows.filter((r) => r.zip.toLowerCase().includes(q));
+    return [...rows].sort(cmp);
+  }, [active, search, sortKey, sortDir]);
+
+  const onSort = (key: ZipSortKey) => {
+    if (key === sortKey) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      setSortDir(key === 'zip' ? 'asc' : 'desc');
+    }
+  };
+
+  const downloadCsv = () => {
+    if (!active) return;
+    const rows = filtered;
+    const lines = ['Zip Code,Affinity Index'];
+    for (const r of rows) {
+      // Quote zip in case it ever contains a comma (rare but safe).
+      const z = /[",\n]/.test(r.zip) ? `"${r.zip.replace(/"/g, '""')}"` : r.zip;
+      lines.push(`${z},${r.affinityIndex}`);
+    }
+    const csv = lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const safeLabel = active.sourceLabel.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60) || 'source';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `zip-affinity_${safeLabel}_${runId.slice(0, 8)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  if (!active) {
+    return (
+      <div className="text-sm text-muted-foreground p-4">
+        No ZIP data available — devices need a resolvable home_zip (FULL schema or
+        reverse-geocoded fallback) to compute affinity.
+      </div>
+    );
+  }
+
+  // Color ramp for the affinity bar — light cyan → vivid blue.
+  const barColor = (idx: number) =>
+    `rgba(59,130,246,${Math.max(0.18, Math.min(1, idx / 100))})`;
+
+  const SortHeader = ({
+    columnKey,
+    align,
+    children,
+  }: {
+    columnKey: ZipSortKey;
+    align: 'left' | 'right';
+    children: React.ReactNode;
+  }) => {
+    const activeCol = sortKey === columnKey;
+    const Icon = activeCol ? (sortDir === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown;
+    return (
+      <th className={`px-3 py-2 ${align === 'left' ? 'text-left' : 'text-right'}`}>
+        <button
+          type="button"
+          onClick={() => onSort(columnKey)}
+          className={`inline-flex items-center gap-1 hover:text-foreground transition-colors ${
+            align === 'right' ? 'flex-row-reverse' : ''
+          } ${activeCol ? 'text-foreground' : ''}`}
+          title={`Sort by ${columnKey}`}
+        >
+          <span>{children}</span>
+          <Icon className={`h-3 w-3 ${activeCol ? 'opacity-100' : 'opacity-40'}`} />
+        </button>
+      </th>
+    );
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="text-sm text-muted-foreground">
+        Affinity Index 0..100 per residential ZIP, normalized against the top ZIP of the
+        selected source. Higher = stronger likelihood of generating visits to this POI set.
+      </div>
+
+      {/* Source toggle (when 2+ sources) */}
+      {sources.length > 1 && (
+        <div className="flex items-center gap-1 flex-wrap">
+          <span className="text-xs text-muted-foreground mr-1">Source:</span>
+          {sources.map((s) => (
+            <button
+              key={s.sourceId}
+              type="button"
+              onClick={() => setActiveSourceId(s.sourceId)}
+              className={`px-3 py-1 rounded-md text-xs font-medium transition-colors border ${
+                s.sourceId === active.sourceId
+                  ? 'bg-primary text-primary-foreground border-primary'
+                  : 'bg-muted/30 text-muted-foreground border-border hover:bg-muted'
+              }`}
+            >
+              {s.sourceLabel}
+              <span className="ml-1.5 opacity-70">· {fmtNum(s.rows.length)} ZIPs</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Toolbar: search + download CSV */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Filter by ZIP code…"
+          className="h-8 px-3 rounded-md border border-input bg-background text-sm w-56"
+        />
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>
+            {filtered.length.toLocaleString()} ZIPs · {fmtNum(active.totalDevicesWithZip)} devices
+          </span>
+          <button
+            type="button"
+            onClick={downloadCsv}
+            className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary/10 text-foreground border border-primary/30 hover:bg-primary/20 transition-colors"
+            title="Download as CSV (Zip Code, Affinity Index)"
+          >
+            Download CSV
+          </button>
+        </div>
+      </div>
+
+      {/* Table */}
+      <div className="border rounded-lg overflow-x-auto max-h-[600px] overflow-y-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-muted/30 text-xs uppercase tracking-wider text-muted-foreground sticky top-0">
+            <tr>
+              <SortHeader columnKey="zip" align="left">Zip Code</SortHeader>
+              <SortHeader columnKey="affinityIndex" align="right">Affinity Index</SortHeader>
+              <SortHeader columnKey="count" align="right">Visitors</SortHeader>
+              <th className="text-left px-3 py-2 w-1/3">Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((r) => (
+              <tr key={r.zip} className="border-t border-border/50 hover:bg-muted/30">
+                <td className="px-3 py-2 font-mono text-xs">{r.zip}</td>
+                <td className="px-3 py-2 text-right tabular-nums font-medium">
+                  {r.affinityIndex}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                  {fmtNum(r.count)}
+                </td>
+                <td className="px-3 py-2">
+                  <div className="h-2 rounded bg-muted/40 overflow-hidden">
+                    <div
+                      className="h-full rounded"
+                      style={{
+                        width: `${r.affinityIndex}%`,
+                        backgroundColor: barColor(r.affinityIndex),
+                      }}
+                    />
+                  </div>
+                </td>
               </tr>
             ))}
           </tbody>

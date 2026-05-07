@@ -47,6 +47,7 @@ import { buildFeatureCTAS, extractPoiCoords } from '@/lib/persona-feature-query'
 import { runClusteringPipeline } from '@/lib/persona-clusterer';
 import { computeRfm } from '@/lib/persona-rfm';
 import { computeCohabitation } from '@/lib/persona-cohabitation';
+import { computeZipAffinityPerSource } from '@/lib/persona-zip-affinity';
 import { generateInsights } from '@/lib/persona-insights';
 import { registerAthenaContribution } from '@/lib/master-maids';
 import {
@@ -579,6 +580,33 @@ async function phaseClusterAndAggregate(
       ? computeCohabitation(features, config.megaJobIds)
       : undefined;
 
+  // Per-source ZIP affinity. Resolve source labels (megajob name / job
+  // name) so the UI tab and CSV download can use the human label.
+  const sourceLabels: Record<string, string> = {};
+  for (const id of config.megaJobIds) {
+    try {
+      const mj = await getMegaJob(id);
+      sourceLabels[id] = mj?.name || id.slice(0, 8);
+    } catch {
+      sourceLabels[id] = id.slice(0, 8);
+    }
+  }
+  for (const id of config.jobIds || []) {
+    try {
+      const j = await getJob(id);
+      sourceLabels[id] = (j as any)?.name || id.slice(0, 8);
+    } catch {
+      sourceLabels[id] = id.slice(0, 8);
+    }
+  }
+  const zipAffinity = computeZipAffinityPerSource(features, sourceLabels);
+  if (zipAffinity.length > 0) {
+    const zipsTotal = zipAffinity.reduce((s, x) => s + x.rows.length, 0);
+    console.log(
+      `[PERSONAS ${runId}] zip-affinity: ${zipAffinity.length} source(s), ${zipsTotal} ZIP rows total`
+    );
+  }
+
   // Scorecard
   const totalDevices = features.length;
   const highQ = features.filter((f) => f.tier_high_quality).length;
@@ -639,6 +667,7 @@ async function phaseClusterAndAggregate(
     personas: clusteringResult.personas,
     rfm,
     cohabitation: cohab,
+    zipAffinity: zipAffinity.length > 0 ? zipAffinity : undefined,
     nseCrosstab,
     insights,
     exports: [],

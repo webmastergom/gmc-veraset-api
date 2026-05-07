@@ -180,6 +180,33 @@ export interface JourneyReport {
   patterns: JourneyPattern[];
 }
 
+/**
+ * Per-ZIP affinity for one source (megajob/job). The index is a 0..100
+ * score relative to the top ZIP of that source — 100 = the ZIP that
+ * contributed the most visitors, 0 ≈ the ZIPs barely represented.
+ *
+ * Computed in Node from the home_zip column of the persona feature
+ * vector — no extra Athena query needed.
+ */
+export interface ZipAffinityRow {
+  zip: string;
+  /** Distinct devices with home_zip = X who visited this source's POIs. */
+  count: number;
+  /** 0..100 affinity score relative to top ZIP in this source. */
+  affinityIndex: number;
+}
+
+export interface SourceZipAffinity {
+  /** Source megajob/job id. */
+  sourceId: string;
+  /** Human-readable label for tab + CSV filename. */
+  sourceLabel: string;
+  /** Sorted desc by affinityIndex (top first). */
+  rows: ZipAffinityRow[];
+  /** Sum of all visitor counts (for "X% of base" labels). */
+  totalDevicesWithZip: number;
+}
+
 /** A single quotable insight string + supporting metric. */
 export interface PersonaInsight {
   id: string;
@@ -213,6 +240,8 @@ export interface PersonaReport {
   personas: PersonaCluster[];
   rfm: RfmReport;
   cohabitation?: CohabitationReport; // only when 2+ megajobs
+  /** Per-source ZIP affinity (one entry per megajob/job in the run). */
+  zipAffinity?: SourceZipAffinity[];
   journey?: JourneyReport;
   /** Per-megajob persona × NSE crosstab. */
   nseCrosstab: {
