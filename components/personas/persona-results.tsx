@@ -27,6 +27,9 @@ import {
   MapPin,
   Compass,
   Star,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown,
 } from 'lucide-react';
 import type {
   PersonaReport,
@@ -369,30 +372,97 @@ function RfmTab({ report }: { report: PersonaReport }) {
 
 // ── Cohabitation tab ─────────────────────────────────────────────────
 
+type CohabSortKey = 'brandA' | 'brandB' | 'jaccard' | 'shareAtoB' | 'shareBtoA' | 'intersectionDevices';
+type SortDir = 'asc' | 'desc';
+
 function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; brands: string[] }) {
+  const [sortKey, setSortKey] = useState<CohabSortKey>('jaccard');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [showAll, setShowAll] = useState(false);
+
+  const sorted = useMemo(() => {
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const cmp = (a: CohabitationEntry, b: CohabitationEntry): number => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * dir;
+      return ((av as number) - (bv as number)) * dir;
+    };
+    return [...entries].sort(cmp);
+  }, [entries, sortKey, sortDir]);
+
+  const visible = showAll ? sorted : sorted.slice(0, 30);
+
+  const onSort = (key: CohabSortKey) => {
+    if (key === sortKey) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      // Numeric columns default desc (largest first); text columns default asc.
+      setSortDir(key === 'brandA' || key === 'brandB' ? 'asc' : 'desc');
+    }
+  };
+
   if (brands.length === 0) {
     return <div className="text-sm text-muted-foreground p-4">No brands detected (need ≥50 visitors per brand).</div>;
   }
-  const top = entries.slice(0, 30);
+
+  const SortHeader = ({
+    columnKey,
+    align,
+    children,
+  }: {
+    columnKey: CohabSortKey;
+    align: 'left' | 'right';
+    children: React.ReactNode;
+  }) => {
+    const active = sortKey === columnKey;
+    const Icon = active ? (sortDir === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown;
+    return (
+      <th className={`px-3 py-2 ${align === 'left' ? 'text-left' : 'text-right'}`}>
+        <button
+          type="button"
+          onClick={() => onSort(columnKey)}
+          className={`inline-flex items-center gap-1 hover:text-foreground transition-colors ${
+            align === 'right' ? 'flex-row-reverse' : ''
+          } ${active ? 'text-foreground' : ''}`}
+          title={`Sort by ${children}`}
+        >
+          <span>{children}</span>
+          <Icon className={`h-3 w-3 ${active ? 'opacity-100' : 'opacity-40'}`} />
+        </button>
+      </th>
+    );
+  };
+
   return (
     <div className="space-y-3">
-      <div className="text-sm text-muted-foreground">
-        Pairwise device-overlap between brands. Higher Jaccard = tighter cross-shopping.
+      <div className="flex items-center justify-between gap-3 text-sm text-muted-foreground">
+        <div>Pairwise device-overlap between brands. Click a column to sort. Higher Jaccard = tighter cross-shopping.</div>
+        {sorted.length > 30 && (
+          <button
+            type="button"
+            onClick={() => setShowAll((v) => !v)}
+            className="text-xs px-2 py-1 rounded bg-muted/40 hover:bg-muted text-foreground whitespace-nowrap"
+          >
+            {showAll ? `Show top 30` : `Show all ${sorted.length}`}
+          </button>
+        )}
       </div>
       <div className="border rounded-lg overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-muted/30 text-xs uppercase tracking-wider text-muted-foreground">
             <tr>
-              <th className="text-left px-3 py-2">Brand A</th>
-              <th className="text-left px-3 py-2">Brand B</th>
-              <th className="text-right px-3 py-2">Jaccard</th>
-              <th className="text-right px-3 py-2">% of A also visit B</th>
-              <th className="text-right px-3 py-2">% of B also visit A</th>
-              <th className="text-right px-3 py-2">Overlap devices</th>
+              <SortHeader columnKey="brandA" align="left">Brand A</SortHeader>
+              <SortHeader columnKey="brandB" align="left">Brand B</SortHeader>
+              <SortHeader columnKey="jaccard" align="right">Jaccard</SortHeader>
+              <SortHeader columnKey="shareAtoB" align="right">% of A also visit B</SortHeader>
+              <SortHeader columnKey="shareBtoA" align="right">% of B also visit A</SortHeader>
+              <SortHeader columnKey="intersectionDevices" align="right">Overlap devices</SortHeader>
             </tr>
           </thead>
           <tbody>
-            {top.map((e, i) => (
+            {visible.map((e, i) => (
               <tr key={`${e.brandA}-${e.brandB}-${i}`} className="border-t border-border/50 hover:bg-muted/30">
                 <td className="px-3 py-2 capitalize">{e.brandA.replace(/_/g, ' ')}</td>
                 <td className="px-3 py-2 capitalize">{e.brandB.replace(/_/g, ' ')}</td>
