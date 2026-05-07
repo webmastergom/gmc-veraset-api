@@ -42,6 +42,7 @@ import { getMegaJob } from '@/lib/mega-jobs';
 import { getJob } from '@/lib/jobs';
 import { getPOICollection } from '@/lib/poi-storage';
 import { resolveBrand } from '@/lib/persona-brand-lookup';
+import { discoverBrands, type PoiNameLookup } from '@/lib/persona-brand-discovery';
 import { buildFeatureCTAS, extractPoiCoords } from '@/lib/persona-feature-query';
 import { runClusteringPipeline } from '@/lib/persona-clusterer';
 import { computeRfm } from '@/lib/persona-rfm';
@@ -145,30 +146,63 @@ async function fireFeatureCtasForSource(args: {
     throw new Error(`No POI coords for source ${source.label}`);
   }
 
-  // Resolve brand for each POI from collections.
-  const poiToBrand: Array<{ poiId: string; brand: string }> = [];
+  // Resolve brand for each POI using a 3-layer strategy:
+  //   1. GeoJSON properties.brand / .chain — explicit user override.
+  //   2. Auto-discovery from POI name frequency (handles arbitrary
+  //      datasets like Auto Dealerships, retail competitors, …).
+  //   3. BRAND_RULES hardcoded fast-food / common chains — final fallback
+  //      for POIs the discovery missed.
+  const poiInputs: PoiNameLookup[] = [];
   for (const colId of source.collectionIds) {
     const geo = await getPOICollection(colId);
     if (!geo?.features) continue;
     for (const f of geo.features as any[]) {
       const id = f.properties?.id || f.id;
       const name = f.properties?.name || f.properties?.label || '';
+      const override = f.properties?.brand || f.properties?.chain || '';
       if (!id) continue;
-      poiToBrand.push({ poiId: String(id), brand: resolveBrand(name) });
+      poiInputs.push({ poiId: String(id), name, brandOverride: override || undefined });
     }
   }
-  // Fallback: if no collection-derived names, use the verasetPayload geo_radius
-  // poi_ids without name → all map to 'other'. The pipeline still works.
-  if (poiToBrand.length === 0) {
-    console.warn(`[PERSONAS ${runId}] No named POIs for source ${source.label}; brand resolution will be 'other'.`);
+  // If we still have no named POIs, synth from verasetPayload.geo_radius.
+  if (poiInputs.length === 0) {
+    console.warn(`[PERSONAS ${runId}] No named POIs for ${source.label}; falling back to verasetPayload.geo_radius.`);
     for (const job of source.syncedJobs) {
       for (const g of job.verasetPayload?.geo_radius || []) {
-        if (g.poi_id) poiToBrand.push({ poiId: String(g.poi_id), brand: 'other' });
+        if (g.poi_id) poiInputs.push({ poiId: String(g.poi_id), name: '' });
       }
     }
   }
-  if (poiToBrand.length === 0) {
+  if (poiInputs.length === 0) {
     throw new Error(`No POIs found for source ${source.label}`);
+  }
+
+  // Layer 2: auto-discovery (handles overrides via brandOverride field).
+  const discovery = discoverBrands(poiInputs);
+  console.log(
+    `[PERSONAS ${runId}] Brand discovery for ${source.label}: ` +
+    `${discovery.source.override} explicit + ${discovery.source.discovered} discovered + ${discovery.source.other} other. ` +
+    `Top candidates: ${discovery.candidates.slice(0, 8).map((c) => `${c.brand}(${c.count})`).join(', ')}`
+  );
+
+  // Layer 3: for POIs left as 'other', try the hardcoded BRAND_RULES
+  // (fast-food chains etc. that auto-discovery may not pick up if the
+  // dataset is a mix of brands with low individual counts).
+  const poiToBrand: Array<{ poiId: string; brand: string }> = [];
+  let layer3Hits = 0;
+  for (const p of poiInputs) {
+    let brand = discovery.poiToBrand.get(p.poiId) || 'other';
+    if (brand === 'other' && p.name) {
+      const ruleBrand = resolveBrand(p.name);
+      if (ruleBrand !== 'other') {
+        brand = ruleBrand;
+        layer3Hits++;
+      }
+    }
+    poiToBrand.push({ poiId: p.poiId, brand });
+  }
+  if (layer3Hits > 0) {
+    console.log(`[PERSONAS ${runId}] BRAND_RULES recovered ${layer3Hits} additional POIs from 'other'.`);
   }
 
   // Materialize brand mapping as external CSV table. Brand mapping is
