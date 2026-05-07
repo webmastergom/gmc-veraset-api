@@ -70,14 +70,17 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
     return () => { cancelled = true; };
   }, [runId]);
 
-  // Best-effort: resolve megajob names from report.config + the runs API.
+  // Best-effort: resolve source names (mega + job) from report.config + the runs API.
   useEffect(() => {
     if (!report) return;
     fetch('/api/personas/runs', { credentials: 'include' })
       .then((r) => r.json())
       .then((data) => {
         const r = data?.runs?.find((x: any) => x.runId === runId);
-        if (r?.megaJobNames) setMegaJobNames(r.megaJobNames);
+        if (r) {
+          const all = [...(r.megaJobNames || []), ...(r.jobNames || [])];
+          setMegaJobNames(all);
+        }
       })
       .catch(() => {});
   }, [report, runId]);

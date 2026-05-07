@@ -240,8 +240,9 @@ export function buildFeatureCTAS(args: {
       hz.home_region,
       COALESCE(m.gps_share, 0.0) as gps_share,
       COALESCE(m.avg_circle_score, 9.99) as avg_circle_score,
-      -- brand_visits_json: cast MAP to string. Format "k1=v1, k2=v2" — Node parses.
-      CAST(b.brand_map AS JSON) as brand_visits_json,
+      -- brand_visits_json: serialize MAP as VARCHAR (Parquet doesn't accept JSON type).
+      -- JSON_FORMAT(CAST(... AS JSON)) returns a VARCHAR like '{"burger_king":12,"mcdonalds":4}'.
+      JSON_FORMAT(CAST(b.brand_map AS JSON)) as brand_visits_json,
       CASE WHEN b.total_brand_visits > 0
         THEN CAST(b.sum_sq AS DOUBLE) / (CAST(b.total_brand_visits AS DOUBLE) * b.total_brand_visits)
         ELSE 0.0

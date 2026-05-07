@@ -14,8 +14,11 @@
 // ── Inputs / config ──────────────────────────────────────────────────
 
 export interface PersonaRunConfig {
-  /** One or two megajob IDs. Cross-dataset when 2 are provided. */
+  /** Megajob IDs (whole megajob = UNION ALL of its sub-jobs). */
   megaJobIds: string[];
+  /** Standalone job IDs (jobs NOT part of any megajob). Treated as a single
+   *  "synthetic megajob" of one sub-job. */
+  jobIds?: string[];
   /** Optional source-side filters (mirror reach-poll filters). */
   filters?: {
     hourFrom?: number;

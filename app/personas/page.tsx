@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { MainLayout } from '@/components/layout/main-layout';
 import { Button } from '@/components/ui/button';
-import { Loader2, Sparkles, Play, ChevronRight, Layers } from 'lucide-react';
+import { Loader2, Sparkles, Play, ChevronRight, Layers, Briefcase } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 interface MegaJobSummary {
@@ -18,19 +18,47 @@ interface MegaJobSummary {
   type?: string;
 }
 
+interface JobSummary {
+  jobId: string;
+  name: string;
+  country?: string;
+  status?: string;
+  syncedAt?: string;
+  schema?: string;
+  type?: string;
+  poiCount?: number;
+  megaJobId?: string; // present if part of a megajob — exclude these
+}
+
+/** Unified picker item: either a megajob or a standalone job. */
+interface PickerItem {
+  kind: 'mega' | 'job';
+  id: string;
+  name: string;
+  country?: string;
+  status?: string;
+  schema?: string;
+  type?: string;
+  /** human-readable progress / metadata blurb */
+  blurb?: string;
+}
+
 interface RunSummary {
   runId: string;
   phase: string;
   generatedAt: string;
   megaJobIds: string[];
   megaJobNames: string[];
+  jobIds: string[];
+  jobNames: string[];
   totalDevices?: number;
   personaCount?: number;
   error?: string;
 }
 
 export default function PersonasIndexPage() {
-  const [megaJobs, setMegaJobs] = useState<MegaJobSummary[]>([]);
+  const [items, setItems] = useState<PickerItem[]>([]);
+  /** keys are `mega:<id>` or `job:<id>` for a unified selection model. */
   const [selected, setSelected] = useState<string[]>([]);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -42,37 +70,89 @@ export default function PersonasIndexPage() {
   useEffect(() => {
     Promise.all([
       fetch('/api/mega-jobs', { credentials: 'include' }).then((r) => r.json()),
+      fetch('/api/jobs', { credentials: 'include' }).then((r) => r.json()),
       fetch('/api/personas/runs', { credentials: 'include' }).then((r) => r.json()),
     ])
-      .then(([mjData, runsData]) => {
-        const arr = Array.isArray(mjData) ? mjData : mjData?.megaJobs || mjData?.entries || Object.values(mjData || {});
-        setMegaJobs(arr as MegaJobSummary[]);
+      .then(([mjData, jobsData, runsData]) => {
+        // Megajobs (from /api/mega-jobs)
+        const mjArr = Array.isArray(mjData)
+          ? mjData
+          : mjData?.megaJobs || mjData?.entries || Object.values(mjData || {});
+        const mjItems: PickerItem[] = (mjArr as MegaJobSummary[])
+          .filter((mj) => mj.megaJobId)
+          .map((mj) => {
+            const synced = mj.progress?.synced || 0;
+            const total = mj.progress?.total || 0;
+            const blurb = [
+              mj.country,
+              mj.schema,
+              mj.status,
+              total > 0 ? `${synced}/${total} synced` : undefined,
+            ].filter(Boolean).join(' · ');
+            return {
+              kind: 'mega' as const,
+              id: mj.megaJobId,
+              name: mj.name || mj.megaJobId,
+              country: mj.country,
+              status: mj.status,
+              schema: mj.schema,
+              type: mj.type,
+              blurb,
+            };
+          });
+
+        // Standalone jobs (SUCCESS + synced + NOT part of any megajob)
+        const jobArr = Array.isArray(jobsData) ? (jobsData as JobSummary[]) : [];
+        const jobItems: PickerItem[] = jobArr
+          .filter((j) => j.status === 'SUCCESS' && j.syncedAt && !j.megaJobId)
+          .map((j) => {
+            const blurb = [
+              j.country,
+              j.schema,
+              j.poiCount != null ? `${j.poiCount} POIs` : undefined,
+            ].filter(Boolean).join(' · ');
+            return {
+              kind: 'job' as const,
+              id: j.jobId,
+              name: j.name || j.jobId,
+              country: j.country,
+              status: j.status,
+              schema: j.schema,
+              type: j.type,
+              blurb,
+            };
+          });
+
+        setItems([...mjItems, ...jobItems]);
         setRuns(runsData?.runs || []);
       })
       .finally(() => setLoading(false));
   }, []);
 
-  const togglePick = (id: string) => {
+  const togglePick = (key: string) => {
     setSelected((cur) => {
-      if (cur.includes(id)) return cur.filter((x) => x !== id);
-      if (cur.length >= 2) return [cur[1], id]; // sliding window of 2
-      return [...cur, id];
+      if (cur.includes(key)) return cur.filter((x) => x !== key);
+      if (cur.length >= 2) return [cur[1], key]; // sliding window of 2
+      return [...cur, key];
     });
   };
 
   const handleRun = async () => {
     if (selected.length === 0) {
-      toast({ title: 'Pick at least one mega-job' });
+      toast({ title: 'Pick at least one source' });
       return;
     }
     setRunning(true);
     setProgressMsg('Starting…');
     try {
+      // Split unified selection into megaJobIds + jobIds for the API.
+      const megaJobIds = selected.filter((s) => s.startsWith('mega:')).map((s) => s.slice(5));
+      const jobIds = selected.filter((s) => s.startsWith('job:')).map((s) => s.slice(4));
       let data = await safePoll('/api/personas/poll', {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ megaJobIds: selected }),
+        body: JSON.stringify({ megaJobIds, jobIds }),
       });
       const runId = data.runId;
       if (data.phase === 'done' && data.report) {
@@ -119,32 +199,44 @@ export default function PersonasIndexPage() {
           <>
             <div className="border rounded-lg p-4 space-y-3 bg-card">
               <div className="flex items-center justify-between">
-                <h2 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">Pick mega-jobs</h2>
+                <h2 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">
+                  Pick sources (mega-jobs or single jobs)
+                </h2>
                 <span className="text-xs text-muted-foreground">{selected.length}/2 selected</span>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-80 overflow-y-auto">
-                {megaJobs.length === 0 ? (
-                  <p className="text-sm text-muted-foreground p-2">No mega-jobs available. Create one first.</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-96 overflow-y-auto">
+                {items.length === 0 ? (
+                  <p className="text-sm text-muted-foreground p-2 col-span-2">
+                    No data sources available. Create a job or mega-job first.
+                  </p>
                 ) : (
-                  megaJobs.map((mj) => {
-                    const isSel = selected.includes(mj.megaJobId);
-                    const synced = mj.progress?.synced || 0;
-                    const total = mj.progress?.total || 0;
+                  items.map((it) => {
+                    const key = `${it.kind}:${it.id}`;
+                    const isSel = selected.includes(key);
+                    const Icon = it.kind === 'mega' ? Layers : Briefcase;
                     return (
                       <div
-                        key={mj.megaJobId}
-                        onClick={() => togglePick(mj.megaJobId)}
+                        key={key}
+                        onClick={() => togglePick(key)}
                         className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                           isSel ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/30'
                         }`}
                       >
-                        <Layers className="h-4 w-4 text-muted-foreground" />
+                        <Icon className="h-4 w-4 text-muted-foreground" />
                         <div className="flex-1 min-w-0">
-                          <div className="text-sm font-medium truncate">{mj.name}</div>
-                          <div className="text-xs text-muted-foreground">
-                            {mj.country || '—'} · {mj.schema || '—'} · {mj.status || '—'}
-                            {total > 0 && ` · ${synced}/${total} synced`}
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium truncate">{it.name}</span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wider ${
+                              it.kind === 'mega'
+                                ? 'bg-blue-500/15 text-blue-500'
+                                : 'bg-emerald-500/15 text-emerald-500'
+                            }`}>
+                              {it.kind === 'mega' ? 'Mega' : 'Job'}
+                            </span>
                           </div>
+                          {it.blurb && (
+                            <div className="text-xs text-muted-foreground truncate">{it.blurb}</div>
+                          )}
                         </div>
                         {isSel && <span className="text-xs text-primary font-semibold">✓</span>}
                       </div>
@@ -160,12 +252,13 @@ export default function PersonasIndexPage() {
                   </>
                 ) : (
                   <>
-                    <Play className="h-4 w-4 mr-2" /> Generate personas ({selected.length} mega-job{selected.length === 1 ? '' : 's'})
+                    <Play className="h-4 w-4 mr-2" /> Generate personas ({selected.length} source{selected.length === 1 ? '' : 's'})
                   </>
                 )}
               </Button>
               <p className="text-xs text-muted-foreground">
-                Two megajobs unlock cross-dataset insights: brand cohabitation matrix, BK-vs-others overlap, persona × brand exclusivity.
+                Pick 2 sources to unlock cross-dataset insights: brand cohabitation matrix, persona × brand exclusivity, BK-vs-other-chains overlap.
+                Standalone jobs (single-month, no megajob parent) are listed alongside mega-jobs.
               </p>
             </div>
 
@@ -180,7 +273,9 @@ export default function PersonasIndexPage() {
                       className="flex items-center gap-3 p-3 hover:bg-muted/30 transition-colors"
                     >
                       <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">{r.megaJobNames.join(' + ')}</div>
+                        <div className="text-sm font-medium truncate">
+                          {[...(r.megaJobNames || []), ...(r.jobNames || [])].join(' + ') || r.runId}
+                        </div>
                         <div className="text-xs text-muted-foreground">
                           {new Date(r.generatedAt).toLocaleString()} ·{' '}
                           {r.phase === 'done'

@@ -74,117 +74,172 @@ function configToRunId(cfg: PersonaRunConfig): string {
 
 // ─── Phase: starting ──────────────────────────────────────────────────
 
+/**
+ * One "source" in the pipeline = one feature CTAS. A megajob is a
+ * collection of sub-jobs unioned together; a single (standalone) job is
+ * treated as a synthetic megajob of one. Everything downstream uses
+ * `sourceId` as the key (in featureCtas, in the per-row `source_megajob_id`,
+ * in cross-dataset analysis).
+ */
+interface ResolvedSource {
+  sourceId: string;
+  syncedJobs: any[]; // Job[]
+  collectionIds: string[];
+  rangeTo: string;
+  label: string;
+}
+
+async function resolveMegaJobSource(megaJobId: string): Promise<ResolvedSource> {
+  const megaJob = await getMegaJob(megaJobId);
+  if (!megaJob) throw new Error(`Mega-job ${megaJobId} not found`);
+  if (!megaJob.subJobIds?.length) throw new Error(`Mega-job ${megaJobId} has no sub-jobs`);
+  const subJobs = (
+    await Promise.all(megaJob.subJobIds.map((j) => getJob(j)))
+  ).filter((j): j is NonNullable<typeof j> => j !== null);
+  const syncedJobs = subJobs.filter((j) => j.status === 'SUCCESS' && j.syncedAt);
+  if (syncedJobs.length === 0) {
+    throw new Error(`Mega-job "${megaJob.name}" has no synced sub-jobs yet`);
+  }
+  const collectionIds = megaJob.sourceScope?.poiCollectionIds || [];
+  const rangeTo =
+    megaJob.sourceScope?.dateRange?.to ||
+    syncedJobs.reduce((max, j) => (j.dateRange?.to && j.dateRange.to > max ? j.dateRange.to : max), '');
+  if (!rangeTo) throw new Error(`Cannot determine date range for mega-job ${megaJobId}`);
+  return { sourceId: megaJobId, syncedJobs, collectionIds, rangeTo, label: megaJob.name };
+}
+
+async function resolveJobSource(jobId: string): Promise<ResolvedSource> {
+  const job = await getJob(jobId);
+  if (!job) throw new Error(`Job ${jobId} not found`);
+  if (job.status !== 'SUCCESS' || !job.syncedAt) {
+    throw new Error(`Job "${job.name}" not synced yet (status=${job.status})`);
+  }
+  // Single-job sources are treated as a 1-element syncedJobs array.
+  const syncedJobs = [job];
+  const colIds: string[] = [];
+  // Job may have legacy single poiCollectionId or none (external POIs).
+  if ((job as any).poiCollectionId) colIds.push((job as any).poiCollectionId);
+  const rangeTo = job.dateRange?.to || '';
+  if (!rangeTo) throw new Error(`Job ${jobId} has no dateRange.to`);
+  return { sourceId: jobId, syncedJobs, collectionIds: colIds, rangeTo, label: job.name || jobId };
+}
+
+async function fireFeatureCtasForSource(args: {
+  source: ResolvedSource;
+  runId: string;
+  filters: any;
+}): Promise<{ queryId: string; tableName: string }> {
+  const { source, runId, filters } = args;
+
+  // Ensure all dataset tables exist.
+  await Promise.all(
+    source.syncedJobs.map(async (j) => {
+      const ds = j.s3DestPath?.replace(/\/$/, '').split('/').pop();
+      if (ds) await ensureTableForDataset(ds);
+    })
+  );
+
+  // Extract POI coords (for spatial join).
+  const poiCoords = extractPoiCoords(source.syncedJobs);
+  if (poiCoords.length === 0) {
+    throw new Error(`No POI coords for source ${source.label}`);
+  }
+
+  // Resolve brand for each POI from collections.
+  const poiToBrand: Array<{ poiId: string; brand: string }> = [];
+  for (const colId of source.collectionIds) {
+    const geo = await getPOICollection(colId);
+    if (!geo?.features) continue;
+    for (const f of geo.features as any[]) {
+      const id = f.properties?.id || f.id;
+      const name = f.properties?.name || f.properties?.label || '';
+      if (!id) continue;
+      poiToBrand.push({ poiId: String(id), brand: resolveBrand(name) });
+    }
+  }
+  // Fallback: if no collection-derived names, use the verasetPayload geo_radius
+  // poi_ids without name → all map to 'other'. The pipeline still works.
+  if (poiToBrand.length === 0) {
+    console.warn(`[PERSONAS ${runId}] No named POIs for source ${source.label}; brand resolution will be 'other'.`);
+    for (const job of source.syncedJobs) {
+      for (const g of job.verasetPayload?.geo_radius || []) {
+        if (g.poi_id) poiToBrand.push({ poiId: String(g.poi_id), brand: 'other' });
+      }
+    }
+  }
+  if (poiToBrand.length === 0) {
+    throw new Error(`No POIs found for source ${source.label}`);
+  }
+
+  // Materialize brand mapping as external CSV table.
+  const safeId = source.sourceId.replace(/-/g, '_').slice(0, 30);
+  const brandTableBase = `persona_brands_${safeId}_${runId}`;
+  const brandTable = brandTableBase.length > 60 ? brandTableBase.slice(0, 60) : brandTableBase;
+  const brandS3Key = `athena-temp/${brandTable}/data.csv`;
+  const csvBody = ['poi_id,brand']
+    .concat(poiToBrand.map((b) => `${b.poiId},${b.brand}`))
+    .join('\n');
+  await s3Client.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: brandS3Key,
+      Body: csvBody,
+      ContentType: 'text/csv',
+    })
+  );
+  try { await runQuery(`DROP TABLE IF EXISTS ${brandTable}`); } catch {}
+  await runQuery(`
+    CREATE EXTERNAL TABLE ${brandTable} (
+      poi_id STRING,
+      brand STRING
+    )
+    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+    STORED AS TEXTFILE
+    LOCATION 's3://${BUCKET}/athena-temp/${brandTable}/'
+    TBLPROPERTIES ('skip.header.line.count' = '1')
+  `);
+  console.log(`[PERSONAS ${runId}] Created brand table ${brandTable} (${poiToBrand.length} POIs) for source ${source.label}`);
+
+  // Build & launch feature CTAS.
+  const featureTableBase = `persona_features_${safeId}_${runId}`;
+  const featureTable = featureTableBase.length > 60 ? featureTableBase.slice(0, 60) : featureTableBase;
+  try { await runQuery(`DROP TABLE IF EXISTS ${featureTable}`); } catch {}
+  const featureS3 = `s3://${BUCKET}/athena-temp/${featureTable}/`;
+
+  const sql = buildFeatureCTAS({
+    ctasTable: featureTable,
+    ctasS3Path: featureS3,
+    syncedJobs: source.syncedJobs,
+    poiCoords,
+    brandTableRef: brandTable,
+    dateRangeTo: source.rangeTo,
+    sourceMegajobId: source.sourceId,
+    filters,
+  });
+
+  const queryId = await startQueryAsync(sql);
+  console.log(`[PERSONAS ${runId}] Feature CTAS started for ${source.label}: queryId=${queryId}`);
+  return { queryId, tableName: featureTable };
+}
+
 async function phaseStarting(state: PersonaState): Promise<PersonaState> {
   const { config, runId } = state;
-  console.log(`[PERSONAS ${runId}] starting: megaJobs=${config.megaJobIds.join(',')}`);
+  console.log(`[PERSONAS ${runId}] starting: megaJobs=${config.megaJobIds.join(',')} jobs=${(config.jobIds || []).join(',')}`);
 
   const featureCtas: Record<string, { queryId: string; tableName: string }> = {};
 
   for (const megaJobId of config.megaJobIds) {
-    const megaJob = await getMegaJob(megaJobId);
-    if (!megaJob) throw new Error(`Mega-job ${megaJobId} not found`);
-    if (!megaJob.subJobIds?.length) throw new Error(`Mega-job ${megaJobId} has no sub-jobs`);
+    const source = await resolveMegaJobSource(megaJobId);
+    featureCtas[source.sourceId] = await fireFeatureCtasForSource({ source, runId, filters: config.filters as any });
+  }
+  for (const jobId of config.jobIds || []) {
+    const source = await resolveJobSource(jobId);
+    featureCtas[source.sourceId] = await fireFeatureCtasForSource({ source, runId, filters: config.filters as any });
+  }
 
-    // Load all sub-jobs
-    const subJobs = (
-      await Promise.all(megaJob.subJobIds.map((j) => getJob(j)))
-    ).filter((j): j is NonNullable<typeof j> => j !== null);
-
-    const syncedJobs = subJobs.filter((j) => j.status === 'SUCCESS' && j.syncedAt);
-    if (syncedJobs.length === 0) {
-      throw new Error(`Mega-job ${megaJobId} has no synced sub-jobs yet`);
-    }
-
-    // Ensure all dataset tables exist.
-    await Promise.all(
-      syncedJobs.map(async (j) => {
-        const ds = j.s3DestPath?.replace(/\/$/, '').split('/').pop();
-        if (ds) await ensureTableForDataset(ds);
-      })
-    );
-
-    // Extract POI coords (for spatial join).
-    const poiCoords = extractPoiCoords(syncedJobs);
-    if (poiCoords.length === 0) throw new Error(`No POI coords for mega-job ${megaJobId}`);
-
-    // Resolve brand for each POI from the source collection's GeoJSON.
-    const collectionIds = megaJob.sourceScope?.poiCollectionIds || [];
-    const poiToBrand: Array<{ poiId: string; brand: string }> = [];
-    for (const colId of collectionIds) {
-      const geo = await getPOICollection(colId);
-      if (!geo?.features) continue;
-      for (const f of geo.features as any[]) {
-        const id = f.properties?.id || f.id;
-        const name = f.properties?.name || f.properties?.label || '';
-        if (!id) continue;
-        poiToBrand.push({ poiId: String(id), brand: resolveBrand(name) });
-      }
-    }
-    if (poiToBrand.length === 0) {
-      throw new Error(`No POIs with names found for mega-job ${megaJobId} (collections=${collectionIds.join(',')})`);
-    }
-
-    // Materialize as external CSV table.
-    const safeMjId = megaJobId.replace(/-/g, '_');
-    const brandTableBase = `persona_brands_${safeMjId}_${runId}`;
-    const brandTable = brandTableBase.length > 60 ? brandTableBase.slice(0, 60) : brandTableBase;
-    const brandS3Key = `athena-temp/${brandTable}/data.csv`;
-    const csvBody = ['poi_id,brand']
-      .concat(poiToBrand.map((b) => `${b.poiId},${b.brand}`))
-      .join('\n');
-
-    await s3Client.send(
-      new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: brandS3Key,
-        Body: csvBody,
-        ContentType: 'text/csv',
-      })
-    );
-
-    // Drop existing brand table before recreating.
-    try { await runQuery(`DROP TABLE IF EXISTS ${brandTable}`); } catch {}
-
-    const createBrandTableSql = `
-      CREATE EXTERNAL TABLE ${brandTable} (
-        poi_id STRING,
-        brand STRING
-      )
-      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-      STORED AS TEXTFILE
-      LOCATION 's3://${BUCKET}/athena-temp/${brandTable}/'
-      TBLPROPERTIES ('skip.header.line.count' = '1')
-    `;
-    await runQuery(createBrandTableSql);
-    console.log(`[PERSONAS ${runId}] Created brand table ${brandTable} (${poiToBrand.length} POIs)`);
-
-    // Build & launch feature CTAS.
-    const featureTableBase = `persona_features_${safeMjId}_${runId}`;
-    const featureTable = featureTableBase.length > 60 ? featureTableBase.slice(0, 60) : featureTableBase;
-    try { await runQuery(`DROP TABLE IF EXISTS ${featureTable}`); } catch {}
-    const featureS3 = `s3://${BUCKET}/athena-temp/${featureTable}/`;
-
-    // dateRangeTo from megaJob's sourceScope or syncedJobs max
-    const rangeTo =
-      megaJob.sourceScope?.dateRange?.to ||
-      syncedJobs.reduce((max, j) => (j.dateRange?.to && j.dateRange.to > max ? j.dateRange.to : max), '');
-    if (!rangeTo) throw new Error(`Cannot determine date range for mega-job ${megaJobId}`);
-
-    const sql = buildFeatureCTAS({
-      ctasTable: featureTable,
-      ctasS3Path: featureS3,
-      syncedJobs,
-      poiCoords,
-      brandTableRef: brandTable,
-      dateRangeTo: rangeTo,
-      sourceMegajobId: megaJobId,
-      filters: config.filters as any,
-    });
-
-    const queryId = await startQueryAsync(sql);
-    console.log(`[PERSONAS ${runId}] Feature CTAS started for ${megaJobId}: queryId=${queryId}`);
-    featureCtas[megaJobId] = { queryId, tableName: featureTable };
+  if (Object.keys(featureCtas).length === 0) {
+    throw new Error('No sources resolved (megaJobIds + jobIds both empty?)');
   }
 
   return {
@@ -461,9 +516,13 @@ async function phaseExportPolling(state: PersonaState): Promise<PersonaState> {
     if (status.state !== 'SUCCEEDED') continue;
     try {
       if (country) {
+        const sourceLabel = [
+          ...state.config.megaJobIds,
+          ...(state.config.jobIds || []),
+        ].join('+') || 'persona-run';
         await registerAthenaContribution(
           country,
-          state.config.megaJobIds.join('+'),
+          sourceLabel,
           'persona' as any, // 'persona' added to AttributeType in master-maids.ts
           persona.name,
           tbl,
@@ -499,6 +558,10 @@ async function guessCountry(state: PersonaState): Promise<string | null> {
     const mj = await getMegaJob(mjId);
     if (mj?.country) return mj.country;
   }
+  for (const jId of state.config.jobIds || []) {
+    const j = await getJob(jId);
+    if ((j as any)?.country) return (j as any).country as string;
+  }
   return null;
 }
 
@@ -508,6 +571,12 @@ async function guessDateRange(state: PersonaState): Promise<{ from: string; to: 
   for (const mjId of state.config.megaJobIds) {
     const mj = await getMegaJob(mjId);
     const r = mj?.sourceScope?.dateRange;
+    if (r?.from && (!from || r.from < from)) from = r.from;
+    if (r?.to && (!to || r.to > to)) to = r.to;
+  }
+  for (const jId of state.config.jobIds || []) {
+    const j = await getJob(jId);
+    const r = (j as any)?.dateRange;
     if (r?.from && (!from || r.from < from)) from = r.from;
     if (r?.to && (!to || r.to > to)) to = r.to;
   }
@@ -521,11 +590,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     let body: any = {};
     try { body = await request.json(); } catch {}
 
-    const isNewRequest = Array.isArray(body.megaJobIds) && body.megaJobIds.length > 0;
+    const hasMega = Array.isArray(body.megaJobIds) && body.megaJobIds.length > 0;
+    const hasJobs = Array.isArray(body.jobIds) && body.jobIds.length > 0;
+    const isNewRequest = hasMega || hasJobs;
     let runId: string = body.runId || '';
     if (isNewRequest) {
       const cfg: PersonaRunConfig = {
-        megaJobIds: body.megaJobIds.filter((s: any) => typeof s === 'string'),
+        megaJobIds: (hasMega ? body.megaJobIds : []).filter((s: any) => typeof s === 'string'),
+        jobIds: (hasJobs ? body.jobIds : []).filter((s: any) => typeof s === 'string'),
         filters: body.filters || {},
       };
       runId = configToRunId(cfg);

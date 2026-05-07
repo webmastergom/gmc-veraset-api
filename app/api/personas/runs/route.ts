@@ -8,6 +8,7 @@ import { ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getConfig, s3Client, BUCKET } from '@/lib/s3-config';
 import { type PersonaState } from '@/lib/persona-types';
 import { getMegaJob } from '@/lib/mega-jobs';
+import { getJob } from '@/lib/jobs';
 
 export const dynamic = 'force-dynamic';
 
@@ -17,6 +18,8 @@ interface RunSummary {
   generatedAt: string;
   megaJobIds: string[];
   megaJobNames: string[];
+  jobIds: string[];
+  jobNames: string[];
   totalDevices?: number;
   personaCount?: number;
   error?: string;
@@ -50,12 +53,19 @@ export async function GET(_request: NextRequest): Promise<NextResponse> {
           const mj = await getMegaJob(id);
           megaJobNames.push(mj?.name || id);
         }
+        const jobNames: string[] = [];
+        for (const id of state.config.jobIds || []) {
+          const j = await getJob(id);
+          jobNames.push(j?.name || id);
+        }
         runs.push({
           runId,
           phase: state.phase,
           generatedAt: state.report?.generatedAt || state.updatedAt,
           megaJobIds: state.config.megaJobIds,
           megaJobNames,
+          jobIds: state.config.jobIds || [],
+          jobNames,
           totalDevices: state.report?.scorecard.totalDevices,
           personaCount: state.report?.personas.length,
           error: state.error,
