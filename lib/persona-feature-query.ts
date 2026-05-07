@@ -49,8 +49,9 @@ const ACCURACY_THRESHOLD = 500;
  * - UNION ALL over the megajob's sub-job tables (already date-partitioned).
  * - Spatial filter: pings within radius of the megajob's POIs (reuse
  *   buildAtPoiPingsCTE — grid-bucket join, O(N+M)).
- * - Brand mapping: a small `(poi_id, brand)` external table joined per ping
- *   (built by the endpoint before this query runs; passed as `brandTableRef`).
+ * - Brand mapping: a small `(poi_id, brand)` map inlined as a VALUES CTE.
+ *   Avoids creating an external CSV-backed Athena table (DDL grammar varies
+ *   between engine versions and workgroups; inlining sidesteps it entirely).
  * - Date envelope: `dateRangeTo` is the megajob's `to_date` — used for
  *   computing `recency_days` deterministically (otherwise it'd depend on
  *   when the query runs).
@@ -59,17 +60,29 @@ const ACCURACY_THRESHOLD = 500;
  * @param ctasS3Path S3 location for Parquet output (athena-temp/...)
  * @param syncedJobs Sub-jobs of the megajob.
  * @param poiCoords All POI coords for the megajob.
- * @param brandTableRef Athena table name for the (poi_id, brand) mapping.
+ * @param poiToBrand Inline (poiId, brand) mapping — emitted as VALUES CTE.
  * @param dateRangeTo End date YYYY-MM-DD for recency calc.
  * @param filters Optional source-side filters.
  * @param sourceMegajobId To stamp into the output for cross-dataset analysis.
  */
+/**
+ * SQL-quote a string literal: 'foo' → 'foo', "O'Reilly" → 'O''Reilly'.
+ * Used to inline brand mappings as a VALUES clause without the cost +
+ * fragility of creating an external CSV-backed Athena table.
+ */
+function sqlQuote(s: string): string {
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
+
 export function buildFeatureCTAS(args: {
   ctasTable: string;
   ctasS3Path: string;
   syncedJobs: Job[];
   poiCoords: PoiCoord[];
-  brandTableRef: string;
+  /** Inline brand mapping (poiId → brand slug). Materializes as a VALUES CTE
+   *  inside the CTAS — no external table. Bounded by POI count which is
+   *  typically <5k for persona runs. */
+  poiToBrand: Array<{ poiId: string; brand: string }>;
   dateRangeTo: string;
   sourceMegajobId: string;
   filters?: VisitorFilter & { dwell?: DwellFilter };
@@ -79,7 +92,7 @@ export function buildFeatureCTAS(args: {
     ctasS3Path,
     syncedJobs,
     poiCoords,
-    brandTableRef,
+    poiToBrand,
     dateRangeTo,
     sourceMegajobId,
     filters,
@@ -224,10 +237,22 @@ export function buildFeatureCTAS(args: {
       CROSS JOIN UNNEST(COALESCE(vp.poi_ids, ARRAY[])) as t(poi_id)
       WHERE t.poi_id IS NOT NULL AND t.poi_id != ''
     ),
+    -- Brand mapping inlined as a VALUES CTE — no external table required.
+    -- For typical persona runs (<5000 POIs) this fits within Athena's 256KB
+    -- statement limit comfortably. Switching to inline avoids DDL-grammar
+    -- compatibility issues across Athena engine versions (Trino-strict
+    -- workgroups reject Hive-style CREATE EXTERNAL TABLE).
+    brand_map AS (
+      SELECT * FROM (VALUES ${
+        poiToBrand.length > 0
+          ? poiToBrand.map((b) => `(${sqlQuote(b.poiId)}, ${sqlQuote(b.brand)})`).join(', ')
+          : `(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR))`
+      }) AS bm(poi_id, brand)
+    ),
     brand_visits AS (
       SELECT pu.ad_id, b.brand, COUNT(DISTINCT pu.date) as visits
       FROM poi_unnest pu
-      INNER JOIN ${brandTableRef} b ON pu.poi_id = b.poi_id
+      INNER JOIN brand_map b ON pu.poi_id = b.poi_id
       GROUP BY pu.ad_id, b.brand
     ),
     brand_visits_agg AS (

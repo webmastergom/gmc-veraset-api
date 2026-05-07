@@ -243,53 +243,20 @@ async function fireFeatureCtasForSource(args: {
     console.log(`[PERSONAS ${runId}] BRAND_RULES recovered ${layer3Hits} additional POIs from 'other'.`);
   }
 
-  // Materialize brand mapping as external CSV table. Brand mapping is
-  // deterministic for the source so reusing across runs is fine — we use
-  // CREATE TABLE IF NOT EXISTS so concurrent attempts don't collide.
-  const safeId = source.sourceId.replace(/-/g, '_').slice(0, 24);
-  // runId may include a `-` (re-run salt: `<hash>-<stamp>`). Athena identifiers
-  // don't accept `-`, so sanitize before building any table name.
-  const safeRunId = runId.replace(/-/g, '_');
-  const brandTableBase = `persona_brands_${safeId}_${safeRunId}`;
-  const brandTable = brandTableBase.length > 60 ? brandTableBase.slice(0, 60) : brandTableBase;
-  const brandS3Key = `athena-temp/${brandTable}/data.csv`;
-  const csvBody = ['poi_id,brand']
-    .concat(poiToBrand.map((b) => `${b.poiId},${b.brand}`))
-    .join('\n');
-  await s3Client.send(
-    new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: brandS3Key,
-      Body: csvBody,
-      ContentType: 'text/csv',
-    })
-  );
-  // Idempotent: IF NOT EXISTS so two concurrent phaseStarting calls don't race.
-  // Trino-compatible external-table syntax — works on both Athena engine v2 and v3.
-  // (Hive `CREATE EXTERNAL TABLE` fails on workgroups using Trino engine v3.)
-  try {
-    await runQuery(`
-      CREATE TABLE IF NOT EXISTS ${brandTable} (
-        poi_id VARCHAR,
-        brand VARCHAR
-      )
-      WITH (
-        format = 'TEXTFILE',
-        external_location = 's3://${BUCKET}/athena-temp/${brandTable}/',
-        textfile_field_separator = ',',
-        skip_header_line_count = 1
-      )
-    `);
-  } catch (e: any) {
-    if (!/already exist/i.test(e?.message || '')) throw e;
-    console.log(`[PERSONAS ${runId}] Brand table ${brandTable} already exists — reusing`);
-  }
-  console.log(`[PERSONAS ${runId}] Brand table ${brandTable} ready (${poiToBrand.length} POIs) for source ${source.label}`);
+  // Brand mapping is inlined as a VALUES CTE inside the feature CTAS
+  // (see lib/persona-feature-query.ts). No external CSV-backed Athena
+  // table is created — that path was fragile across Athena engine
+  // versions (Hive `CREATE EXTERNAL TABLE` is rejected by Trino-strict
+  // workgroups; Trino's `CREATE TABLE WITH (external_location=...)`
+  // is rejected by some Athena DDL parsers as `WITH (` after a column
+  // list with no `AS`). Inlining sidesteps both grammars.
+  console.log(`[PERSONAS ${runId}] Brand mapping (${poiToBrand.length} POIs) will be inlined for source ${source.label}`);
 
   // Feature CTAS uses a per-attempt timestamp suffix so two concurrent
   // phaseStarting calls (frontend retries during a long Vercel cycle)
   // don't collide on table creation. The state machine persists the
   // chosen tableName so downstream phases reuse it.
+  const safeId = source.sourceId.replace(/-/g, '_').slice(0, 24);
   const attemptTs = Math.floor(Date.now() / 1000).toString(36); // ~7 chars
   const featureTableBase = `persona_features_${safeId}_${runId.slice(0, 8)}_${attemptTs}`;
   const featureTable = featureTableBase.length > 60 ? featureTableBase.slice(0, 60) : featureTableBase;
@@ -301,7 +268,7 @@ async function fireFeatureCtasForSource(args: {
     ctasS3Path: featureS3,
     syncedJobs: source.syncedJobs,
     poiCoords,
-    brandTableRef: brandTable,
+    poiToBrand,
     dateRangeTo: source.rangeTo,
     sourceMegajobId: source.sourceId,
     filters,
@@ -777,18 +744,21 @@ async function phaseMasterMaidsExport(
   );
   try { await runQuery(`DROP TABLE IF EXISTS ${labelsTable}`); } catch {}
   try {
-    // Trino-compatible external-table syntax (see brand table above).
+    // Hive-style external table backed by the labels CSV. Same syntax used
+    // by nse-poll and lib/athena.ts for the base parquet tables — known to
+    // work on the project's Athena setup. (Earlier "Trino-style" attempt
+    // failed with "no viable alternative at input '...WITH ('" — Athena
+    // DDL parser doesn't support `WITH (external_location=...)` here.)
     await runQuery(`
-      CREATE TABLE IF NOT EXISTS ${labelsTable} (
-        ad_id VARCHAR,
-        persona_name VARCHAR
+      CREATE EXTERNAL TABLE IF NOT EXISTS ${labelsTable} (
+        ad_id STRING,
+        persona_name STRING
       )
-      WITH (
-        format = 'TEXTFILE',
-        external_location = 's3://${BUCKET}/athena-temp/persona-labels/${runId}_${exportTs}/',
-        textfile_field_separator = ',',
-        skip_header_line_count = 1
-      )
+      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+      STORED AS TEXTFILE
+      LOCATION 's3://${BUCKET}/athena-temp/persona-labels/${runId}_${exportTs}/'
+      TBLPROPERTIES ('skip.header.line.count' = '1')
     `);
   } catch (e: any) {
     if (!/already exist/i.test(e?.message || '')) throw e;
