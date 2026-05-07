@@ -30,6 +30,7 @@ import {
   buildHourFilterClause,
   buildGpsOnlyClause,
   buildCircleScoreClause,
+  buildDayOfWeekClause,
   type PoiCoord,
   type VisitorFilter,
   type DwellFilter,
@@ -83,6 +84,7 @@ export function buildFeatureCTAS(args: {
   const hourClause = buildHourFilterClause(filters);
   const gpsClause = buildGpsOnlyClause(filters);
   const scoreClause = buildCircleScoreClause(filters);
+  const dowClause = buildDayOfWeekClause(filters);
 
   // Build the all_pings UNION over sub-job tables.
   const allPingsUnion = syncedJobs
@@ -108,6 +110,7 @@ export function buildFeatureCTAS(args: {
           ${hourClause}
           ${gpsClause}
           ${scoreClause}
+          ${dowClause}
       `;
     })
     .join('\n      UNION ALL\n      ');

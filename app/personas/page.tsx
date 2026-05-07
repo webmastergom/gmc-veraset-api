@@ -64,6 +64,8 @@ export default function PersonasIndexPage() {
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [progressMsg, setProgressMsg] = useState('');
+  /** Day-of-week filter (1=Mon..7=Sun). Empty = all days. */
+  const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
   const router = useRouter();
   const { toast } = useToast();
 
@@ -148,6 +150,8 @@ export default function PersonasIndexPage() {
       // Split unified selection into megaJobIds + jobIds for the API.
       const megaJobIds = selected.filter((s) => s.startsWith('mega:')).map((s) => s.slice(5));
       const jobIds = selected.filter((s) => s.startsWith('job:')).map((s) => s.slice(4));
+      const filters: Record<string, any> = {};
+      if (daysOfWeek.length > 0 && daysOfWeek.length < 7) filters.daysOfWeek = daysOfWeek;
       // Send the user to the runId page as soon as we have one — that page
       // owns the resilient polling + rich loader. We just need the first
       // response to extract runId.
@@ -155,7 +159,7 @@ export default function PersonasIndexPage() {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ megaJobIds, jobIds }),
+        body: JSON.stringify({ megaJobIds, jobIds, ...(Object.keys(filters).length ? { filters } : {}) }),
       });
       const runId = data.runId;
       if (runId) {
@@ -247,6 +251,82 @@ export default function PersonasIndexPage() {
                   })
                 )}
               </div>
+
+              {/* Day-of-week filter (optional; empty = all days). */}
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Days of week:</label>
+                <div className="flex gap-0.5">
+                  {[
+                    { d: 1, label: 'M' },
+                    { d: 2, label: 'T' },
+                    { d: 3, label: 'W' },
+                    { d: 4, label: 'T' },
+                    { d: 5, label: 'F' },
+                    { d: 6, label: 'S' },
+                    { d: 7, label: 'S' },
+                  ].map(({ d, label }) => {
+                    const active = daysOfWeek.length === 0 || daysOfWeek.includes(d);
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => {
+                          let next: number[];
+                          if (daysOfWeek.length === 0) {
+                            next = [1, 2, 3, 4, 5, 6, 7].filter((x) => x !== d);
+                          } else if (daysOfWeek.includes(d)) {
+                            next = daysOfWeek.filter((x) => x !== d);
+                          } else {
+                            next = [...daysOfWeek, d];
+                          }
+                          if (next.length === 7) next = [];
+                          setDaysOfWeek(next);
+                        }}
+                        className={`h-8 w-7 rounded text-xs font-medium transition-colors ${
+                          active
+                            ? 'bg-primary/15 text-foreground border border-primary/40'
+                            : 'bg-muted/30 text-muted-foreground border border-border'
+                        }`}
+                        title={['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][d - 1]}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setDaysOfWeek([])}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Reset to all days"
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDaysOfWeek([1, 2, 3, 4, 5])}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Weekdays only"
+                  >
+                    M-F
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDaysOfWeek([6, 7])}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Weekend only"
+                  >
+                    S-S
+                  </button>
+                </div>
+                {daysOfWeek.length > 0 && daysOfWeek.length < 7 && (
+                  <span className="text-[11px] text-muted-foreground ml-auto">
+                    Filtering {daysOfWeek.length}/7 day{daysOfWeek.length === 1 ? '' : 's'}
+                  </span>
+                )}
+              </div>
+
               <Button onClick={handleRun} disabled={running || selected.length === 0} className="w-full">
                 {running ? (
                   <>
@@ -262,6 +342,7 @@ export default function PersonasIndexPage() {
               <p className="text-xs text-muted-foreground">
                 Pick 2 sources to unlock cross-dataset insights: brand cohabitation matrix, persona × brand exclusivity, BK-vs-other-chains overlap.
                 Standalone jobs (single-month, no megajob parent) are listed alongside mega-jobs.
+                The day-of-week filter restricts the analysis to selected days only — useful for &quot;weekday lunch crowd&quot; or &quot;weekend family&quot; cohorts.
               </p>
             </div>
 

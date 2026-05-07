@@ -679,6 +679,7 @@ async function phaseExportPolling(state: PersonaState): Promise<PersonaState> {
   // Register successful exports.
   const country = await guessCountry(state);
   const dateRange = await guessDateRange(state);
+  const sourceDisplayName = await resolveSourceDisplayName(state);
   const exports: PersonaReport['exports'] = [];
   for (const persona of state.report.personas) {
     if (persona.deviceCount === 0) continue;
@@ -689,15 +690,16 @@ async function phaseExportPolling(state: PersonaState): Promise<PersonaState> {
     if (status.state !== 'SUCCEEDED') continue;
     try {
       if (country) {
-        const sourceLabel = [
-          ...state.config.megaJobIds,
-          ...(state.config.jobIds || []),
-        ].join('+') || 'persona-run';
+        // attr_value is what shows up everywhere a persona is referenced
+        // (Master MAIDs UI, audience pickers, exports). Prefix with the
+        // source display name so the brand / study is obvious without
+        // having to dig into sourceDataset.
+        const attributeValue = `${sourceDisplayName} · ${persona.name}`;
         await registerAthenaContribution(
           country,
-          sourceLabel,
+          sourceDisplayName,
           'persona' as any, // 'persona' added to AttributeType in master-maids.ts
-          persona.name,
+          attributeValue,
           tbl,
           `s3://${BUCKET}/athena-temp/${tbl}/`,
           persona.deviceCount,
@@ -724,6 +726,28 @@ async function phaseExportPolling(state: PersonaState): Promise<PersonaState> {
     report: updatedReport,
     updatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Build a human-readable label that names the source megajobs / jobs the
+ * persona run was generated from. Used both as `sourceDataset` and as the
+ * prefix of `attributeValue` when registering Master MAIDs contributions
+ * — so an analyst opening /master-maids sees "BK History · Heavy Lunchtime"
+ * instead of an opaque persona name with no context.
+ */
+async function resolveSourceDisplayName(state: PersonaState): Promise<string> {
+  const names: string[] = [];
+  for (const id of state.config.megaJobIds) {
+    const mj = await getMegaJob(id);
+    if (mj?.name) names.push(mj.name);
+    else names.push(id.slice(0, 8));
+  }
+  for (const id of state.config.jobIds || []) {
+    const j = await getJob(id);
+    if ((j as any)?.name) names.push((j as any).name);
+    else names.push(id.slice(0, 8));
+  }
+  return names.length > 0 ? names.join(' + ') : 'persona-run';
 }
 
 async function guessCountry(state: PersonaState): Promise<string | null> {

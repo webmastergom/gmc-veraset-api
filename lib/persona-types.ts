@@ -28,6 +28,8 @@ export interface PersonaRunConfig {
     minVisits?: number;
     gpsOnly?: boolean;
     maxCircleScore?: number;
+    /** Days of week 1..7 (Mon..Sun, ISO 8601). Empty/all-7 = no filter. */
+    daysOfWeek?: number[];
   };
 }
 
