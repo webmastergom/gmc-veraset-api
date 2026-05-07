@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   ResponsiveContainer,
   RadarChart,
@@ -38,6 +38,7 @@ import type {
   RfmCell,
   CohabitationEntry,
   SourceZipAffinity,
+  ZipAffinityRow,
 } from '@/lib/persona-types';
 
 const PERSONA_COLORS = [
@@ -545,7 +546,8 @@ function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; br
 
 // ── Zip Affinity tab ─────────────────────────────────────────────────
 
-type ZipSortKey = 'zip' | 'affinityIndex' | 'count';
+type AffinityMode = 'pop' | 'volume';
+type ZipSortKey = 'zip' | 'affinityIndex' | 'count' | 'population';
 
 function ZipAffinityTab({
   sources,
@@ -561,20 +563,42 @@ function ZipAffinityTab({
 
   const active = sources.find((s) => s.sourceId === activeSourceId) || sources[0];
 
+  // Default to population-weighted when this source has it; volume otherwise.
+  const [mode, setMode] = useState<AffinityMode>(active?.hasPopulation ? 'pop' : 'volume');
+
+  // Switch mode automatically when the user switches source to one without pop.
+  useEffect(() => {
+    if (!active) return;
+    if (mode === 'pop' && !active.hasPopulation) setMode('volume');
+  }, [activeSourceId, active, mode]);
+
+  const indexFor = (r: ZipAffinityRow) =>
+    mode === 'pop' ? r.affinityIndexPop : r.affinityIndexVolume;
+
   const filtered = useMemo(() => {
     if (!active) return [];
     const q = search.trim().toLowerCase();
     const dir = sortDir === 'asc' ? 1 : -1;
-    const cmp = (a: typeof active.rows[number], b: typeof active.rows[number]) => {
-      const av = a[sortKey];
-      const bv = b[sortKey];
+    const cmp = (a: ZipAffinityRow, b: ZipAffinityRow) => {
+      let av: string | number;
+      let bv: string | number;
+      if (sortKey === 'affinityIndex') {
+        av = indexFor(a);
+        bv = indexFor(b);
+      } else if (sortKey === 'zip') {
+        av = a.zip;
+        bv = b.zip;
+      } else {
+        av = a[sortKey] as number;
+        bv = b[sortKey] as number;
+      }
       if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * dir;
       return ((av as number) - (bv as number)) * dir;
     };
     let rows = active.rows;
     if (q) rows = rows.filter((r) => r.zip.toLowerCase().includes(q));
     return [...rows].sort(cmp);
-  }, [active, search, sortKey, sortDir]);
+  }, [active, search, sortKey, sortDir, mode]);
 
   const onSort = (key: ZipSortKey) => {
     if (key === sortKey) {
@@ -590,9 +614,8 @@ function ZipAffinityTab({
     const rows = filtered;
     const lines = ['Zip Code,Affinity Index'];
     for (const r of rows) {
-      // Quote zip in case it ever contains a comma (rare but safe).
       const z = /[",\n]/.test(r.zip) ? `"${r.zip.replace(/"/g, '""')}"` : r.zip;
-      lines.push(`${z},${r.affinityIndex}`);
+      lines.push(`${z},${indexFor(r)}`);
     }
     const csv = lines.join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -600,7 +623,7 @@ function ZipAffinityTab({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `zip-affinity_${safeLabel}_${runId.slice(0, 8)}.csv`;
+    a.download = `zip-affinity-${mode}_${safeLabel}_${runId.slice(0, 8)}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -616,9 +639,16 @@ function ZipAffinityTab({
     );
   }
 
-  // Color ramp for the affinity bar — light cyan → vivid blue.
-  const barColor = (idx: number) =>
-    `rgba(59,130,246,${Math.max(0.18, Math.min(1, idx / 100))})`;
+  // Color ramp. Pop-mode max ≈ 200 (anything ≥ 200 saturates to vivid blue);
+  // volume-mode max = 100. Normalize to [0,1] for opacity.
+  const barWidthPct = (idx: number) => {
+    if (mode === 'pop') return Math.min(100, (idx / 200) * 100);
+    return Math.max(0, Math.min(100, idx));
+  };
+  const barColor = (idx: number) => {
+    const norm = mode === 'pop' ? Math.min(1, idx / 200) : Math.min(1, idx / 100);
+    return `rgba(59,130,246,${Math.max(0.18, norm)})`;
+  };
 
   const SortHeader = ({
     columnKey,
@@ -648,12 +678,14 @@ function ZipAffinityTab({
     );
   };
 
+  const modeDescription =
+    mode === 'pop'
+      ? 'Population-weighted index (CPG-style "vs baseline"). 100 = ZIP delivers visitors proportional to its size. >100 over-indexes; <100 under-indexes. Capped at 300.'
+      : 'Volume index 0..100 — share of the top ZIP\'s visitor count. Best for coverage / media buying where audience size matters most.';
+
   return (
     <div className="space-y-3">
-      <div className="text-sm text-muted-foreground">
-        Affinity Index 0..100 per residential ZIP, normalized against the top ZIP of the
-        selected source. Higher = stronger likelihood of generating visits to this POI set.
-      </div>
+      <div className="text-sm text-muted-foreground">{modeDescription}</div>
 
       {/* Source toggle (when 2+ sources) */}
       {sources.length > 1 && (
@@ -672,10 +704,48 @@ function ZipAffinityTab({
             >
               {s.sourceLabel}
               <span className="ml-1.5 opacity-70">· {fmtNum(s.rows.length)} ZIPs</span>
+              {s.hasPopulation && <span className="ml-1 text-[10px] opacity-60">📊</span>}
             </button>
           ))}
         </div>
       )}
+
+      {/* Mode toggle */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs text-muted-foreground">Index by:</span>
+        <div className="inline-flex rounded-md border border-border overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setMode('pop')}
+            disabled={!active.hasPopulation}
+            className={`px-3 py-1 text-xs font-medium transition-colors ${
+              mode === 'pop'
+                ? 'bg-primary text-primary-foreground'
+                : 'bg-muted/30 text-muted-foreground hover:bg-muted'
+            } ${!active.hasPopulation ? 'opacity-40 cursor-not-allowed' : ''}`}
+            title={active.hasPopulation ? 'CPG-style: visitors per resident, normalized vs baseline' : `No population data uploaded for ${active.country || 'this country'}. Upload via /datasets → NSE modal.`}
+          >
+            Population-weighted
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode('volume')}
+            className={`px-3 py-1 text-xs font-medium transition-colors border-l border-border ${
+              mode === 'volume'
+                ? 'bg-primary text-primary-foreground'
+                : 'bg-muted/30 text-muted-foreground hover:bg-muted'
+            }`}
+            title="Raw visitor count normalized to top ZIP (0..100)"
+          >
+            Volume-only
+          </button>
+        </div>
+        {!active.hasPopulation && (
+          <span className="text-xs text-amber-500/80">
+            ⚠ No population data for {active.country || 'this country'} — pop-weighted unavailable. Upload via the dataset NSE modal.
+          </span>
+        )}
+      </div>
 
       {/* Toolbar: search + download CSV */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -709,32 +779,62 @@ function ZipAffinityTab({
               <SortHeader columnKey="zip" align="left">Zip Code</SortHeader>
               <SortHeader columnKey="affinityIndex" align="right">Affinity Index</SortHeader>
               <SortHeader columnKey="count" align="right">Visitors</SortHeader>
+              {active.hasPopulation && (
+                <SortHeader columnKey="population" align="right">Population</SortHeader>
+              )}
               <th className="text-left px-3 py-2 w-1/3">Score</th>
             </tr>
           </thead>
           <tbody>
-            {filtered.map((r) => (
-              <tr key={r.zip} className="border-t border-border/50 hover:bg-muted/30">
-                <td className="px-3 py-2 font-mono text-xs">{r.zip}</td>
-                <td className="px-3 py-2 text-right tabular-nums font-medium">
-                  {r.affinityIndex}
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                  {fmtNum(r.count)}
-                </td>
-                <td className="px-3 py-2">
-                  <div className="h-2 rounded bg-muted/40 overflow-hidden">
-                    <div
-                      className="h-full rounded"
-                      style={{
-                        width: `${r.affinityIndex}%`,
-                        backgroundColor: barColor(r.affinityIndex),
-                      }}
-                    />
-                  </div>
-                </td>
-              </tr>
-            ))}
+            {filtered.map((r) => {
+              const idx = indexFor(r);
+              const isFallback = mode === 'pop' && r.noPopulation;
+              return (
+                <tr key={r.zip} className="border-t border-border/50 hover:bg-muted/30">
+                  <td className="px-3 py-2 font-mono text-xs">{r.zip}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-medium">
+                    <div className="inline-flex items-center gap-1.5 justify-end">
+                      <span>{idx}</span>
+                      {isFallback && (
+                        <span
+                          className="text-[9px] px-1 py-0.5 rounded bg-amber-500/15 text-amber-500/80 border border-amber-500/30"
+                          title="No population data for this ZIP — fell back to volume-only"
+                        >
+                          no pop
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                    {fmtNum(r.count)}
+                  </td>
+                  {active.hasPopulation && (
+                    <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                      {r.population > 0 ? fmtNum(r.population) : '—'}
+                    </td>
+                  )}
+                  <td className="px-3 py-2">
+                    <div className="h-2 rounded bg-muted/40 overflow-hidden relative">
+                      <div
+                        className="h-full rounded"
+                        style={{
+                          width: `${barWidthPct(idx)}%`,
+                          backgroundColor: barColor(idx),
+                        }}
+                      />
+                      {/* Reference line at index=100 (the "average" baseline) */}
+                      {mode === 'pop' && (
+                        <div
+                          className="absolute top-0 h-full w-px bg-foreground/40"
+                          style={{ left: `${barWidthPct(100)}%` }}
+                          title="Baseline (index = 100)"
+                        />
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

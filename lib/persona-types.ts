@@ -185,19 +185,36 @@ export interface JourneyReport {
 }
 
 /**
- * Per-ZIP affinity for one source (megajob/job). The index is a 0..100
- * score relative to the top ZIP of that source — 100 = the ZIP that
- * contributed the most visitors, 0 ≈ the ZIPs barely represented.
+ * Per-ZIP affinity for one source (megajob/job). Two indices are
+ * computed so the user can pick the lens that fits their use case:
  *
- * Computed in Node from the home_zip column of the persona feature
- * vector — no extra Athena query needed.
+ *   - affinityIndexPop (population-weighted, CPG style)
+ *       = (visitor_share / pop_share) × 100, capped at 300
+ *       100 = the ZIP delivers visitors proportional to its size.
+ *       150 = over-indexes 1.5×.
+ *       <50 = ZIP under-indexes (residents ignore the POI set).
+ *       Requires a population lookup; falls back to volume-only when
+ *       the ZIP has no population data (flagged via `noPopulation`).
+ *
+ *   - affinityIndexVolume (raw share, the original metric)
+ *       = round(100 × visitors / max_visitors_in_source)
+ *       Useful for media buying or coverage campaigns where absolute
+ *       reach matters more than per-resident affinity.
+ *
+ * Both are computed always; the UI toggles between them.
  */
 export interface ZipAffinityRow {
   zip: string;
   /** Distinct devices with home_zip = X who visited this source's POIs. */
   count: number;
-  /** 0..100 affinity score relative to top ZIP in this source. */
-  affinityIndex: number;
+  /** Population of the ZIP (from the country's NSE upload). 0 if unknown. */
+  population: number;
+  /** Population-weighted index (CPG-style "vs baseline"). Capped at 300. */
+  affinityIndexPop: number;
+  /** Volume-only index (visitors normalized to top ZIP, 0..100). */
+  affinityIndexVolume: number;
+  /** True when no population was available — affinityIndexPop falls back to volume. */
+  noPopulation: boolean;
 }
 
 export interface SourceZipAffinity {
@@ -205,10 +222,14 @@ export interface SourceZipAffinity {
   sourceId: string;
   /** Human-readable label for tab + CSV filename. */
   sourceLabel: string;
-  /** Sorted desc by affinityIndex (top first). */
+  /** Country (ISO2) for which the population lookup was applied. Empty when none. */
+  country: string;
+  /** Sorted desc by affinityIndexPop (top first). */
   rows: ZipAffinityRow[];
   /** Sum of all visitor counts (for "X% of base" labels). */
   totalDevicesWithZip: number;
+  /** True when at least one row used a population-weighted index. */
+  hasPopulation: boolean;
 }
 
 /** A single quotable insight string + supporting metric. */

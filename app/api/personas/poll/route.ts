@@ -612,13 +612,16 @@ async function phaseClusterAndAggregate(
       ? computeCohabitation(features, config.megaJobIds)
       : undefined;
 
-  // Per-source ZIP affinity. Resolve source labels (megajob name / job
-  // name) so the UI tab and CSV download can use the human label.
+  // Per-source ZIP affinity. Resolve source labels + countries so the
+  // UI tab and CSV download can use the human label, and so we can load
+  // the right NSE population lookup per country.
   const sourceLabels: Record<string, string> = {};
+  const sourceCountries: Record<string, string> = {};
   for (const id of config.megaJobIds) {
     try {
       const mj = await getMegaJob(id);
       sourceLabels[id] = mj?.name || id.slice(0, 8);
+      if (mj?.country) sourceCountries[id] = mj.country.toUpperCase();
     } catch {
       sourceLabels[id] = id.slice(0, 8);
     }
@@ -627,15 +630,47 @@ async function phaseClusterAndAggregate(
     try {
       const j = await getJob(id);
       sourceLabels[id] = (j as any)?.name || id.slice(0, 8);
+      if ((j as any)?.country) sourceCountries[id] = String((j as any).country).toUpperCase();
     } catch {
       sourceLabels[id] = id.slice(0, 8);
     }
   }
-  const zipAffinity = computeZipAffinityPerSource(features, sourceLabels);
+
+  // Population lookup per source. Uses the per-country NSE upload
+  // (already on S3 as `nse/{CC}`) — falls back to volume-only when no
+  // population data exists for the country.
+  const populationLookup = { bySource: new Map<string, Map<string, number>>() };
+  const popCacheByCountry = new Map<string, Map<string, number>>();
+  for (const [sourceId, country] of Object.entries(sourceCountries)) {
+    if (!country) continue;
+    let popMap = popCacheByCountry.get(country);
+    if (!popMap) {
+      try {
+        const records = await getConfig<Array<{ postal_code: string; population: number }>>(`nse/${country}`);
+        popMap = new Map();
+        if (records && Array.isArray(records)) {
+          for (const r of records) {
+            if (r?.postal_code && Number.isFinite(r.population) && r.population > 0) {
+              popMap.set(String(r.postal_code).trim(), r.population);
+            }
+          }
+        }
+        popCacheByCountry.set(country, popMap);
+        console.log(`[PERSONAS ${runId}] Loaded population lookup for ${country}: ${popMap.size} ZIPs`);
+      } catch (e: any) {
+        console.warn(`[PERSONAS ${runId}] No population data for ${country} (${e?.message || e})`);
+        popMap = new Map();
+        popCacheByCountry.set(country, popMap);
+      }
+    }
+    if (popMap.size > 0) populationLookup.bySource.set(sourceId, popMap);
+  }
+  const zipAffinity = computeZipAffinityPerSource(features, sourceLabels, populationLookup, sourceCountries);
   if (zipAffinity.length > 0) {
     const zipsTotal = zipAffinity.reduce((s, x) => s + x.rows.length, 0);
+    const withPop = zipAffinity.filter((s) => s.hasPopulation).length;
     console.log(
-      `[PERSONAS ${runId}] zip-affinity: ${zipAffinity.length} source(s), ${zipsTotal} ZIP rows total`
+      `[PERSONAS ${runId}] zip-affinity: ${zipAffinity.length} source(s) (${withPop} with pop data), ${zipsTotal} ZIP rows total`
     );
   }
 

@@ -1,19 +1,18 @@
 /**
- * ZIP affinity score per source — the relative attractiveness of each
- * residential ZIP toward a POI set.
+ * ZIP affinity score per source — two complementary lenses:
  *
- * Computed from the persona feature vector (already in memory after the
- * clustering phase) — no extra Athena query needed. Each device has a
- * `home_zip` (mode of geo_fields['zipcode'] during night hours, with
- * reverse-geocoded fallback) and a `source_megajob_id`. We group by
- * (source, zip), count distinct devices, then normalize 0..100 per
- * source against its own top ZIP.
+ *   - Population-weighted (CPG-style index vs baseline). Visitors per
+ *     resident, normalized to the source's expected baseline. Best for
+ *     understanding which ZIPs DISPROPORTIONATELY engage with the POI
+ *     set, regardless of size. Reads as: 100 = proportional to size,
+ *     150 = over-indexes 1.5×, <50 = under-indexes.
  *
- * Why per-source normalization (not global): each megajob has its own
- * geographic footprint and base size. A ZIP that contributes 1000
- * visitors to BK might mean little for Auto Dealerships of 50 POIs
- * total. Normalizing inside the source produces an "affinity" reading
- * that's comparable across ZIPs within the same study.
+ *   - Volume-only (the original 0..100 share-of-top metric). Best for
+ *     coverage / media-buying when raw audience size is what matters.
+ *
+ * Both are computed; the UI toggles between them. Computed in Node
+ * from the home_zip column of the persona feature vector — no extra
+ * Athena query.
  */
 
 import type {
@@ -22,17 +21,32 @@ import type {
   ZipAffinityRow,
 } from './persona-types';
 
+/** Skip ZIPs below this population — small enough that a few visitors give noisy >>100 indices. */
+const MIN_POPULATION_FOR_POP_INDEX = 200;
+
+/** Cap the population-weighted index. Beyond 300 the differences stop being meaningful (saturated affinity). */
+const POP_INDEX_CAP = 300;
+
+export interface PopulationLookup {
+  /**
+   * Map from sourceId → (postalCode → population). Built by the caller
+   * from per-country NSE uploads. Missing entries fall back to volume-only.
+   */
+  bySource: Map<string, Map<string, number>>;
+}
+
 /**
  * Group features by (source_megajob_id, home_zip), count uniques,
- * and produce a ZIP affinity table per source.
+ * and produce a ZIP affinity table per source. Both
+ * volume-only and population-weighted indices are computed.
  *
- * Devices without a resolved home_zip are dropped — they can't be
- * attributed to any geography. The resulting per-source list is sorted
- * by affinityIndex desc.
+ * Devices without a resolved home_zip are dropped.
  */
 export function computeZipAffinityPerSource(
   features: DeviceFeatures[],
-  sourceLabels: Record<string, string>
+  sourceLabels: Record<string, string>,
+  populationLookup?: PopulationLookup,
+  sourceCountries?: Record<string, string>
 ): SourceZipAffinity[] {
   // source → (zip → unique adIds)
   const bySource = new Map<string, Map<string, Set<string>>>();
@@ -63,18 +77,58 @@ export function computeZipAffinityPerSource(
       totalDevices += ids.size;
     }
     if (counts.length === 0) continue;
+
+    // Volume-only: normalize to top ZIP. Same formula as before.
     counts.sort((a, b) => b.count - a.count);
-    const top = counts[0].count || 1;
-    const rows: ZipAffinityRow[] = counts.map((c) => ({
-      zip: c.zip,
-      count: c.count,
-      affinityIndex: Math.max(0, Math.min(100, Math.round((c.count / top) * 100))),
-    }));
+    const topCount = counts[0].count || 1;
+
+    // Population lookup for this source (may be missing if no NSE uploaded
+    // for the country). Compute pop_share denominator from pops we DO have
+    // — using the pop-uploaded ZIPs as the universe of comparison.
+    const popMap = populationLookup?.bySource.get(sourceId);
+    let totalPopWithVisitors = 0;
+    if (popMap) {
+      for (const c of counts) {
+        const pop = popMap.get(c.zip) || 0;
+        if (pop >= MIN_POPULATION_FOR_POP_INDEX) totalPopWithVisitors += pop;
+      }
+    }
+
+    let hasPopulation = false;
+    const rows: ZipAffinityRow[] = counts.map((c) => {
+      const pop = popMap?.get(c.zip) || 0;
+      const volumeIndex = Math.max(0, Math.min(100, Math.round((c.count / topCount) * 100)));
+      let popIndex = volumeIndex; // fallback when no population
+      let noPop = true;
+      if (pop >= MIN_POPULATION_FOR_POP_INDEX && totalPopWithVisitors > 0 && totalDevices > 0) {
+        // CPG-style: (visitor_share) / (pop_share) × 100
+        const visitorShare = c.count / totalDevices;
+        const popShare = pop / totalPopWithVisitors;
+        const raw = popShare > 0 ? (visitorShare / popShare) * 100 : 0;
+        popIndex = Math.max(0, Math.min(POP_INDEX_CAP, Math.round(raw)));
+        noPop = false;
+        hasPopulation = true;
+      }
+      return {
+        zip: c.zip,
+        count: c.count,
+        population: pop,
+        affinityIndexPop: popIndex,
+        affinityIndexVolume: volumeIndex,
+        noPopulation: noPop,
+      };
+    });
+
+    // Sort desc by population-weighted index (the new default).
+    rows.sort((a, b) => b.affinityIndexPop - a.affinityIndexPop);
+
     out.push({
       sourceId,
       sourceLabel: sourceLabels[sourceId] || sourceId.slice(0, 8),
+      country: sourceCountries?.[sourceId] || '',
       rows,
       totalDevicesWithZip: totalDevices,
+      hasPopulation,
     });
   }
 
