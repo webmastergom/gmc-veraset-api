@@ -148,6 +148,9 @@ export default function PersonasIndexPage() {
       // Split unified selection into megaJobIds + jobIds for the API.
       const megaJobIds = selected.filter((s) => s.startsWith('mega:')).map((s) => s.slice(5));
       const jobIds = selected.filter((s) => s.startsWith('job:')).map((s) => s.slice(4));
+      // Send the user to the runId page as soon as we have one — that page
+      // owns the resilient polling + rich loader. We just need the first
+      // response to extract runId.
       let data = await safePoll('/api/personas/poll', {
         method: 'POST',
         credentials: 'include',
@@ -155,7 +158,7 @@ export default function PersonasIndexPage() {
         body: JSON.stringify({ megaJobIds, jobIds }),
       });
       const runId = data.runId;
-      if (data.phase === 'done' && data.report) {
+      if (runId) {
         router.push(`/personas/${runId}`);
         return;
       }
@@ -303,11 +306,38 @@ export default function PersonasIndexPage() {
   );
 }
 
+/**
+ * Resilient single fetch with retry on transient failures.
+ * Tolerates: 504 Vercel timeouts, ERR_NETWORK_CHANGED / offline blips,
+ *            non-JSON responses (HTML error pages from Vercel edge).
+ * Up to 4 attempts with exponential backoff (3s, 5s, 8s).
+ */
 async function safePoll(url: string, init?: RequestInit) {
-  const r = await fetch(url, init);
-  if (r.status === 504) return { phase: 'polling', progress: { message: 'Server processing (retrying…)' } };
-  let data: any;
-  try { data = await r.json(); } catch { return { phase: 'polling', progress: { message: 'Server processing (retrying…)' } }; }
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-  return data;
+  const MAX_ATTEMPTS = 4;
+  let lastError: any = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const r = await fetch(url, init);
+      if (r.status === 504) {
+        // Backend still working — retry.
+        lastError = new Error('Server timeout (504)');
+      } else {
+        let data: any;
+        try { data = await r.json(); } catch (e: any) {
+          lastError = new Error(`Bad JSON (HTTP ${r.status})`);
+          continue;
+        }
+        if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+        return data;
+      }
+    } catch (e: any) {
+      // Network error (ERR_NETWORK_CHANGED, offline, DNS) — retry.
+      lastError = e;
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      const delay = 3000 * Math.pow(1.6, attempt - 1);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastError || new Error('Unknown polling error');
 }

@@ -29,48 +29,91 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
 
   useEffect(() => {
     let cancelled = false;
-    async function run() {
+
+    /**
+     * Resilient poll: tolerates network blips (Wi-Fi switching, VPN, modem
+     * reconnects → ERR_NETWORK_CHANGED, ERR_INTERNET_DISCONNECTED, etc.) and
+     * Vercel 504s by surfacing a "retrying" status to the UI and retrying
+     * with exponential backoff. Only gives up after MAX_CONSECUTIVE failures.
+     */
+    const MAX_CONSECUTIVE = 8;
+
+    async function pollOnce(body: any): Promise<{ ok: boolean; data?: any; error?: string }> {
       try {
-        // Try to load any cached report immediately so the user sees results
-        // while exports might still be finalizing in the background.
-        const r = await fetch(`/api/personas/report?runId=${encodeURIComponent(runId)}`, { credentials: 'include' });
-        if (r.ok) {
-          const data = await r.json();
-          if (!cancelled && data.report) setReport(data.report);
-        }
-        // Drive the state machine forward via /poll calls until done/error.
-        let pollData: any = await fetch('/api/personas/poll', {
+        const res = await fetch('/api/personas/poll', {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ runId }),
-        }).then((r) => r.json()).catch(() => ({ phase: 'unknown' }));
-
-        if (!cancelled) {
-          setPhase(pollData.phase || 'unknown');
-          setProgressInfo(pollData.progress || {});
+          body: JSON.stringify(body),
+        });
+        // 504 from Vercel = function timeout — retry instead of bailing.
+        if (res.status === 504) {
+          return { ok: false, error: 'Server timeout (504), will retry' };
         }
+        let data: any;
+        try {
+          data = await res.json();
+        } catch (e: any) {
+          return { ok: false, error: `Bad JSON (HTTP ${res.status})` };
+        }
+        if (!res.ok) {
+          return { ok: false, error: data?.error || `HTTP ${res.status}`, data };
+        }
+        return { ok: true, data };
+      } catch (e: any) {
+        // Network errors (ERR_NETWORK_CHANGED, offline, DNS, etc.) — retry.
+        return { ok: false, error: e?.message || 'Network error' };
+      }
+    }
 
-        while (!cancelled && pollData.phase !== 'done' && pollData.phase !== 'error' && pollData.phase !== 'unknown') {
-          if (pollData.report && !cancelled) setReport(pollData.report);
-          await new Promise((r) => setTimeout(r, 4000));
-          pollData = await fetch('/api/personas/poll', {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ runId }),
-          }).then((r) => r.json()).catch(() => ({ phase: 'error', error: 'network' }));
-          if (!cancelled) {
+    async function run() {
+      try {
+        // Cached report (best-effort).
+        try {
+          const r = await fetch(`/api/personas/report?runId=${encodeURIComponent(runId)}`, { credentials: 'include' });
+          if (r.ok) {
+            const data = await r.json();
+            if (!cancelled && data.report) setReport(data.report);
+          }
+        } catch {}
+
+        let consecutiveErrors = 0;
+        let pollData: any = null;
+
+        while (!cancelled) {
+          const result = await pollOnce({ runId });
+          if (cancelled) break;
+
+          if (result.ok) {
+            consecutiveErrors = 0;
+            pollData = result.data;
             setPhase(pollData.phase || 'unknown');
             setProgressInfo(pollData.progress || {});
-          }
-        }
+            if (pollData.report) setReport(pollData.report);
 
-        if (!cancelled && pollData.phase === 'done' && pollData.report) {
-          setReport(pollData.report);
-        }
-        if (!cancelled && pollData.phase === 'error') {
-          setError(pollData.error || 'Run failed');
+            if (pollData.phase === 'done') break;
+            if (pollData.phase === 'error') {
+              setError(pollData.error || 'Run failed');
+              break;
+            }
+            // Normal cadence between healthy polls.
+            await new Promise((r) => setTimeout(r, 4000));
+          } else {
+            consecutiveErrors++;
+            // Surface the retry state on the loader.
+            setProgressInfo((prev) => ({
+              ...prev,
+              message: `Connection blip — retrying (${consecutiveErrors}/${MAX_CONSECUTIVE})`,
+              details: result.error,
+            }));
+            if (consecutiveErrors >= MAX_CONSECUTIVE) {
+              setError(`Lost connection to server (${result.error}). Reload to resume — the run is still running on the backend.`);
+              break;
+            }
+            // Exponential backoff: 3s, 5s, 8s, 13s, 21s, 34s, 55s, 89s …
+            const delay = Math.min(90_000, 3000 * Math.pow(1.6, consecutiveErrors - 1));
+            await new Promise((r) => setTimeout(r, delay));
+          }
         }
       } catch (e: any) {
         if (!cancelled) setError(e?.message || String(e));
