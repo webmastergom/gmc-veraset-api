@@ -390,8 +390,20 @@ function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; br
   const [sortKey, setSortKey] = useState<CohabSortKey>('jaccard');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [showAll, setShowAll] = useState(false);
+  const [brandFilter, setBrandFilter] = useState<string>('');
 
-  const sorted = useMemo(() => {
+  // Apply brand filter first (so the row count + Show all label reflect it),
+  // then sort.
+  const filteredAndSorted = useMemo(() => {
+    const q = brandFilter.trim().toLowerCase();
+    let rows = entries;
+    if (q) {
+      rows = entries.filter(
+        (e) =>
+          e.brandA.toLowerCase().includes(q) ||
+          e.brandB.toLowerCase().includes(q)
+      );
+    }
     const dir = sortDir === 'asc' ? 1 : -1;
     const cmp = (a: CohabitationEntry, b: CohabitationEntry): number => {
       const av = a[sortKey];
@@ -399,10 +411,17 @@ function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; br
       if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * dir;
       return ((av as number) - (bv as number)) * dir;
     };
-    return [...entries].sort(cmp);
-  }, [entries, sortKey, sortDir]);
+    return [...rows].sort(cmp);
+  }, [entries, sortKey, sortDir, brandFilter]);
 
+  const sorted = filteredAndSorted;
   const visible = showAll ? sorted : sorted.slice(0, 30);
+
+  // Sorted unique brand list for the dropdown — alphabetical.
+  const brandsSorted = useMemo(
+    () => [...brands].sort((a, b) => a.localeCompare(b)),
+    [brands]
+  );
 
   const onSort = (key: CohabSortKey) => {
     if (key === sortKey) {
@@ -448,17 +467,47 @@ function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; br
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between gap-3 text-sm text-muted-foreground">
-        <div>Pairwise device-overlap between brands. Click a column to sort. Higher Jaccard = tighter cross-shopping.</div>
-        {sorted.length > 30 && (
-          <button
-            type="button"
-            onClick={() => setShowAll((v) => !v)}
-            className="text-xs px-2 py-1 rounded bg-muted/40 hover:bg-muted text-foreground whitespace-nowrap"
-          >
-            {showAll ? `Show top 30` : `Show all ${sorted.length}`}
-          </button>
-        )}
+      <div className="text-sm text-muted-foreground">
+        Pairwise device-overlap between brands. Click a column to sort. Higher Jaccard = tighter cross-shopping.
+      </div>
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={brandFilter}
+            onChange={(e) => setBrandFilter(e.target.value)}
+            placeholder="Filter by brand…"
+            list="cohab-brand-list"
+            className="h-8 px-3 rounded-md border border-input bg-background text-sm w-56"
+          />
+          <datalist id="cohab-brand-list">
+            {brandsSorted.map((b) => (
+              <option key={b} value={b.replace(/_/g, ' ')} />
+            ))}
+          </datalist>
+          {brandFilter && (
+            <button
+              type="button"
+              onClick={() => setBrandFilter('')}
+              className="text-xs px-2 py-1 rounded bg-muted/40 hover:bg-muted text-foreground"
+              title="Clear filter"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{sorted.length.toLocaleString()} pair{sorted.length === 1 ? '' : 's'}</span>
+          {sorted.length > 30 && (
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              className="px-2 py-1 rounded bg-muted/40 hover:bg-muted text-foreground whitespace-nowrap"
+            >
+              {showAll ? `Show top 30` : `Show all ${sorted.length}`}
+            </button>
+          )}
+        </div>
       </div>
       <div className="border rounded-lg overflow-x-auto">
         <table className="w-full text-sm">

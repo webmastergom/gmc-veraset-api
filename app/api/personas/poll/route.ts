@@ -262,17 +262,20 @@ async function fireFeatureCtasForSource(args: {
     })
   );
   // Idempotent: IF NOT EXISTS so two concurrent phaseStarting calls don't race.
+  // Trino-compatible external-table syntax — works on both Athena engine v2 and v3.
+  // (Hive `CREATE EXTERNAL TABLE` fails on workgroups using Trino engine v3.)
   try {
     await runQuery(`
-      CREATE EXTERNAL TABLE IF NOT EXISTS ${brandTable} (
-        poi_id STRING,
-        brand STRING
+      CREATE TABLE IF NOT EXISTS ${brandTable} (
+        poi_id VARCHAR,
+        brand VARCHAR
       )
-      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-      STORED AS TEXTFILE
-      LOCATION 's3://${BUCKET}/athena-temp/${brandTable}/'
-      TBLPROPERTIES ('skip.header.line.count' = '1')
+      WITH (
+        format = 'TEXTFILE',
+        external_location = 's3://${BUCKET}/athena-temp/${brandTable}/',
+        textfile_field_separator = ',',
+        skip_header_line_count = 1
+      )
     `);
   } catch (e: any) {
     if (!/already exist/i.test(e?.message || '')) throw e;
@@ -771,16 +774,18 @@ async function phaseMasterMaidsExport(
   );
   try { await runQuery(`DROP TABLE IF EXISTS ${labelsTable}`); } catch {}
   try {
+    // Trino-compatible external-table syntax (see brand table above).
     await runQuery(`
-      CREATE EXTERNAL TABLE IF NOT EXISTS ${labelsTable} (
-        ad_id STRING,
-        persona_name STRING
+      CREATE TABLE IF NOT EXISTS ${labelsTable} (
+        ad_id VARCHAR,
+        persona_name VARCHAR
       )
-      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-      STORED AS TEXTFILE
-      LOCATION 's3://${BUCKET}/athena-temp/persona-labels/${runId}_${exportTs}/'
-      TBLPROPERTIES ('skip.header.line.count' = '1')
+      WITH (
+        format = 'TEXTFILE',
+        external_location = 's3://${BUCKET}/athena-temp/persona-labels/${runId}_${exportTs}/',
+        textfile_field_separator = ',',
+        skip_header_line_count = 1
+      )
     `);
   } catch (e: any) {
     if (!/already exist/i.test(e?.message || '')) throw e;
