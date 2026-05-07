@@ -270,13 +270,93 @@ async function phaseFeaturePolling(state: PersonaState): Promise<PersonaState> {
   const anyFailed = statuses.find((s) => s.state === 'FAILED' || s.state === 'CANCELLED');
   if (anyFailed) throw new Error(`Feature CTAS failed: ${anyFailed.error || 'unknown'}`);
   const allDone = statuses.every((s) => s.state === 'SUCCEEDED');
+
+  // Surface granular progress: GB scanned + runtime per query.
+  const totalScannedGB = statuses.reduce((s, x) => s + ((x.statistics?.dataScannedBytes || 0) / 1e9), 0);
+  const doneCount = statuses.filter((s) => s.state === 'SUCCEEDED').length;
+  const perSource: Record<string, string> = {};
+  Object.entries(state.featureCtas).forEach(([src, { queryId }], i) => {
+    const st = statuses[i];
+    perSource[src] = `${st.state} · ${((st.statistics?.dataScannedBytes || 0) / 1e9).toFixed(1)} GB scanned`;
+  });
+  const subProgress = {
+    label: allDone ? 'All feature CTAS finished' : `Athena CTAS: ${doneCount}/${statuses.length} sources done`,
+    ratio: doneCount / Math.max(1, statuses.length),
+    details: `${totalScannedGB.toFixed(1)} GB scanned across ${statuses.length} source${statuses.length > 1 ? 's' : ''}`,
+    perSource,
+  };
+
   if (!allDone) {
-    return { ...state, updatedAt: new Date().toISOString() };
+    return { ...state, subProgress, updatedAt: new Date().toISOString() };
   }
-  return { ...state, phase: 'download', updatedAt: new Date().toISOString() };
+  return { ...state, phase: 'download_query', subProgress, updatedAt: new Date().toISOString() };
 }
 
-// ─── Phase: download ─────────────────────────────────────────────────
+// ─── Phase: download_query ───────────────────────────────────────────
+
+async function phaseDownloadQuery(state: PersonaState): Promise<PersonaState> {
+  if (!state.featureCtas) throw new Error('No featureCtas in state');
+  const downloadQueries: Record<string, { queryId: string; csvKey: string }> = {};
+  for (const [src, { tableName }] of Object.entries(state.featureCtas)) {
+    // Project only the columns we need for clustering + aggregation —
+    // omits gps_share / avg_circle_score (already captured in
+    // tier_high_quality), afternoon_share (not used), source_megajob_id
+    // (we already know per source).
+    const sql = `
+      SELECT ad_id, total_visits, total_dwell_min, recency_days, avg_dwell_min,
+        morning_share, midday_share, evening_share, night_share, weekend_share,
+        friday_evening_share, gyration_km, unique_h3_cells,
+        home_zip, home_region,
+        brand_visits_json, brand_loyalty_hhi, tier_high_quality
+      FROM ${tableName}
+    `;
+    const queryId = await startQueryAsync(sql);
+    downloadQueries[src] = { queryId, csvKey: `athena-results/${queryId}.csv` };
+    console.log(`[PERSONAS ${state.runId}] Download SELECT started for ${src}: queryId=${queryId}`);
+  }
+  return {
+    ...state,
+    phase: 'download_polling',
+    downloadQueries,
+    subProgress: {
+      label: 'Streaming feature vectors',
+      details: `${Object.keys(downloadQueries).length} parallel SELECT queries launched`,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+// ─── Phase: download_polling ─────────────────────────────────────────
+
+async function phaseDownloadPolling(state: PersonaState): Promise<PersonaState> {
+  if (!state.downloadQueries) throw new Error('No downloadQueries');
+  const queryIds = Object.values(state.downloadQueries).map((d) => d.queryId);
+  const statuses = await Promise.all(queryIds.map((q) => checkQueryStatus(q)));
+  const anyFailed = statuses.find((s) => s.state === 'FAILED' || s.state === 'CANCELLED');
+  if (anyFailed) throw new Error(`Download SELECT failed: ${anyFailed.error || 'unknown'}`);
+  const allDone = statuses.every((s) => s.state === 'SUCCEEDED');
+
+  const totalScannedGB = statuses.reduce((s, x) => s + ((x.statistics?.dataScannedBytes || 0) / 1e9), 0);
+  const doneCount = statuses.filter((s) => s.state === 'SUCCEEDED').length;
+  const perSource: Record<string, string> = {};
+  Object.entries(state.downloadQueries).forEach(([src, { queryId }], i) => {
+    const st = statuses[i];
+    perSource[src] = `${st.state} · ${((st.statistics?.dataScannedBytes || 0) / 1e9).toFixed(2)} GB`;
+  });
+  const subProgress = {
+    label: allDone ? 'Feature vectors ready' : `Athena: ${doneCount}/${statuses.length} downloads done`,
+    ratio: doneCount / Math.max(1, statuses.length),
+    details: `${totalScannedGB.toFixed(2)} GB processed`,
+    perSource,
+  };
+
+  if (!allDone) {
+    return { ...state, subProgress, updatedAt: new Date().toISOString() };
+  }
+  return { ...state, phase: 'download_read', subProgress, updatedAt: new Date().toISOString() };
+}
+
+// ─── Phase: download_read ────────────────────────────────────────────
 
 function parseBrandJson(s: string | null | undefined): Record<string, number> {
   if (!s) return {};
@@ -295,11 +375,24 @@ function parseBrandJson(s: string | null | undefined): Record<string, number> {
   return {};
 }
 
-async function phaseDownload(state: PersonaState): Promise<{ state: PersonaState; features: DeviceFeatures[] }> {
-  if (!state.featureCtas) throw new Error('No featureCtas in state');
+async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaState; features: DeviceFeatures[] }> {
+  if (!state.downloadQueries) throw new Error('No downloadQueries');
+  const { fetchQueryResults } = await import('@/lib/athena');
   const all: DeviceFeatures[] = [];
-  for (const [megaJobId, { tableName }] of Object.entries(state.featureCtas)) {
-    const result = await runQueryViaS3(`SELECT * FROM ${tableName}`);
+  for (const [src, { queryId }] of Object.entries(state.downloadQueries)) {
+    // Use S3-staged read for large result sets.
+    const { runQueryViaS3 } = await import('@/lib/athena');
+    // Re-issuing SELECT against the table is wasteful. Instead, pull the
+    // existing CSV directly from athena-results/ via fetchQueryResults
+    // (which uses Athena pagination) when small, or runQueryViaS3 for
+    // large CSVs (paginated S3 GET).
+    let result;
+    try {
+      result = await runQueryViaS3(`SELECT * FROM ${state.featureCtas![src].tableName}`);
+    } catch (e: any) {
+      console.error(`[PERSONAS ${state.runId}] runQueryViaS3 failed for ${src}, fallback to fetchQueryResults: ${e.message}`);
+      result = await fetchQueryResults(queryId);
+    }
     for (const r of result.rows as any[]) {
       const brandVisits = parseBrandJson(r.brand_visits_json);
       all.push({
@@ -319,19 +412,23 @@ async function phaseDownload(state: PersonaState): Promise<{ state: PersonaState
         unique_h3_cells: parseInt(r.unique_h3_cells, 10) || 0,
         home_zip: String(r.home_zip || '').trim(),
         home_region: String(r.home_region || '').trim(),
-        gps_share: parseFloat(r.gps_share) || 0,
-        avg_circle_score: parseFloat(r.avg_circle_score) || 0,
+        gps_share: 0,
+        avg_circle_score: 0,
         brand_visits: brandVisits,
         brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
-        nearby_categories_top5: [], // not yet computed in v1
+        nearby_categories_top5: [],
         tier_high_quality: r.tier_high_quality === true || r.tier_high_quality === 'true',
-        source_megajob_id: megaJobId,
+        source_megajob_id: src,
       });
     }
-    console.log(`[PERSONAS ${state.runId}] Downloaded ${result.rows.length} feature rows for ${megaJobId}`);
+    console.log(`[PERSONAS ${state.runId}] Read ${result.rows.length} rows for ${src}`);
   }
+  const subProgress = {
+    label: `Loaded ${all.length.toLocaleString()} feature rows`,
+    details: 'Ready for clustering',
+  };
   return {
-    state: { ...state, phase: 'clustering', updatedAt: new Date().toISOString() },
+    state: { ...state, phase: 'clustering', subProgress, updatedAt: new Date().toISOString() },
     features: all,
   };
 }
@@ -653,14 +750,36 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         case 'feature_polling':
           state = await phaseFeaturePolling(state);
           break;
-        case 'download': {
-          const { state: ns, features } = await phaseDownload(state);
+        // Legacy state for runs created before the download split — auto-promote.
+        case 'feature_ctas' as any:
+          state = { ...state, phase: 'feature_polling' };
+          break;
+        case 'download_query':
+          state = await phaseDownloadQuery(state);
+          break;
+        case 'download_polling':
+          state = await phaseDownloadPolling(state);
+          break;
+        // Legacy state name 'download' from earlier deploys → restart from query.
+        case 'download' as any:
+          state = await phaseDownloadQuery(state);
+          break;
+        case 'download_read': {
+          const { state: ns, features } = await phaseDownloadRead(state);
           const { state: ns2, report, clusterAssignments, clusterNames } = await phaseClusterAndAggregate(ns, features);
           // Save the report early so frontend can render scorecard while exports finish.
           await putConfig(REPORT_KEY(state.runId), report, { compact: true });
           state = await phaseMasterMaidsExport(ns2, report, clusterAssignments, clusterNames);
           break;
         }
+        case 'clustering':
+        case 'aggregation':
+          // These are intermediate states that should never persist (the
+          // download_read handler does both inline). If we land here, it
+          // means a previous run was killed mid-flight — restart from
+          // download_query so the SELECT fires again.
+          state = { ...state, phase: 'download_query' };
+          break;
         case 'master_maids_export':
         case 'export_polling':
           state = await phaseExportPolling(state);
@@ -686,7 +805,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       progress: {
         step: state.phase,
         percent: phasePercent(state.phase),
-        message: phaseMessage(state.phase),
+        message: state.subProgress?.label || phaseMessage(state.phase),
+        details: state.subProgress?.details,
+        ratio: state.subProgress?.ratio,
+        perSource: state.subProgress?.perSource,
+        phaseLabel: phaseMessage(state.phase),
       },
     });
   } catch (e: any) {
@@ -699,12 +822,14 @@ function phasePercent(phase: PersonaPhase): number {
   return ({
     starting: 5,
     feature_ctas: 10,
-    feature_polling: 30,
-    enrichment_ctas: 35,
-    enrichment_polling: 45,
-    download: 55,
-    clustering: 70,
-    aggregation: 80,
+    feature_polling: 25,
+    enrichment_ctas: 30,
+    enrichment_polling: 35,
+    download_query: 45,
+    download_polling: 55,
+    download_read: 65,
+    clustering: 75,
+    aggregation: 82,
     master_maids_export: 88,
     export_polling: 95,
     done: 100,
@@ -715,15 +840,17 @@ function phasePercent(phase: PersonaPhase): number {
 function phaseMessage(phase: PersonaPhase): string {
   return ({
     starting: 'Resolving POIs and brands…',
-    feature_ctas: 'Launching feature CTAS…',
-    feature_polling: 'Running per-device feature aggregation in Athena…',
+    feature_ctas: 'Launching feature CTAS in Athena…',
+    feature_polling: 'Aggregating per-device features in Athena',
     enrichment_ctas: 'Building enrichment tables…',
     enrichment_polling: 'Waiting for enrichment…',
-    download: 'Downloading feature vectors…',
-    clustering: 'Discovering clusters with k-means…',
-    aggregation: 'Aggregating per-persona stats and insights…',
-    master_maids_export: 'Exporting personas to Master MAIDs…',
-    export_polling: 'Finalizing Master MAIDs contributions…',
+    download_query: 'Launching feature-vector download…',
+    download_polling: 'Streaming feature vectors from Athena',
+    download_read: 'Loading feature vectors into memory',
+    clustering: 'Discovering clusters with k-means',
+    aggregation: 'Aggregating per-persona stats + insights',
+    master_maids_export: 'Exporting personas to Master MAIDs',
+    export_polling: 'Finalizing Master MAIDs contributions',
     done: 'Done',
     error: 'Error',
   } as const)[phase];

@@ -3,17 +3,27 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { MainLayout } from '@/components/layout/main-layout';
-import { Loader2, Sparkles, ChevronLeft, RefreshCw } from 'lucide-react';
+import { Sparkles, ChevronLeft, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import PersonaResults from '@/components/personas/persona-results';
+import PersonaProgress from '@/components/personas/persona-progress';
 import type { PersonaReport } from '@/lib/persona-types';
+
+interface ProgressInfo {
+  step?: string;
+  percent?: number;
+  message?: string;
+  details?: string;
+  phaseLabel?: string;
+  ratio?: number;
+  perSource?: Record<string, string>;
+}
 
 export default function PersonaRunPage({ params }: { params: { runId: string } }) {
   const { runId } = params;
   const [report, setReport] = useState<PersonaReport | null>(null);
-  const [loading, setLoading] = useState(true);
   const [phase, setPhase] = useState<string>('');
-  const [progressMsg, setProgressMsg] = useState<string>('');
+  const [progressInfo, setProgressInfo] = useState<ProgressInfo>({});
   const [megaJobNames, setMegaJobNames] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -21,26 +31,27 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
     let cancelled = false;
     async function run() {
       try {
+        // Try to load any cached report immediately so the user sees results
+        // while exports might still be finalizing in the background.
         const r = await fetch(`/api/personas/report?runId=${encodeURIComponent(runId)}`, { credentials: 'include' });
         if (r.ok) {
           const data = await r.json();
-          if (!cancelled && data.report) {
-            setReport(data.report);
-            setLoading(false);
-          }
+          if (!cancelled && data.report) setReport(data.report);
         }
-        // Always poll the state so we know if exports are still running.
-        let pollData = await fetch('/api/personas/poll', {
+        // Drive the state machine forward via /poll calls until done/error.
+        let pollData: any = await fetch('/api/personas/poll', {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ runId }),
         }).then((r) => r.json()).catch(() => ({ phase: 'unknown' }));
 
-        if (!cancelled) setPhase(pollData.phase || 'unknown');
+        if (!cancelled) {
+          setPhase(pollData.phase || 'unknown');
+          setProgressInfo(pollData.progress || {});
+        }
 
         while (!cancelled && pollData.phase !== 'done' && pollData.phase !== 'error' && pollData.phase !== 'unknown') {
-          setProgressMsg(pollData.progress?.message || pollData.phase);
           if (pollData.report && !cancelled) setReport(pollData.report);
           await new Promise((r) => setTimeout(r, 4000));
           pollData = await fetch('/api/personas/poll', {
@@ -49,7 +60,10 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ runId }),
           }).then((r) => r.json()).catch(() => ({ phase: 'error', error: 'network' }));
-          if (!cancelled) setPhase(pollData.phase || 'unknown');
+          if (!cancelled) {
+            setPhase(pollData.phase || 'unknown');
+            setProgressInfo(pollData.progress || {});
+          }
         }
 
         if (!cancelled && pollData.phase === 'done' && pollData.report) {
@@ -58,12 +72,8 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
         if (!cancelled && pollData.phase === 'error') {
           setError(pollData.error || 'Run failed');
         }
-        if (!cancelled) setLoading(false);
       } catch (e: any) {
-        if (!cancelled) {
-          setError(e?.message || String(e));
-          setLoading(false);
-        }
+        if (!cancelled) setError(e?.message || String(e));
       }
     }
     run();
@@ -102,20 +112,30 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
         </div>
 
         {error ? (
-          <div className="border border-red-500/40 bg-red-500/5 rounded-lg p-4">
-            <div className="font-semibold text-red-500">Error</div>
-            <div className="text-sm text-muted-foreground mt-1">{error}</div>
-            <Button onClick={() => window.location.reload()} variant="outline" size="sm" className="mt-3">
-              <RefreshCw className="h-4 w-4 mr-2" /> Retry
-            </Button>
-          </div>
-        ) : loading && !report ? (
-          <div className="flex flex-col items-center justify-center py-16 gap-2">
-            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-            <div className="text-sm text-muted-foreground">{progressMsg || 'Loading…'}</div>
-          </div>
+          <>
+            <PersonaProgress progress={progressInfo} phase="error" error={error} />
+            <div className="flex justify-center">
+              <Button onClick={() => window.location.reload()} variant="outline" size="sm">
+                <RefreshCw className="h-4 w-4 mr-2" /> Retry
+              </Button>
+            </div>
+          </>
+        ) : !report && phase !== 'done' ? (
+          <PersonaProgress progress={progressInfo} phase={phase} />
         ) : report ? (
-          <PersonaResults report={report} megaJobNames={megaJobNames} />
+          <>
+            {/* Still polling exports? Show a slim progress strip on top of results. */}
+            {phase && phase !== 'done' && phase !== 'error' && (
+              <div className="border border-blue-500/30 bg-blue-500/5 rounded-lg px-4 py-2 text-xs text-muted-foreground flex items-center gap-2">
+                <span className="inline-block h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+                <span>
+                  {progressInfo.message || progressInfo.phaseLabel || 'Finalizing…'}
+                  {progressInfo.details && ` · ${progressInfo.details}`}
+                </span>
+              </div>
+            )}
+            <PersonaResults report={report} megaJobNames={megaJobNames} />
+          </>
         ) : (
           <div className="text-sm text-muted-foreground">No data.</div>
         )}

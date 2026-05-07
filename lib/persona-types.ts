@@ -234,7 +234,9 @@ export type PersonaPhase =
   | 'feature_polling'
   | 'enrichment_ctas'
   | 'enrichment_polling'
-  | 'download'
+  | 'download_query'      // launch SELECT * async
+  | 'download_polling'    // wait for SELECT to finish
+  | 'download_read'       // stream CSV from S3 + parse
   | 'clustering'
   | 'aggregation'
   | 'master_maids_export'
@@ -242,15 +244,31 @@ export type PersonaPhase =
   | 'done'
   | 'error';
 
+/** Granular progress detail for the loader UI. */
+export interface PersonaSubProgress {
+  /** What's currently happening, e.g. "Athena scanning data", "Reading CSV chunk 3 of 12". */
+  label: string;
+  /** Optional 0-1 progress within the current phase. */
+  ratio?: number;
+  /** Optional human-readable details — bytes scanned, runtime, rows read, etc. */
+  details?: string;
+  /** Per-source breakdown (megajob id → status string) when relevant. */
+  perSource?: Record<string, string>;
+}
+
 export interface PersonaState {
   phase: PersonaPhase;
   runId: string;
   config: PersonaRunConfig;
-  /** Feature CTAS table per megajob. */
+  /** Feature CTAS table per source. */
   featureCtas?: Record<string, { queryId: string; tableName: string }>;
+  /** SELECT * download queries per source. */
+  downloadQueries?: Record<string, { queryId: string; csvKey: string }>;
   enrichmentCtas?: { queryId: string; tableName: string };
   exportQueryIds?: Record<string, string>; // personaId → queryId
   exportTables?: Record<string, string>; // personaId → athena table name
+  /** Granular progress info surfaced to UI loader. */
+  subProgress?: PersonaSubProgress;
   /** Cached final report (when phase=done). */
   report?: PersonaReport;
   error?: string;
