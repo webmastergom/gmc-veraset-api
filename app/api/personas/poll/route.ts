@@ -171,8 +171,10 @@ async function fireFeatureCtasForSource(args: {
     throw new Error(`No POIs found for source ${source.label}`);
   }
 
-  // Materialize brand mapping as external CSV table.
-  const safeId = source.sourceId.replace(/-/g, '_').slice(0, 30);
+  // Materialize brand mapping as external CSV table. Brand mapping is
+  // deterministic for the source so reusing across runs is fine — we use
+  // CREATE TABLE IF NOT EXISTS so concurrent attempts don't collide.
+  const safeId = source.sourceId.replace(/-/g, '_').slice(0, 24);
   const brandTableBase = `persona_brands_${safeId}_${runId}`;
   const brandTable = brandTableBase.length > 60 ? brandTableBase.slice(0, 60) : brandTableBase;
   const brandS3Key = `athena-temp/${brandTable}/data.csv`;
@@ -187,22 +189,31 @@ async function fireFeatureCtasForSource(args: {
       ContentType: 'text/csv',
     })
   );
-  try { await runQuery(`DROP TABLE IF EXISTS ${brandTable}`); } catch {}
-  await runQuery(`
-    CREATE EXTERNAL TABLE ${brandTable} (
-      poi_id STRING,
-      brand STRING
-    )
-    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-    STORED AS TEXTFILE
-    LOCATION 's3://${BUCKET}/athena-temp/${brandTable}/'
-    TBLPROPERTIES ('skip.header.line.count' = '1')
-  `);
-  console.log(`[PERSONAS ${runId}] Created brand table ${brandTable} (${poiToBrand.length} POIs) for source ${source.label}`);
+  // Idempotent: IF NOT EXISTS so two concurrent phaseStarting calls don't race.
+  try {
+    await runQuery(`
+      CREATE EXTERNAL TABLE IF NOT EXISTS ${brandTable} (
+        poi_id STRING,
+        brand STRING
+      )
+      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+      STORED AS TEXTFILE
+      LOCATION 's3://${BUCKET}/athena-temp/${brandTable}/'
+      TBLPROPERTIES ('skip.header.line.count' = '1')
+    `);
+  } catch (e: any) {
+    if (!/already exist/i.test(e?.message || '')) throw e;
+    console.log(`[PERSONAS ${runId}] Brand table ${brandTable} already exists — reusing`);
+  }
+  console.log(`[PERSONAS ${runId}] Brand table ${brandTable} ready (${poiToBrand.length} POIs) for source ${source.label}`);
 
-  // Build & launch feature CTAS.
-  const featureTableBase = `persona_features_${safeId}_${runId}`;
+  // Feature CTAS uses a per-attempt timestamp suffix so two concurrent
+  // phaseStarting calls (frontend retries during a long Vercel cycle)
+  // don't collide on table creation. The state machine persists the
+  // chosen tableName so downstream phases reuse it.
+  const attemptTs = Math.floor(Date.now() / 1000).toString(36); // ~7 chars
+  const featureTableBase = `persona_features_${safeId}_${runId.slice(0, 8)}_${attemptTs}`;
   const featureTable = featureTableBase.length > 60 ? featureTableBase.slice(0, 60) : featureTableBase;
   try { await runQuery(`DROP TABLE IF EXISTS ${featureTable}`); } catch {}
   const featureS3 = `s3://${BUCKET}/athena-temp/${featureTable}/`;
@@ -425,9 +436,11 @@ async function phaseMasterMaidsExport(
 ): Promise<PersonaState> {
   const { runId } = state;
 
-  // Materialize labels CSV: (ad_id, persona_name)
-  const labelsKey = `athena-temp/persona-labels/${runId}/labels.csv`;
-  const labelsTable = `persona_labels_${runId.replace(/-/g, '_')}`;
+  // Materialize labels CSV: (ad_id, persona_name).
+  // Use timestamp suffix on table name to avoid collisions if exports race.
+  const exportTs = Math.floor(Date.now() / 1000).toString(36);
+  const labelsKey = `athena-temp/persona-labels/${runId}_${exportTs}/labels.csv`;
+  const labelsTable = `persona_labels_${runId.replace(/-/g, '_').slice(0, 16)}_${exportTs}`;
   const lines = ['ad_id,persona_name'];
   for (const [adId, clusterId] of clusterAssignments.entries()) {
     const name = clusterNames[clusterId] || `cluster_${clusterId}`;
@@ -443,26 +456,30 @@ async function phaseMasterMaidsExport(
     })
   );
   try { await runQuery(`DROP TABLE IF EXISTS ${labelsTable}`); } catch {}
-  await runQuery(`
-    CREATE EXTERNAL TABLE ${labelsTable} (
-      ad_id STRING,
-      persona_name STRING
-    )
-    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-    STORED AS TEXTFILE
-    LOCATION 's3://${BUCKET}/athena-temp/persona-labels/${runId}/'
-    TBLPROPERTIES ('skip.header.line.count' = '1')
-  `);
+  try {
+    await runQuery(`
+      CREATE EXTERNAL TABLE IF NOT EXISTS ${labelsTable} (
+        ad_id STRING,
+        persona_name STRING
+      )
+      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+      STORED AS TEXTFILE
+      LOCATION 's3://${BUCKET}/athena-temp/persona-labels/${runId}_${exportTs}/'
+      TBLPROPERTIES ('skip.header.line.count' = '1')
+    `);
+  } catch (e: any) {
+    if (!/already exist/i.test(e?.message || '')) throw e;
+  }
   console.log(`[PERSONAS ${runId}] Labels table ${labelsTable} ready`);
 
-  // Per cluster CTAS in parallel.
+  // Per cluster CTAS in parallel — table names include the same timestamp.
   const exportQueryIds: Record<string, string> = {};
   const exportTables: Record<string, string> = {};
   for (const persona of report.personas) {
     if (persona.deviceCount === 0) continue;
-    const slug = persona.name.replace(/[^a-z0-9]+/gi, '_').toLowerCase().slice(0, 30);
-    const table = `master_persona_${slug}_${runId.slice(0, 8)}`;
+    const slug = persona.name.replace(/[^a-z0-9]+/gi, '_').toLowerCase().slice(0, 24);
+    const table = `master_persona_${slug}_${runId.slice(0, 6)}_${exportTs}`;
     const s3Path = `s3://${BUCKET}/athena-temp/${table}/`;
     try { await runQuery(`DROP TABLE IF EXISTS ${table}`); } catch {}
     const sql = `
