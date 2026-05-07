@@ -298,10 +298,10 @@ async function phaseDownloadQuery(state: PersonaState): Promise<PersonaState> {
   if (!state.featureCtas) throw new Error('No featureCtas in state');
   const downloadQueries: Record<string, { queryId: string; csvKey: string }> = {};
   for (const [src, { tableName }] of Object.entries(state.featureCtas)) {
-    // Project only the columns we need for clustering + aggregation —
-    // omits gps_share / avg_circle_score (already captured in
-    // tier_high_quality), afternoon_share (not used), source_megajob_id
-    // (we already know per source).
+    // Project only the columns we need for clustering + aggregation.
+    // Filter out devices with <2 visits — those are noise (one-off
+    // visitors with unstable features) and they bloat the CSV by 2-5×.
+    // The cluster centroids derive from real repeat visitors anyway.
     const sql = `
       SELECT ad_id, total_visits, total_dwell_min, recency_days, avg_dwell_min,
         morning_share, midday_share, evening_share, night_share, weekend_share,
@@ -309,6 +309,7 @@ async function phaseDownloadQuery(state: PersonaState): Promise<PersonaState> {
         home_zip, home_region,
         brand_visits_json, brand_loyalty_hhi, tier_high_quality
       FROM ${tableName}
+      WHERE total_visits >= 2
     `;
     const queryId = await startQueryAsync(sql);
     downloadQueries[src] = { queryId, csvKey: `athena-results/${queryId}.csv` };
@@ -320,7 +321,7 @@ async function phaseDownloadQuery(state: PersonaState): Promise<PersonaState> {
     downloadQueries,
     subProgress: {
       label: 'Streaming feature vectors',
-      details: `${Object.keys(downloadQueries).length} parallel SELECT queries launched`,
+      details: `${Object.keys(downloadQueries).length} parallel SELECT queries launched (devices with 2+ visits)`,
     },
     updatedAt: new Date().toISOString(),
   };
@@ -375,53 +376,111 @@ function parseBrandJson(s: string | null | undefined): Record<string, number> {
   return {};
 }
 
+/**
+ * Parse a single CSV line respecting double-quote escaping (Athena uses
+ * RFC 4180 style: '"value with, comma"', '""' = literal '"' inside quoted).
+ */
+function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else { inQuote = false; }
+      } else {
+        cur += c;
+      }
+    } else {
+      if (c === ',') { cells.push(cur); cur = ''; }
+      else if (c === '"') { inQuote = true; }
+      else { cur += c; }
+    }
+  }
+  cells.push(cur);
+  return cells;
+}
+
+/**
+ * Stream the Athena result CSV from S3 (athena-results/{queryId}.csv).
+ * Avoids loading the full 200-300 MB string into memory by parsing
+ * line-by-line off the S3 body stream.
+ */
+async function streamAthenaCsv<T>(
+  queryId: string,
+  parseRow: (record: Record<string, string>) => T,
+): Promise<{ rows: T[]; lineCount: number }> {
+  const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+  const obj = await s3Client.send(new GetObjectCommand({
+    Bucket: BUCKET,
+    Key: `athena-results/${queryId}.csv`,
+  }));
+  if (!obj.Body) throw new Error(`Empty body for athena-results/${queryId}.csv`);
+  const body = obj.Body as any; // Node.js Readable stream
+  let buffer = '';
+  let header: string[] | null = null;
+  const out: T[] = [];
+  let lineCount = 0;
+
+  const handleLine = (line: string) => {
+    if (!line) return;
+    if (!header) {
+      header = parseCsvLine(line);
+      return;
+    }
+    const cells = parseCsvLine(line);
+    const rec: Record<string, string> = {};
+    for (let i = 0; i < header.length; i++) rec[header[i]] = cells[i] ?? '';
+    out.push(parseRow(rec));
+    lineCount++;
+  };
+
+  for await (const chunk of body) {
+    buffer += chunk.toString('utf-8');
+    let nl = buffer.indexOf('\n');
+    while (nl >= 0) {
+      handleLine(buffer.slice(0, nl).replace(/\r$/, ''));
+      buffer = buffer.slice(nl + 1);
+      nl = buffer.indexOf('\n');
+    }
+  }
+  if (buffer.trim()) handleLine(buffer.trim());
+  return { rows: out, lineCount };
+}
+
 async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaState; features: DeviceFeatures[] }> {
   if (!state.downloadQueries) throw new Error('No downloadQueries');
-  const { fetchQueryResults } = await import('@/lib/athena');
   const all: DeviceFeatures[] = [];
   for (const [src, { queryId }] of Object.entries(state.downloadQueries)) {
-    // Use S3-staged read for large result sets.
-    const { runQueryViaS3 } = await import('@/lib/athena');
-    // Re-issuing SELECT against the table is wasteful. Instead, pull the
-    // existing CSV directly from athena-results/ via fetchQueryResults
-    // (which uses Athena pagination) when small, or runQueryViaS3 for
-    // large CSVs (paginated S3 GET).
-    let result;
-    try {
-      result = await runQueryViaS3(`SELECT * FROM ${state.featureCtas![src].tableName}`);
-    } catch (e: any) {
-      console.error(`[PERSONAS ${state.runId}] runQueryViaS3 failed for ${src}, fallback to fetchQueryResults: ${e.message}`);
-      result = await fetchQueryResults(queryId);
-    }
-    for (const r of result.rows as any[]) {
-      const brandVisits = parseBrandJson(r.brand_visits_json);
-      all.push({
-        ad_id: String(r.ad_id || ''),
-        total_visits: parseInt(r.total_visits, 10) || 0,
-        total_dwell_min: parseFloat(r.total_dwell_min) || 0,
-        recency_days: parseInt(r.recency_days, 10) || 0,
-        avg_dwell_min: parseFloat(r.avg_dwell_min) || 0,
-        morning_share: parseFloat(r.morning_share) || 0,
-        midday_share: parseFloat(r.midday_share) || 0,
-        afternoon_share: parseFloat(r.afternoon_share) || 0,
-        evening_share: parseFloat(r.evening_share) || 0,
-        night_share: parseFloat(r.night_share) || 0,
-        weekend_share: parseFloat(r.weekend_share) || 0,
-        friday_evening_share: parseFloat(r.friday_evening_share) || 0,
-        gyration_km: parseFloat(r.gyration_km) || 0,
-        unique_h3_cells: parseInt(r.unique_h3_cells, 10) || 0,
-        home_zip: String(r.home_zip || '').trim(),
-        home_region: String(r.home_region || '').trim(),
-        gps_share: 0,
-        avg_circle_score: 0,
-        brand_visits: brandVisits,
-        brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
-        nearby_categories_top5: [],
-        tier_high_quality: r.tier_high_quality === true || r.tier_high_quality === 'true',
-        source_megajob_id: src,
-      });
-    }
-    console.log(`[PERSONAS ${state.runId}] Read ${result.rows.length} rows for ${src}`);
+    const { rows } = await streamAthenaCsv(queryId, (r): DeviceFeatures => ({
+      ad_id: String(r.ad_id || ''),
+      total_visits: parseInt(r.total_visits, 10) || 0,
+      total_dwell_min: parseFloat(r.total_dwell_min) || 0,
+      recency_days: parseInt(r.recency_days, 10) || 0,
+      avg_dwell_min: parseFloat(r.avg_dwell_min) || 0,
+      morning_share: parseFloat(r.morning_share) || 0,
+      midday_share: parseFloat(r.midday_share) || 0,
+      afternoon_share: parseFloat(r.afternoon_share) || 0,
+      evening_share: parseFloat(r.evening_share) || 0,
+      night_share: parseFloat(r.night_share) || 0,
+      weekend_share: parseFloat(r.weekend_share) || 0,
+      friday_evening_share: parseFloat(r.friday_evening_share) || 0,
+      gyration_km: parseFloat(r.gyration_km) || 0,
+      unique_h3_cells: parseInt(r.unique_h3_cells, 10) || 0,
+      home_zip: String(r.home_zip || '').trim(),
+      home_region: String(r.home_region || '').trim(),
+      gps_share: 0,
+      avg_circle_score: 0,
+      brand_visits: parseBrandJson(r.brand_visits_json),
+      brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
+      nearby_categories_top5: [],
+      tier_high_quality: r.tier_high_quality === 'true',
+      source_megajob_id: src,
+    }));
+    for (const f of rows) all.push(f);
+    console.log(`[PERSONAS ${state.runId}] Streamed ${rows.length} rows for ${src} (queryId=${queryId})`);
   }
   const subProgress = {
     label: `Loaded ${all.length.toLocaleString()} feature rows`,
