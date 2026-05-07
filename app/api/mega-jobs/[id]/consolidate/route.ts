@@ -96,6 +96,8 @@ interface ConsolidationState {
   gpsOnly?: boolean;
   /** FULL-schema only: drop pings whose ping_circle_score exceeds this. 0 = off. */
   maxCircleScore?: number;
+  /** Days of week to keep (ISO 8601: 1=Mon..7=Sun). Empty/all-7 = no filter. */
+  daysOfWeek?: number[];
   /** Materialized MAIDs CSV key (set during parsing_od) — used as the export download URL. */
   maidsCsvKey?: string;
   error?: string;
@@ -134,6 +136,7 @@ export async function POST(
     let minVisits: number | undefined;
     let gpsOnly: boolean | undefined;
     let maxCircleScore: number | undefined;
+    let daysOfWeek: number[] | undefined;
     try {
       const body = await _request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
@@ -143,6 +146,12 @@ export async function POST(
       if (typeof body?.minVisits === 'number' && body.minVisits > 1) minVisits = body.minVisits;
       if (body?.gpsOnly === true) gpsOnly = true;
       if (typeof body?.maxCircleScore === 'number' && body.maxCircleScore > 0) maxCircleScore = body.maxCircleScore;
+      if (Array.isArray(body?.daysOfWeek)) {
+        const valid = body.daysOfWeek
+          .map((d: any) => parseInt(d, 10))
+          .filter((d: number) => Number.isInteger(d) && d >= 1 && d <= 7);
+        if (valid.length > 0 && valid.length < 7) daysOfWeek = valid;
+      }
     } catch { }
 
     // Load sub-jobs
@@ -186,7 +195,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore };
+      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek };
     }
 
     // Update mega-job status — only set to consolidating when starting fresh work.
@@ -262,10 +271,12 @@ export async function POST(
         const mVisits = state.minVisits ?? minVisits;
         const gOnly = state.gpsOnly ?? gpsOnly;
         const cScore = state.maxCircleScore ?? maxCircleScore;
-        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0))
-          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore }
+        const dow = state.daysOfWeek ?? daysOfWeek;
+        const dowActive = !!(dow && dow.length > 0 && dow.length < 7);
+        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0) || dowActive)
+          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore, daysOfWeek: dow }
           : undefined;
-        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}`);
+        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}, daysOfWeek=${dow?.join(',') || 'all'}`);
 
         // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
         const runId = (state as any).runId || Date.now().toString(36);

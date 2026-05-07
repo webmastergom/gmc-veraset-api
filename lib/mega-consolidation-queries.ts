@@ -209,6 +209,12 @@ export interface VisitorFilter {
    * 0 disables the filter.
    */
   maxCircleScore?: number;
+  /**
+   * Days of the week to keep. Values are ISO 8601 day numbers
+   * (1 = Monday, 2 = Tuesday, ..., 7 = Sunday) that match Athena's
+   * DAY_OF_WEEK(utc_timestamp). Empty/undefined or all 7 days = no filter.
+   */
+  daysOfWeek?: number[];
 }
 
 /**
@@ -235,6 +241,23 @@ export function buildHourFilterClause(filter?: VisitorFilter, tsCol: string = 'u
 export function buildGpsOnlyClause(filter?: VisitorFilter): string {
   if (!filter?.gpsOnly) return '';
   return `AND (TRY(quality_fields['ping_origin_type']) IS NULL OR TRY(quality_fields['ping_origin_type']) = 'gps')`;
+}
+
+/**
+ * Build SQL fragment for day-of-week filter. Athena's DAY_OF_WEEK returns
+ * 1..7 (Mon..Sun, ISO 8601). Empty array, undefined, or all 7 days = no
+ * filter (returns ''). Otherwise emits `AND DAY_OF_WEEK(<ts>) IN (...)`.
+ *
+ * @param tsCol Column expression to apply DAY_OF_WEEK to (default utc_timestamp).
+ */
+export function buildDayOfWeekClause(filter?: VisitorFilter, tsCol: string = 'utc_timestamp'): string {
+  const days = filter?.daysOfWeek;
+  if (!days || days.length === 0 || days.length === 7) return '';
+  // Sanitize: keep 1..7, dedupe, sort.
+  const valid = Array.from(new Set(days.filter((d) => Number.isInteger(d) && d >= 1 && d <= 7)));
+  if (valid.length === 0 || valid.length === 7) return '';
+  valid.sort((a, b) => a - b);
+  return `AND DAY_OF_WEEK(${tsCol}) IN (${valid.join(',')})`;
 }
 
 /**
@@ -333,10 +356,11 @@ function buildUnionAll(
   const hourClause = buildHourFilterClause(visitorFilter);
   const gpsClause = buildGpsOnlyClause(visitorFilter);
   const scoreClause = buildCircleScoreClause(visitorFilter);
+  const dowClause = buildDayOfWeekClause(visitorFilter);
   return syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause}`;
+      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause} ${dowClause}`;
     })
     .join('\n    UNION ALL\n    ');
 }

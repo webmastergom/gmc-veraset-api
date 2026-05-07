@@ -153,6 +153,8 @@ export default function DatasetAnalysisPage() {
   const [minVisits, setMinVisits] = useState<number>(1);
   const [gpsOnly, setGpsOnly] = useState<boolean>(false);
   const [maxCircleScore, setMaxCircleScore] = useState<number>(0);
+  // Day-of-week filter (ISO 8601: 1=Mon..7=Sun). Empty = all days.
+  const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [dayhourReport, setDayhourReport] = useState<any>(null);
@@ -187,7 +189,7 @@ export default function DatasetAnalysisPage() {
   }, [datasetName]);
 
   // Load reports for specific dwell interval + hour range
-  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly, cScore = maxCircleScore) => {
+  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly, cScore = maxCircleScore, dow = daysOfWeek) => {
     const types = ['od', 'hourly', 'dayhour', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -203,8 +205,9 @@ export default function DatasetAnalysisPage() {
     const visitParams = mVisits > 1 ? `&minVisits=${mVisits}` : '';
     const gpsParams = gOnly ? `&gpsOnly=true` : '';
     const scoreParams = cScore > 0 ? `&maxCircleScore=${cScore}` : '';
+    const dowParams = (dow.length > 0 && dow.length < 7) ? `&daysOfWeek=${[...dow].sort((a, b) => a - b).join(',')}` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}${scoreParams}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}${scoreParams}${dowParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -288,6 +291,7 @@ export default function DatasetAnalysisPage() {
               ...(minVisits > 1 ? { minVisits } : {}),
               ...(gpsOnly ? { gpsOnly: true } : {}),
               ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
+              ...(daysOfWeek.length > 0 && daysOfWeek.length < 7 ? { daysOfWeek } : {}),
             }),
           });
           consecutiveErrors = 0;
@@ -623,7 +627,7 @@ export default function DatasetAnalysisPage() {
               checked={gpsOnly}
               onChange={(e) => {
                 setGpsOnly(e.target.checked);
-                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, e.target.checked, maxCircleScore);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, e.target.checked, maxCircleScore, daysOfWeek);
               }}
               className="h-3.5 w-3.5"
             />
@@ -636,7 +640,7 @@ export default function DatasetAnalysisPage() {
               onChange={(e) => {
                 const v = parseFloat(e.target.value);
                 setMaxCircleScore(v);
-                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, v);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, v, daysOfWeek);
               }}
               className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
             >
@@ -644,6 +648,91 @@ export default function DatasetAnalysisPage() {
                 <option key={v} value={v}>{v === 0 ? 'off' : v}</option>
               ))}
             </select>
+          </div>
+          <div
+            className="flex items-center gap-1 mr-2"
+            title="Restrict the analysis to specific days of the week. All selected = no filter. Click a day to toggle; use the All / Mon-Fri / Weekend shortcuts."
+          >
+            <label className="text-xs text-muted-foreground whitespace-nowrap">Days:</label>
+            <div className="flex gap-0.5">
+              {[
+                { d: 1, label: 'M' },
+                { d: 2, label: 'T' },
+                { d: 3, label: 'W' },
+                { d: 4, label: 'T' },
+                { d: 5, label: 'F' },
+                { d: 6, label: 'S' },
+                { d: 7, label: 'S' },
+              ].map(({ d, label }) => {
+                const active = daysOfWeek.length === 0 || daysOfWeek.includes(d);
+                return (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() => {
+                      // Toggle. If currently "all" (empty), clicking de-selects this day → keep the other 6.
+                      let next: number[];
+                      if (daysOfWeek.length === 0) {
+                        next = [1, 2, 3, 4, 5, 6, 7].filter((x) => x !== d);
+                      } else if (daysOfWeek.includes(d)) {
+                        next = daysOfWeek.filter((x) => x !== d);
+                      } else {
+                        next = [...daysOfWeek, d];
+                      }
+                      // If user toggled back to all 7, normalize to "all".
+                      if (next.length === 7) next = [];
+                      setDaysOfWeek(next);
+                      loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, next);
+                    }}
+                    className={`h-8 w-7 rounded text-xs font-medium transition-colors ${
+                      active
+                        ? 'bg-primary/15 text-foreground border border-primary/40'
+                        : 'bg-muted/30 text-muted-foreground border border-border'
+                    }`}
+                    title={['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][d - 1]}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex gap-1 ml-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setDaysOfWeek([]);
+                  loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, []);
+                }}
+                className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                title="Reset to all days"
+              >
+                All
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = [1, 2, 3, 4, 5];
+                  setDaysOfWeek(next);
+                  loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, next);
+                }}
+                className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                title="Weekdays only"
+              >
+                M-F
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = [6, 7];
+                  setDaysOfWeek(next);
+                  loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, next);
+                }}
+                className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                title="Weekend only"
+              >
+                S-S
+              </button>
+            </div>
           </div>
           <Button onClick={runFullAnalysis} disabled={loading || generatingReports}>
             {loading || generatingReports ? (

@@ -97,6 +97,8 @@ export default function MegaJobDetailPage() {
   const [gpsOnly, setGpsOnly] = useState<boolean>(false)
   // FULL-schema ping_circle_score threshold (0 = off; lower = tighter)
   const [maxCircleScore, setMaxCircleScore] = useState<number>(0)
+  // Day-of-week filter (1=Mon..7=Sun ISO 8601). Empty = all days.
+  const [daysOfWeek, setDaysOfWeek] = useState<number[]>([])
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
@@ -224,6 +226,7 @@ export default function MegaJobDetailPage() {
             ...(minVisits > 1 ? { minVisits } : {}),
             ...(gpsOnly ? { gpsOnly: true } : {}),
             ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
+            ...(daysOfWeek.length > 0 && daysOfWeek.length < 7 ? { daysOfWeek } : {}),
           }),
         })
         if (!res.ok) {
@@ -403,6 +406,77 @@ export default function MegaJobDetailPage() {
                     <option key={v} value={v}>{v === 0 ? 'off' : v}</option>
                   ))}
                 </select>
+              </div>
+              <div
+                className="flex items-center gap-1"
+                title="Restrict the analysis to specific days of the week. All selected = no filter."
+              >
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Days:</label>
+                <div className="flex gap-0.5">
+                  {[
+                    { d: 1, label: 'M' },
+                    { d: 2, label: 'T' },
+                    { d: 3, label: 'W' },
+                    { d: 4, label: 'T' },
+                    { d: 5, label: 'F' },
+                    { d: 6, label: 'S' },
+                    { d: 7, label: 'S' },
+                  ].map(({ d, label }) => {
+                    const active = daysOfWeek.length === 0 || daysOfWeek.includes(d)
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => {
+                          let next: number[]
+                          if (daysOfWeek.length === 0) {
+                            next = [1, 2, 3, 4, 5, 6, 7].filter((x) => x !== d)
+                          } else if (daysOfWeek.includes(d)) {
+                            next = daysOfWeek.filter((x) => x !== d)
+                          } else {
+                            next = [...daysOfWeek, d]
+                          }
+                          if (next.length === 7) next = []
+                          setDaysOfWeek(next)
+                        }}
+                        className={`h-8 w-7 rounded text-xs font-medium transition-colors ${
+                          active
+                            ? 'bg-primary/15 text-foreground border border-primary/40'
+                            : 'bg-muted/30 text-muted-foreground border border-border'
+                        }`}
+                        title={['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][d - 1]}
+                      >
+                        {label}
+                      </button>
+                    )
+                  })}
+                </div>
+                <div className="flex gap-1 ml-1">
+                  <button
+                    type="button"
+                    onClick={() => setDaysOfWeek([])}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Reset to all days"
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDaysOfWeek([1, 2, 3, 4, 5])}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Weekdays only"
+                  >
+                    M-F
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDaysOfWeek([6, 7])}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Weekend only"
+                  >
+                    S-S
+                  </button>
+                </div>
               </div>
               <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
                 {consolidating ? (
