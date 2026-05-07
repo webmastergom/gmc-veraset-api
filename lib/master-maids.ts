@@ -25,7 +25,7 @@ function normalizeCC(cc: string): string {
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment';
+export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment' | 'persona';
 
 /**
  * Each contribution is an Athena table backed by Parquet.
@@ -34,6 +34,7 @@ export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment';
  *   category:  (ad_id STRING, category STRING, dwell_minutes DOUBLE)
  *   nse:       (ad_id STRING, nse_bracket STRING, postal_code STRING)
  *   catchment: (ad_id STRING, origin_lat DOUBLE, origin_lng DOUBLE)
+ *   persona:   (ad_id STRING)  — attributeValue stores the persona name
  */
 export interface Contribution {
   id: string;
@@ -336,6 +337,13 @@ export function buildConsolidationFromTables(
         case 'catchment':
           selects.push(`
             SELECT ad_id, 'catchment' as attr_type, '' as attr_value,
+                   CAST(NULL AS DOUBLE) as dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+        case 'persona':
+          selects.push(`
+            SELECT ad_id, 'persona' as attr_type, '${c.attributeValue.replace(/'/g, "''")}' as attr_value,
                    CAST(NULL AS DOUBLE) as dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
             FROM ${c.athenaTable}
           `);
