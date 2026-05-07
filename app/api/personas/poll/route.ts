@@ -247,7 +247,10 @@ async function fireFeatureCtasForSource(args: {
   // deterministic for the source so reusing across runs is fine — we use
   // CREATE TABLE IF NOT EXISTS so concurrent attempts don't collide.
   const safeId = source.sourceId.replace(/-/g, '_').slice(0, 24);
-  const brandTableBase = `persona_brands_${safeId}_${runId}`;
+  // runId may include a `-` (re-run salt: `<hash>-<stamp>`). Athena identifiers
+  // don't accept `-`, so sanitize before building any table name.
+  const safeRunId = runId.replace(/-/g, '_');
+  const brandTableBase = `persona_brands_${safeId}_${safeRunId}`;
   const brandTable = brandTableBase.length > 60 ? brandTableBase.slice(0, 60) : brandTableBase;
   const brandS3Key = `athena-temp/${brandTable}/data.csv`;
   const csvBody = ['poi_id,brand']
