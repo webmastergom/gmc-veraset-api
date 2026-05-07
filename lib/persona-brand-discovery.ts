@@ -18,7 +18,10 @@
  *
  * Properly tuned, this produces clean results for typical 200-2000-POI
  * studies. For specialty cases the user can still override per-POI by
- * setting `properties.brand` (or `chain`) in the GeoJSON.
+ * setting any of these GeoJSON properties (case-insensitive):
+ *   `brand`, `chain`, `cadena`, `marca`, `franquicia`,
+ *   `concesionaria`, `concesionario`, `operador`, `operator`, `enseigne`.
+ * The first non-empty match is used as the brand override.
  */
 
 // ── Stopwords ────────────────────────────────────────────────────────

@@ -147,11 +147,34 @@ async function fireFeatureCtasForSource(args: {
   }
 
   // Resolve brand for each POI using a 3-layer strategy:
-  //   1. GeoJSON properties.brand / .chain — explicit user override.
+  //   1. GeoJSON properties (brand / chain / cadena / marca / concesionaria / …)
+  //      — explicit user override. Match is case-insensitive.
   //   2. Auto-discovery from POI name frequency (handles arbitrary
   //      datasets like Auto Dealerships, retail competitors, …).
   //   3. BRAND_RULES hardcoded fast-food / common chains — final fallback
   //      for POIs the discovery missed.
+  // Common GeoJSON property names that carry a brand/chain. Case-insensitive
+  // match — typed by analysts in EN/ES so "Cadena", "MARCA", "Brand" all work.
+  const BRAND_PROP_KEYS = [
+    'brand', 'chain',
+    'cadena', 'marca', 'franquicia',
+    'concesionaria', 'concesionario',
+    'operador', 'operator',
+    'enseigne', // FR — used in some Carrefour / fashion catalogues
+  ];
+  const pickBrandProp = (props: Record<string, any> | undefined): string => {
+    if (!props) return '';
+    // Build a case-insensitive lookup once per feature.
+    const lower: Record<string, string> = {};
+    for (const k of Object.keys(props)) {
+      const v = props[k];
+      if (typeof v === 'string' && v.trim()) lower[k.toLowerCase()] = v.trim();
+    }
+    for (const key of BRAND_PROP_KEYS) {
+      if (lower[key]) return lower[key];
+    }
+    return '';
+  };
   const poiInputs: PoiNameLookup[] = [];
   for (const colId of source.collectionIds) {
     const geo = await getPOICollection(colId);
@@ -159,7 +182,7 @@ async function fireFeatureCtasForSource(args: {
     for (const f of geo.features as any[]) {
       const id = f.properties?.id || f.id;
       const name = f.properties?.name || f.properties?.label || '';
-      const override = f.properties?.brand || f.properties?.chain || '';
+      const override = pickBrandProp(f.properties);
       if (!id) continue;
       poiInputs.push({ poiId: String(id), name, brandOverride: override || undefined });
     }
