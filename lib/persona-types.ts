@@ -30,6 +30,8 @@ export interface PersonaRunConfig {
     maxCircleScore?: number;
     /** Days of week 1..7 (Mon..Sun, ISO 8601). Empty/all-7 = no filter. */
     daysOfWeek?: number[];
+    /** Drop devices that look like employees (heavy recurrent dwell, work-hour heavy, no overnight). */
+    discardEmployees?: boolean;
   };
 }
 

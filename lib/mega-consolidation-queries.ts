@@ -215,7 +215,20 @@ export interface VisitorFilter {
    * DAY_OF_WEEK(utc_timestamp). Empty/undefined or all 7 days = no filter.
    */
   daysOfWeek?: number[];
+  /**
+   * When true, exclude probable staff/employees from the analysis. A device
+   * is flagged as employee if, within the dataset/sub-job table, it has
+   * (a) ≥ 15 distinct visit-days at the POI set AND
+   * (b) avg per-day dwell ≥ 240 min (4 h).
+   * The check is per source table — for a multi-month megajob, an employee
+   * shows up in EACH monthly sub-job, so they're filtered consistently.
+   */
+  discardEmployees?: boolean;
 }
+
+/** Default thresholds for employee detection. Conservative — favours keeping real visitors. */
+export const EMPLOYEE_MIN_VISIT_DAYS = 15;
+export const EMPLOYEE_MIN_AVG_DWELL_MIN = 240;
 
 /**
  * Build SQL fragment for hour-of-day filter on `utc_timestamp`. Returns
@@ -241,6 +254,47 @@ export function buildHourFilterClause(filter?: VisitorFilter, tsCol: string = 'u
 export function buildGpsOnlyClause(filter?: VisitorFilter): string {
   if (!filter?.gpsOnly) return '';
   return `AND (TRY(quality_fields['ping_origin_type']) IS NULL OR TRY(quality_fields['ping_origin_type']) = 'gps')`;
+}
+
+/**
+ * Build a SQL fragment that excludes probable employees from a per-table
+ * SELECT — without catching nearby RESIDENTS.
+ *
+ * Naive heuristic (only dwell + day-count) would also exclude people who
+ * live inside the POI's radius — they too show large dwell and recurring
+ * days. We add two distinguishers based on intra-day timing:
+ *   - work_share: fraction of pings that fell in working hours (8h-20h).
+ *     Employees concentrate here; residents pings are spread 24/7.
+ *   - has_overnight: did the device ping during 2h-5h? Residents do this
+ *     daily; employees don't (unless they also live nearby — but then it
+ *     IS a resident, by definition).
+ *
+ * Final employee criteria (all must hold):
+ *   COUNT(distinct days) ≥ 15
+ *   AVG(per-day dwell minutes) ≥ 240
+ *   AVG(work_share) ≥ 0.6   — mostly inside work hours
+ *   AVG(has_overnight) ≤ 0.3 — rarely there overnight
+ */
+export function buildEmployeeExclusionClause(filter: VisitorFilter | undefined, tableName: string): string {
+  if (!filter?.discardEmployees) return '';
+  return `AND ad_id NOT IN (
+        SELECT ad_id FROM (
+          SELECT ad_id, date,
+            DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as _emp_dwell_min,
+            AVG(IF(HOUR(utc_timestamp) >= 8 AND HOUR(utc_timestamp) < 20, 1.0, 0.0)) as _emp_work_share,
+            MAX(IF(HOUR(utc_timestamp) >= 2 AND HOUR(utc_timestamp) < 5, 1, 0)) as _emp_has_overnight
+          FROM ${tableName}
+          CROSS JOIN UNNEST(poi_ids) AS _emp_t(_emp_pid)
+          WHERE _emp_pid IS NOT NULL AND _emp_pid != ''
+            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          GROUP BY ad_id, date
+        ) _per_day
+        GROUP BY ad_id
+        HAVING COUNT(*) >= ${EMPLOYEE_MIN_VISIT_DAYS}
+          AND AVG(_emp_dwell_min) >= ${EMPLOYEE_MIN_AVG_DWELL_MIN}
+          AND AVG(_emp_work_share) >= 0.6
+          AND AVG(_emp_has_overnight) <= 0.3
+      )`;
 }
 
 /**
@@ -360,7 +414,8 @@ function buildUnionAll(
   return syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause} ${dowClause}`;
+      const empClause = buildEmployeeExclusionClause(visitorFilter, table);
+      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause} ${dowClause} ${empClause}`;
     })
     .join('\n    UNION ALL\n    ');
 }

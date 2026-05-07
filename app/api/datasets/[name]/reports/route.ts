@@ -4,7 +4,7 @@ import { getConfig } from '@/lib/s3-config';
 
 export const dynamic = 'force-dynamic';
 
-function REPORT_KEY_FULL(ds: string, type: string, dwellMin: number, dwellMax: number, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = []): string {
+function REPORT_KEY_FULL(ds: string, type: string, dwellMin: number, dwellMax: number, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
   let key = `dataset-reports/${ds}/${type}`;
   if (dwellMin > 0 || dwellMax > 0) key += `-dwell-${dwellMin}-${dwellMax}`;
   if (hourFrom > 0 || hourTo < 23) key += `-h${hourFrom}-${hourTo}`;
@@ -15,6 +15,7 @@ function REPORT_KEY_FULL(ds: string, type: string, dwellMin: number, dwellMax: n
     const sorted = [...daysOfWeek].sort((a, b) => a - b);
     key += `-d${sorted.join('')}`;
   }
+  if (discardEmployees) key += `-noemp`;
   return key;
 }
 const REPORT_KEY_LEGACY = (ds: string, type: string) =>
@@ -53,6 +54,7 @@ export async function GET(
   const daysOfWeek: number[] = daysOfWeekParam
     ? daysOfWeekParam.split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isInteger(n) && n >= 1 && n <= 7)
     : [];
+  const discardEmployees = request.nextUrl.searchParams.get('discardEmployees') === 'true';
 
   if (!VALID_TYPES.includes(reportType)) {
     return NextResponse.json(
@@ -63,7 +65,7 @@ export async function GET(
 
   try {
     // Try full-keyed report first (dwell interval + hour + minVisits + gpsOnly + circle_score + daysOfWeek)
-    let report = await getConfig<any>(REPORT_KEY_FULL(datasetName, reportType, effectiveDwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek));
+    let report = await getConfig<any>(REPORT_KEY_FULL(datasetName, reportType, effectiveDwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees));
 
     // Fallback: old single-bucket key format (dwell-{N} without max)
     if (!report && effectiveDwellMin > 0 && dwellMax === 0) {

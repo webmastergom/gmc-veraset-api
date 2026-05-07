@@ -66,6 +66,8 @@ export default function PersonasIndexPage() {
   const [progressMsg, setProgressMsg] = useState('');
   /** Day-of-week filter (1=Mon..7=Sun). Empty = all days. */
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
+  /** Drop devices that look like employees of the POIs (heavy recurrent dwell, work-hour heavy, no overnight). */
+  const [discardEmployees, setDiscardEmployees] = useState<boolean>(false);
   const router = useRouter();
   const { toast } = useToast();
 
@@ -152,6 +154,7 @@ export default function PersonasIndexPage() {
       const jobIds = selected.filter((s) => s.startsWith('job:')).map((s) => s.slice(4));
       const filters: Record<string, any> = {};
       if (daysOfWeek.length > 0 && daysOfWeek.length < 7) filters.daysOfWeek = daysOfWeek;
+      if (discardEmployees) filters.discardEmployees = true;
       // Send the user to the runId page as soon as we have one — that page
       // owns the resilient polling + rich loader. We just need the first
       // response to extract runId.
@@ -326,6 +329,19 @@ export default function PersonasIndexPage() {
                   </span>
                 )}
               </div>
+
+              <label
+                className="flex items-center gap-2 text-xs text-muted-foreground select-none cursor-pointer"
+                title="Drop devices that look like employees of the POIs: 15+ visit-days, ≥4h average dwell, ≥60% pings within 8h-20h, ≤30% pings between 2h-5h. Residents who simply live nearby are kept (their pings spread across 24h, including the 2-5am overnight window)."
+              >
+                <input
+                  type="checkbox"
+                  checked={discardEmployees}
+                  onChange={(e) => setDiscardEmployees(e.target.checked)}
+                  className="h-3.5 w-3.5"
+                />
+                <span>Discard employees (heavy recurrent + work-hours + no overnight)</span>
+              </label>
 
               <Button onClick={handleRun} disabled={running || selected.length === 0} className="w-full">
                 {running ? (

@@ -99,6 +99,8 @@ export default function MegaJobDetailPage() {
   const [maxCircleScore, setMaxCircleScore] = useState<number>(0)
   // Day-of-week filter (1=Mon..7=Sun ISO 8601). Empty = all days.
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([])
+  // Discard employees (15+ days, ≥4h avg dwell, ≥0.6 work-hour share, ≤0.3 overnight share)
+  const [discardEmployees, setDiscardEmployees] = useState<boolean>(false)
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
@@ -227,6 +229,7 @@ export default function MegaJobDetailPage() {
             ...(gpsOnly ? { gpsOnly: true } : {}),
             ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
             ...(daysOfWeek.length > 0 && daysOfWeek.length < 7 ? { daysOfWeek } : {}),
+            ...(discardEmployees ? { discardEmployees: true } : {}),
           }),
         })
         if (!res.ok) {
@@ -478,6 +481,15 @@ export default function MegaJobDetailPage() {
                   </button>
                 </div>
               </div>
+              <label className="flex items-center gap-1 text-xs text-muted-foreground select-none cursor-pointer" title="Drop devices that look like employees: 15+ visit-days, 4+ hours avg dwell, mostly 8h-20h, no overnight presence. Residents are kept (they distribute pings across 24h, including 2-5am).">
+                <input
+                  type="checkbox"
+                  checked={discardEmployees}
+                  onChange={(e) => setDiscardEmployees(e.target.checked)}
+                  className="h-3.5 w-3.5"
+                />
+                No employees
+              </label>
               <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
                 {consolidating ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />

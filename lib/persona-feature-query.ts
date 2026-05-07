@@ -31,6 +31,7 @@ import {
   buildGpsOnlyClause,
   buildCircleScoreClause,
   buildDayOfWeekClause,
+  buildEmployeeExclusionClause,
   type PoiCoord,
   type VisitorFilter,
   type DwellFilter,
@@ -90,6 +91,7 @@ export function buildFeatureCTAS(args: {
   const allPingsUnion = syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+      const empClause = buildEmployeeExclusionClause(filters, table);
       return `
         SELECT
           ad_id, date, utc_timestamp,
@@ -111,6 +113,7 @@ export function buildFeatureCTAS(args: {
           ${gpsClause}
           ${scoreClause}
           ${dowClause}
+          ${empClause}
       `;
     })
     .join('\n      UNION ALL\n      ');
