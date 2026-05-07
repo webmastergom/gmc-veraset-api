@@ -224,11 +224,24 @@ export interface VisitorFilter {
    * shows up in EACH monthly sub-job, so they're filtered consistently.
    */
   discardEmployees?: boolean;
+  /**
+   * When true, exclude probable RESIDENTS from the analysis. A device is
+   * flagged as resident if it has (a) ≥ 15 distinct visit-days at the POI
+   * set, (b) avg per-day dwell ≥ 240 min, AND (c) ≥ 50% of days include an
+   * overnight ping (2h-5h). The overnight signal is what separates a true
+   * resident (who sleeps inside the POI radius) from heavy daytime visitors.
+   */
+  discardResidents?: boolean;
 }
 
 /** Default thresholds for employee detection. Conservative — favours keeping real visitors. */
 export const EMPLOYEE_MIN_VISIT_DAYS = 15;
 export const EMPLOYEE_MIN_AVG_DWELL_MIN = 240;
+
+/** Default thresholds for resident detection. Same scale as employees so toggles compose. */
+export const RESIDENT_MIN_VISIT_DAYS = 15;
+export const RESIDENT_MIN_AVG_DWELL_MIN = 240;
+export const RESIDENT_MIN_OVERNIGHT_SHARE = 0.5;
 
 /**
  * Build SQL fragment for hour-of-day filter on `utc_timestamp`. Returns
@@ -294,6 +307,38 @@ export function buildEmployeeExclusionClause(filter: VisitorFilter | undefined, 
           AND AVG(_emp_dwell_min) >= ${EMPLOYEE_MIN_AVG_DWELL_MIN}
           AND AVG(_emp_work_share) >= 0.6
           AND AVG(_emp_has_overnight) <= 0.3
+      )`;
+}
+
+/**
+ * Build a SQL fragment that excludes probable RESIDENTS from a per-table
+ * SELECT — the inverse signal of the employee filter.
+ *
+ * A resident lives inside the POI's radius. Their fingerprint:
+ *   - high dwell + many days (same as employees), but
+ *   - ≥50% of days include an overnight ping (they SLEEP there).
+ *
+ * Toggles compose: turning on both employee + resident excludes both
+ * groups. A device that satisfies BOTH signatures (e.g. a shopkeeper who
+ * also lives above the shop) gets caught by either filter.
+ */
+export function buildResidentExclusionClause(filter: VisitorFilter | undefined, tableName: string): string {
+  if (!filter?.discardResidents) return '';
+  return `AND ad_id NOT IN (
+        SELECT ad_id FROM (
+          SELECT ad_id, date,
+            DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as _res_dwell_min,
+            MAX(IF(HOUR(utc_timestamp) >= 2 AND HOUR(utc_timestamp) < 5, 1, 0)) as _res_has_overnight
+          FROM ${tableName}
+          CROSS JOIN UNNEST(poi_ids) AS _res_t(_res_pid)
+          WHERE _res_pid IS NOT NULL AND _res_pid != ''
+            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          GROUP BY ad_id, date
+        ) _per_day
+        GROUP BY ad_id
+        HAVING COUNT(*) >= ${RESIDENT_MIN_VISIT_DAYS}
+          AND AVG(_res_dwell_min) >= ${RESIDENT_MIN_AVG_DWELL_MIN}
+          AND AVG(_res_has_overnight) >= ${RESIDENT_MIN_OVERNIGHT_SHARE}
       )`;
 }
 
@@ -415,7 +460,8 @@ function buildUnionAll(
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
       const empClause = buildEmployeeExclusionClause(visitorFilter, table);
-      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause} ${dowClause} ${empClause}`;
+      const resClause = buildResidentExclusionClause(visitorFilter, table);
+      return `SELECT ${columns} FROM ${table} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != '' ${whereExtra} ${hourClause} ${gpsClause} ${scoreClause} ${dowClause} ${empClause} ${resClause}`;
     })
     .join('\n    UNION ALL\n    ');
 }

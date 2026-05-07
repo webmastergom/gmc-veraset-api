@@ -100,6 +100,8 @@ interface ConsolidationState {
   daysOfWeek?: number[];
   /** Drop devices that look like employees of the POIs (long recurrent dwell, work-hour heavy, no overnight). */
   discardEmployees?: boolean;
+  /** Drop devices that look like residents of the POIs (long recurrent dwell + heavy overnight share). */
+  discardResidents?: boolean;
   /** Materialized MAIDs CSV key (set during parsing_od) — used as the export download URL. */
   maidsCsvKey?: string;
   error?: string;
@@ -140,6 +142,7 @@ export async function POST(
     let maxCircleScore: number | undefined;
     let daysOfWeek: number[] | undefined;
     let discardEmployees: boolean | undefined;
+    let discardResidents: boolean | undefined;
     try {
       const body = await _request.json();
       if (body?.poiIds?.length) poiIds = body.poiIds;
@@ -156,6 +159,7 @@ export async function POST(
         if (valid.length > 0 && valid.length < 7) daysOfWeek = valid;
       }
       if (body?.discardEmployees === true) discardEmployees = true;
+      if (body?.discardResidents === true) discardResidents = true;
     } catch { }
 
     // Load sub-jobs
@@ -199,7 +203,7 @@ export async function POST(
     }
 
     if (!state || state.phase === 'done') {
-      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees };
+      state = { phase: 'starting', poiIds, dwellFilter, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents };
     }
 
     // Update mega-job status — only set to consolidating when starting fresh work.
@@ -277,11 +281,12 @@ export async function POST(
         const cScore = state.maxCircleScore ?? maxCircleScore;
         const dow = state.daysOfWeek ?? daysOfWeek;
         const noEmp = state.discardEmployees ?? discardEmployees;
+        const noRes = state.discardResidents ?? discardResidents;
         const dowActive = !!(dow && dow.length > 0 && dow.length < 7);
-        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0) || dowActive || noEmp)
-          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore, daysOfWeek: dow, discardEmployees: noEmp }
+        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0) || dowActive || noEmp || noRes)
+          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore, daysOfWeek: dow, discardEmployees: noEmp, discardResidents: noRes }
           : undefined;
-        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}, daysOfWeek=${dow?.join(',') || 'all'}, discardEmployees=${!!noEmp}`);
+        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}, daysOfWeek=${dow?.join(',') || 'all'}, discardEmployees=${!!noEmp}, discardResidents=${!!noRes}`);
 
         // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
         const runId = (state as any).runId || Date.now().toString(36);

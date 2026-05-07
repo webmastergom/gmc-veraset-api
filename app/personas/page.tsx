@@ -69,6 +69,8 @@ export default function PersonasIndexPage() {
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
   /** Drop devices that look like employees of the POIs (heavy recurrent dwell, work-hour heavy, no overnight). */
   const [discardEmployees, setDiscardEmployees] = useState<boolean>(false);
+  /** Drop devices that LIVE inside the POI radius (heavy recurrent dwell + overnight share ≥ 0.5). */
+  const [discardResidents, setDiscardResidents] = useState<boolean>(false);
   const router = useRouter();
   const { toast } = useToast();
 
@@ -156,6 +158,7 @@ export default function PersonasIndexPage() {
       const filters: Record<string, any> = {};
       if (daysOfWeek.length > 0 && daysOfWeek.length < 7) filters.daysOfWeek = daysOfWeek;
       if (discardEmployees) filters.discardEmployees = true;
+      if (discardResidents) filters.discardResidents = true;
       // Send the user to the runId page as soon as we have one — that page
       // owns the resilient polling + rich loader. We just need the first
       // response to extract runId.
@@ -366,6 +369,18 @@ export default function PersonasIndexPage() {
                   className="h-3.5 w-3.5"
                 />
                 <span>Discard employees (heavy recurrent + work-hours + no overnight)</span>
+              </label>
+              <label
+                className="flex items-center gap-2 text-xs text-muted-foreground select-none cursor-pointer"
+                title="Drop devices that LIVE inside the POI radius: 15+ visit-days, ≥4h average dwell, ≥50% of days include an overnight ping (2h-5h). Composes with the employees toggle — turn on both to remove staff and residents."
+              >
+                <input
+                  type="checkbox"
+                  checked={discardResidents}
+                  onChange={(e) => setDiscardResidents(e.target.checked)}
+                  className="h-3.5 w-3.5"
+                />
+                <span>Discard residents (heavy recurrent + overnight ≥ 50% of days)</span>
               </label>
 
               <Button onClick={handleRun} disabled={running || selected.length === 0} className="w-full">

@@ -101,6 +101,8 @@ export default function MegaJobDetailPage() {
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([])
   // Discard employees (15+ days, ≥4h avg dwell, ≥0.6 work-hour share, ≤0.3 overnight share)
   const [discardEmployees, setDiscardEmployees] = useState<boolean>(false)
+  // Discard residents (15+ days, ≥4h avg dwell, ≥0.5 overnight share)
+  const [discardResidents, setDiscardResidents] = useState<boolean>(false)
 
   // NSE modal
   const [nseModalOpen, setNseModalOpen] = useState(false)
@@ -230,6 +232,7 @@ export default function MegaJobDetailPage() {
             ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
             ...(daysOfWeek.length > 0 && daysOfWeek.length < 7 ? { daysOfWeek } : {}),
             ...(discardEmployees ? { discardEmployees: true } : {}),
+            ...(discardResidents ? { discardResidents: true } : {}),
           }),
         })
         if (!res.ok) {
@@ -489,6 +492,15 @@ export default function MegaJobDetailPage() {
                   className="h-3.5 w-3.5"
                 />
                 No employees
+              </label>
+              <label className="flex items-center gap-1 text-xs text-muted-foreground select-none cursor-pointer" title="Drop devices that LIVE inside the POI radius: 15+ visit-days, 4+ hours avg dwell, ≥50% of days include an overnight ping (2h-5h). Composes with No employees.">
+                <input
+                  type="checkbox"
+                  checked={discardResidents}
+                  onChange={(e) => setDiscardResidents(e.target.checked)}
+                  className="h-3.5 w-3.5"
+                />
+                No residents
               </label>
               <Button onClick={() => handleConsolidate(megaJob.status === 'consolidating')} disabled={consolidating}>
                 {consolidating ? (

@@ -22,7 +22,7 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
 
 const STATE_KEY = (ds: string) => `dataset-report-state/${ds}`;
-function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   let key = `dataset-reports/${ds}/${type}`;
   if (minDwell > 0 || maxDwell > 0) key += `-dwell-${minDwell}-${maxDwell}`;
   if (hourFrom > 0 || hourTo < 23) key += `-h${hourFrom}-${hourTo}`;
@@ -34,6 +34,7 @@ function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFr
     key += `-d${sorted.join('')}`;
   }
   if (discardEmployees) key += `-noemp`;
+  if (discardResidents) key += `-nores`;
   return key;
 }
 
@@ -52,6 +53,7 @@ interface ReportState {
   maxCircleScore?: number;
   daysOfWeek?: number[];
   discardEmployees?: boolean;
+  discardResidents?: boolean;
   error?: string;
 }
 
@@ -139,6 +141,36 @@ function employeeExclusionSQL(table: string, discardEmployees: boolean): string 
 }
 
 /**
+ * Resident detection — excludes devices that LIVE inside the POI radius.
+ * Mirror of employeeExclusionSQL: same day-count + dwell thresholds,
+ * but the disposing signal is high overnight share (≥0.5 of days have a
+ * ping in 2h-5h). Composes with the employee filter — turning on both
+ * removes both groups.
+ */
+const RESIDENT_MIN_DAYS = 15;
+const RESIDENT_MIN_AVG_DWELL = 240;
+const RESIDENT_MIN_OVERNIGHT = 0.5;
+function residentExclusionSQL(table: string, discardResidents: boolean): string {
+  if (!discardResidents) return '';
+  return `AND ad_id NOT IN (
+        SELECT ad_id FROM (
+          SELECT ad_id, date,
+            DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as _res_dwell_min,
+            MAX(IF(HOUR(utc_timestamp) >= 2 AND HOUR(utc_timestamp) < 5, 1, 0)) as _res_has_overnight
+          FROM ${table}
+          CROSS JOIN UNNEST(poi_ids) AS _res_t(_res_pid)
+          WHERE _res_pid IS NOT NULL AND _res_pid != ''
+            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          GROUP BY ad_id, date
+        ) _per_day
+        GROUP BY ad_id
+        HAVING COUNT(*) >= ${RESIDENT_MIN_DAYS}
+          AND AVG(_res_dwell_min) >= ${RESIDENT_MIN_AVG_DWELL}
+          AND AVG(_res_has_overnight) >= ${RESIDENT_MIN_OVERNIGHT}
+      )`;
+}
+
+/**
  * Day-of-week filter. ISO 8601: 1=Mon..7=Sun (matches Athena DAY_OF_WEEK).
  * Empty/all-7 = no filter. Returns '' or `AND DAY_OF_WEEK(<tsCol>) IN (1,3,5)`.
  */
@@ -159,7 +191,7 @@ function dayOfWeekFilterSQL(daysOfWeek: number[] | undefined, tsCol = 'utc_times
  * @param hourFrom - start hour filter (0-23, default 0)
  * @param hourTo - end hour filter (0-23, default 23)
  */
-function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   const havingParts: string[] = [];
   if (minDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`);
   if (maxDwell > 0) havingParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${maxDwell}`);
@@ -169,6 +201,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
   const sFilter = circleScoreFilterSQL(maxCircleScore);
   const dFilter = dayOfWeekFilterSQL(daysOfWeek);
   const eFilter = employeeExclusionSQL(table, discardEmployees);
+  const rFilter = residentExclusionSQL(table, discardResidents);
   const visitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
       SELECT ad_id FROM (
         SELECT ad_id, COUNT(DISTINCT date) as vd
@@ -180,6 +213,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
           ${sFilter}
           ${dFilter}
           ${eFilter}
+        ${rFilter}
         GROUP BY ad_id
         HAVING COUNT(DISTINCT date) >= ${minVisits}
       ) t_vc
@@ -202,6 +236,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
         ${visitWhere}
     ),
     at_poi AS (
@@ -220,7 +255,7 @@ function atPoiWithDwellCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom =
 /** Simple CTE for queries that just need the raw pings (hourly, temporal).
  * When minDwell/maxDwell > 0, only includes device-days with dwell in range.
  * When hourFrom/hourTo specified, only includes pings within the time window. */
-function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   const hFilter = hourFilterSQL(hourFrom, hourTo);
   const hFilterT = hourFilterSQL(hourFrom, hourTo, 't.utc_timestamp');
   const gFilter = gpsOnlyFilterSQL(gpsOnly);
@@ -228,6 +263,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
   const dFilter = dayOfWeekFilterSQL(daysOfWeek);
   const dFilterT = dayOfWeekFilterSQL(daysOfWeek, 't.utc_timestamp');
   const eFilter = employeeExclusionSQL(table, discardEmployees);
+  const rFilter = residentExclusionSQL(table, discardResidents);
   // Note: when gpsOnly is on, the predicate references quality_fields directly
   // on the base table (no alias). The aliased version is needed for the joined
   // form below.
@@ -248,6 +284,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
           ${sFilter}
           ${dFilter}
           ${eFilter}
+        ${rFilter}
         GROUP BY ad_id
         HAVING COUNT(DISTINCT date) >= ${minVisits}
       ) t_vc
@@ -272,6 +309,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
         ${visitWhere}
       GROUP BY ad_id, date
       HAVING ${havingParts.join(' AND ')}
@@ -309,12 +347,13 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
         ${visitWhere}
     )`;
 }
 
-function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)}
+function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)}
     SELECT HOUR(utc_timestamp) as touch_hour,
       COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY 1 ORDER BY 1`;
@@ -325,8 +364,8 @@ function buildHourlySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0,
  * (1=Monday..7=Sunday, ISO 8601). Using utc_timestamp directly avoids
  * casting the varchar `date` partition column.
  */
-function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)}
+function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)}
     SELECT DAY_OF_WEEK(utc_timestamp) as dow,
       HOUR(utc_timestamp) as hour,
       COUNT(*) as pings,
@@ -334,23 +373,24 @@ function buildDayHourSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0
     FROM at_poi GROUP BY 1, 2 ORDER BY 1, 2`;
 }
 
-function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)}
+function buildTemporalSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)}
     SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
     FROM at_poi GROUP BY date ORDER BY date`;
 }
 
-function buildTotalDevicesSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
-  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)}
+function buildTotalDevicesSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
+  return `WITH ${atPoiCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)}
     SELECT COUNT(DISTINCT ad_id) as total_unique_devices FROM at_poi`;
 }
 
-function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   const gFilter = gpsOnlyFilterSQL(gpsOnly);
   const sFilter = circleScoreFilterSQL(maxCircleScore);
   const dFilter = dayOfWeekFilterSQL(daysOfWeek);
   const eFilter = employeeExclusionSQL(table, discardEmployees);
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)},
+  const rFilter = residentExclusionSQL(table, discardResidents);
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)},
     poi_visits AS (
       SELECT ad_id, date, first_ping as first_poi_visit
       FROM at_poi
@@ -368,6 +408,7 @@ function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hou
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
     ),
     device_day AS (
       SELECT p.ad_id, p.date,
@@ -394,7 +435,7 @@ function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hou
     LIMIT 100000`;
 }
 
-function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   // FULL-schema bypass: TRY(geo_fields['zipcode'/'city']) returns NULL on BASIC
   // (column populated by ALTER TABLE backfill but parquet has no value), so the
   // query is safe across schemas. When non-NULL we surface it as native_zip /
@@ -409,7 +450,7 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
     ? `AND (TRY(t.quality_fields['ping_circle_score']) IS NULL OR TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) IS NULL OR TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) <= ${maxCircleScore})`
     : '';
   const dFilterT = dayOfWeekFilterSQL(daysOfWeek, 't.utc_timestamp');
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)},
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)},
     poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
     valid_pings AS (
       SELECT t.ad_id, t.date, t.utc_timestamp,
@@ -487,13 +528,14 @@ function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom =
  * avg dwell, and visit frequency. These feed the affinity index calculation
  * after reverse geocoding groups them by postal code.
  */
-function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   // See buildCatchmentSQL — same FULL-schema zipcode bypass strategy.
   const gFilter = gpsOnlyFilterSQL(gpsOnly);
   const sFilter = circleScoreFilterSQL(maxCircleScore);
   const dFilter = dayOfWeekFilterSQL(daysOfWeek);
   const eFilter = employeeExclusionSQL(table, discardEmployees);
-  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)},
+  const rFilter = residentExclusionSQL(table, discardResidents);
+  return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)},
     all_pings AS (
       SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
@@ -509,6 +551,7 @@ function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
     ),
     first_pings AS (
       SELECT p.ad_id, p.date,
@@ -582,7 +625,7 @@ interface PoiCoordForMobility {
   radiusM: number;
 }
 
-function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?: PoiCoordForMobility[], hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false): string {
+function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?: PoiCoordForMobility[], hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
   // Mobility: POI categories visited before/after target POI visit.
   //
   // Strategy (same as mega-job consolidation):
@@ -599,6 +642,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
   const sFilter = circleScoreFilterSQL(maxCircleScore);
   const dFilter = dayOfWeekFilterSQL(daysOfWeek);
   const eFilter = employeeExclusionSQL(table, discardEmployees);
+  const rFilter = residentExclusionSQL(table, discardResidents);
 
   // Compute geographic bounding box from POI coords to limit the Overture POI
   // table scan and the all_pings scan. Without this, we join millions of global
@@ -628,6 +672,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
           ${sFilter}
           ${dFilter}
           ${eFilter}
+        ${rFilter}
         GROUP BY ad_id
         HAVING COUNT(DISTINCT date) >= ${minVisits}
       ) t_vc
@@ -678,6 +723,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
     ),
     target_pois AS (
       SELECT * FROM (VALUES ${poiValues}) AS t(poi_lat, poi_lng, poi_radius_m)
@@ -724,6 +770,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
         ${mobilityVisitWhere}
       GROUP BY ad_id, date
       ${dwellHaving}
@@ -741,6 +788,7 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
         ${sFilter}
         ${dFilter}
         ${eFilter}
+        ${rFilter}
     )`;
   }
 
@@ -1024,6 +1072,7 @@ export async function POST(
     let maxCircleScore = 0;
     let daysOfWeek: number[] = [];
     let discardEmployees = false;
+    let discardResidents = false;
     try {
       const body = await request.json();
       if (body?.minDwell) minDwell = parseInt(body.minDwell, 10) || 0;
@@ -1041,6 +1090,7 @@ export async function POST(
           .filter((d: number) => Number.isInteger(d) && d >= 1 && d <= 7);
       }
       if (body?.discardEmployees === true) discardEmployees = true;
+      if (body?.discardResidents === true) discardResidents = true;
     } catch { /* no body */ }
 
     // Reset if done, error, or filters changed
@@ -1075,6 +1125,10 @@ export async function POST(
     }
     if (state && Boolean(state.discardEmployees) !== discardEmployees) {
       console.log(`[DS-REPORT] discardEmployees changed (${Boolean(state.discardEmployees)} → ${discardEmployees}), resetting`);
+      state = null;
+    }
+    if (state && Boolean(state.discardResidents) !== discardResidents) {
+      console.log(`[DS-REPORT] discardResidents changed (${Boolean(state.discardResidents)} → ${discardResidents}), resetting`);
       state = null;
     }
 
@@ -1117,14 +1171,14 @@ export async function POST(
       // Launch all 8 queries in parallel
       const queries: Record<string, string> = {};
       await Promise.all([
-        startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
-        startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
-        startQueryAsync(buildDayHourSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.dayhour = id; }).catch(e => console.error('[DS-REPORT] dayhour:', e.message)),
-        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
-        startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
-        startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
-        startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
-        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
+        startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
+        startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
+        startQueryAsync(buildDayHourSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.dayhour = id; }).catch(e => console.error('[DS-REPORT] dayhour:', e.message)),
+        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
+        startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
+        startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
+        startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
+        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
       // Get dataset size for progress estimation
@@ -1154,6 +1208,7 @@ export async function POST(
         maxCircleScore: maxCircleScore > 0 ? maxCircleScore : undefined,
         daysOfWeek: (daysOfWeek.length > 0 && daysOfWeek.length < 7) ? daysOfWeek : undefined,
         discardEmployees: discardEmployees || undefined,
+        discardResidents: discardResidents || undefined,
       };
       await saveState(datasetName, state);
 
@@ -1253,7 +1308,8 @@ export async function POST(
       const cScore = state.maxCircleScore || 0;
       const dow = state.daysOfWeek || [];
       const noEmp = !!state.discardEmployees;
-      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo, mVisits, gOnly, cScore, dow, noEmp);
+      const noRes = !!state.discardResidents;
+      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo, mVisits, gOnly, cScore, dow, noEmp, noRes);
       const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
 
       // Parse hourly

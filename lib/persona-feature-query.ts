@@ -32,6 +32,7 @@ import {
   buildCircleScoreClause,
   buildDayOfWeekClause,
   buildEmployeeExclusionClause,
+  buildResidentExclusionClause,
   type PoiCoord,
   type VisitorFilter,
   type DwellFilter,
@@ -92,6 +93,7 @@ export function buildFeatureCTAS(args: {
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
       const empClause = buildEmployeeExclusionClause(filters, table);
+      const resClause = buildResidentExclusionClause(filters, table);
       return `
         SELECT
           ad_id, date, utc_timestamp,
@@ -114,6 +116,7 @@ export function buildFeatureCTAS(args: {
           ${scoreClause}
           ${dowClause}
           ${empClause}
+          ${resClause}
       `;
     })
     .join('\n      UNION ALL\n      ');

@@ -32,6 +32,8 @@ export interface PersonaRunConfig {
     daysOfWeek?: number[];
     /** Drop devices that look like employees (heavy recurrent dwell, work-hour heavy, no overnight). */
     discardEmployees?: boolean;
+    /** Drop devices that look like residents (heavy recurrent dwell + overnight share ≥ 0.5). */
+    discardResidents?: boolean;
   };
 }
 

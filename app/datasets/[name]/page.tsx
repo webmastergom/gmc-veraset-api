@@ -157,6 +157,8 @@ export default function DatasetAnalysisPage() {
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
   // Discard employees: drop devices with high recurrent dwell + work-hour heavy + no overnight
   const [discardEmployees, setDiscardEmployees] = useState<boolean>(false);
+  // Discard residents: drop devices with high recurrent dwell + overnight share ≥ 0.5
+  const [discardResidents, setDiscardResidents] = useState<boolean>(false);
   const [odReport, setODReport] = useState<any>(null);
   const [hourlyReport, setHourlyReport] = useState<any>(null);
   const [dayhourReport, setDayhourReport] = useState<any>(null);
@@ -191,7 +193,7 @@ export default function DatasetAnalysisPage() {
   }, [datasetName]);
 
   // Load reports for specific dwell interval + hour range
-  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly, cScore = maxCircleScore, dow = daysOfWeek, noEmp = discardEmployees) => {
+  const loadReportsForFilters = (dMin = dwellMin, dMax = dwellMax, hFrom = hourFrom, hTo = hourTo, mVisits = minVisits, gOnly = gpsOnly, cScore = maxCircleScore, dow = daysOfWeek, noEmp = discardEmployees, noRes = discardResidents) => {
     const types = ['od', 'hourly', 'dayhour', 'catchment', 'mobility', 'temporal', 'affinity'];
     const setters: Record<string, (d: any) => void> = {
       od: setODReport,
@@ -209,8 +211,9 @@ export default function DatasetAnalysisPage() {
     const scoreParams = cScore > 0 ? `&maxCircleScore=${cScore}` : '';
     const dowParams = (dow.length > 0 && dow.length < 7) ? `&daysOfWeek=${[...dow].sort((a, b) => a - b).join(',')}` : '';
     const empParams = noEmp ? `&discardEmployees=true` : '';
+    const resParams = noRes ? `&discardResidents=true` : '';
     for (const type of types) {
-      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}${scoreParams}${dowParams}${empParams}`, { credentials: 'include' })
+      fetch(`/api/datasets/${datasetName}/reports?type=${type}${dwellParams}${hourParams}${visitParams}${gpsParams}${scoreParams}${dowParams}${empParams}${resParams}`, { credentials: 'include' })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (data) setters[type](data); })
         .catch(() => {});
@@ -296,6 +299,7 @@ export default function DatasetAnalysisPage() {
               ...(maxCircleScore > 0 ? { maxCircleScore } : {}),
               ...(daysOfWeek.length > 0 && daysOfWeek.length < 7 ? { daysOfWeek } : {}),
               ...(discardEmployees ? { discardEmployees: true } : {}),
+              ...(discardResidents ? { discardResidents: true } : {}),
             }),
           });
           consecutiveErrors = 0;
@@ -744,11 +748,23 @@ export default function DatasetAnalysisPage() {
               checked={discardEmployees}
               onChange={(e) => {
                 setDiscardEmployees(e.target.checked);
-                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, e.target.checked);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, e.target.checked, discardResidents);
               }}
               className="h-3.5 w-3.5"
             />
             No employees
+          </label>
+          <label className="flex items-center gap-1 mr-2 text-xs text-muted-foreground select-none cursor-pointer" title="Drop devices that LIVE inside the POI radius: 15+ visit-days, 4+ hours avg dwell, ≥50% of days include an overnight ping (2h-5h). Composes with No employees — turn on both to remove staff and residents.">
+            <input
+              type="checkbox"
+              checked={discardResidents}
+              onChange={(e) => {
+                setDiscardResidents(e.target.checked);
+                loadReportsForFilters(dwellMin, dwellMax, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, e.target.checked);
+              }}
+              className="h-3.5 w-3.5"
+            />
+            No residents
           </label>
           <Button onClick={runFullAnalysis} disabled={loading || generatingReports}>
             {loading || generatingReports ? (
