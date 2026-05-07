@@ -2,9 +2,11 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { MainLayout } from '@/components/layout/main-layout';
-import { Sparkles, ChevronLeft, RefreshCw } from 'lucide-react';
+import { Sparkles, ChevronLeft, RefreshCw, RotateCw, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { useToast } from '@/hooks/use-toast';
 import PersonaResults from '@/components/personas/persona-results';
 import PersonaProgress from '@/components/personas/persona-progress';
 import type { PersonaReport } from '@/lib/persona-types';
@@ -26,6 +28,28 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
   const [progressInfo, setProgressInfo] = useState<ProgressInfo>({});
   const [megaJobNames, setMegaJobNames] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [rerunning, setRerunning] = useState(false);
+  const router = useRouter();
+  const { toast } = useToast();
+
+  const handleRerun = async () => {
+    setRerunning(true);
+    try {
+      const res = await fetch('/api/personas/poll', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ srcRunId: runId, rerun: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      if (!data.runId) throw new Error('No runId returned from re-run');
+      router.push(`/personas/${data.runId}`);
+    } catch (e: any) {
+      toast({ title: 'Re-run failed', description: e.message, variant: 'destructive' });
+      setRerunning(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -152,6 +176,21 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
           {phase && phase !== 'done' && (
             <span className="text-xs px-2 py-0.5 rounded bg-blue-500/15 text-blue-500">{phase}</span>
           )}
+          <div className="ml-auto">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleRerun}
+              disabled={rerunning || (phase !== 'done' && phase !== 'error' && phase !== '')}
+              title="Re-run this analysis with the same config — keeps the original run as history"
+            >
+              {rerunning ? (
+                <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Re-running...</>
+              ) : (
+                <><RotateCw className="h-4 w-4 mr-2" /> Re-run</>
+              )}
+            </Button>
+          </div>
         </div>
 
         {error ? (

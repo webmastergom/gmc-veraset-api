@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { MainLayout } from '@/components/layout/main-layout';
 import { Button } from '@/components/ui/button';
-import { Loader2, Sparkles, Play, ChevronRight, Layers, Briefcase } from 'lucide-react';
+import { Loader2, Sparkles, Play, ChevronRight, Layers, Briefcase, RotateCw } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 interface MegaJobSummary {
@@ -63,6 +63,7 @@ export default function PersonasIndexPage() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [rerunning, setRerunning] = useState<string | null>(null);
   const [progressMsg, setProgressMsg] = useState('');
   /** Day-of-week filter (1=Mon..7=Sun). Empty = all days. */
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
@@ -185,6 +186,30 @@ export default function PersonasIndexPage() {
       toast({ title: 'Failed', description: e.message, variant: 'destructive' });
       setRunning(false);
       setProgressMsg('');
+    }
+  };
+
+  /**
+   * Re-run a previous run with the same config. The backend reads the
+   * source run's config from S3 and starts a brand-new run with a fresh
+   * runId, preserving the past run as history.
+   */
+  const handleRerun = async (srcRunId: string) => {
+    setRerunning(srcRunId);
+    try {
+      const res = await fetch('/api/personas/poll', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ srcRunId, rerun: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      if (!data.runId) throw new Error('No runId returned from re-run');
+      router.push(`/personas/${data.runId}`);
+    } catch (e: any) {
+      toast({ title: 'Re-run failed', description: e.message, variant: 'destructive' });
+      setRerunning(null);
     }
   };
 
@@ -367,31 +392,50 @@ export default function PersonasIndexPage() {
                 <div className="px-4 py-2 text-sm font-semibold border-b bg-muted/30">Past runs</div>
                 <div className="divide-y">
                   {runs.slice(0, 20).map((r) => (
-                    <Link
+                    <div
                       key={r.runId}
-                      href={`/personas/${r.runId}`}
-                      className="flex items-center gap-3 p-3 hover:bg-muted/30 transition-colors"
+                      className="flex items-center gap-2 p-3 hover:bg-muted/30 transition-colors"
                     >
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">
-                          {[...(r.megaJobNames || []), ...(r.jobNames || [])].join(' + ') || r.runId}
+                      <Link
+                        href={`/personas/${r.runId}`}
+                        className="flex items-center gap-3 flex-1 min-w-0"
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-medium truncate">
+                            {[...(r.megaJobNames || []), ...(r.jobNames || [])].join(' + ') || r.runId}
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            {new Date(r.generatedAt).toLocaleString()} ·{' '}
+                            {r.phase === 'done'
+                              ? `${r.totalDevices?.toLocaleString() ?? '?'} devices · ${r.personaCount ?? '?'} personas`
+                              : r.phase}
+                          </div>
                         </div>
-                        <div className="text-xs text-muted-foreground">
-                          {new Date(r.generatedAt).toLocaleString()} ·{' '}
-                          {r.phase === 'done'
-                            ? `${r.totalDevices?.toLocaleString() ?? '?'} devices · ${r.personaCount ?? '?'} personas`
-                            : r.phase}
-                        </div>
-                      </div>
-                      <span className={`text-xs px-2 py-0.5 rounded ${
-                        r.phase === 'done' ? 'bg-emerald-500/15 text-emerald-500' :
-                        r.phase === 'error' ? 'bg-red-500/15 text-red-500' :
-                        'bg-blue-500/15 text-blue-500'
-                      }`}>
-                        {r.phase}
-                      </span>
-                      <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                    </Link>
+                        <span className={`text-xs px-2 py-0.5 rounded ${
+                          r.phase === 'done' ? 'bg-emerald-500/15 text-emerald-500' :
+                          r.phase === 'error' ? 'bg-red-500/15 text-red-500' :
+                          'bg-blue-500/15 text-blue-500'
+                        }`}>
+                          {r.phase}
+                        </span>
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      </Link>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0"
+                        disabled={!!rerunning}
+                        onClick={() => handleRerun(r.runId)}
+                        title="Re-run with the same config (preserves the original run)"
+                      >
+                        {rerunning === r.runId ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RotateCw className="h-3.5 w-3.5" />
+                        )}
+                        <span className="ml-1.5 hidden sm:inline">Re-run</span>
+                      </Button>
+                    </div>
                   ))}
                 </div>
               </div>

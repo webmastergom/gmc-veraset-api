@@ -73,6 +73,19 @@ function configToRunId(cfg: PersonaRunConfig): string {
   return createHash('sha1').update(JSON.stringify(norm)).digest('hex').slice(0, 16);
 }
 
+/**
+ * Force a fresh runId for the same config. Used when the user explicitly
+ * asks to re-run (e.g. data was synced after the last run, or to compare
+ * results before/after a tweak). Past runs are preserved on S3 — the new
+ * runId is just `<configHash>-<timestamp>` so it sorts next to its
+ * siblings in the runs list.
+ */
+function rerunRunId(cfg: PersonaRunConfig): string {
+  const baseHash = configToRunId(cfg);
+  const stamp = Date.now().toString(36).slice(-6);
+  return `${baseHash}-${stamp}`;
+}
+
 // ─── Phase: starting ──────────────────────────────────────────────────
 
 /**
@@ -844,9 +857,39 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     let body: any = {};
     try { body = await request.json(); } catch {}
 
+    // ── Re-run shortcut ────────────────────────────────────────────
+    // Body: { srcRunId: '<id>', rerun: true }
+    // Loads the previous run's config from S3, kicks off a brand-new run
+    // with a unique runId. The past run is preserved as history.
+    if (body.srcRunId && body.rerun === true) {
+      invalidateCache(STATE_KEY(body.srcRunId));
+      const src = await getConfig<PersonaState>(STATE_KEY(body.srcRunId));
+      if (!src) {
+        return NextResponse.json({ error: `Source run ${body.srcRunId} not found` }, { status: 404 });
+      }
+      const cfg = src.config;
+      const newRunId = rerunRunId(cfg);
+      const initialState: PersonaState = {
+        phase: 'starting',
+        runId: newRunId,
+        config: cfg,
+        updatedAt: new Date().toISOString(),
+      };
+      await putConfig(STATE_KEY(newRunId), initialState, { compact: true });
+      console.log(`[PERSONAS] Re-run: ${body.srcRunId} → ${newRunId}`);
+      // Return the new runId immediately. The client's polling loop will
+      // drive the state machine on the new run.
+      return NextResponse.json({
+        phase: 'starting',
+        runId: newRunId,
+        progress: { step: 'starting', percent: 0, message: 'Re-running with fresh state...' },
+      });
+    }
+
     const hasMega = Array.isArray(body.megaJobIds) && body.megaJobIds.length > 0;
     const hasJobs = Array.isArray(body.jobIds) && body.jobIds.length > 0;
     const isNewRequest = hasMega || hasJobs;
+    const forceRerun = body.rerun === true;
     let runId: string = body.runId || '';
     if (isNewRequest) {
       const cfg: PersonaRunConfig = {
@@ -854,14 +897,17 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         jobIds: (hasJobs ? body.jobIds : []).filter((s: any) => typeof s === 'string'),
         filters: body.filters || {},
       };
-      runId = configToRunId(cfg);
-      // Idempotency: if state exists and is done, return cached
+      // forceRerun: bypass config-hash idempotency by salting with a timestamp.
+      runId = forceRerun ? rerunRunId(cfg) : configToRunId(cfg);
+      // Idempotency: if state exists and is done, return cached (only when not re-running).
       invalidateCache(STATE_KEY(runId));
-      const existing = await getConfig<PersonaState>(STATE_KEY(runId));
-      if (existing?.phase === 'done' && existing.report) {
-        return NextResponse.json({ phase: 'done', runId, report: existing.report });
+      if (!forceRerun) {
+        const existing = await getConfig<PersonaState>(STATE_KEY(runId));
+        if (existing?.phase === 'done' && existing.report) {
+          return NextResponse.json({ phase: 'done', runId, report: existing.report });
+        }
       }
-      // Reset on error or first time
+      // Reset on error or first time (or re-run)
       const initialState: PersonaState = {
         phase: 'starting',
         runId,
@@ -869,6 +915,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         updatedAt: new Date().toISOString(),
       };
       await putConfig(STATE_KEY(runId), initialState, { compact: true });
+      if (forceRerun) console.log(`[PERSONAS] Force re-run with new runId=${runId}`);
     }
 
     if (!runId) {
