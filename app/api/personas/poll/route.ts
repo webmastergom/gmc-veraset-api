@@ -48,6 +48,7 @@ import { runClusteringPipeline } from '@/lib/persona-clusterer';
 import { computeRfm } from '@/lib/persona-rfm';
 import { computeCohabitation } from '@/lib/persona-cohabitation';
 import { computeZipAffinityPerSource } from '@/lib/persona-zip-affinity';
+import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { generateInsights } from '@/lib/persona-insights';
 import { registerAthenaContribution } from '@/lib/master-maids';
 import {
@@ -377,7 +378,7 @@ async function phaseDownloadQuery(state: PersonaState): Promise<PersonaState> {
       SELECT ad_id, total_visits, total_dwell_min, recency_days, avg_dwell_min,
         morning_share, midday_share, evening_share, night_share, weekend_share,
         friday_evening_share, gyration_km, unique_h3_cells,
-        home_zip, home_region,
+        home_zip, home_region, home_lat, home_lng,
         brand_visits_json, brand_loyalty_hhi, tier_high_quality
       FROM ${tableName}
       WHERE total_visits >= 2
@@ -542,6 +543,8 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
       unique_h3_cells: parseInt(r.unique_h3_cells, 10) || 0,
       home_zip: String(r.home_zip || '').trim(),
       home_region: String(r.home_region || '').trim(),
+      home_lat: r.home_lat ? parseFloat(r.home_lat) : null,
+      home_lng: r.home_lng ? parseFloat(r.home_lng) : null,
       gps_share: 0,
       avg_circle_score: 0,
       brand_visits: parseBrandJson(r.brand_visits_json),
@@ -553,6 +556,62 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
     for (const f of rows) all.push(f);
     console.log(`[PERSONAS ${state.runId}] Streamed ${rows.length} rows for ${src} (queryId=${queryId})`);
   }
+
+  // Reverse-geocode fallback for devices missing home_zip (BASIC schema, or
+  // FULL with sparse zipcode coverage). We use the home_lat/home_lng pair
+  // we materialized in the feature CTAS — these are night-mode (with
+  // any-hour fallback) averages of the device's location, so they
+  // approximate the residential address. Reverse-geocoding through
+  // lib/reverse-geocode resolves them to local postal codes.
+  const missing = all.filter(
+    (f) => (!f.home_zip || !f.home_zip.trim())
+      && f.home_lat != null && f.home_lng != null
+      && Number.isFinite(f.home_lat) && Number.isFinite(f.home_lng)
+  );
+  if (missing.length > 0) {
+    try {
+      const country = await guessCountry(state);
+      if (country) setCountryFilter([country]);
+      // Round to 1 decimal (~11km cells) so we batch-geocode at most a
+      // few thousand unique points instead of millions of devices.
+      const cellMap = new Map<string, { lat: number; lng: number; ads: string[] }>();
+      for (const f of missing) {
+        const key = `${(f.home_lat as number).toFixed(1)},${(f.home_lng as number).toFixed(1)}`;
+        let cell = cellMap.get(key);
+        if (!cell) {
+          cell = { lat: f.home_lat as number, lng: f.home_lng as number, ads: [] };
+          cellMap.set(key, cell);
+        }
+        cell.ads.push(f.ad_id);
+      }
+      const points = Array.from(cellMap.values()).map((c) => ({
+        lat: c.lat, lng: c.lng, deviceCount: c.ads.length,
+      }));
+      const results = await batchReverseGeocode(points);
+      const adZip = new Map<string, string>();
+      const cells = Array.from(cellMap.values());
+      for (let i = 0; i < cells.length; i++) {
+        const r = results[i];
+        if (r.type === 'geojson_local' && r.postcode) {
+          for (const ad of cells[i].ads) adZip.set(ad, r.postcode);
+        }
+      }
+      let resolvedCount = 0;
+      for (const f of all) {
+        if ((!f.home_zip || !f.home_zip.trim()) && adZip.has(f.ad_id)) {
+          f.home_zip = adZip.get(f.ad_id) || '';
+          if (f.home_zip) resolvedCount++;
+        }
+      }
+      console.log(
+        `[PERSONAS ${state.runId}] Reverse-geocoded ${resolvedCount}/${missing.length} ` +
+        `missing home_zip via ${cellMap.size} unique cells (country=${country || 'auto'})`
+      );
+    } catch (e: any) {
+      console.warn(`[PERSONAS ${state.runId}] Reverse-geocode fallback failed: ${e?.message || e}`);
+    }
+  }
+
   const subProgress = {
     label: `Loaded ${all.length.toLocaleString()} feature rows`,
     details: 'Ready for clustering',

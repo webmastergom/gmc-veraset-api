@@ -15,6 +15,8 @@
  *   unique_h3_cells BIGINT
  *   home_zip STRING       -- prefers FULL geo_fields['zipcode'], else NULL
  *   home_region STRING    -- FULL geo_fields['region'], else NULL
+ *   home_lat DOUBLE       -- avg lat in night-mode, fallback any-hour. Used in
+ *   home_lng DOUBLE       -- Node to reverse-geocode when home_zip is NULL.
  *   gps_share DOUBLE      -- FULL only; 1.0 fallback for BASIC
  *   avg_circle_score DOUBLE
  *   brand_visits_json STRING   -- JSON map "brand → count" (parsed in Node)
@@ -147,22 +149,35 @@ export function buildFeatureCTAS(args: {
     visitor_ad_ids AS (
       SELECT DISTINCT ad_id FROM at_poi_pings
     ),
-    -- Home zipcode: prefer FULL geo_fields['zipcode']; mode of zips in night hours (22-06)
+    -- Home zipcode (FULL only): mode of geo_fields['zipcode'] during night hours (22-06).
+    -- Tagged with a priority so we can fall back to all-hour mode when night data is sparse.
     home_zip_pre AS (
       SELECT
         p.ad_id,
         p.native_zip as zip,
         p.native_region as region,
-        COUNT(*) as freq
+        COUNT(*) as freq,
+        1 as priority -- night-mode wins over any-hour mode (priority 2 below)
       FROM all_pings p
       INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
       WHERE p.native_zip IS NOT NULL AND p.native_zip != ''
         AND (HOUR(p.utc_timestamp) >= 22 OR HOUR(p.utc_timestamp) <= 6)
       GROUP BY p.ad_id, p.native_zip, p.native_region
+      UNION ALL
+      SELECT
+        p.ad_id,
+        p.native_zip as zip,
+        p.native_region as region,
+        COUNT(*) as freq,
+        2 as priority -- any-hour fallback when device has no night pings
+      FROM all_pings p
+      INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
+      WHERE p.native_zip IS NOT NULL AND p.native_zip != ''
+      GROUP BY p.ad_id, p.native_zip, p.native_region
     ),
     home_zip_ranked AS (
       SELECT ad_id, zip, region, freq,
-        ROW_NUMBER() OVER (PARTITION BY ad_id ORDER BY freq DESC, zip) as rn
+        ROW_NUMBER() OVER (PARTITION BY ad_id ORDER BY priority ASC, freq DESC, zip) as rn
       FROM home_zip_pre
     ),
     home_zip AS (
@@ -170,16 +185,47 @@ export function buildFeatureCTAS(args: {
       FROM home_zip_ranked
       WHERE rn = 1
     ),
-    -- Brand visits per device: poi_ids array → resolved brand → count
+    -- Home coordinates: avg lat/lng during the device's likely-home window. Used
+    -- in Node as a reverse-geocode fallback for devices without native_zip
+    -- (BASIC schema, sparse FULL coverage). Same priority pattern as home_zip:
+    -- prefer night pings, fall back to any hour.
+    home_coord_pre AS (
+      SELECT p.ad_id, AVG(p.lat) as lat, AVG(p.lng) as lng, 1 as priority
+      FROM all_pings p
+      INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
+      WHERE p.lat IS NOT NULL AND p.lng IS NOT NULL
+        AND (HOUR(p.utc_timestamp) >= 22 OR HOUR(p.utc_timestamp) <= 6)
+      GROUP BY p.ad_id
+      UNION ALL
+      SELECT p.ad_id, AVG(p.lat) as lat, AVG(p.lng) as lng, 2 as priority
+      FROM all_pings p
+      INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
+      WHERE p.lat IS NOT NULL AND p.lng IS NOT NULL
+      GROUP BY p.ad_id
+    ),
+    home_coord_ranked AS (
+      SELECT ad_id, lat, lng, priority,
+        ROW_NUMBER() OVER (PARTITION BY ad_id ORDER BY priority ASC) as rn
+      FROM home_coord_pre
+    ),
+    home_coord AS (
+      SELECT ad_id, lat as home_lat, lng as home_lng
+      FROM home_coord_ranked
+      WHERE rn = 1
+    ),
+    -- Brand visit-days per device: distinct (ad_id, date, brand). Replaces the
+    -- previous COUNT(*) of pings, which inflated counts ~30-50× because GPS
+    -- pings fire frequently during a single visit. Visit-days is what humans
+    -- read as "visits" and matches how total_visits is computed elsewhere.
     poi_unnest AS (
-      SELECT vp.ad_id, t.poi_id
+      SELECT vp.ad_id, vp.date, t.poi_id
       FROM all_pings vp
       INNER JOIN visitor_ad_ids v ON vp.ad_id = v.ad_id
       CROSS JOIN UNNEST(COALESCE(vp.poi_ids, ARRAY[])) as t(poi_id)
       WHERE t.poi_id IS NOT NULL AND t.poi_id != ''
     ),
     brand_visits AS (
-      SELECT pu.ad_id, b.brand, COUNT(*) as visits
+      SELECT pu.ad_id, b.brand, COUNT(DISTINCT pu.date) as visits
       FROM poi_unnest pu
       INNER JOIN ${brandTableRef} b ON pu.poi_id = b.poi_id
       GROUP BY pu.ad_id, b.brand
@@ -247,6 +293,8 @@ export function buildFeatureCTAS(args: {
       m.unique_h3_cells,
       hz.home_zip,
       hz.home_region,
+      hc.home_lat,
+      hc.home_lng,
       COALESCE(m.gps_share, 0.0) as gps_share,
       COALESCE(m.avg_circle_score, 9.99) as avg_circle_score,
       -- brand_visits_json: serialize MAP as VARCHAR (Parquet doesn't accept JSON type).
@@ -261,6 +309,7 @@ export function buildFeatureCTAS(args: {
     FROM visit_agg v
     LEFT JOIN mobility m ON v.ad_id = m.ad_id
     LEFT JOIN home_zip hz ON v.ad_id = hz.ad_id
+    LEFT JOIN home_coord hc ON v.ad_id = hc.ad_id
     LEFT JOIN brand_visits_agg b ON v.ad_id = b.ad_id
   `;
 

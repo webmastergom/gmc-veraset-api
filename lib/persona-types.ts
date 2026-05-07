@@ -56,6 +56,10 @@ export interface DeviceFeatures {
   unique_h3_cells: number;
   home_zip: string;
   home_region: string;
+  /** Avg lat at the device's likely-home window (night-mode, fallback any-hour).
+   *  Used as a reverse-geocode fallback for home_zip when geo_fields is sparse. */
+  home_lat?: number | null;
+  home_lng?: number | null;
   gps_share: number;
   avg_circle_score: number;
   /** brand → visits (e.g. "burger_king" → 12, "mcdonalds" → 4). Comes back as JSON or "k:v|k:v" string from Athena. */
