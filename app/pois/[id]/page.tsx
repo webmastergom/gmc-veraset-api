@@ -11,7 +11,7 @@ import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { useToast } from "@/hooks/use-toast"
-import { ArrowLeft, Save, Edit2, X, Check, MapPin, Loader2, AlertCircle } from "lucide-react"
+import { ArrowLeft, Save, Edit2, X, Check, MapPin, Loader2, AlertCircle, Tag } from "lucide-react"
 import Link from "next/link"
 
 interface POIFeature {
@@ -304,19 +304,27 @@ export default function POICollectionPage() {
               {geojson.features.length} POIs
             </p>
           </div>
-          <Button onClick={saveCollection} disabled={saving}>
-            {saving ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save className="mr-2 h-4 w-4" />
-                Save Changes
-              </>
-            )}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Link href={`/pois/${collectionId}/brands`}>
+              <Button variant="outline" title="Auto-detect and clean up brand assignments per POI">
+                <Tag className="mr-2 h-4 w-4" />
+                Brand Editor
+              </Button>
+            </Link>
+            <Button onClick={saveCollection} disabled={saving}>
+              {saving ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Save className="mr-2 h-4 w-4" />
+                  Save Changes
+                </>
+              )}
+            </Button>
+          </div>
         </div>
       </div>
 
