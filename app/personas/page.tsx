@@ -67,6 +67,9 @@ export default function PersonasIndexPage() {
   const [progressMsg, setProgressMsg] = useState('');
   /** Day-of-week filter (1=Mon..7=Sun). Empty = all days. */
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([]);
+  /** Hour-of-day filter (0..23 inclusive, LOCAL time). Defaults to all hours. */
+  const [hourFrom, setHourFrom] = useState<number>(0);
+  const [hourTo, setHourTo] = useState<number>(23);
   /** Drop devices that look like employees of the POIs (heavy recurrent dwell, work-hour heavy, no overnight). */
   const [discardEmployees, setDiscardEmployees] = useState<boolean>(false);
   /** Drop devices that LIVE inside the POI radius (heavy recurrent dwell + overnight share ≥ 0.5). */
@@ -157,6 +160,13 @@ export default function PersonasIndexPage() {
       const jobIds = selected.filter((s) => s.startsWith('job:')).map((s) => s.slice(4));
       const filters: Record<string, any> = {};
       if (daysOfWeek.length > 0 && daysOfWeek.length < 7) filters.daysOfWeek = daysOfWeek;
+      // Hour-of-day filter — only emit when not the full-day default.
+      // Both ends are LOCAL hours (the persona CTAS already wraps utc_timestamp
+      // with at_timezone(...) per source country, so 8..20 here means MX 08:00–20:00).
+      if (hourFrom !== 0 || hourTo !== 23) {
+        filters.hourFrom = hourFrom;
+        filters.hourTo = hourTo;
+      }
       if (discardEmployees) filters.discardEmployees = true;
       if (discardResidents) filters.discardResidents = true;
       // Send the user to the runId page as soon as we have one — that page
@@ -354,6 +364,77 @@ export default function PersonasIndexPage() {
                 {daysOfWeek.length > 0 && daysOfWeek.length < 7 && (
                   <span className="text-[11px] text-muted-foreground ml-auto">
                     Filtering {daysOfWeek.length}/7 day{daysOfWeek.length === 1 ? '' : 's'}
+                  </span>
+                )}
+              </div>
+
+              {/* Hour-of-day filter — interpreted in LOCAL time (timezone of
+                  the source country), so 8h-20h means local 8am-8pm. */}
+              <div
+                className="flex flex-wrap items-center gap-2 pt-2"
+                title="Limit the analysis to pings between these LOCAL hours. e.g. 8h-20h cuts out night-time noise from drive-bys / pass-throughs that survive the resident filter."
+              >
+                <label className="text-xs text-muted-foreground whitespace-nowrap">Hours (local):</label>
+                <select
+                  value={hourFrom}
+                  onChange={(e) => setHourFrom(parseInt(e.target.value, 10))}
+                  className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                  aria-label="Hour from"
+                >
+                  {Array.from({ length: 24 }, (_, h) => (
+                    <option key={`from-${h}`} value={h}>{h.toString().padStart(2, '0')}h</option>
+                  ))}
+                </select>
+                <span className="text-xs text-muted-foreground">→</span>
+                <select
+                  value={hourTo}
+                  onChange={(e) => setHourTo(parseInt(e.target.value, 10))}
+                  className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                  aria-label="Hour to"
+                >
+                  {Array.from({ length: 24 }, (_, h) => (
+                    <option key={`to-${h}`} value={h}>{h.toString().padStart(2, '0')}h</option>
+                  ))}
+                </select>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => { setHourFrom(0); setHourTo(23); }}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="All hours"
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setHourFrom(8); setHourTo(20); }}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Business hours 8am-8pm (local)"
+                  >
+                    8-20
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setHourFrom(11); setHourTo(14); }}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Lunch crowd 11-14"
+                  >
+                    Lunch
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setHourFrom(18); setHourTo(22); }}
+                    className="h-8 px-2 rounded text-[10px] uppercase tracking-wider bg-muted/40 hover:bg-muted text-muted-foreground"
+                    title="Evening crowd 18-22"
+                  >
+                    Evening
+                  </button>
+                </div>
+                {(hourFrom !== 0 || hourTo !== 23) && (
+                  <span className="text-[11px] text-muted-foreground ml-auto">
+                    {hourFrom <= hourTo
+                      ? `${hourTo - hourFrom + 1}h window`
+                      : `wraps midnight (${24 - hourFrom + hourTo + 1}h)`}
                   </span>
                 )}
               </div>
