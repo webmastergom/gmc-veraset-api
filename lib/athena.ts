@@ -481,6 +481,132 @@ export async function fetchQueryResultsViaS3(
   return { columns, rows };
 }
 
+/**
+ * STREAMING variant of fetchQueryResultsViaS3 — never holds the full CSV
+ * (or the parsed rows array) in memory. Use this when the result set
+ * could be millions of rows. Calls `onRow(row)` for each parsed data
+ * row as soon as it's available; returns `{ columns, rowCount }` when
+ * the stream ends.
+ *
+ * Why: fetchQueryResultsViaS3 calls `transformToString()` which loads
+ * the entire CSV (potentially 400+ MB for France-scale results) plus
+ * the .split('\n') array AND the parsed rows array into memory. Three
+ * full copies of the data → easily 1.5 GB → OOM on Vercel's 1 GB
+ * function memory limit. The user's previous run (timeout diagnostic
+ * NOT firing, generic "stream closed" returned) is consistent with
+ * a silent OOM kill exactly here.
+ *
+ * The streaming version walks the response body chunk-by-chunk,
+ * accumulates a small overflow buffer for partial lines, and emits
+ * one row per newline. Peak memory ≈ chunk size (~64 KB) + caller's
+ * downstream structures.
+ */
+export async function streamQueryResultsViaS3(
+  queryId: string,
+  onRow: (row: Record<string, string>) => void,
+  outputCsvKey?: string,
+): Promise<{ columns: string[]; rowCount: number }> {
+  const csvKey = outputCsvKey || `athena-results/${queryId}.csv`;
+
+  const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+  const response = await s3Client.send(new GetObjectCommand({
+    Bucket: BUCKET,
+    Key: csvKey,
+  }));
+
+  const body = response.Body;
+  if (!body) return { columns: [], rowCount: 0 };
+
+  // Athena CSV: header on line 1, all values quoted with doubled quotes
+  // for escaping. Re-uses the same parseCSVLine logic from
+  // fetchQueryResultsViaS3 so the two functions handle the format
+  // identically.
+  const parseCSVLine = (line: string): string[] => {
+    const values: string[] = [];
+    let i = 0;
+    while (i < line.length) {
+      if (line[i] === '"') {
+        let end = i + 1;
+        while (end < line.length) {
+          if (line[end] === '"') {
+            if (end + 1 < line.length && line[end + 1] === '"') {
+              end += 2;
+            } else {
+              break;
+            }
+          } else {
+            end++;
+          }
+        }
+        values.push(line.substring(i + 1, end).replace(/""/g, '"'));
+        i = end + 2;
+      } else {
+        const comma = line.indexOf(',', i);
+        if (comma === -1) {
+          values.push(line.substring(i));
+          break;
+        } else {
+          values.push(line.substring(i, comma));
+          i = comma + 1;
+        }
+      }
+    }
+    return values;
+  };
+
+  const decoder = new TextDecoder('utf-8');
+  let columns: string[] = [];
+  let rowCount = 0;
+  let leftover = '';
+  let onFirstLine = true;
+
+  // The AWS SDK v3 response.Body is an async iterable in Node — each
+  // iteration yields a Uint8Array chunk from the S3 stream.
+  const stream = body as AsyncIterable<Uint8Array>;
+  for await (const chunk of stream) {
+    leftover += decoder.decode(chunk, { stream: true });
+    let nl;
+    while ((nl = leftover.indexOf('\n')) !== -1) {
+      const line = leftover.slice(0, nl).replace(/\r$/, '');
+      leftover = leftover.slice(nl + 1);
+      if (onFirstLine) {
+        columns = parseCSVLine(line);
+        onFirstLine = false;
+        continue;
+      }
+      if (!line) continue;
+      const values = parseCSVLine(line);
+      const row: Record<string, string> = {};
+      for (let j = 0; j < columns.length; j++) {
+        row[columns[j]] = values[j] ?? '';
+      }
+      onRow(row);
+      rowCount++;
+    }
+  }
+  // Tail: process any final line without a trailing newline.
+  leftover += decoder.decode();
+  const last = leftover.replace(/\r$/, '');
+  if (last) {
+    if (onFirstLine) {
+      columns = parseCSVLine(last);
+    } else {
+      const values = parseCSVLine(last);
+      const row: Record<string, string> = {};
+      for (let j = 0; j < columns.length; j++) {
+        row[columns[j]] = values[j] ?? '';
+      }
+      onRow(row);
+      rowCount++;
+    }
+  }
+
+  console.log(
+    `✅ streamQueryResultsViaS3: ${rowCount} rows streamed from ${csvKey} (query ${queryId})`,
+  );
+  return { columns, rowCount };
+}
+
 // ── CTAS (Create Table As Select) Functions ──────────────────────────────
 
 /**

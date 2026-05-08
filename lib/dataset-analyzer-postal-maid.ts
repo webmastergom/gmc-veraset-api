@@ -9,7 +9,7 @@
  * ORDER BY device_days DESC LIMIT n — biases toward heavy users; omit for full coverage.
  */
 
-import { ensureTableForDataset, runQuery, getTableName, startQueryAsync, checkQueryStatus, fetchQueryResults, fetchQueryResultsViaS3 } from './athena';
+import { ensureTableForDataset, runQuery, getTableName, startQueryAsync, checkQueryStatus, fetchQueryResults, fetchQueryResultsViaS3, streamQueryResultsViaS3 } from './athena';
 import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
 import { localTimestamp, tzForCountry } from './timezones';
 import type {
@@ -1095,10 +1095,12 @@ export async function analyzePostalMaid(
     startQueryAsync(maidsQuery),
   ]);
 
-  // Poll both queries until done, reporting progress
+  // Poll both queries until done, reporting progress.
+  // maidsRes is NOT declared/loaded here — we stream the maidsQuery
+  // result directly from S3 in two passes after the polling loop
+  // exits, to keep peak memory flat for million-row results.
   let totalDone = false, maidsDone = false;
   let totalRes: { rows: Record<string, string>[] } = { rows: [] };
-  let maidsRes: { rows: Record<string, string>[] } = { rows: [] };
   const t0 = Date.now();
 
   while (!totalDone || !maidsDone) {
@@ -1114,19 +1116,21 @@ export async function analyzePostalMaid(
     if (!maidsDone) {
       const s = await checkQueryStatus(maidsQId);
       // maidsQuery returns one row per (ad_id, origin coord) — millions
-      // for big megajobs. fetchQueryResults paginates the GetQueryResults
-      // API at 1000 rows / page (~5 min wall-clock for 5M rows), which
-      // alone exhausts the Vercel cap. Read the result CSV directly from
-      // S3 instead — single GetObject, ~5-30s for any size.
+      // for big megajobs. We DON'T materialize them in memory here:
+      // fetchQueryResultsViaS3 would load the full ~400 MB CSV into a
+      // string and a parsed array (~1.5 GB peak), OOM-killing the Vercel
+      // function silently (1 GB cap). Instead we just mark the query as
+      // done; the post-loop logic streams the CSV twice (once to build
+      // coordMap, once to emit matched devices), peak memory ≈ chunk
+      // size + small structures.
       if (s.state === 'SUCCEEDED') {
         maidsDone = true;
         report({
           step: 'running_queries',
           percent: 55,
-          message: 'Athena origins query done · streaming result CSV from S3…',
-          detail: 'avoiding paginated GetQueryResults API (slow for million-row results)',
+          message: 'Athena origins query done · ready to stream CSV from S3',
+          detail: 'two-pass streaming: pass 1 = coords, pass 2 = match devices',
         });
-        maidsRes = await fetchQueryResultsViaS3(maidsQId);
       }
       else if (s.state === 'FAILED') throw new Error(`Origins query failed: ${s.error}`);
     }
@@ -1148,35 +1152,49 @@ export async function analyzePostalMaid(
     report({ step: 'completed', percent: 100, message: 'No POI visitors in dataset for these filters' });
     return buildEmptyResult(datasetName, filters, 0);
   }
-  console.log(`[POSTAL-MAID] device-origin rows: ${maidsRes.rows.length}`);
+
+  // ── PASS 1: stream the origins CSV from S3 to collect unique coords ────
+  //
+  // We DO NOT materialize the full row set in memory — for France-scale
+  // megajobs this is 5M+ rows × ~80 chars = a 400 MB CSV. Loading that
+  // via transformToString() (string + split-array + parsed-rows array)
+  // peaks at ~1.5 GB and OOMs the Vercel 1 GB function silently.
+  // Instead, streamQueryResultsViaS3 walks the body chunk-by-chunk and
+  // fires onRow() per parsed line; we accumulate ONLY the small coord
+  // map here (~5K-50K unique coords for any country).
   report({
     step: 'running_queries',
     percent: 60,
-    message: 'Athena queries complete',
-    detail: `${maidsRes.rows.length} device-origin rows`,
+    message: 'Streaming Athena origins (pass 1: collecting unique coords)…',
+    detail: 'no row materialization — peak memory stays small',
   });
-
-  // ── Geocode origins and match to requested postal codes ──────────────────
   const coordMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-  const deviceOrigins: Array<{ adId: string; coordKey: string; deviceDays: number }> = [];
   let totalDeviceDays = 0;
-
-  for (const row of maidsRes.rows) {
-    const adId = String(row.ad_id);
+  let totalRows = 0;
+  await streamQueryResultsViaS3(maidsQId, (row) => {
+    totalRows++;
     const lat = parseFloat(String(row.origin_lat));
     const lng = parseFloat(String(row.origin_lng));
     const days = parseInt(String(row.device_days)) || 0;
-    if (isNaN(lat) || isNaN(lng) || !adId) continue;
+    if (isNaN(lat) || isNaN(lng)) return;
     totalDeviceDays += days;
     const coordKey = `${lat.toFixed(COORDINATE_PRECISION)},${lng.toFixed(COORDINATE_PRECISION)}`;
-    deviceOrigins.push({ adId, coordKey, deviceDays: days });
     const existing = coordMap.get(coordKey);
     if (existing) {
       existing.deviceCount += days;
     } else {
       coordMap.set(coordKey, { lat, lng, deviceCount: days });
     }
-  }
+  });
+  console.log(
+    `[POSTAL-MAID] Pass 1 done: ${totalRows} rows streamed, ${coordMap.size} unique coords (4-decimal)`,
+  );
+  report({
+    step: 'running_queries',
+    percent: 70,
+    message: `Pass 1 complete · ${coordMap.size.toLocaleString()} unique coords`,
+    detail: `${totalRows.toLocaleString()} device-day origins · streaming kept memory flat`,
+  });
 
   // Pre-aggregate to 1-decimal precision for geocoding (×10-100x fewer points)
   // This is sufficient for postal code matching (~11km resolution)
@@ -1220,21 +1238,37 @@ export async function analyzePostalMaid(
 
   console.log(`[POSTAL-MAID] Geocoded ${coordToPostal.size}/${coordMap.size} coordinates to postal codes`);
 
-  // Match devices to requested postal codes
-  report({ step: 'matching', percent: 92, message: 'Matching devices to postal codes...', detail: `${requestedPostalCodes.size} postal codes` });
+  // ── PASS 2: stream the same CSV again, this time emit matched devices ──
+  //
+  // We re-stream from S3 (same key, cached in S3 so this is fast). For
+  // each row we check whether its coord maps to a target postal code;
+  // if yes we add it to deviceMap + postalBreakdown directly. Only
+  // matched devices stay in memory — for 20 zip codes out of millions
+  // this is typically <1 GB of devices retained, often <100 MB.
+  report({
+    step: 'matching',
+    percent: 92,
+    message: 'Matching devices to postal codes (pass 2 streaming)…',
+    detail: `${requestedPostalCodes.size} postal codes`,
+  });
 
   const deviceMap = new Map<string, { deviceDays: number; postalCodes: Set<string> }>();
   const postalBreakdown = new Map<string, { devices: Set<string>; deviceDays: number }>();
-
-  // Initialize breakdown for all requested codes
   for (const pc of requestedPostalCodes) {
     postalBreakdown.set(pc, { devices: new Set(), deviceDays: 0 });
   }
 
-  for (const { adId, coordKey, deviceDays } of deviceOrigins) {
+  let matchedRowsSeen = 0;
+  await streamQueryResultsViaS3(maidsQId, (row) => {
+    const adId = String(row.ad_id || '');
+    const lat = parseFloat(String(row.origin_lat));
+    const lng = parseFloat(String(row.origin_lng));
+    const deviceDays = parseInt(String(row.device_days)) || 0;
+    if (!adId || isNaN(lat) || isNaN(lng)) return;
+    const coordKey = `${lat.toFixed(COORDINATE_PRECISION)},${lng.toFixed(COORDINATE_PRECISION)}`;
     const postalCode = coordToPostal.get(coordKey);
-    if (!postalCode || !requestedPostalCodes.has(postalCode)) continue;
-
+    if (!postalCode || !requestedPostalCodes.has(postalCode)) return;
+    matchedRowsSeen++;
     const existing = deviceMap.get(adId);
     if (existing) {
       existing.deviceDays += deviceDays;
@@ -1242,11 +1276,11 @@ export async function analyzePostalMaid(
     } else {
       deviceMap.set(adId, { deviceDays, postalCodes: new Set([postalCode]) });
     }
-
     const breakdown = postalBreakdown.get(postalCode)!;
     breakdown.devices.add(adId);
     breakdown.deviceDays += deviceDays;
-  }
+  });
+  console.log(`[POSTAL-MAID] Pass 2 done: ${matchedRowsSeen} matched rows, ${deviceMap.size} unique devices`);
 
   // Build result arrays
   const devices: PostalMaidDevice[] = Array.from(deviceMap.entries())
