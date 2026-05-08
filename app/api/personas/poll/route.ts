@@ -68,9 +68,16 @@ const STATE_KEY = (runId: string) => `persona-state/${runId}`;
 const REPORT_KEY = (runId: string) => `persona-reports/${runId}`;
 
 // Hash a config to a stable runId.
+//
+// CRITICAL: must include jobIds AND megaJobIds AND filters. Earlier
+// versions of this function only hashed megaJobIds + filters, which
+// caused runs with the same megaJobIds but different jobIds to collide
+// on the same runId — selecting [DatasetA] would serve a cached run
+// of [DatasetA, DatasetB] from S3. Real bug observed in MX dealerships.
 function configToRunId(cfg: PersonaRunConfig): string {
   const norm = {
     megaJobIds: [...cfg.megaJobIds].sort(),
+    jobIds: [...(cfg.jobIds || [])].sort(),
     filters: cfg.filters || {},
   };
   return createHash('sha1').update(JSON.stringify(norm)).digest('hex').slice(0, 16);

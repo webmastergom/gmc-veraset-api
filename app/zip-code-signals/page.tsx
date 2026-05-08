@@ -183,13 +183,24 @@ export default function ZipCodeSignalsPage() {
       fetch('/api/datasets', { credentials: 'include' }).then(r => r.json()).catch(() => ({})),
       fetch('/api/mega-jobs', { credentials: 'include' }).then(r => r.json()).catch(() => ([])),
     ]).then(([dsData, mjData]) => {
+      const allMega = Array.isArray(mjData) ? mjData : (mjData?.megaJobs || []);
+      // Sub-jobs that live INSIDE any megajob — consolidated or not.
+      // We hide them from the "single datasets" list because:
+      //   - consolidated megajobs cover them (use the megajob entry instead)
+      //   - non-consolidated megajobs are unfinished work and orphan
+      //     sub-jobs are misleading to surface separately.
+      const subJobIdsInAnyMegajob = new Set<string>();
+      for (const m of allMega) {
+        for (const sub of (m.subJobIds || [])) subJobIdsInAnyMegajob.add(sub);
+      }
       const ds = (dsData?.datasets || []).filter((d: any) =>
         d.jobId && d.objectCount > 0 && d.totalBytes > 0 &&
-        d.country === selectedCountry
+        d.country === selectedCountry &&
+        !subJobIdsInAnyMegajob.has(d.jobId)
       );
       setDatasets(ds);
       // Megajobs: only show consolidated ones (β path requires the MAIDs CSV).
-      const mjList = (Array.isArray(mjData) ? mjData : (mjData?.megaJobs || []))
+      const mjList = allMega
         .filter((m: any) =>
           m.country === selectedCountry &&
           m.consolidatedReports?.maids,
