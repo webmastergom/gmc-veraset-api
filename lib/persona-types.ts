@@ -102,8 +102,20 @@ export interface PersonaCluster {
   topZips: { zip: string; count: number }[];
   /** Top 5 nearby categories (mode across cluster members). */
   topNearbyCategories: { category: string; count: number }[];
-  /** Brand mix: brand → total visits across cluster. */
+  /** Brand mix: brand → unique device count within this persona. */
   brandMix: Record<string, number>;
+  /**
+   * Peak-traffic time bucket — when this persona is most likely to be at
+   * the POI set. Use this to schedule push / DOOH / ad delivery. The
+   * bucket is whichever of morning/midday/afternoon/evening/night has
+   * the highest mean share across cluster members. `share` is that mean
+   * (0..1); `label` is a human-readable window like "2pm-6pm".
+   */
+  peakHour: {
+    bucket: 'morning' | 'midday' | 'afternoon' | 'evening' | 'night';
+    label: string;
+    share: number;
+  };
   /** NSE distribution: bracket → device count. */
   nseHistogram: Record<string, number>;
   /** Up to 5 example ad_ids (closest to centroid) for spot-check. */

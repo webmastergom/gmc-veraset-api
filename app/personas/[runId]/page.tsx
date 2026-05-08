@@ -165,32 +165,41 @@ export default function PersonaRunPage({ params }: { params: { runId: string } }
   return (
     <MainLayout>
       <div className="max-w-6xl mx-auto space-y-6">
-        <div className="flex items-center gap-3">
-          <Link href="/personas" className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
-            <ChevronLeft className="h-4 w-4" /> Back
-          </Link>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <Sparkles className="h-6 w-6" /> Persona Run
-          </h1>
-          <span className="text-xs text-muted-foreground font-mono">{runId}</span>
-          {phase && phase !== 'done' && (
-            <span className="text-xs px-2 py-0.5 rounded bg-blue-500/15 text-blue-500">{phase}</span>
-          )}
-          <div className="ml-auto">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleRerun}
-              disabled={rerunning || (phase !== 'done' && phase !== 'error' && phase !== '')}
-              title="Re-run this analysis with the same config — keeps the original run as history"
-            >
-              {rerunning ? (
-                <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Re-running...</>
-              ) : (
-                <><RotateCw className="h-4 w-4 mr-2" /> Re-run</>
-              )}
-            </Button>
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-3">
+            <Link href="/personas" className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
+              <ChevronLeft className="h-4 w-4" /> Back
+            </Link>
+            <Sparkles className="h-6 w-6" />
+            <h1 className="text-2xl font-bold flex items-center gap-2 truncate">
+              {megaJobNames.length > 0 ? megaJobNames.join(' + ') : 'Persona Run'}
+            </h1>
+            {phase && phase !== 'done' && (
+              <span className="text-xs px-2 py-0.5 rounded bg-blue-500/15 text-blue-500">{phase}</span>
+            )}
+            <div className="ml-auto">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRerun}
+                disabled={rerunning || (phase !== 'done' && phase !== 'error' && phase !== '')}
+                title="Re-run this analysis with the same config — keeps the original run as history"
+              >
+                {rerunning ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Re-running...</>
+                ) : (
+                  <><RotateCw className="h-4 w-4 mr-2" /> Re-run</>
+                )}
+              </Button>
+            </div>
           </div>
+          {megaJobNames.length > 0 && (
+            <div className="flex items-center gap-2 ml-7 text-xs text-muted-foreground">
+              <span>Persona Run</span>
+              <span>·</span>
+              <span className="font-mono">{runId}</span>
+            </div>
+          )}
         </div>
 
         {error ? (

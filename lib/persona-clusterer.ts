@@ -301,6 +301,8 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
   const dwellAll = features.map((f) => f.avg_dwell_min);
   const recAll = features.map((f) => f.recency_days);
   const gyrAll = features.map((f) => f.gyration_km);
+  const wkAll = features.map((f) => f.weekend_share);
+  const loyAll = features.map((f) => f.brand_loyalty_hhi);
   const globalP = {
     p10: {
       total_visits: percentile(totalVisitsAll, 0.1),
@@ -314,6 +316,19 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
       recency_days: percentile(recAll, 0.9),
       gyration_km: percentile(gyrAll, 0.9),
     },
+  };
+
+  // P25/P50/P75 bands for the naming sanity check — "high X" only emits
+  // when the cluster's median feature value is ≥ global p75 (and similarly
+  // for "low"). Stops the description from saying "high dwell" when the
+  // cluster median is 0 because the centroid mean is skewed by outliers.
+  const globalMedianBands = {
+    avg_dwell_min: { p25: percentile(dwellAll, 0.25), p50: percentile(dwellAll, 0.5), p75: percentile(dwellAll, 0.75) },
+    total_visits: { p25: percentile(totalVisitsAll, 0.25), p50: percentile(totalVisitsAll, 0.5), p75: percentile(totalVisitsAll, 0.75) },
+    recency_days: { p25: percentile(recAll, 0.25), p50: percentile(recAll, 0.5), p75: percentile(recAll, 0.75) },
+    gyration_km: { p25: percentile(gyrAll, 0.25), p50: percentile(gyrAll, 0.5), p75: percentile(gyrAll, 0.75) },
+    weekend_share: { p25: percentile(wkAll, 0.25), p50: percentile(wkAll, 0.5), p75: percentile(wkAll, 0.75) },
+    brand_loyalty_hhi: { p25: percentile(loyAll, 0.25), p50: percentile(loyAll, 0.5), p75: percentile(loyAll, 0.75) },
   };
 
   // Stage 3: per-cluster aggregation over the FULL population.
@@ -348,6 +363,7 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
             total_visits: 0, avg_dwell_min: 0, recency_days: 0,
             weekend_share: 0, gyration_km: 0, brand_loyalty_hhi: 0,
           },
+          peakHour: { bucket: 'midday', label: '11am–2pm', share: 0 },
         },
       });
       continue;
@@ -356,15 +372,23 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
     const { centroidNorm, rawMedians } = computeRawCentroid(features, indices);
 
     // z-score vs global mean for naming (centroid - global / spread).
+    // Pass rawMedians + globalMedianBands so autoName can sanity-check each
+    // "high X" / "low X" claim against the actual median the user will see.
     const z = centroidNorm.map((v, i) => (v - globalNormMean[i]));
-    const naming = autoName({ centroidZ: z, featureLabels: FEATURE_LABELS });
+    const naming = autoName({
+      centroidZ: z,
+      featureLabels: FEATURE_LABELS,
+      rawMedians,
+      globalMedianBands,
+    });
 
     // Aggregate top zips, categories, brand mix, NSE histogram, exampleAdIds.
     const zipCounts = new Map<string, number>();
     const catCounts = new Map<string, number>();
     const brandTotals: Record<string, number> = {};
     const nseHistogram: Record<string, number> = {};
-    let eveningSum = 0, middaySum = 0;
+    // Peak-hour aggregation: average each hour-bucket share across the cluster.
+    let morningSum = 0, middaySum = 0, afternoonSum = 0, eveningSum = 0, nightSum = 0;
 
     for (const i of indices) {
       const f = features[i];
@@ -372,13 +396,21 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
       for (const c of f.nearby_categories_top5) {
         catCounts.set(c, (catCounts.get(c) || 0) + 1);
       }
-      for (const [brand, n] of Object.entries(f.brand_visits)) {
-        brandTotals[brand] = (brandTotals[brand] || 0) + n;
+      // Brand mix: count UNIQUE devices per brand within this cluster, not
+      // visit-days. "X devices in this persona visited Oxxo" reads cleaner
+      // than "X visit-days" (which still felt opaque after the pings→days fix).
+      for (const brand of Object.keys(f.brand_visits)) {
+        if ((f.brand_visits as any)[brand] > 0) {
+          brandTotals[brand] = (brandTotals[brand] || 0) + 1;
+        }
       }
       const bracket = f.nse_bracket || 'unknown';
       nseHistogram[bracket] = (nseHistogram[bracket] || 0) + 1;
-      eveningSum += f.evening_share;
+      morningSum += f.morning_share;
       middaySum += f.midday_share;
+      afternoonSum += f.afternoon_share;
+      eveningSum += f.evening_share;
+      nightSum += f.night_share;
     }
     const exampleAdIds: string[] = [];
     // Sort cluster members by distance to centroid; take top 5 closest.
@@ -402,6 +434,19 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
     radar[6].value = indices.length > 0 ? eveningSum / indices.length : 0;
     radar[7].value = indices.length > 0 ? middaySum / indices.length : 0;
 
+    // Peak-hour bucket — pick the bucket with the highest mean share across
+    // the cluster. Falls back to 'midday' when the cluster is empty.
+    const denom = Math.max(1, indices.length);
+    const buckets: { bucket: 'morning' | 'midday' | 'afternoon' | 'evening' | 'night'; label: string; share: number }[] = [
+      { bucket: 'morning',   label: '5am–11am',  share: morningSum   / denom },
+      { bucket: 'midday',    label: '11am–2pm',  share: middaySum    / denom },
+      { bucket: 'afternoon', label: '2pm–6pm',   share: afternoonSum / denom },
+      { bucket: 'evening',   label: '6pm–10pm',  share: eveningSum   / denom },
+      { bucket: 'night',     label: '10pm–5am',  share: nightSum     / denom },
+    ];
+    buckets.sort((a, b) => b.share - a.share);
+    const peakHour = buckets[0];
+
     personasRaw.push({
       id: cid,
       namingInfo: naming,
@@ -419,12 +464,18 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
         nseHistogram,
         exampleAdIds,
         medians: rawMedians,
+        peakHour,
       },
     });
   }
 
-  // Disambiguate names if collisions.
-  const dis = disambiguateNames(personasRaw.map((p) => p.cluster.name));
+  // Disambiguate names if collisions. Pass each cluster's top-5 features so
+  // colliding names get a meaningful suffix (e.g. "Lapsed Long-stay (Weekend)"
+  // vs "Lapsed Long-stay (Weekday)") instead of "Long-stay 2".
+  const dis = disambiguateNames(
+    personasRaw.map((p) => p.cluster.name),
+    personasRaw.map((p) => p.namingInfo.topFeatures)
+  );
   const personas: PersonaCluster[] = personasRaw.map((p, i) => ({ ...p.cluster, name: dis[i] }));
   return { personas, assignments };
 }

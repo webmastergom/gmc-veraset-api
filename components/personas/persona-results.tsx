@@ -296,9 +296,24 @@ function PersonaCard({ persona, totalDevices }: { persona: PersonaCluster; total
           </div>
         )}
 
+        {/* Peak-traffic time — when devices in this persona are most likely
+            at the POI set. Use it to schedule push / DOOH / ad delivery. */}
+        {persona.peakHour && persona.peakHour.share > 0 && (
+          <div className="text-xs flex items-center gap-2">
+            <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-muted-foreground">Peak hour</span>
+            <span className="font-medium capitalize">{persona.peakHour.bucket}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="tabular-nums">{persona.peakHour.label}</span>
+            <span className="ml-auto text-muted-foreground tabular-nums">
+              {(persona.peakHour.share * 100).toFixed(0)}%
+            </span>
+          </div>
+        )}
+
         {Object.keys(persona.brandMix).length > 0 && (
           <div className="text-xs">
-            <div className="text-muted-foreground mb-1">Brand mix (top)</div>
+            <div className="text-muted-foreground mb-1">Brand mix — unique devices</div>
             <div className="space-y-1">
               {Object.entries(persona.brandMix)
                 .sort((a, b) => b[1] - a[1])
