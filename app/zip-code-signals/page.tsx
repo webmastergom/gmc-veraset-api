@@ -131,8 +131,17 @@ export default function ZipCodeSignalsPage() {
   // Datasets
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [loadingDatasets, setLoadingDatasets] = useState(true);
+  // Megajobs (consolidated only — needed to reuse the MAIDs CSV for the
+  // β fast path that skips the per-table POI scan).
+  const [megaJobs, setMegaJobs] = useState<Array<{
+    id: string;
+    name: string;
+    country?: string;
+    syncedSubJobs: number;
+    hasMaids: boolean;
+  }>>([]);
 
-  // Config
+  // Config — selected source ID is prefixed: "ds:<dataset>" or "mj:<megaJobId>".
   const [selectedDatasetId, setSelectedDatasetId] = useState<string>('');
   const [selectedCountry, setSelectedCountry] = useState<string>('');
   const [dateFrom, setDateFrom] = useState<string>('');
@@ -159,34 +168,55 @@ export default function ZipCodeSignalsPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedAll, setCopiedAll] = useState(false);
 
-  // ── Fetch datasets (only when country is selected) ───────────────
+  // ── Fetch datasets + megajobs (only when country is selected) ──────
   useEffect(() => {
     if (!selectedCountry) {
       setDatasets([]);
+      setMegaJobs([]);
       setSelectedDatasetId('');
       setLoadingDatasets(false);
       return;
     }
     setLoadingDatasets(true);
     setSelectedDatasetId('');
-    fetch('/api/datasets', { credentials: 'include' })
-      .then(r => r.json())
-      .then(data => {
-        const ds = (data.datasets || []).filter((d: any) =>
-          d.jobId && d.objectCount > 0 && d.totalBytes > 0 &&
-          d.country === selectedCountry
-        );
-        setDatasets(ds);
-        setLoadingDatasets(false);
-      })
-      .catch(() => setLoadingDatasets(false));
+    Promise.all([
+      fetch('/api/datasets', { credentials: 'include' }).then(r => r.json()).catch(() => ({})),
+      fetch('/api/mega-jobs', { credentials: 'include' }).then(r => r.json()).catch(() => ([])),
+    ]).then(([dsData, mjData]) => {
+      const ds = (dsData?.datasets || []).filter((d: any) =>
+        d.jobId && d.objectCount > 0 && d.totalBytes > 0 &&
+        d.country === selectedCountry
+      );
+      setDatasets(ds);
+      // Megajobs: only show consolidated ones (β path requires the MAIDs CSV).
+      const mjList = (Array.isArray(mjData) ? mjData : (mjData?.megaJobs || []))
+        .filter((m: any) =>
+          m.country === selectedCountry &&
+          m.consolidatedReports?.maids,
+        )
+        .map((m: any) => ({
+          id: m.megaJobId,
+          name: m.name,
+          country: m.country,
+          syncedSubJobs: m.progress?.synced ?? 0,
+          hasMaids: !!m.consolidatedReports?.maids,
+        }));
+      setMegaJobs(mjList);
+      setLoadingDatasets(false);
+    }).catch(() => setLoadingDatasets(false));
   }, [selectedCountry]);
 
   // ── Derived ───────────────────────────────────────────────────────
-  const selectedDataset = datasets.find(d => d.id === selectedDatasetId);
+  // selectedDatasetId is prefixed: "ds:<id>" for datasets, "mj:<id>" for megajobs.
+  const isMegaJob = selectedDatasetId.startsWith('mj:');
+  const isDataset = selectedDatasetId.startsWith('ds:');
+  const rawSourceId = selectedDatasetId.slice(3);
+  const selectedDataset = isDataset ? datasets.find(d => d.id === rawSourceId) : undefined;
+  const selectedMegaJob = isMegaJob ? megaJobs.find(m => m.id === rawSourceId) : undefined;
+  const sourceLabel = selectedDataset?.name || selectedMegaJob?.name || '';
 
   const canRun = !!(
-    selectedDatasetId &&
+    (isDataset || isMegaJob) &&
     selectedCountry &&
     postalCodes.length > 0
   );
@@ -262,11 +292,13 @@ export default function ZipCodeSignalsPage() {
 
   // ── Run analysis ──────────────────────────────────────────────────
   const handleRun = async () => {
-    if (!canRun || !selectedDataset) return;
+    if (!canRun) return;
 
-    /** Empty date fields default to dataset catalog range so Athena does not scan 100+ GB unpartitioned. */
-    const effDateFrom = (dateFrom || selectedDataset.dateRange?.from || '').trim();
-    const effDateTo = (dateTo || selectedDataset.dateRange?.to || '').trim();
+    /** Empty date fields default to dataset catalog range when known so Athena
+     *  doesn't scan 100+ GB unpartitioned. Megajobs don't expose a dataset-level
+     *  range here, so we let the backend default unless the user picks dates. */
+    const effDateFrom = (dateFrom || selectedDataset?.dateRange?.from || '').trim();
+    const effDateTo = (dateTo || selectedDataset?.dateRange?.to || '').trim();
 
     setPhase('running');
     setError(null);
@@ -276,7 +308,7 @@ export default function ZipCodeSignalsPage() {
     runStartedAtRef.current = Date.now();
     lastProgressRef.current = { percent: 0, message: 'Starting...' };
     const runMeta = {
-      dataset: selectedDataset.id,
+      source: isMegaJob ? `megajob:${rawSourceId}` : `dataset:${rawSourceId}`,
       country: selectedCountry,
       postalCount: postalCodes.length,
       dateFrom: effDateFrom || null,
@@ -287,7 +319,7 @@ export default function ZipCodeSignalsPage() {
       step: 'initializing',
       percent: 0,
       message: 'Run started (client)',
-      detail: `${runMeta.dataset} · ${runMeta.country} · ${runMeta.postalCount} postal code(s)${
+      detail: `${runMeta.source} · ${runMeta.country} · ${runMeta.postalCount} postal code(s)${
         runMeta.dateFrom || runMeta.dateTo
           ? ` · Athena dates ${runMeta.dateFrom ?? '…'} → ${runMeta.dateTo ?? '…'}`
           : ' · Athena dates: full table (all partitions)'
@@ -325,7 +357,10 @@ export default function ZipCodeSignalsPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          datasetName: selectedDataset.id,
+          // Branch on selectedDatasetId prefix — backend dispatches to
+          // analyzePostalMaid (single dataset) or analyzePostalMaidMegaJob
+          // (megajob, reuses consolidated MAIDs CSV).
+          ...(isMegaJob ? { megaJobId: rawSourceId } : { datasetName: rawSourceId }),
           postalCodes,
           country: selectedCountry,
           dateFrom: effDateFrom || undefined,
@@ -668,24 +703,48 @@ export default function ZipCodeSignalsPage() {
                         <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
                           <Loader2 className="w-4 h-4 animate-spin" /> Loading datasets...
                         </div>
-                      ) : datasets.length === 0 ? (
+                      ) : datasets.length === 0 && megaJobs.length === 0 ? (
                         <div className="text-sm text-muted-foreground py-2">
-                          No datasets for {COUNTRY_FLAGS[selectedCountry]} {selectedCountry}
+                          No datasets or consolidated megajobs for {COUNTRY_FLAGS[selectedCountry]} {selectedCountry}
                         </div>
                       ) : (
                         <Select value={selectedDatasetId} onValueChange={setSelectedDatasetId}>
                           <SelectTrigger>
-                            <SelectValue placeholder="Select a dataset" />
+                            <SelectValue placeholder="Select a dataset or megajob" />
                           </SelectTrigger>
                           <SelectContent>
-                            {datasets.map(d => (
-                              <SelectItem key={d.id} value={d.id}>
-                                <span className="font-medium">{d.name}</span>
-                                <span className="text-muted-foreground ml-2 text-xs">
-                                  {formatBytes(d.totalBytes)}
-                                </span>
-                              </SelectItem>
-                            ))}
+                            {/* Megajobs first — visually distinguished as a group */}
+                            {megaJobs.length > 0 && (
+                              <>
+                                <div className="px-2 py-1.5 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-medium">
+                                  ⚡ Megajobs (consolidated · β fast path)
+                                </div>
+                                {megaJobs.map(m => (
+                                  <SelectItem key={`mj:${m.id}`} value={`mj:${m.id}`}>
+                                    <span className="font-medium">{m.name}</span>
+                                    <span className="text-muted-foreground ml-2 text-xs">
+                                      {m.syncedSubJobs} sub-jobs
+                                    </span>
+                                  </SelectItem>
+                                ))}
+                                <div className="border-t my-1" />
+                              </>
+                            )}
+                            {datasets.length > 0 && (
+                              <>
+                                <div className="px-2 py-1.5 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-medium">
+                                  Single datasets
+                                </div>
+                                {datasets.map(d => (
+                                  <SelectItem key={`ds:${d.id}`} value={`ds:${d.id}`}>
+                                    <span className="font-medium">{d.name}</span>
+                                    <span className="text-muted-foreground ml-2 text-xs">
+                                      {formatBytes(d.totalBytes)}
+                                    </span>
+                                  </SelectItem>
+                                ))}
+                              </>
+                            )}
                           </SelectContent>
                         </Select>
                       )}
@@ -718,7 +777,7 @@ export default function ZipCodeSignalsPage() {
                     Omitting that filter forces Athena over all partitions and often hits server time limits on large jobs.
                   </p>
 
-                  {/* Dataset info */}
+                  {/* Source info */}
                   {selectedDataset && (
                     <div className="bg-secondary/50 rounded-xl p-3 flex items-center gap-4 text-xs text-muted-foreground">
                       <span>{selectedDataset.objectCount} parquets</span>
@@ -728,6 +787,15 @@ export default function ZipCodeSignalsPage() {
                           {selectedDataset.dateRange.from} &rarr; {selectedDataset.dateRange.to}
                         </span>
                       )}
+                    </div>
+                  )}
+                  {selectedMegaJob && (
+                    <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 flex items-center gap-3 text-xs">
+                      <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-500 border border-amber-500/40 font-medium text-[10px]">⚡ FAST PATH</span>
+                      <span className="text-muted-foreground">
+                        Reusing the consolidated MAIDs CSV — skips the per-table POI scan.
+                      </span>
+                      <span className="text-muted-foreground ml-auto">{selectedMegaJob.syncedSubJobs} sub-jobs</span>
                     </div>
                   )}
                 </CardContent>

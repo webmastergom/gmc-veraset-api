@@ -92,6 +92,12 @@ async function analyzeFullSchemaFast(
   tableName: string,
   dateWhere: string,
   requestedPostalCodes: Set<string>,
+  /** When set, the source is a megajob: tableExpr is a UNION ALL across
+   *  sub-jobs (used in FROM clauses) and maidsTableName is the pre-built
+   *  external table holding the megajob's consolidated MAIDs CSV. The
+   *  poi_visitors CTE then becomes a simple SELECT from that table —
+   *  skipping the per-table CROSS JOIN UNNEST(poi_ids) scan. */
+  megajobOpts?: { tableExpr: string; maidsTableName: string },
 ): Promise<PostalMaidResult> {
   const report = onProgress;
   const requestedList = Array.from(requestedPostalCodes);
@@ -105,18 +111,26 @@ async function analyzeFullSchemaFast(
     console.log(`[POSTAL-MAID-FAST] Country=${filters.country} → tz=${localTz}`);
   }
 
+  // SQL parameterization: when a megajob is the source, we read pings
+  // from the UNION-ALL of all its sub-job tables and use the consolidated
+  // MAIDs CSV as the POI-visitor list (skipping the heavy poi_ids scan).
+  const fromExpr = megajobOpts?.tableExpr ?? tableName;
+  const poiVisitorsCte = megajobOpts
+    ? `SELECT ad_id FROM ${megajobOpts.maidsTableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''`
+    : `SELECT DISTINCT ad_id
+       FROM ${tableName}
+       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+       WHERE poi_id IS NOT NULL AND poi_id != ''
+         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+         ${dateWhere}`;
+
   // Single Athena query: device-level matched origins.
   // Returns one row per (ad_id, zip) with all the metadata we need to
   // build both the device list AND the per-ZIP signature in Node.
   const devicesQuery = `
     WITH
     poi_visitors AS (
-      SELECT DISTINCT ad_id
-      FROM ${tableName}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        ${dateWhere}
+      ${poiVisitorsCte}
     ),
     valid_pings AS (
       SELECT
@@ -131,7 +145,7 @@ async function analyzeFullSchemaFast(
         TRY_CAST(t.longitude AS DOUBLE) as lng,
         IF(TRY(t.quality_fields['ping_origin_type']) = 'gps', 1.0, 0.0) as is_gps,
         TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) as circle_score
-      FROM ${tableName} t
+      FROM ${fromExpr} t
       INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
       WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
@@ -187,12 +201,7 @@ async function analyzeFullSchemaFast(
   const h3Query = `
     WITH
     poi_visitors AS (
-      SELECT DISTINCT ad_id
-      FROM ${tableName}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        ${dateWhere}
+      ${poiVisitorsCte}
     ),
     valid_pings AS (
       SELECT
@@ -201,7 +210,7 @@ async function analyzeFullSchemaFast(
         TRY(t.geo_fields['h3_res10']) as h3,
         TRY_CAST(t.latitude AS DOUBLE) as lat,
         TRY_CAST(t.longitude AS DOUBLE) as lng
-      FROM ${tableName} t
+      FROM ${fromExpr} t
       INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
       WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
@@ -560,6 +569,143 @@ async function analyzeFullSchemaFast(
     postalCodeBreakdown,
     fullSchema: enrichment,
   };
+}
+
+/**
+ * Megajob entry: treats N synced sub-jobs as one virtual dataset by
+ * UNION-ALL'ing their tables, and re-uses the consolidated MAIDs CSV
+ * (config/mega-reports/{id}/maids.csv) as the POI-visitor set. Skips
+ * the per-table CROSS JOIN UNNEST(poi_ids) scan — typically ~2× faster
+ * than re-running the POI filter from scratch.
+ *
+ * Currently FULL-schema only (most production datasets are FULL). If
+ * the megajob's first sub-job is BASIC, throws — user can fall back to
+ * single-dataset ZCS instead.
+ */
+export async function analyzePostalMaidMegaJob(
+  megaJobId: string,
+  filters: PostalMaidFilters,
+  onProgress?: PostalMaidProgressCallback,
+): Promise<PostalMaidResult> {
+  const report = onProgress || (() => {});
+  const { getMegaJob } = await import('./mega-jobs');
+  const { getJob } = await import('./jobs');
+  const { CopyObjectCommand } = await import('@aws-sdk/client-s3');
+  const { s3Client, BUCKET } = await import('./s3-config');
+
+  report({ step: 'initializing', percent: 0, message: 'Loading megajob metadata...' });
+  const megaJob = await getMegaJob(megaJobId);
+  if (!megaJob) throw new Error(`Megajob ${megaJobId} not found`);
+
+  // Validate consolidation has run — we re-use the MAIDs CSV produced there.
+  const maidsCsvKey = megaJob.consolidatedReports?.maids;
+  if (!maidsCsvKey) {
+    throw new Error(
+      'This megajob has not been consolidated yet. Run consolidation first ' +
+      '(it produces the MAIDs CSV that ZCS reuses to skip the heavy POI scan).',
+    );
+  }
+
+  // Resolve synced sub-jobs → Athena table names.
+  if (!megaJob.subJobIds?.length) throw new Error(`Megajob ${megaJobId} has no sub-jobs`);
+  const subJobs = (await Promise.all(megaJob.subJobIds.map((j) => getJob(j))))
+    .filter((j): j is NonNullable<typeof j> => j !== null && j.status === 'SUCCESS' && !!j.syncedAt);
+  if (subJobs.length === 0) {
+    throw new Error('Megajob has no synced sub-jobs to query');
+  }
+  const datasetNames = subJobs
+    .map((j) => j.s3DestPath?.replace(/\/$/, '').split('/').pop()!)
+    .filter(Boolean);
+  for (const ds of datasetNames) await ensureTableForDataset(ds);
+  const tableNames = datasetNames.map((ds) => getTableName(ds));
+
+  // Sniff FULL schema on the first sub-job table (all share the same schema).
+  const isFull = await detectFullSchema(tableNames[0]);
+  if (!isFull) {
+    throw new Error(
+      'Megajob ZCS support requires FULL schema (geo_fields populated). ' +
+      'This megajob looks BASIC — run ZCS on individual sub-jobs instead.',
+    );
+  }
+
+  try {
+    setCountryFilter([filters.country.toUpperCase()]);
+    const requestedPostalCodes = new Set(
+      filters.postalCodes.map((pc) => normalizePostalForCountry(filters.country, pc)),
+    );
+
+    // ── Materialize the consolidated MAIDs CSV as an Athena external table ──
+    // The CSV is at `athena-results/<queryId>.csv` (single file). Athena's
+    // external-table LOCATION wants a directory containing only the file,
+    // so we server-side-copy the CSV to a fresh prefix first.
+    report({
+      step: 'preparing_table',
+      percent: 5,
+      message: '⚡ Reusing consolidated MAIDs (β fast path)',
+      detail: `${subJobs.length} sub-jobs · maids = ${maidsCsvKey}`,
+    });
+    const ts = Date.now();
+    const safeId = megaJobId.replace(/[^a-z0-9_]/gi, '_').slice(0, 32);
+    const maidsTableName = `zcs_maids_${safeId}_${ts}`;
+    const maidsPrefix = `athena-temp/zcs-maids/${safeId}/${ts}/`;
+    const maidsObjectKey = `${maidsPrefix}data.csv`;
+    await s3Client.send(
+      new CopyObjectCommand({
+        Bucket: BUCKET,
+        Key: maidsObjectKey,
+        CopySource: `${BUCKET}/${maidsCsvKey}`,
+      }),
+    );
+    await runQuery(`
+      CREATE EXTERNAL TABLE IF NOT EXISTS ${maidsTableName} (ad_id STRING)
+      ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+      WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+      STORED AS TEXTFILE
+      LOCATION 's3://${BUCKET}/${maidsPrefix}'
+      TBLPROPERTIES ('skip.header.line.count' = '1')
+    `);
+    console.log(`[POSTAL-MAID-MEGAJOB] Materialized ${maidsTableName} from ${maidsCsvKey}`);
+
+    // ── totalDevicesInDataset — use the MAIDs count directly. No need
+    //    for a separate query: it's the total POI visitors of this megajob.
+    const totalRes = await runQuery(`SELECT COUNT(*) as n FROM ${maidsTableName}`);
+    const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.n)) || 0;
+    if (totalDevicesInDataset === 0) {
+      report({ step: 'completed', percent: 100, message: 'Megajob has no MAIDs to analyze' });
+      return buildEmptyResult(megaJob.name || megaJobId, filters, 0);
+    }
+
+    // ── Build the UNION ALL of sub-job tables. Need: ad_id, date,
+    //    utc_timestamp, geo_fields, quality_fields, latitude, longitude,
+    //    horizontal_accuracy. (poi_ids is NOT needed because we use the
+    //    pre-computed MAIDs CSV instead of scanning poi_ids.)
+    const tableExpr = `(
+      ${tableNames
+        .map(
+          (t) =>
+            `SELECT ad_id, date, utc_timestamp, geo_fields, quality_fields, latitude, longitude, horizontal_accuracy FROM ${t}`,
+        )
+        .join('\n      UNION ALL\n      ')}
+    )`;
+
+    const dateConditions: string[] = [];
+    if (filters.dateFrom) dateConditions.push(`date >= '${filters.dateFrom}'`);
+    if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
+    const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+    return await analyzeFullSchemaFast(
+      megaJob.name || megaJobId,
+      filters,
+      report,
+      totalDevicesInDataset,
+      tableNames[0], // unused when megajobOpts is set
+      dateWhere,
+      requestedPostalCodes,
+      { tableExpr, maidsTableName },
+    );
+  } finally {
+    setCountryFilter(null);
+  }
 }
 
 /**

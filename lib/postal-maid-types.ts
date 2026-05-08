@@ -11,6 +11,13 @@ export interface PostalMaidFilters {
   country: string;             // ISO 2-letter code (for GeoJSON reverse geocoding)
   dateFrom?: string;           // YYYY-MM-DD
   dateTo?: string;             // YYYY-MM-DD
+  /**
+   * When set, the source is a megajob (= union of N synced sub-jobs treated
+   * as one virtual dataset). Skips the heavy CROSS JOIN UNNEST(poi_ids)
+   * scan by re-using the consolidated MAIDs CSV the megajob already
+   * produced — typically ~2× faster than running the POI filter fresh.
+   */
+  megaJobId?: string;
 }
 
 export interface PostalMaidDevice {

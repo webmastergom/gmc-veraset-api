@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { NextRequest } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
-import { analyzePostalMaid } from '@/lib/dataset-analyzer-postal-maid';
+import { analyzePostalMaid, analyzePostalMaidMegaJob } from '@/lib/dataset-analyzer-postal-maid';
 import type { PostalMaidFilters, PostalMaidResult } from '@/lib/postal-maid-types';
 import { putConfig } from '@/lib/s3-config';
 
@@ -38,7 +38,10 @@ export async function POST(request: NextRequest): Promise<Response> {
   }
 
   let body: {
-    datasetName: string;
+    /** Single-dataset mode: S3 folder name. */
+    datasetName?: string;
+    /** Megajob mode: union of all synced sub-jobs, reuses consolidated MAIDs CSV. */
+    megaJobId?: string;
     postalCodes: string[];
     country: string;
     dateFrom?: string;
@@ -51,8 +54,11 @@ export async function POST(request: NextRequest): Promise<Response> {
     return new Response('Invalid JSON body', { status: 400 });
   }
 
-  if (!body.datasetName) {
-    return new Response('datasetName is required', { status: 400 });
+  if (!body.datasetName && !body.megaJobId) {
+    return new Response('Either datasetName or megaJobId is required', { status: 400 });
+  }
+  if (body.datasetName && body.megaJobId) {
+    return new Response('Provide either datasetName or megaJobId, not both', { status: 400 });
   }
   if (!body.postalCodes?.length) {
     return new Response('At least one postal code is required', { status: 400 });
@@ -66,7 +72,10 @@ export async function POST(request: NextRequest): Promise<Response> {
     country: body.country.toUpperCase(),
     dateFrom: body.dateFrom,
     dateTo: body.dateTo,
+    megaJobId: body.megaJobId,
   };
+
+  const sourceLabel = body.megaJobId ? `megajob:${body.megaJobId}` : (body.datasetName || '');
 
   const encoder = new TextEncoder();
 
@@ -93,15 +102,25 @@ export async function POST(request: NextRequest): Promise<Response> {
       }, 15_000);
 
       try {
-        const result = await analyzePostalMaid(body.datasetName, filters, (progress) => {
-          if (aborted) return;
-          send('progress', {
-            step: progress.step,
-            percent: progress.percent,
-            message: progress.message,
-            detail: progress.detail,
-          });
-        });
+        const result = body.megaJobId
+          ? await analyzePostalMaidMegaJob(body.megaJobId, filters, (progress) => {
+              if (aborted) return;
+              send('progress', {
+                step: progress.step,
+                percent: progress.percent,
+                message: progress.message,
+                detail: progress.detail,
+              });
+            })
+          : await analyzePostalMaid(body.datasetName!, filters, (progress) => {
+              if (aborted) return;
+              send('progress', {
+                step: progress.step,
+                percent: progress.percent,
+                message: progress.message,
+                detail: progress.detail,
+              });
+            });
 
         if (aborted) return;
 
@@ -112,7 +131,7 @@ export async function POST(request: NextRequest): Promise<Response> {
           result.devices.length * 40 > MAX_SSE_PAYLOAD_CHARS;
 
         if (needsSpill) {
-          const safeDs = body.datasetName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 72);
+          const safeDs = sourceLabel.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 72);
           const spillKey = `postal-maid-spill/${safeDs}/${Date.now()}-${randomBytes(6).toString('hex')}`;
           await putConfig(spillKey, result, { compact: true });
           outbound = {
@@ -128,7 +147,7 @@ export async function POST(request: NextRequest): Promise<Response> {
 
         const payload = JSON.stringify(outbound);
         if (!needsSpill && payload.length > MAX_SSE_PAYLOAD_CHARS) {
-          const safeDs = body.datasetName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 72);
+          const safeDs = sourceLabel.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 72);
           const spillKey = `postal-maid-spill/${safeDs}/${Date.now()}-${randomBytes(6).toString('hex')}`;
           await putConfig(spillKey, result, { compact: true });
           outbound = {
