@@ -182,17 +182,29 @@ export function buildFeatureCTAS(args: {
         date,
         MIN(utc_timestamp) as first_ping,
         MAX(utc_timestamp) as last_ping,
-        DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_minutes,
+        -- Compute dwell in SECONDS (continuous), divide by 60.0 for fractional
+        -- minutes. DATE_DIFF('minute', …) truncates to whole minutes which
+        -- bucketed all sub-minute spans to 0 — the source of the "0 min avg
+        -- dwell" personas. With seconds we get e.g. 1.5 min for a 90-second
+        -- visit instead of 0.
+        DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_seconds,
+        DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0 as dwell_minutes,
         HOUR(${lts('MIN(utc_timestamp)')}) as arrival_hour,
         DAY_OF_WEEK(${lts('MIN(utc_timestamp)')}) as dow,
         COUNT(*) as ping_count
       FROM at_poi_pings
       GROUP BY ad_id, date
     ),
-    -- Only device-days with ≥2 pings count as real visits. This drops
-    -- drive-by / single-ping events that mathematically force dwell=0.
+    -- Real-visit threshold (industry standard, Foursquare/SafeGraph/Placer):
+    --   1) ≥2 pings same day at the POI (filters single-ping SDK noise)
+    --   2) ≥2 minutes between first and last ping (filters drive-bys —
+    --      a person passing in a car would have <30s of pings even with
+    --      ≥2 events). Without this floor, devices with 2+ pings within
+    --      the same minute leaked through with dwell=0 and dragged the
+    --      cluster averages to "0 min avg dwell" — the user-visible bug.
     daily_visits AS (
-      SELECT * FROM daily_visits_raw WHERE ping_count >= 2
+      SELECT * FROM daily_visits_raw
+      WHERE ping_count >= 2 AND dwell_seconds >= 120
     ),
     -- visitor_ad_ids: only devices with at least one qualified visit-day
     -- enter clustering. Devices whose visits are ALL single-ping → out.

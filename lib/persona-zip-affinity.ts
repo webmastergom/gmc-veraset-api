@@ -24,8 +24,11 @@ import type {
 /** Skip ZIPs below this population — small enough that a few visitors give noisy >>100 indices. */
 const MIN_POPULATION_FOR_POP_INDEX = 200;
 
-/** Cap the population-weighted index. Beyond 300 the differences stop being meaningful (saturated affinity). */
-const POP_INDEX_CAP = 300;
+/** Cap the population-weighted index at 100 — readable as a 0-100 score
+ *  where 100 = at-or-above baseline (ZIP over-delivers vs its size) and
+ *  values <100 = under-indexing. Same scale as the volume-only index so
+ *  the two modes align in the UI. */
+const POP_INDEX_CAP = 100;
 
 export interface PopulationLookup {
   /**

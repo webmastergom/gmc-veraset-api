@@ -695,7 +695,7 @@ function ZipAffinityTab({
 
   const modeDescription =
     mode === 'pop'
-      ? 'Population-weighted index (CPG-style "vs baseline"). 100 = ZIP delivers visitors proportional to its size. >100 over-indexes; <100 under-indexes. Capped at 300.'
+      ? 'Population-weighted index 0..100. 100 = ZIP over-delivers visitors vs its size (at or above baseline); <100 = under-indexes. Saturated at 100 so the scale aligns with the volume index.'
       : 'Volume index 0..100 — share of the top ZIP\'s visitor count. Best for coverage / media buying where audience size matters most.';
 
   return (
