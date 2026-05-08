@@ -619,12 +619,36 @@ export async function analyzePostalMaidMegaJob(
   for (const ds of datasetNames) await ensureTableForDataset(ds);
   const tableNames = datasetNames.map((ds) => getTableName(ds));
 
-  // Sniff FULL schema on the first sub-job table (all share the same schema).
-  const isFull = await detectFullSchema(tableNames[0]);
+  // Detect FULL schema. Prefer the job-level metadata (schema field set
+  // when the megajob was created), then fall back to an Athena sniff in
+  // case the metadata is missing on legacy jobs. The previous strict
+  // sniff-only path threw false-negatives when the first sub-job had
+  // sparse geo_fields even though the job was requested as FULL.
+  const declaredSchemas = subJobs
+    .map((j) => (j as any)?.schema || '')
+    .filter((s) => typeof s === 'string') as string[];
+  const declaredFull = declaredSchemas.length > 0 && declaredSchemas.every((s) => s === 'FULL' || s === 'ENHANCED');
+  const declaredBasic = declaredSchemas.length > 0 && declaredSchemas.every((s) => s === 'BASIC');
+  let isFull = declaredFull;
+  if (!declaredFull && !declaredBasic) {
+    // Mixed or unknown — try sniffing each sub-job's table until one
+    // returns a row with a non-null zipcode.
+    for (const t of tableNames) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await detectFullSchema(t)) { isFull = true; break; }
+    }
+  }
+  console.log(
+    `[POSTAL-MAID-MEGAJOB] schema check: declared=[${declaredSchemas.join(',')}] → ` +
+    `${declaredFull ? 'FULL (metadata)' : declaredBasic ? 'BASIC (metadata)' : 'sniff'} ` +
+    `→ isFull=${isFull}`,
+  );
   if (!isFull) {
     throw new Error(
-      'Megajob ZCS support requires FULL schema (geo_fields populated). ' +
-      'This megajob looks BASIC — run ZCS on individual sub-jobs instead.',
+      'Megajob ZCS support requires FULL schema. The sub-jobs report ' +
+      `schema=[${declaredSchemas.join(', ')}] and a sample of their tables ` +
+      'returned no geo_fields[zipcode] either. Re-pull as FULL or run ZCS ' +
+      'on individual sub-jobs that ARE FULL.',
     );
   }
 
