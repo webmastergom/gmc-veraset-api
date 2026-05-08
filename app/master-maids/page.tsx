@@ -47,6 +47,8 @@ const ATTR_COLORS: Record<string, string> = {
   nse_bracket: 'bg-purple-500/20 text-purple-400',
   category: 'bg-blue-500/20 text-blue-400',
   catchment: 'bg-green-500/20 text-green-400',
+  persona: 'bg-amber-500/20 text-amber-400',
+  persona_lookalike: 'bg-orange-500/20 text-orange-400',
 }
 
 interface CountrySummary {
@@ -219,6 +221,15 @@ export default function MasterMaidsPage() {
     } finally {
       setDeduplicating(false)
     }
+  }
+
+  const handleDownloadCluster = (cc: string, attrType: string, attrValue: string) => {
+    // Streams the cluster CSV directly to the user's downloads. The endpoint
+    // runs an Athena SELECT and pipes the result file — no client-side memory
+    // pressure even for million-row clusters.
+    const params = new URLSearchParams({ type: attrType, value: attrValue || '' })
+    const url = `/api/master-maids/${cc}/download-cluster?${params.toString()}`
+    window.open(url, '_blank')
   }
 
   const handleRemoveContribution = async (cc: string, id: string) => {
@@ -419,6 +430,7 @@ export default function MasterMaidsPage() {
                                   <TableHead className="text-right">MAIDs</TableHead>
                                   <TableHead className="text-right">%</TableHead>
                                   <TableHead className="text-right">Data Period</TableHead>
+                                  <TableHead className="text-right w-[60px]"></TableHead>
                                 </TableRow>
                               </TableHeader>
                               <TableBody>
@@ -442,6 +454,20 @@ export default function MasterMaidsPage() {
                                     </TableCell>
                                     <TableCell className="text-right text-xs text-muted-foreground">
                                       {formatShortDate(attr.oldestData)} → {formatShortDate(attr.newestData)}
+                                    </TableCell>
+                                    <TableCell className="text-right">
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-7 w-7 p-0 text-muted-foreground hover:text-theme-accent"
+                                        title={`Download MAIDs for ${attr.attributeType}=${attr.attributeValue || '(all)'}`}
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleDownloadCluster(c.country, attr.attributeType, attr.attributeValue)
+                                        }}
+                                      >
+                                        <Download className="h-3.5 w-3.5" />
+                                      </Button>
                                     </TableCell>
                                   </TableRow>
                                 ))}
