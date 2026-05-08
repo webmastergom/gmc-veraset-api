@@ -751,11 +751,38 @@ export async function analyzePostalMaidMegaJob(
     if (effectiveFrom) dateConditions.push(`date >= '${effectiveFrom}'`);
     if (effectiveTo) dateConditions.push(`date <= '${effectiveTo}'`);
     const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+    const usedCatalog = !filters.dateFrom && !filters.dateTo && (catalogFrom || catalogTo);
     if (effectiveFrom || effectiveTo) {
       console.log(
         `[POSTAL-MAID-MEGAJOB] partition prune: date >= ${effectiveFrom || '∞'} AND date <= ${effectiveTo || '∞'} ` +
           `(user-supplied=${!!(filters.dateFrom || filters.dateTo)}, catalog=${catalogFrom}..${catalogTo})`,
       );
+      // Surface this in the SSE log so the user can verify partition prune
+      // was applied (the client log says "full table (all partitions)"
+      // because it doesn't know about server-side defaulting).
+      report({
+        step: 'preparing_table',
+        percent: 7,
+        message: usedCatalog
+          ? `📅 Server applied catalog date range: ${effectiveFrom} → ${effectiveTo}`
+          : `📅 Athena partitions filtered: ${effectiveFrom || '∞'} → ${effectiveTo || '∞'}`,
+        detail: usedCatalog
+          ? 'You left dates blank → using megaJob.sourceScope.dateRange so Athena can prune partitions.'
+          : 'User-supplied date range will be applied to all sub-job tables.',
+      });
+    } else {
+      console.warn(
+        `[POSTAL-MAID-MEGAJOB] NO date range available (user blank, catalog=${catalogFrom}..${catalogTo}) — ` +
+          `Athena will scan ALL partitions, expect long runtime`,
+      );
+      report({
+        step: 'preparing_table',
+        percent: 7,
+        message: '⚠️ No date range available — Athena will scan ALL partitions',
+        detail:
+          `Megajob ${megaJobId.slice(0, 8)} has no sourceScope.dateRange. Set DATE FROM/TO ` +
+          `manually or re-create the megajob with a defined catalog range to enable partition pruning.`,
+      });
     }
     // Push the effective range into filters so analyzePostalMaid (BASIC
     // megajob fork) and analyzeFullSchemaFast both see the partition prune
