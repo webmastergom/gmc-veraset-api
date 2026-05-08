@@ -738,50 +738,79 @@ export async function analyzePostalMaidMegaJob(
     )`;
 
     // CRITICAL: when the user leaves date fields blank, fall back to the
-    // megajob's CATALOG range (sourceScope.dateRange). Without this, Athena
-    // scans EVERY partition of every sub-job table (potentially many months
-    // of data the megajob doesn't even cover) and the run blows past the
-    // Vercel 5-min cap. The UI tells users "leaving dates blank uses the
-    // catalog range" — this is what makes that promise true.
-    const catalogFrom = megaJob.sourceScope?.dateRange?.from;
-    const catalogTo = megaJob.sourceScope?.dateRange?.to;
+    // megajob's CATALOG range. Without this, Athena scans EVERY partition
+    // of every sub-job table (potentially many months of data the megajob
+    // doesn't even cover) and the run blows past the Vercel 5-min cap.
+    //
+    // Three sources, in order of preference:
+    //   1. user input (filters.dateFrom / filters.dateTo)
+    //   2. megajob.sourceScope.dateRange — set when megajob was created
+    //      via auto-split flow. Old / imported megajobs may not have it.
+    //   3. derived = min(subJob.dateRange.from), max(subJob.dateRange.to)
+    //      across all synced sub-jobs. ALWAYS available for any megajob
+    //      whose sub-jobs have synced data — the safety net that ensures
+    //      we never run a "no date range, scan everything" query when we
+    //      could have computed one for free.
+    let catalogFrom = megaJob.sourceScope?.dateRange?.from;
+    let catalogTo = megaJob.sourceScope?.dateRange?.to;
+    let catalogSource: 'sourceScope' | 'derivedFromSubJobs' | 'none' = catalogFrom || catalogTo
+      ? 'sourceScope'
+      : 'none';
+    if (!catalogFrom || !catalogTo) {
+      let minFrom = '';
+      let maxTo = '';
+      for (const sj of subJobs) {
+        const r = (sj as any)?.dateRange as { from?: string; to?: string } | undefined;
+        if (r?.from && (!minFrom || r.from < minFrom)) minFrom = r.from;
+        if (r?.to && (!maxTo || r.to > maxTo)) maxTo = r.to;
+      }
+      if (minFrom && !catalogFrom) catalogFrom = minFrom;
+      if (maxTo && !catalogTo) catalogTo = maxTo;
+      if ((minFrom || maxTo) && catalogSource === 'none') catalogSource = 'derivedFromSubJobs';
+      if (catalogSource === 'derivedFromSubJobs') {
+        console.log(
+          `[POSTAL-MAID-MEGAJOB] sourceScope.dateRange missing — derived from sub-jobs: ${minFrom}..${maxTo}`,
+        );
+      }
+    }
     const effectiveFrom = filters.dateFrom || catalogFrom;
     const effectiveTo = filters.dateTo || catalogTo;
     const dateConditions: string[] = [];
     if (effectiveFrom) dateConditions.push(`date >= '${effectiveFrom}'`);
     if (effectiveTo) dateConditions.push(`date <= '${effectiveTo}'`);
     const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
-    const usedCatalog = !filters.dateFrom && !filters.dateTo && (catalogFrom || catalogTo);
+    const userSupplied = !!(filters.dateFrom || filters.dateTo);
     if (effectiveFrom || effectiveTo) {
       console.log(
         `[POSTAL-MAID-MEGAJOB] partition prune: date >= ${effectiveFrom || '∞'} AND date <= ${effectiveTo || '∞'} ` +
-          `(user-supplied=${!!(filters.dateFrom || filters.dateTo)}, catalog=${catalogFrom}..${catalogTo})`,
+          `(source=${userSupplied ? 'user' : catalogSource})`,
       );
-      // Surface this in the SSE log so the user can verify partition prune
-      // was applied (the client log says "full table (all partitions)"
-      // because it doesn't know about server-side defaulting).
-      report({
-        step: 'preparing_table',
-        percent: 7,
-        message: usedCatalog
-          ? `📅 Server applied catalog date range: ${effectiveFrom} → ${effectiveTo}`
-          : `📅 Athena partitions filtered: ${effectiveFrom || '∞'} → ${effectiveTo || '∞'}`,
-        detail: usedCatalog
-          ? 'You left dates blank → using megaJob.sourceScope.dateRange so Athena can prune partitions.'
-          : 'User-supplied date range will be applied to all sub-job tables.',
-      });
+      let message: string;
+      let detail: string;
+      if (userSupplied) {
+        message = `📅 Athena partitions filtered: ${effectiveFrom || '∞'} → ${effectiveTo || '∞'}`;
+        detail = 'User-supplied date range will be applied to all sub-job tables.';
+      } else if (catalogSource === 'sourceScope') {
+        message = `📅 Server applied catalog date range: ${effectiveFrom} → ${effectiveTo}`;
+        detail = 'You left dates blank → using megaJob.sourceScope.dateRange for partition pruning.';
+      } else {
+        message = `📅 Date range derived from sub-jobs: ${effectiveFrom} → ${effectiveTo}`;
+        detail =
+          `Megajob has no sourceScope.dateRange — computed min/max across ${subJobs.length} ` +
+          `synced sub-job(s). Athena can still prune partitions.`;
+      }
+      report({ step: 'preparing_table', percent: 7, message, detail });
     } else {
       console.warn(
-        `[POSTAL-MAID-MEGAJOB] NO date range available (user blank, catalog=${catalogFrom}..${catalogTo}) — ` +
-          `Athena will scan ALL partitions, expect long runtime`,
+        `[POSTAL-MAID-MEGAJOB] NO date range available — Athena will scan ALL partitions`,
       );
       report({
         step: 'preparing_table',
         percent: 7,
         message: '⚠️ No date range available — Athena will scan ALL partitions',
         detail:
-          `Megajob ${megaJobId.slice(0, 8)} has no sourceScope.dateRange. Set DATE FROM/TO ` +
-          `manually or re-create the megajob with a defined catalog range to enable partition pruning.`,
+          'Neither sourceScope.dateRange nor sub-job dateRanges yielded any value. ' +
+          'Set DATE FROM/TO manually to enable partition pruning.',
       });
     }
     // Push the effective range into filters so analyzePostalMaid (BASIC
