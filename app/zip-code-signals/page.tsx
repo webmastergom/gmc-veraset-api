@@ -49,8 +49,15 @@ import {
   FileDown,
   RotateCcw,
   ScrollText,
+  Zap,
+  MapPin,
+  Clock,
+  Sparkles,
+  Award,
+  Activity,
+  Building2,
 } from 'lucide-react';
-import type { PostalMaidResult, PostalMaidDevice } from '@/lib/postal-maid-types';
+import type { PostalMaidResult, PostalMaidDevice, ZipSignature } from '@/lib/postal-maid-types';
 
 // ── Types ─────────────────────────────────────────────────────────────
 interface DatasetInfo {
@@ -526,15 +533,68 @@ export default function ZipCodeSignalsPage() {
   // ── Export CSV ────────────────────────────────────────────────────
   const exportDevicesCsv = () => {
     if (!result?.devices?.length) return;
-    const rows = [['ad_id', 'device_days', 'postal_codes'].join(',')];
+    // Enriched columns when FULL schema fast-path produced extras
+    const enriched = !!result.methodology?.fastPath;
+    const headers = enriched
+      ? ['ad_id', 'device_days', 'postal_codes', 'region', 'city', 'quality_tier', 'overnight_presence']
+      : ['ad_id', 'device_days', 'postal_codes'];
+    const rows = [headers.join(',')];
+    const csvCell = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     for (const d of result.devices) {
-      rows.push([d.adId, String(d.deviceDays), `"${d.postalCodes.join(';')}"`].join(','));
+      const base = [d.adId, String(d.deviceDays), csvCell(d.postalCodes.join(';'))];
+      if (enriched) {
+        base.push(csvCell(d.region || ''));
+        base.push(csvCell(d.city || ''));
+        base.push(d.qualityTier || '');
+        base.push(d.overnightPresence ? 'true' : 'false');
+      }
+      rows.push(base.join(','));
+    }
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const suffix = enriched ? '-enriched' : '';
+    a.href = url;
+    a.download = `zip-signals${suffix}-${result.dataset}-${result.filters.country}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportZipSignaturesCsv = () => {
+    const sigs = result?.fullSchema?.zipSignatures;
+    if (!sigs?.length) return;
+    const headers = [
+      'postal_code', 'region', 'top_cities', 'devices', 'device_days',
+      'peak_hour_bucket', 'weekend_share', 'overnight_share',
+      'quality_tier', 'gps_share', 'avg_circle_score',
+      'persistence_once', 'persistence_casual', 'persistence_regular', 'persistence_resident',
+      'centroid_lat', 'centroid_lng', 'top_h3_lat', 'top_h3_lng', 'top_h3_devices',
+    ];
+    const csvCell = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    const rows = [headers.join(',')];
+    for (const s of sigs) {
+      const top = s.topH3Cells[0];
+      rows.push([
+        s.postalCode, csvCell(s.region || ''),
+        csvCell(s.topCities.map((c) => `${c.city}:${c.devices}`).join(';')),
+        String(s.devices), String(s.deviceDays),
+        s.peakHourBucket,
+        s.weekendShare.toFixed(3),
+        s.overnightShare.toFixed(3),
+        s.qualityTier,
+        s.gpsShare.toFixed(3),
+        s.avgCircleScore.toFixed(3),
+        String(s.persistence.onceOnly), String(s.persistence.casual),
+        String(s.persistence.regular), String(s.persistence.resident),
+        s.centroid.lat.toFixed(6), s.centroid.lng.toFixed(6),
+        top ? top.lat.toFixed(6) : '', top ? top.lng.toFixed(6) : '', top ? String(top.devices) : '',
+      ].join(','));
     }
     const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `zip-signals-${result.dataset}-${result.filters.country}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `zip-signatures-${result!.dataset}-${result!.filters.country}-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -988,6 +1048,14 @@ export default function ZipCodeSignalsPage() {
               </Card>
             </div>
 
+            {/* ── FULL schema fast-path enrichment ──────────────────── */}
+            {result.methodology?.fastPath && result.fullSchema && (
+              <FullSchemaEnrichmentSection
+                fullSchema={result.fullSchema}
+                onExportZipCsv={exportZipSignaturesCsv}
+              />
+            )}
+
             {progressLog.length > 0 && (
               <Card>
                 <CardHeader className="pb-2">
@@ -1195,7 +1263,14 @@ export default function ZipCodeSignalsPage() {
                 <div className="flex items-start gap-3 text-xs text-muted-foreground">
                   <Globe className="w-4 h-4 mt-0.5 shrink-0 text-theme-accent" />
                   <div>
-                    <p className="font-medium text-foreground mb-1">Methodology</p>
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className="font-medium text-foreground">Methodology</p>
+                      {result.methodology.fastPath && (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                          <Zap className="w-3 h-3" /> FULL fast path
+                        </span>
+                      )}
+                    </div>
                     <p>{result.methodology.description}</p>
                     <p className="mt-1">
                       Accuracy threshold: {result.methodology.accuracyThresholdMeters}m &middot;
@@ -1209,5 +1284,241 @@ export default function ZipCodeSignalsPage() {
         )}
       </div>
     </MainLayout>
+  );
+}
+
+// ── FULL-schema fast-path enrichment ──────────────────────────────────
+
+const HOUR_BUCKET_LABELS: Record<string, string> = {
+  morning: '5am–10am',
+  midday: '11am–1pm',
+  afternoon: '2pm–5pm',
+  evening: '6pm–9pm',
+  night: '10pm–4am',
+};
+
+const QUALITY_TIER_COLORS: Record<string, string> = {
+  high: 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30',
+  mixed: 'bg-amber-500/15 text-amber-500 border-amber-500/30',
+  low: 'bg-rose-500/15 text-rose-500 border-rose-500/30',
+};
+
+function fmtPct(n: number): string {
+  return `${(Math.max(0, Math.min(1, n)) * 100).toFixed(0)}%`;
+}
+
+function fmtNumCompact(n: number): string {
+  if (!Number.isFinite(n)) return '0';
+  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return Math.round(n).toLocaleString();
+}
+
+function FullSchemaEnrichmentSection({
+  fullSchema,
+  onExportZipCsv,
+}: {
+  fullSchema: NonNullable<PostalMaidResult['fullSchema']>;
+  onExportZipCsv: () => void;
+}) {
+  const { zipSignatures, regionSummary, qualityHistogram } = fullSchema;
+  const totalQuality = qualityHistogram.high + qualityHistogram.medium + qualityHistogram.low || 1;
+
+  return (
+    <Card className="border-amber-500/30 bg-gradient-to-br from-amber-500/5 to-transparent">
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <CardTitle className="text-base flex items-center gap-2">
+              <Zap className="w-4 h-4 text-amber-500" />
+              FULL schema enrichment
+              <span className="text-[10px] font-normal px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                fast path
+              </span>
+            </CardTitle>
+            <CardDescription className="text-xs mt-1">
+              Per-ZIP signatures derived from <code>geo_fields</code> directly — no Node geocoding step.
+              Includes region, top cities, peak hour, persistence, quality tier, and sub-ZIP H3 hotspots.
+            </CardDescription>
+          </div>
+          <Button variant="outline" size="sm" onClick={onExportZipCsv} className="gap-1.5 text-xs">
+            <FileDown className="w-3.5 h-3.5" /> Export ZIP signatures
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        {/* Top-level histograms */}
+        <div className="grid gap-3 md:grid-cols-2">
+          {/* Quality histogram */}
+          <div className="rounded-lg border bg-card/40 p-3">
+            <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground mb-2">
+              <Award className="w-3.5 h-3.5" /> Device quality distribution
+            </div>
+            <div className="space-y-1.5">
+              {(['high', 'medium', 'low'] as const).map((tier) => {
+                const n = qualityHistogram[tier];
+                const pct = (n / totalQuality) * 100;
+                const cls = QUALITY_TIER_COLORS[tier === 'medium' ? 'mixed' : tier];
+                return (
+                  <div key={tier} className="flex items-center gap-2 text-xs">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] border w-16 text-center ${cls}`}>{tier}</span>
+                    <div className="flex-1 h-2 bg-muted rounded overflow-hidden">
+                      <div
+                        className={`h-full ${tier === 'high' ? 'bg-emerald-500' : tier === 'medium' ? 'bg-amber-500' : 'bg-rose-500'}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="tabular-nums w-12 text-right">{fmtNumCompact(n)}</span>
+                    <span className="text-muted-foreground tabular-nums w-10 text-right">{pct.toFixed(0)}%</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Region rollup */}
+          <div className="rounded-lg border bg-card/40 p-3">
+            <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground mb-2">
+              <Building2 className="w-3.5 h-3.5" /> Region rollup
+              <span className="text-[10px] font-normal opacity-70">
+                ({regionSummary.length} regions)
+              </span>
+            </div>
+            <div className="space-y-1 max-h-40 overflow-y-auto">
+              {regionSummary.length === 0 ? (
+                <p className="text-xs text-muted-foreground italic">No region data.</p>
+              ) : regionSummary.slice(0, 10).map((r) => (
+                <div key={r.region} className="flex items-center gap-2 text-xs">
+                  <span className="flex-1 truncate">{r.region}</span>
+                  <span className="text-muted-foreground tabular-nums w-10 text-right">{r.zips} ZIPs</span>
+                  <div className="w-16 h-1.5 bg-muted rounded overflow-hidden">
+                    <div className="h-full bg-blue-500" style={{ width: `${r.shareOfTotal * 100}%` }} />
+                  </div>
+                  <span className="tabular-nums w-12 text-right font-medium">{fmtNumCompact(r.devices)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Per-ZIP signature cards */}
+        <div>
+          <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground mb-2">
+            <Sparkles className="w-3.5 h-3.5" /> Per-ZIP signatures
+            <span className="text-[10px] font-normal opacity-70">
+              ({zipSignatures.length} ZIPs with data)
+            </span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+            {zipSignatures.slice(0, 24).map((s) => (
+              <ZipSignatureCard key={s.postalCode} sig={s} />
+            ))}
+          </div>
+          {zipSignatures.length > 24 && (
+            <p className="text-xs text-muted-foreground mt-3 text-center">
+              Showing top 24 of {zipSignatures.length} ZIPs · download the CSV for the full list.
+            </p>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ZipSignatureCard({ sig }: { sig: ZipSignature }) {
+  const totalDD = sig.deviceDays || 1;
+  const buckets = sig.hourBuckets;
+  const maxBucket = Math.max(buckets.morning, buckets.midday, buckets.afternoon, buckets.evening, buckets.night) || 1;
+  const persistTotal =
+    sig.persistence.onceOnly + sig.persistence.casual + sig.persistence.regular + sig.persistence.resident || 1;
+  const tierClass = QUALITY_TIER_COLORS[sig.qualityTier] || '';
+  const top = sig.topH3Cells[0];
+
+  return (
+    <div className="rounded-lg border bg-card/60 p-3 space-y-2.5 text-xs">
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <div className="font-mono font-bold text-sm">{sig.postalCode}</div>
+          <div className="text-muted-foreground text-[11px] truncate">
+            {sig.region || '—'}
+            {sig.topCities[0] ? ` · ${sig.topCities[0].city}` : ''}
+          </div>
+        </div>
+        <span className={`px-1.5 py-0.5 rounded text-[10px] border ${tierClass}`}>{sig.qualityTier}</span>
+      </div>
+
+      {/* Headline numbers */}
+      <div className="flex items-baseline gap-2">
+        <div className="text-lg font-bold tabular-nums">{fmtNumCompact(sig.devices)}</div>
+        <div className="text-[11px] text-muted-foreground">devices</div>
+        <div className="ml-auto text-[11px] text-muted-foreground tabular-nums">
+          {fmtNumCompact(sig.deviceDays)} dev-days
+        </div>
+      </div>
+
+      {/* Hour distribution mini-bars */}
+      <div>
+        <div className="flex items-center gap-1 text-[10px] text-muted-foreground mb-1">
+          <Clock className="w-3 h-3" /> Origin hour ·
+          <span className="text-foreground font-medium capitalize">
+            peak {sig.peakHourBucket}
+          </span>
+          <span className="opacity-70">{HOUR_BUCKET_LABELS[sig.peakHourBucket]}</span>
+        </div>
+        <div className="flex items-end gap-1 h-7">
+          {(['morning','midday','afternoon','evening','night'] as const).map((b) => {
+            const v = buckets[b];
+            const h = (v / maxBucket) * 100;
+            const isPeak = b === sig.peakHourBucket;
+            return (
+              <div key={b} className="flex-1 flex flex-col items-center justify-end" title={`${b}: ${v.toLocaleString()} dev-days`}>
+                <div
+                  className={`w-full rounded-t ${isPeak ? 'bg-amber-500' : 'bg-blue-500/60'}`}
+                  style={{ height: `${Math.max(4, h)}%` }}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Weekend + overnight */}
+      <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+        <div className="rounded bg-muted/30 px-2 py-1">
+          <div className="text-muted-foreground text-[10px]">Weekend</div>
+          <div className="tabular-nums font-medium">{fmtPct(sig.weekendShare)}</div>
+        </div>
+        <div className="rounded bg-muted/30 px-2 py-1">
+          <div className="text-muted-foreground text-[10px]">Overnight</div>
+          <div className="tabular-nums font-medium">{fmtPct(sig.overnightShare)}</div>
+        </div>
+      </div>
+
+      {/* Persistence histogram */}
+      <div>
+        <div className="text-[10px] text-muted-foreground mb-1 flex items-center gap-1">
+          <Activity className="w-3 h-3" /> Persistence
+        </div>
+        <div className="flex h-1.5 rounded overflow-hidden bg-muted/40">
+          <div className="bg-rose-400" style={{ width: `${(sig.persistence.onceOnly / persistTotal) * 100}%` }} title={`Once only: ${sig.persistence.onceOnly}`} />
+          <div className="bg-amber-400" style={{ width: `${(sig.persistence.casual / persistTotal) * 100}%` }} title={`Casual: ${sig.persistence.casual}`} />
+          <div className="bg-blue-400" style={{ width: `${(sig.persistence.regular / persistTotal) * 100}%` }} title={`Regular: ${sig.persistence.regular}`} />
+          <div className="bg-emerald-500" style={{ width: `${(sig.persistence.resident / persistTotal) * 100}%` }} title={`Resident: ${sig.persistence.resident}`} />
+        </div>
+        <div className="flex justify-between text-[9px] text-muted-foreground mt-0.5">
+          <span>1 day</span><span>2-7</span><span>8-30</span><span>30+</span>
+        </div>
+      </div>
+
+      {/* Top H3 hotspot — sub-ZIP precision */}
+      {top && (
+        <div className="text-[10px] text-muted-foreground border-t pt-1.5 flex items-center gap-1">
+          <MapPin className="w-3 h-3" />
+          <span>Top hotspot</span>
+          <span className="font-mono">{top.lat.toFixed(4)}, {top.lng.toFixed(4)}</span>
+          <span className="ml-auto tabular-nums">{top.devices} dev</span>
+        </div>
+      )}
+    </div>
   );
 }
