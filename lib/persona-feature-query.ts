@@ -159,7 +159,13 @@ export function buildFeatureCTAS(args: {
     -- Per (ad_id, date): one row with first/last ping, dwell, hour bucket, dow.
     -- arrival_hour and dow are computed in LOCAL time (at_timezone wrapper)
     -- so MX afternoon visits don't end up in the UTC night bucket.
-    daily_visits AS (
+    --
+    -- QUALIFIED VISIT FLAG: industry standard for mobility analytics
+    -- (Foursquare, SafeGraph, Placer.ai) treats a "visit" as ≥2 pings
+    -- at the POI on the same day — single-ping device-days are SDK
+    -- noise / drive-bys, not real visits. We tag each device-day with
+    -- a flag here, then downstream aggregations exclude unqualified days.
+    daily_visits_raw AS (
       SELECT
         ad_id,
         date,
@@ -167,12 +173,20 @@ export function buildFeatureCTAS(args: {
         MAX(utc_timestamp) as last_ping,
         DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_minutes,
         HOUR(${lts('MIN(utc_timestamp)')}) as arrival_hour,
-        DAY_OF_WEEK(${lts('MIN(utc_timestamp)')}) as dow
+        DAY_OF_WEEK(${lts('MIN(utc_timestamp)')}) as dow,
+        COUNT(*) as ping_count
       FROM at_poi_pings
       GROUP BY ad_id, date
     ),
+    -- Only device-days with ≥2 pings count as real visits. This drops
+    -- drive-by / single-ping events that mathematically force dwell=0.
+    daily_visits AS (
+      SELECT * FROM daily_visits_raw WHERE ping_count >= 2
+    ),
+    -- visitor_ad_ids: only devices with at least one qualified visit-day
+    -- enter clustering. Devices whose visits are ALL single-ping → out.
     visitor_ad_ids AS (
-      SELECT DISTINCT ad_id FROM at_poi_pings
+      SELECT DISTINCT ad_id FROM daily_visits
     ),
     -- Home zipcode (FULL only): mode of geo_fields['zipcode'] during night hours (22-06).
     -- Tagged with a priority so we can fall back to all-hour mode when night data is sparse.

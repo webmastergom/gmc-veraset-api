@@ -199,18 +199,23 @@ export default function ZipCodeSignalsPage() {
         !subJobIdsInAnyMegajob.has(d.jobId)
       );
       setDatasets(ds);
-      // Megajobs: only show consolidated ones (β path requires the MAIDs CSV).
+      // Megajobs: filter by lightweight status='completed' (proxy of
+      // "consolidation done") because /api/mega-jobs returns the index
+      // which intentionally STRIPS the heavy consolidatedReports field.
+      // The strict consolidatedReports.maids check still runs server-side
+      // when the analyzer kicks off — catches the rare "completed but
+      // maids materialization failed" case with a clear error.
       const mjList = allMega
         .filter((m: any) =>
           m.country === selectedCountry &&
-          m.consolidatedReports?.maids,
+          m.status === 'completed',
         )
         .map((m: any) => ({
           id: m.megaJobId,
           name: m.name,
           country: m.country,
           syncedSubJobs: m.progress?.synced ?? 0,
-          hasMaids: !!m.consolidatedReports?.maids,
+          hasMaids: true, // assumed when status=completed; analyzer verifies
         }));
       setMegaJobs(mjList);
       setLoadingDatasets(false);
