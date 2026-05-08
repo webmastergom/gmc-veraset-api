@@ -621,18 +621,27 @@ export async function analyzePostalMaidMegaJob(
 
   // Detect FULL schema. Prefer the job-level metadata (schema field set
   // when the megajob was created), then fall back to an Athena sniff in
-  // case the metadata is missing on legacy jobs. The previous strict
-  // sniff-only path threw false-negatives when the first sub-job had
-  // sparse geo_fields even though the job was requested as FULL.
+  // case the metadata is missing on legacy jobs. Raw per-sub-job logging
+  // so when we hit weird readings we have ground truth.
   const declaredSchemas = subJobs
     .map((j) => (j as any)?.schema || '')
     .filter((s) => typeof s === 'string') as string[];
+  for (let i = 0; i < subJobs.length; i++) {
+    const sj: any = subJobs[i];
+    console.log(
+      `[POSTAL-MAID-MEGAJOB] sub-job[${i}] id=${sj.jobId} name="${sj.name}" ` +
+      `schema=${JSON.stringify(sj.schema)} status=${sj.status} ` +
+      `keys=[${Object.keys(sj).slice(0, 30).join(',')}]`,
+    );
+  }
   const declaredFull = declaredSchemas.length > 0 && declaredSchemas.every((s) => s === 'FULL' || s === 'ENHANCED');
   const declaredBasic = declaredSchemas.length > 0 && declaredSchemas.every((s) => s === 'BASIC');
   let isFull = declaredFull;
+  let usedSniff = false;
   if (!declaredFull && !declaredBasic) {
     // Mixed or unknown — try sniffing each sub-job's table until one
     // returns a row with a non-null zipcode.
+    usedSniff = true;
     for (const t of tableNames) {
       // eslint-disable-next-line no-await-in-loop
       if (await detectFullSchema(t)) { isFull = true; break; }
@@ -643,12 +652,15 @@ export async function analyzePostalMaidMegaJob(
     `${declaredFull ? 'FULL (metadata)' : declaredBasic ? 'BASIC (metadata)' : 'sniff'} ` +
     `→ isFull=${isFull}`,
   );
-  if (!isFull) {
+  // BASIC megajobs are now SUPPORTED (lat/lng + Node reverse-geocode path).
+  // We dispatch to analyzePostalMaid with megajobOpts populated. Only
+  // throw when even sniff returned no geo_fields AND metadata was unknown.
+  if (!isFull && usedSniff && !declaredBasic) {
     throw new Error(
-      'Megajob ZCS support requires FULL schema. The sub-jobs report ' +
-      `schema=[${declaredSchemas.join(', ')}] and a sample of their tables ` +
-      'returned no geo_fields[zipcode] either. Re-pull as FULL or run ZCS ' +
-      'on individual sub-jobs that ARE FULL.',
+      'Megajob schema unknown — neither metadata nor a sample of the ' +
+      `tables (${tableNames.length} sub-jobs) found geo_fields[zipcode] ` +
+      'or a declared schema. Sub-jobs may be empty or the data may not ' +
+      'have synced yet.',
     );
   }
 
@@ -699,16 +711,15 @@ export async function analyzePostalMaidMegaJob(
       return buildEmptyResult(megaJob.name || megaJobId, filters, 0);
     }
 
-    // ── Build the UNION ALL of sub-job tables. Need: ad_id, date,
-    //    utc_timestamp, geo_fields, quality_fields, latitude, longitude,
-    //    horizontal_accuracy. (poi_ids is NOT needed because we use the
-    //    pre-computed MAIDs CSV instead of scanning poi_ids.)
+    // ── Build the UNION ALL of sub-job tables. Different column sets per
+    //    schema mode: FULL needs geo_fields + quality_fields; BASIC just
+    //    needs lat/lng + horizontal_accuracy. (poi_ids is NOT needed in
+    //    either case — we use the pre-computed MAIDs CSV instead.)
+    const fullColumns = 'ad_id, date, utc_timestamp, geo_fields, quality_fields, latitude, longitude, horizontal_accuracy';
+    const basicColumns = 'ad_id, date, utc_timestamp, latitude, longitude, horizontal_accuracy';
     const tableExpr = `(
       ${tableNames
-        .map(
-          (t) =>
-            `SELECT ad_id, date, utc_timestamp, geo_fields, quality_fields, latitude, longitude, horizontal_accuracy FROM ${t}`,
-        )
+        .map((t) => `SELECT ${isFull ? fullColumns : basicColumns} FROM ${t}`)
         .join('\n      UNION ALL\n      ')}
     )`;
 
@@ -717,14 +728,27 @@ export async function analyzePostalMaidMegaJob(
     if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
     const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
-    return await analyzeFullSchemaFast(
+    if (isFull) {
+      return await analyzeFullSchemaFast(
+        megaJob.name || megaJobId,
+        filters,
+        report,
+        totalDevicesInDataset,
+        tableNames[0], // unused when megajobOpts is set
+        dateWhere,
+        requestedPostalCodes,
+        { tableExpr, maidsTableName },
+      );
+    }
+
+    // BASIC megajob — uses lat/lng + Node-side reverse-geocode. The
+    // existing single-dataset BASIC path handles this when given the
+    // tableExpr + maidsTableName. We pass datasetName as the megajob
+    // name so log lines + result.dataset are human-readable.
+    return await analyzePostalMaid(
       megaJob.name || megaJobId,
       filters,
       report,
-      totalDevicesInDataset,
-      tableNames[0], // unused when megajobOpts is set
-      dateWhere,
-      requestedPostalCodes,
       { tableExpr, maidsTableName },
     );
   } finally {
@@ -739,7 +763,11 @@ export async function analyzePostalMaidMegaJob(
 export async function analyzePostalMaid(
   datasetName: string,
   filters: PostalMaidFilters,
-  onProgress?: PostalMaidProgressCallback
+  onProgress?: PostalMaidProgressCallback,
+  /** Megajob mode (BASIC schema): tableExpr is a UNION ALL of sub-job
+   *  tables, maidsTableName is the consolidated MAIDs CSV materialized
+   *  as an Athena external table. Both are mandatory together. */
+  megajobOpts?: { tableExpr: string; maidsTableName: string },
 ): Promise<PostalMaidResult> {
   const report = onProgress || (() => {});
 
@@ -747,6 +775,7 @@ export async function analyzePostalMaid(
   console.log(`[POSTAL-MAID] Starting postal→MAID analysis for dataset: ${datasetName}`, {
     postalCodes: filters.postalCodes,
     country: filters.country,
+    mode: megajobOpts ? 'MEGAJOB-BASIC' : 'SINGLE',
   });
 
   if (!filters.postalCodes?.length) {
@@ -763,13 +792,21 @@ export async function analyzePostalMaid(
     filters.postalCodes.map(pc => normalizePostalForCountry(filters.country, pc)),
   );
 
+  // In megajob mode, the FROM clause is the UNION-ALL expression and the
+  // POI-visitor set comes from the pre-computed MAIDs CSV. Otherwise it's
+  // a single dataset table with the standard CROSS JOIN UNNEST scan.
   const tableName = getTableName(datasetName);
+  const fromExpr = megajobOpts?.tableExpr ?? tableName;
 
   // ── Detect FULL schema and branch ──────────────────────────────────
-  report({ step: 'preparing_table', percent: 3, message: 'Preparing Athena table...', detail: tableName });
-  await ensureTableForDataset(datasetName);
+  // (Megajob mode skips both: the parent dispatcher already decided
+  // BASIC vs FULL, and the table-ensure has been done sub-job-by-sub-job.)
+  if (!megajobOpts) {
+    report({ step: 'preparing_table', percent: 3, message: 'Preparing Athena table...', detail: tableName });
+    await ensureTableForDataset(datasetName);
+  }
 
-  const isFull = await detectFullSchema(tableName);
+  const isFull = megajobOpts ? false : await detectFullSchema(tableName);
   if (isFull) {
     report({
       step: 'preparing_table',
@@ -810,20 +847,34 @@ export async function analyzePostalMaid(
     );
   }
 
-  console.log('[POSTAL-MAID] BASIC schema path (Node reverse-geocode)');
+  console.log(`[POSTAL-MAID] BASIC schema path (Node reverse-geocode) — ${megajobOpts ? 'MEGAJOB mode' : 'single dataset'}`);
   const dateConditions: string[] = [];
   if (filters.dateFrom) dateConditions.push(`date >= '${filters.dateFrom}'`);
   if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
   const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
-  const totalQuery = `
-    SELECT COUNT(DISTINCT ad_id) as total_devices
-    FROM ${tableName}
-    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-    WHERE poi_id IS NOT NULL AND poi_id != ''
-      AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-      ${dateWhere}
-  `;
+  // POI-visitor source: pre-built MAIDs CSV in megajob mode (β fast path,
+  // skips the per-table CROSS JOIN UNNEST(poi_ids) scan), OR derived from
+  // poi_ids in single-dataset mode.
+  const poiVisitorsCte = megajobOpts
+    ? `SELECT ad_id FROM ${megajobOpts.maidsTableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''`
+    : `SELECT DISTINCT ad_id
+       FROM ${tableName}
+       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+       WHERE poi_id IS NOT NULL AND poi_id != ''
+         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+         ${dateWhere}`;
+
+  // Total devices in scope: count from MAIDs table directly when megajob,
+  // or run the CROSS JOIN UNNEST otherwise.
+  const totalQuery = megajobOpts
+    ? `SELECT COUNT(DISTINCT ad_id) as total_devices FROM ${megajobOpts.maidsTableName}`
+    : `SELECT COUNT(DISTINCT ad_id) as total_devices
+       FROM ${tableName}
+       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+       WHERE poi_id IS NOT NULL AND poi_id != ''
+         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+         ${dateWhere}`;
 
   const sqlRowCap = parseInt(process.env.POSTAL_MAID_SQL_ROW_LIMIT || '', 10);
   const applyRowCap = Number.isFinite(sqlRowCap) && sqlRowCap > 0;
@@ -840,12 +891,7 @@ export async function analyzePostalMaid(
   const maidsQuery = `
     WITH
     poi_visitors AS (
-      SELECT DISTINCT ad_id
-      FROM ${tableName}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        ${dateWhere}
+      ${poiVisitorsCte}
     ),
     valid_pings AS (
       SELECT
@@ -854,7 +900,7 @@ export async function analyzePostalMaid(
         t.utc_timestamp,
         TRY_CAST(t.latitude AS DOUBLE) as lat,
         TRY_CAST(t.longitude AS DOUBLE) as lng
-      FROM ${tableName} t
+      FROM ${fromExpr} t
       INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
       WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
