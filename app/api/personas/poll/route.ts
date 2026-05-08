@@ -540,7 +540,6 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
       avg_circle_score: parseFloat(r.avg_circle_score) || 0,
       brand_visits: parseBrandJson(r.brand_visits_json),
       brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
-      nearby_categories_top5: [],
       tier_high_quality: r.tier_high_quality === 'true',
       source_megajob_id: src,
     }));
@@ -620,19 +619,8 @@ async function phaseClusterAndAggregate(
   features: DeviceFeatures[]
 ): Promise<{ state: PersonaState; report: PersonaReport; clusterAssignments: Map<string, number>; clusterNames: string[] }> {
   const { runId, config } = state;
-  console.log(`[PERSONAS ${runId}] clustering ${features.length} devices`);
 
-  const clusteringResult = runClusteringPipeline(features);
-
-  const rfm = computeRfm(features);
-  const cohab =
-    config.megaJobIds.length >= 2
-      ? computeCohabitation(features, config.megaJobIds)
-      : undefined;
-
-  // Per-source ZIP affinity. Resolve source labels + countries so the
-  // UI tab and CSV download can use the human label, and so we can load
-  // the right NSE population lookup per country.
+  // ── Resolve source labels + countries (used by NSE load + zipAffinity) ───
   const sourceLabels: Record<string, string> = {};
   const sourceCountries: Record<string, string> = {};
   for (const id of config.megaJobIds) {
@@ -654,34 +642,76 @@ async function phaseClusterAndAggregate(
     }
   }
 
-  // Population lookup per source. Uses the per-country NSE upload
-  // (already on S3 as `nse/{CC}`) — falls back to volume-only when no
-  // population data exists for the country.
-  const populationLookup = { bySource: new Map<string, Map<string, number>>() };
-  const popCacheByCountry = new Map<string, Map<string, number>>();
-  for (const [sourceId, country] of Object.entries(sourceCountries)) {
+  // ── Load NSE records per country (powers BOTH population lookup AND
+  //    nse_bracket enrichment per device). Loaded once, reused below. ─────
+  type NseRecord = { postal_code: string; population: number; nse: number };
+  const nseByCountry = new Map<string, NseRecord[]>();
+  const popMapByCountry = new Map<string, Map<string, number>>();
+  const nseScoreByCountry = new Map<string, Map<string, number>>();
+  for (const country of new Set(Object.values(sourceCountries))) {
     if (!country) continue;
-    let popMap = popCacheByCountry.get(country);
-    if (!popMap) {
-      try {
-        const records = await getConfig<Array<{ postal_code: string; population: number }>>(`nse/${country}`);
-        popMap = new Map();
-        if (records && Array.isArray(records)) {
-          for (const r of records) {
-            if (r?.postal_code && Number.isFinite(r.population) && r.population > 0) {
-              popMap.set(String(r.postal_code).trim(), r.population);
-            }
-          }
+    try {
+      const records = await getConfig<NseRecord[]>(`nse/${country}`);
+      const popMap = new Map<string, number>();
+      const nseMap = new Map<string, number>();
+      if (records && Array.isArray(records)) {
+        for (const r of records) {
+          if (!r?.postal_code) continue;
+          const zip = String(r.postal_code).trim();
+          if (Number.isFinite(r.population) && r.population > 0) popMap.set(zip, r.population);
+          if (Number.isFinite(r.nse)) nseMap.set(zip, r.nse);
         }
-        popCacheByCountry.set(country, popMap);
-        console.log(`[PERSONAS ${runId}] Loaded population lookup for ${country}: ${popMap.size} ZIPs`);
-      } catch (e: any) {
-        console.warn(`[PERSONAS ${runId}] No population data for ${country} (${e?.message || e})`);
-        popMap = new Map();
-        popCacheByCountry.set(country, popMap);
       }
+      nseByCountry.set(country, records || []);
+      popMapByCountry.set(country, popMap);
+      nseScoreByCountry.set(country, nseMap);
+      console.log(`[PERSONAS ${runId}] NSE for ${country}: ${popMap.size} ZIPs with pop, ${nseMap.size} with NSE`);
+    } catch (e: any) {
+      console.warn(`[PERSONAS ${runId}] No NSE data for ${country} (${e?.message || e})`);
+      popMapByCountry.set(country, new Map());
+      nseScoreByCountry.set(country, new Map());
     }
-    if (popMap.size > 0) populationLookup.bySource.set(sourceId, popMap);
+  }
+
+  // ── Enrich features with nse_bracket BEFORE clustering. Brackets
+  //    match the rest of the platform: 0-19, 20-39, 40-59, 60-79, 80-100.
+  const bracketize = (score: number): string => {
+    if (!Number.isFinite(score)) return '';
+    if (score < 20) return '0-19';
+    if (score < 40) return '20-39';
+    if (score < 60) return '40-59';
+    if (score < 80) return '60-79';
+    return '80-100';
+  };
+  let nseEnriched = 0;
+  for (const f of features) {
+    const country = sourceCountries[f.source_megajob_id] || '';
+    const nseMap = nseScoreByCountry.get(country);
+    if (!nseMap || !f.home_zip) continue;
+    const score = nseMap.get(f.home_zip);
+    if (score == null) continue;
+    f.nse_bracket = bracketize(score);
+    nseEnriched++;
+  }
+  if (nseEnriched > 0) {
+    console.log(`[PERSONAS ${runId}] Enriched ${nseEnriched}/${features.length} devices with NSE bracket`);
+  }
+
+  console.log(`[PERSONAS ${runId}] clustering ${features.length} devices`);
+  const clusteringResult = runClusteringPipeline(features);
+
+  const rfm = computeRfm(features);
+  const cohab =
+    config.megaJobIds.length >= 2
+      ? computeCohabitation(features, config.megaJobIds)
+      : undefined;
+
+  // Build the populationLookup expected by computeZipAffinityPerSource
+  // (sourceId → zip-pop map). Uses the per-country pop maps loaded above.
+  const populationLookup = { bySource: new Map<string, Map<string, number>>() };
+  for (const [sourceId, country] of Object.entries(sourceCountries)) {
+    const popMap = popMapByCountry.get(country);
+    if (popMap && popMap.size > 0) populationLookup.bySource.set(sourceId, popMap);
   }
   const zipAffinity = computeZipAffinityPerSource(features, sourceLabels, populationLookup, sourceCountries);
   if (zipAffinity.length > 0) {

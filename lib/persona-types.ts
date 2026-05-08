@@ -64,10 +64,10 @@ export interface DeviceFeatures {
   avg_circle_score: number;
   /** brand → visits (e.g. "burger_king" → 12, "mcdonalds" → 4). Comes back as JSON or "k:v|k:v" string from Athena. */
   brand_visits: Record<string, number>;
-  /** Herfindahl-Hirschman Index over brand_visits (0..1). 1 = full loyalty to one brand. */
+  /** Herfindahl-Hirschman Index over brand_visits (0..1). 1 = full loyalty to one brand.
+   *  CTAS emits 0 below the noise floor (5 brand-visit-days) to avoid the
+   *  small-sample artefact where 1 visit = HHI=1.0. */
   brand_loyalty_hhi: number;
-  /** Top-5 nearby POI categories within ±2h of anchor visits (from mobility CTE). */
-  nearby_categories_top5: string[];
   /** Whether the device passes a "high quality" gate (gps + tight circle). */
   tier_high_quality: boolean;
   /** NSE bracket from home_zip lookup; '' / undefined when not resolved. */
@@ -100,8 +100,6 @@ export interface PersonaCluster {
   radarAxes: RadarAxis[];
   /** Top 5 zips (most frequent home_zip in cluster). */
   topZips: { zip: string; count: number }[];
-  /** Top 5 nearby categories (mode across cluster members). */
-  topNearbyCategories: { category: string; count: number }[];
   /** Brand mix: brand → unique device count within this persona. */
   brandMix: Record<string, number>;
   /**

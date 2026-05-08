@@ -355,7 +355,6 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
           centroid: bestCentroids[cid],
           radarAxes: [],
           topZips: [],
-          topNearbyCategories: [],
           brandMix: {},
           nseHistogram: {},
           exampleAdIds: [],
@@ -382,9 +381,8 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
       globalMedianBands,
     });
 
-    // Aggregate top zips, categories, brand mix, NSE histogram, exampleAdIds.
+    // Aggregate top zips, brand mix, NSE histogram, exampleAdIds.
     const zipCounts = new Map<string, number>();
-    const catCounts = new Map<string, number>();
     const brandTotals: Record<string, number> = {};
     const nseHistogram: Record<string, number> = {};
     // Peak-hour aggregation: average each hour-bucket share across the cluster.
@@ -393,9 +391,6 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
     for (const i of indices) {
       const f = features[i];
       if (f.home_zip) zipCounts.set(f.home_zip, (zipCounts.get(f.home_zip) || 0) + 1);
-      for (const c of f.nearby_categories_top5) {
-        catCounts.set(c, (catCounts.get(c) || 0) + 1);
-      }
       // Brand mix: count UNIQUE devices per brand within this cluster, not
       // visit-days. "X devices in this persona visited Oxxo" reads cleaner
       // than "X visit-days" (which still felt opaque after the pings→days fix).
@@ -424,10 +419,6 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
       .map(([zip, count]) => ({ zip, count }));
-    const topNearby = Array.from(catCounts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([category, count]) => ({ category, count }));
 
     // Build radar with evening/lunch shares filled in.
     const radar = buildRadarAxes(rawMedians, globalP);
@@ -459,7 +450,6 @@ export function runClusteringPipeline(features: DeviceFeatures[]): ClusteringRes
         centroid: bestCentroids[cid],
         radarAxes: radar,
         topZips,
-        topNearbyCategories: topNearby,
         brandMix: brandTotals,
         nseHistogram,
         exampleAdIds,

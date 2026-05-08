@@ -283,10 +283,15 @@ export async function POST(
         const noEmp = state.discardEmployees ?? discardEmployees;
         const noRes = state.discardResidents ?? discardResidents;
         const dowActive = !!(dow && dow.length > 0 && dow.length < 7);
-        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0) || dowActive || noEmp || noRes)
-          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore, daysOfWeek: dow, discardEmployees: noEmp, discardResidents: noRes }
+        // Local timezone derived from megajob.country — applied to ALL hour
+        // and DAY_OF_WEEK SQL clauses so user-entered "hours=8..18" matches
+        // local time, not UTC. (See lib/timezones.ts for country→IANA map.)
+        const { tzForCountry } = await import('@/lib/timezones');
+        const localTz = tzForCountry(megaJob.country);
+        const visitorFilter = (hFrom != null || hTo != null || (mVisits != null && mVisits > 1) || gOnly || (cScore != null && cScore > 0) || dowActive || noEmp || noRes || localTz !== 'UTC')
+          ? { hourFrom: hFrom, hourTo: hTo, minVisits: mVisits, gpsOnly: gOnly, maxCircleScore: cScore, daysOfWeek: dow, discardEmployees: noEmp, discardResidents: noRes, localTz }
           : undefined;
-        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}, daysOfWeek=${dow?.join(',') || 'all'}, discardEmployees=${!!noEmp}, discardResidents=${!!noRes}`);
+        if (visitorFilter) console.log(`[MEGA] Visitor filter: hours=${hFrom ?? 0}..${hTo ?? 23}, minVisits=${mVisits ?? 1}, gpsOnly=${!!gOnly}, maxCircleScore=${cScore ?? 0}, daysOfWeek=${dow?.join(',') || 'all'}, discardEmployees=${!!noEmp}, discardResidents=${!!noRes}, tz=${localTz}`);
 
         // Generate per-run id so CTAS tables never collide with leftover ones from previous runs
         const runId = (state as any).runId || Date.now().toString(36);

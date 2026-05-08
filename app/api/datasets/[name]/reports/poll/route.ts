@@ -72,14 +72,17 @@ const PREC = 4;
 const GRID = 0.01;
 const POI_GMC_TABLE = 'lab_pois_gmc';
 
-/** Build SQL fragment to filter pings by hour of day. Handles cross-midnight ranges (e.g., 22h→6h). */
-function hourFilterSQL(hourFrom: number, hourTo: number, tsCol = 'utc_timestamp'): string {
+/** Build SQL fragment to filter pings by hour of day. Handles cross-midnight ranges (e.g., 22h→6h).
+ *  Wraps tsCol with at_timezone(...) when a localTz is provided so the user's
+ *  hourFrom/hourTo are interpreted in LOCAL time, not UTC. */
+function hourFilterSQL(hourFrom: number, hourTo: number, tsCol = 'utc_timestamp', localTz?: string): string {
   if (hourFrom === 0 && hourTo === 23) return '';
+  const lts = localTz && localTz !== 'UTC' ? `at_timezone(${tsCol}, '${localTz}')` : tsCol;
   if (hourFrom <= hourTo) {
-    return `AND HOUR(${tsCol}) >= ${hourFrom} AND HOUR(${tsCol}) <= ${hourTo}`;
+    return `AND HOUR(${lts}) >= ${hourFrom} AND HOUR(${lts}) <= ${hourTo}`;
   }
   // Cross-midnight (e.g., 22h to 6h)
-  return `AND (HOUR(${tsCol}) >= ${hourFrom} OR HOUR(${tsCol}) <= ${hourTo})`;
+  return `AND (HOUR(${lts}) >= ${hourFrom} OR HOUR(${lts}) <= ${hourTo})`;
 }
 
 /**

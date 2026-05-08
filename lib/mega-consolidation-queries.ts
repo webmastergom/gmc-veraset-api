@@ -16,6 +16,7 @@ import { getTableName, startQueryAsync, startCTASAsync, tempTableName, runQuery,
 import { type Job } from './jobs';
 import { PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from './s3-config';
+import { localTimestamp } from './timezones';
 
 /**
  * Result returned by every consolidated query: the running queryId and the
@@ -232,6 +233,14 @@ export interface VisitorFilter {
    * resident (who sleeps inside the POI radius) from heavy daytime visitors.
    */
   discardResidents?: boolean;
+  /**
+   * IANA timezone (e.g. 'America/Mexico_City') used to convert UTC pings to
+   * LOCAL time when computing HOUR / DAY_OF_WEEK / employee+resident windows.
+   * Without this, MX afternoon visits (UTC 22+) get bucketed as night and
+   * the hourFrom/hourTo / daysOfWeek filters operate on UTC instead of local.
+   * Empty / undefined / 'UTC' → legacy UTC behaviour.
+   */
+  localTz?: string;
 }
 
 /** Default thresholds for employee detection. Conservative — favours keeping real visitors. */
@@ -252,11 +261,14 @@ export function buildHourFilterClause(filter?: VisitorFilter, tsCol: string = 'u
   const from = filter.hourFrom ?? 0;
   const to = filter.hourTo ?? 23;
   if (from === 0 && to === 23) return '';
+  // Convert to local time first so user-entered hours match what they
+  // mean ("8am" = local 8am, not UTC 8am which is local 2am in MX).
+  const lts = localTimestamp(tsCol, filter.localTz);
   if (from <= to) {
-    return `AND HOUR(${tsCol}) >= ${from} AND HOUR(${tsCol}) <= ${to}`;
+    return `AND HOUR(${lts}) >= ${from} AND HOUR(${lts}) <= ${to}`;
   }
   // Wrap-around window (e.g. 22..6)
-  return `AND (HOUR(${tsCol}) >= ${from} OR HOUR(${tsCol}) <= ${to})`;
+  return `AND (HOUR(${lts}) >= ${from} OR HOUR(${lts}) <= ${to})`;
 }
 
 /**
@@ -290,12 +302,16 @@ export function buildGpsOnlyClause(filter?: VisitorFilter): string {
  */
 export function buildEmployeeExclusionClause(filter: VisitorFilter | undefined, tableName: string): string {
   if (!filter?.discardEmployees) return '';
+  // work_share window (8h-20h) and has_overnight window (2h-5h) are
+  // LOCAL hour windows — wrap utc_timestamp with at_timezone(...) so
+  // they line up with how a person actually splits their day.
+  const lts = localTimestamp('utc_timestamp', filter.localTz);
   return `AND ad_id NOT IN (
         SELECT ad_id FROM (
           SELECT ad_id, date,
             DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as _emp_dwell_min,
-            AVG(IF(HOUR(utc_timestamp) >= 8 AND HOUR(utc_timestamp) < 20, 1.0, 0.0)) as _emp_work_share,
-            MAX(IF(HOUR(utc_timestamp) >= 2 AND HOUR(utc_timestamp) < 5, 1, 0)) as _emp_has_overnight
+            AVG(IF(HOUR(${lts}) >= 8 AND HOUR(${lts}) < 20, 1.0, 0.0)) as _emp_work_share,
+            MAX(IF(HOUR(${lts}) >= 2 AND HOUR(${lts}) < 5, 1, 0)) as _emp_has_overnight
           FROM ${tableName}
           CROSS JOIN UNNEST(poi_ids) AS _emp_t(_emp_pid)
           WHERE _emp_pid IS NOT NULL AND _emp_pid != ''
@@ -324,11 +340,12 @@ export function buildEmployeeExclusionClause(filter: VisitorFilter | undefined, 
  */
 export function buildResidentExclusionClause(filter: VisitorFilter | undefined, tableName: string): string {
   if (!filter?.discardResidents) return '';
+  const lts = localTimestamp('utc_timestamp', filter.localTz);
   return `AND ad_id NOT IN (
         SELECT ad_id FROM (
           SELECT ad_id, date,
             DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as _res_dwell_min,
-            MAX(IF(HOUR(utc_timestamp) >= 2 AND HOUR(utc_timestamp) < 5, 1, 0)) as _res_has_overnight
+            MAX(IF(HOUR(${lts}) >= 2 AND HOUR(${lts}) < 5, 1, 0)) as _res_has_overnight
           FROM ${tableName}
           CROSS JOIN UNNEST(poi_ids) AS _res_t(_res_pid)
           WHERE _res_pid IS NOT NULL AND _res_pid != ''
@@ -350,6 +367,11 @@ export function buildResidentExclusionClause(filter: VisitorFilter | undefined, 
  * @param tsCol Column expression to apply DAY_OF_WEEK to (default utc_timestamp).
  */
 export function buildDayOfWeekClause(filter?: VisitorFilter, tsCol: string = 'utc_timestamp'): string {
+  if (filter) {
+    // Wrap with at_timezone so DAY_OF_WEEK matches the device's local day,
+    // not UTC. (Matters for visits near midnight in negative-offset TZs.)
+    tsCol = localTimestamp(tsCol, filter.localTz);
+  }
   const days = filter?.daysOfWeek;
   if (!days || days.length === 0 || days.length === 7) return '';
   // Sanitize: keep 1..7, dedupe, sort.
@@ -729,6 +751,10 @@ export async function startConsolidatedHourlyQuery(
       ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
       : `at_poi_pings`;
 
+    // Hour buckets in LOCAL time (Trino at_timezone) so the heatmap shows
+    // when devices ping at the POIs in their own clock — not in UTC.
+    const tsCol = useDwell ? 'a.utc_timestamp' : 'utc_timestamp';
+    const ltsHour = localTimestamp(tsCol, visitorFilter?.localTz);
     sql = `
     WITH
     all_pings AS (
@@ -739,11 +765,11 @@ export async function startConsolidatedHourlyQuery(
     ),
     ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT
-      HOUR(${useDwell ? 'a.' : ''}utc_timestamp) as touch_hour,
+      HOUR(${ltsHour}) as touch_hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ${useDwell ? 'a.' : ''}ad_id) as devices
     FROM ${hourlySource}
-    GROUP BY HOUR(${useDwell ? 'a.' : ''}utc_timestamp)
+    GROUP BY HOUR(${ltsHour})
     ORDER BY touch_hour
     `;
   } else {
@@ -756,15 +782,16 @@ export async function startConsolidatedHourlyQuery(
       })
       .join('\n      UNION ALL\n      ');
 
+    const ltsHour = localTimestamp('utc_timestamp', visitorFilter?.localTz);
     sql = `
     SELECT
-      HOUR(utc_timestamp) as touch_hour,
+      HOUR(${ltsHour}) as touch_hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ad_id) as devices
     FROM (
       ${unionParts}
     )
-    GROUP BY HOUR(utc_timestamp)
+    GROUP BY HOUR(${ltsHour})
     ORDER BY touch_hour
     `;
   }
@@ -810,6 +837,10 @@ export async function startConsolidatedDayHourQuery(
       : `at_poi_pings`;
     const aPrefix = useDwell ? 'a.' : '';
 
+    // dow + hour in LOCAL time for the heatmap (otherwise weekend visits
+    // near midnight in MX read as Mon dawn).
+    const tsCol = aPrefix + 'utc_timestamp';
+    const lts = localTimestamp(tsCol, visitorFilter?.localTz);
     sql = `
     WITH
     all_pings AS (
@@ -820,12 +851,12 @@ export async function startConsolidatedDayHourQuery(
     ),
     ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs}
     SELECT
-      DAY_OF_WEEK(${aPrefix}utc_timestamp) as dow,
-      HOUR(${aPrefix}utc_timestamp) as hour,
+      DAY_OF_WEEK(${lts}) as dow,
+      HOUR(${lts}) as hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ${aPrefix}ad_id) as devices
     FROM ${dhSource}
-    GROUP BY DAY_OF_WEEK(${aPrefix}utc_timestamp), HOUR(${aPrefix}utc_timestamp)
+    GROUP BY DAY_OF_WEEK(${lts}), HOUR(${lts})
     ORDER BY dow, hour
     `;
   } else {
@@ -838,16 +869,17 @@ export async function startConsolidatedDayHourQuery(
       })
       .join('\n      UNION ALL\n      ');
 
+    const lts = localTimestamp('utc_timestamp', visitorFilter?.localTz);
     sql = `
     SELECT
-      DAY_OF_WEEK(utc_timestamp) as dow,
-      HOUR(utc_timestamp) as hour,
+      DAY_OF_WEEK(${lts}) as dow,
+      HOUR(${lts}) as hour,
       COUNT(*) as pings,
       COUNT(DISTINCT ad_id) as devices
     FROM (
       ${unionParts}
     )
-    GROUP BY DAY_OF_WEEK(utc_timestamp), HOUR(utc_timestamp)
+    GROUP BY DAY_OF_WEEK(${lts}), HOUR(${lts})
     ORDER BY dow, hour
     `;
   }
