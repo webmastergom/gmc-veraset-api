@@ -650,11 +650,20 @@ export async function analyzePostalMaidMegaJob(
   }
   const declaredFull = declaredSchemas.length > 0 && declaredSchemas.every((s) => s === 'FULL' || s === 'ENHANCED');
   const declaredBasic = declaredSchemas.length > 0 && declaredSchemas.every((s) => s === 'BASIC');
-  let isFull = declaredFull;
+  // Megajob-level schema hint — set on the sourceScope when the megajob
+  // was created via auto-split. Trust this BEFORE sniffing: the megajob
+  // creator declared the schema explicitly. Only the sub-jobs themselves
+  // can override (declaredFull / declaredBasic), because they reflect
+  // what was ACTUALLY synced.
+  const megaJobScopeSchema = megaJob.sourceScope?.schema;
+  const megaJobSaysFull = megaJobScopeSchema === 'FULL' || megaJobScopeSchema === 'ENHANCED';
+  let isFull = declaredFull || (declaredSchemas.length === 0 && megaJobSaysFull);
   let usedSniff = false;
-  if (!declaredFull && !declaredBasic) {
-    // Mixed or unknown — try sniffing each sub-job's table until one
-    // returns a row with a non-null zipcode.
+  if (!isFull && !declaredBasic && !megaJobSaysFull) {
+    // No schema hint anywhere — sniff each sub-job's table until one
+    // returns a row with a non-null zipcode. As soon as ONE sub-job
+    // has geo_fields populated, treat the whole megajob as FULL —
+    // the SQL TRY(...) wrappers handle missing fields gracefully.
     usedSniff = true;
     for (const t of tableNames) {
       // eslint-disable-next-line no-await-in-loop
@@ -666,6 +675,31 @@ export async function analyzePostalMaidMegaJob(
     `${declaredFull ? 'FULL (metadata)' : declaredBasic ? 'BASIC (metadata)' : 'sniff'} ` +
     `→ isFull=${isFull}`,
   );
+  // Surface the schema decision so the user can see WHY we're taking
+  // a particular path. The fast path (FULL) skips Node geocoding —
+  // it filters geo_fields['zipcode'] IN (target_zips) directly in SQL.
+  // The BASIC path has to extract lat/lng for every device-day and
+  // reverse-geocode in Node, which is much heavier.
+  const schemaSource = declaredFull
+    ? 'FULL (sub-jobs declared)'
+    : declaredBasic
+      ? 'BASIC (sub-jobs declared)'
+      : megaJobSaysFull && isFull
+        ? `FULL (megajob.sourceScope.schema=${megaJobScopeSchema})`
+        : isFull
+          ? 'FULL (sniffed)'
+          : 'BASIC (sniffed/fallback)';
+  report({
+    step: 'preparing_table',
+    percent: 6,
+    message: isFull
+      ? `🔍 Schema: ${schemaSource} → fast path via geo_fields[zipcode]`
+      : `🔍 Schema: ${schemaSource} → BASIC path with Node reverse-geocode (slower)`,
+    detail: isFull
+      ? 'Direct SQL filter — no Node geocoding needed.'
+      : `Sub-job schemas: [${declaredSchemas.join(', ') || '(none declared)'}]. ` +
+        'If the data IS FULL, declare schema=FULL on the sub-jobs to skip the slow BASIC path.',
+  });
   // BASIC megajobs are now SUPPORTED (lat/lng + Node reverse-geocode path).
   // We dispatch to analyzePostalMaid with megajobOpts populated. Only
   // throw when even sniff returned no geo_fields AND metadata was unknown.
