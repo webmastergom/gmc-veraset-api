@@ -101,26 +101,52 @@ export async function POST(request: NextRequest): Promise<Response> {
         try { controller.enqueue(encoder.encode(': keepalive\n\n')); } catch { /* closed */ }
       }, 15_000);
 
+      // Track the LAST progress event so a graceful timeout can tell the user
+      // exactly where they were when Vercel was about to kill the function.
+      // Without this the user sees the generic "stream closed without result"
+      // — which is what we're trying to replace with a precise diagnostic.
+      let lastProgress: { step?: string; percent?: number; message?: string; detail?: string } | null = null;
+
+      // Hard server-side timeout that fires ~25s BEFORE Vercel's hard cap of
+      // maxDuration=300s. This gives us time to emit a structured `error`
+      // event and close cleanly, instead of getting force-killed mid-write.
+      const SOFT_TIMEOUT_MS = (300 - 25) * 1000; // 275s
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          const last = lastProgress;
+          const lastWhere = last
+            ? `last step: "${last.step}" @ ${last.percent}% — ${last.message ?? ''}${last.detail ? ` (${last.detail})` : ''}`
+            : 'no progress events received';
+          reject(
+            new Error(
+              `Server-side timeout (${SOFT_TIMEOUT_MS / 1000}s) — Vercel was about to hard-stop. ${lastWhere}. ` +
+                `Try a narrower date range, fewer postal codes, or split the megajob.`,
+            ),
+          );
+        }, SOFT_TIMEOUT_MS);
+      });
+
+      const reportWrap = (progress: any) => {
+        lastProgress = {
+          step: progress?.step,
+          percent: progress?.percent,
+          message: progress?.message,
+          detail: progress?.detail,
+        };
+        if (aborted) return;
+        send('progress', {
+          step: progress.step,
+          percent: progress.percent,
+          message: progress.message,
+          detail: progress.detail,
+        });
+      };
+
       try {
-        const result = body.megaJobId
-          ? await analyzePostalMaidMegaJob(body.megaJobId, filters, (progress) => {
-              if (aborted) return;
-              send('progress', {
-                step: progress.step,
-                percent: progress.percent,
-                message: progress.message,
-                detail: progress.detail,
-              });
-            })
-          : await analyzePostalMaid(body.datasetName!, filters, (progress) => {
-              if (aborted) return;
-              send('progress', {
-                step: progress.step,
-                percent: progress.percent,
-                message: progress.message,
-                detail: progress.detail,
-              });
-            });
+        const work = body.megaJobId
+          ? analyzePostalMaidMegaJob(body.megaJobId, filters, reportWrap)
+          : analyzePostalMaid(body.datasetName!, filters, reportWrap);
+        const result = await Promise.race([work, timeoutPromise]);
 
         if (aborted) return;
 
