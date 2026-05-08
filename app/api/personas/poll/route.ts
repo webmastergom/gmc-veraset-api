@@ -49,6 +49,7 @@ import { computeRfm } from '@/lib/persona-rfm';
 import { computeCohabitation } from '@/lib/persona-cohabitation';
 import { computeZipAffinityPerSource } from '@/lib/persona-zip-affinity';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
+import { tzForCountry } from '@/lib/timezones';
 import { generateInsights } from '@/lib/persona-insights';
 import { registerAthenaContribution } from '@/lib/master-maids';
 import {
@@ -103,6 +104,8 @@ interface ResolvedSource {
   collectionIds: string[];
   rangeTo: string;
   label: string;
+  /** ISO2 country code, used to derive local timezone for hour buckets. */
+  country?: string;
 }
 
 async function resolveMegaJobSource(megaJobId: string): Promise<ResolvedSource> {
@@ -121,7 +124,10 @@ async function resolveMegaJobSource(megaJobId: string): Promise<ResolvedSource> 
     megaJob.sourceScope?.dateRange?.to ||
     syncedJobs.reduce((max, j) => (j.dateRange?.to && j.dateRange.to > max ? j.dateRange.to : max), '');
   if (!rangeTo) throw new Error(`Cannot determine date range for mega-job ${megaJobId}`);
-  return { sourceId: megaJobId, syncedJobs, collectionIds, rangeTo, label: megaJob.name };
+  const country = megaJob.country
+    || (syncedJobs.find((j: any) => j.country) as any)?.country
+    || '';
+  return { sourceId: megaJobId, syncedJobs, collectionIds, rangeTo, label: megaJob.name, country };
 }
 
 async function resolveJobSource(jobId: string): Promise<ResolvedSource> {
@@ -137,7 +143,8 @@ async function resolveJobSource(jobId: string): Promise<ResolvedSource> {
   if ((job as any).poiCollectionId) colIds.push((job as any).poiCollectionId);
   const rangeTo = job.dateRange?.to || '';
   if (!rangeTo) throw new Error(`Job ${jobId} has no dateRange.to`);
-  return { sourceId: jobId, syncedJobs, collectionIds: colIds, rangeTo, label: job.name || jobId };
+  const country = (job as any).country || '';
+  return { sourceId: jobId, syncedJobs, collectionIds: colIds, rangeTo, label: job.name || jobId, country };
 }
 
 async function fireFeatureCtasForSource(args: {
@@ -263,6 +270,15 @@ async function fireFeatureCtasForSource(args: {
   try { await runQuery(`DROP TABLE IF EXISTS ${featureTable}`); } catch {}
   const featureS3 = `s3://${BUCKET}/athena-temp/${featureTable}/`;
 
+  // Resolve local timezone from the source's country so that hour
+  // buckets + DAY_OF_WEEK reflect local time (not UTC). Without this,
+  // MX afternoon visits (UTC 22:00+) get bucketed as "Night" and ALL
+  // personas show peak-hour = Night.
+  const localTz = tzForCountry(source.country);
+  if (localTz !== 'UTC') {
+    console.log(`[PERSONAS ${runId}] Source ${source.label} (country=${source.country}) → tz=${localTz}`);
+  }
+
   const sql = buildFeatureCTAS({
     ctasTable: featureTable,
     ctasS3Path: featureS3,
@@ -271,6 +287,7 @@ async function fireFeatureCtasForSource(args: {
     poiToBrand,
     dateRangeTo: source.rangeTo,
     sourceMegajobId: source.sourceId,
+    localTz,
     filters,
   });
 
@@ -349,9 +366,10 @@ async function phaseDownloadQuery(state: PersonaState): Promise<PersonaState> {
     // The cluster centroids derive from real repeat visitors anyway.
     const sql = `
       SELECT ad_id, total_visits, total_dwell_min, recency_days, avg_dwell_min,
-        morning_share, midday_share, evening_share, night_share, weekend_share,
-        friday_evening_share, gyration_km, unique_h3_cells,
+        morning_share, midday_share, afternoon_share, evening_share, night_share,
+        weekend_share, friday_evening_share, gyration_km, unique_h3_cells,
         home_zip, home_region, home_lat, home_lng,
+        gps_share, avg_circle_score,
         brand_visits_json, brand_loyalty_hhi, tier_high_quality
       FROM ${tableName}
       WHERE total_visits >= 2
@@ -518,8 +536,8 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
       home_region: String(r.home_region || '').trim(),
       home_lat: r.home_lat ? parseFloat(r.home_lat) : null,
       home_lng: r.home_lng ? parseFloat(r.home_lng) : null,
-      gps_share: 0,
-      avg_circle_score: 0,
+      gps_share: parseFloat(r.gps_share) || 0,
+      avg_circle_score: parseFloat(r.avg_circle_score) || 0,
       brand_visits: parseBrandJson(r.brand_visits_json),
       brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
       nearby_categories_top5: [],

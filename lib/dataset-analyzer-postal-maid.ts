@@ -11,6 +11,7 @@
 
 import { ensureTableForDataset, runQuery, getTableName, startQueryAsync, checkQueryStatus, fetchQueryResults } from './athena';
 import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
+import { localTimestamp, tzForCountry } from './timezones';
 import type {
   PostalMaidFilters,
   PostalMaidDevice,
@@ -95,6 +96,14 @@ async function analyzeFullSchemaFast(
   const report = onProgress;
   const requestedList = Array.from(requestedPostalCodes);
   const requestedSql = requestedList.map((c) => `'${c.replace(/'/g, "''")}'`).join(', ');
+  // Convert UTC timestamps to local time for hour-bucket / overnight /
+  // weekend extraction. MX afternoon visits would otherwise show as
+  // UTC night and skew the per-ZIP peak hour.
+  const localTz = tzForCountry(filters.country);
+  const lts = (col: string) => localTimestamp(col, localTz);
+  if (localTz !== 'UTC') {
+    console.log(`[POSTAL-MAID-FAST] Country=${filters.country} → tz=${localTz}`);
+  }
 
   // Single Athena query: device-level matched origins.
   // Returns one row per (ad_id, zip) with all the metadata we need to
@@ -141,9 +150,9 @@ async function analyzeFullSchemaFast(
         MIN_BY(h3, utc_timestamp) as h3,
         MIN_BY(lat, utc_timestamp) as lat,
         MIN_BY(lng, utc_timestamp) as lng,
-        HOUR(MIN(utc_timestamp)) as origin_hour,
-        DAY_OF_WEEK(MIN(utc_timestamp)) as origin_dow,
-        MAX(IF(HOUR(utc_timestamp) >= 22 OR HOUR(utc_timestamp) <= 6, 1, 0)) as has_overnight,
+        HOUR(${lts('MIN(utc_timestamp)')}) as origin_hour,
+        DAY_OF_WEEK(${lts('MIN(utc_timestamp)')}) as origin_dow,
+        MAX(IF(HOUR(${lts('utc_timestamp')}) >= 22 OR HOUR(${lts('utc_timestamp')}) <= 6, 1, 0)) as has_overnight,
         AVG(is_gps) as gps_share,
         AVG(circle_score) as avg_circle
       FROM valid_pings

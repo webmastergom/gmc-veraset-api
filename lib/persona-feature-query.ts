@@ -39,6 +39,7 @@ import {
   type VisitorFilter,
   type DwellFilter,
 } from './mega-consolidation-queries';
+import { localTimestamp } from './timezones';
 
 const ACCURACY_THRESHOLD = 500;
 
@@ -85,6 +86,10 @@ export function buildFeatureCTAS(args: {
   poiToBrand: Array<{ poiId: string; brand: string }>;
   dateRangeTo: string;
   sourceMegajobId: string;
+  /** IANA timezone for the source country. Hour buckets + DAY_OF_WEEK are
+   *  computed in this local time (Veraset stores pings in UTC). Default:
+   *  'UTC' — keeps legacy behaviour when caller doesn't specify. */
+  localTz?: string;
   filters?: VisitorFilter & { dwell?: DwellFilter };
 }): string {
   const {
@@ -95,8 +100,13 @@ export function buildFeatureCTAS(args: {
     poiToBrand,
     dateRangeTo,
     sourceMegajobId,
+    localTz,
     filters,
   } = args;
+  /** Local-time expression for hour-of-day / day-of-week extraction.
+   *  Wraps utc_timestamp with at_timezone(...) when tz is set; passes
+   *  through when tz is empty or 'UTC' to keep query plans unchanged. */
+  const lts = (col: string) => localTimestamp(col, localTz);
 
   const hourClause = buildHourFilterClause(filters);
   const gpsClause = buildGpsOnlyClause(filters);
@@ -146,7 +156,9 @@ export function buildFeatureCTAS(args: {
       ${allPingsUnion}
     ),
     ${buildAtPoiPingsCTE('all_pings', poiCoords)},
-    -- Per (ad_id, date): one row with first/last ping, dwell, hour bucket, dow
+    -- Per (ad_id, date): one row with first/last ping, dwell, hour bucket, dow.
+    -- arrival_hour and dow are computed in LOCAL time (at_timezone wrapper)
+    -- so MX afternoon visits don't end up in the UTC night bucket.
     daily_visits AS (
       SELECT
         ad_id,
@@ -154,8 +166,8 @@ export function buildFeatureCTAS(args: {
         MIN(utc_timestamp) as first_ping,
         MAX(utc_timestamp) as last_ping,
         DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) as dwell_minutes,
-        HOUR(MIN(utc_timestamp)) as arrival_hour,
-        DAY_OF_WEEK(MIN(utc_timestamp)) as dow
+        HOUR(${lts('MIN(utc_timestamp)')}) as arrival_hour,
+        DAY_OF_WEEK(${lts('MIN(utc_timestamp)')}) as dow
       FROM at_poi_pings
       GROUP BY ad_id, date
     ),
@@ -174,7 +186,7 @@ export function buildFeatureCTAS(args: {
       FROM all_pings p
       INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
       WHERE p.native_zip IS NOT NULL AND p.native_zip != ''
-        AND (HOUR(p.utc_timestamp) >= 22 OR HOUR(p.utc_timestamp) <= 6)
+        AND (HOUR(${lts('p.utc_timestamp')}) >= 22 OR HOUR(${lts('p.utc_timestamp')}) <= 6)
       GROUP BY p.ad_id, p.native_zip, p.native_region
       UNION ALL
       SELECT
@@ -207,7 +219,7 @@ export function buildFeatureCTAS(args: {
       FROM all_pings p
       INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
       WHERE p.lat IS NOT NULL AND p.lng IS NOT NULL
-        AND (HOUR(p.utc_timestamp) >= 22 OR HOUR(p.utc_timestamp) <= 6)
+        AND (HOUR(${lts('p.utc_timestamp')}) >= 22 OR HOUR(${lts('p.utc_timestamp')}) <= 6)
       GROUP BY p.ad_id
       UNION ALL
       SELECT p.ad_id, AVG(p.lat) as lat, AVG(p.lng) as lng, 2 as priority
@@ -325,7 +337,11 @@ export function buildFeatureCTAS(args: {
       -- brand_visits_json: serialize MAP as VARCHAR (Parquet doesn't accept JSON type).
       -- JSON_FORMAT(CAST(... AS JSON)) returns a VARCHAR like '{"burger_king":12,"mcdonalds":4}'.
       JSON_FORMAT(CAST(b.brand_map AS JSON)) as brand_visits_json,
-      CASE WHEN b.total_brand_visits > 0
+      -- Brand-loyalty HHI: only meaningful with ≥5 brand-visit-days, since
+      -- with 1-2 visits to a single brand HHI is mathematically forced to
+      -- 1.0 (Σ share² = 1²). That artefact made low-visit drive-by devices
+      -- look "100% loyal" — emit 0 (neutral) below the noise floor.
+      CASE WHEN b.total_brand_visits >= 5
         THEN CAST(b.sum_sq AS DOUBLE) / (CAST(b.total_brand_visits AS DOUBLE) * b.total_brand_visits)
         ELSE 0.0
       END as brand_loyalty_hhi,
