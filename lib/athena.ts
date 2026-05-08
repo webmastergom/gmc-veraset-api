@@ -392,12 +392,32 @@ export async function startQueryAndWait(
  */
 export async function runQueryViaS3(sql: string): Promise<QueryResult> {
   const { queryId, outputCsvKey } = await startQueryAndWait(sql);
+  return await fetchQueryResultsViaS3(queryId, outputCsvKey);
+}
 
-  // Download the result CSV from S3
+/**
+ * Download + parse Athena query results from S3 by queryId, given that
+ * the query has already SUCCEEDED. Use this from a polling loop where
+ * you've already managed startQueryAsync + checkQueryStatus yourself —
+ * it just does the CSV fetch part of runQueryViaS3.
+ *
+ * Why this matters: fetchQueryResults() paginates the GetQueryResults
+ * API at 1000 rows / page. For million-row results that's hundreds of
+ * sequential round-trips and easily 3-5 minutes wall-clock — enough to
+ * exhaust the Vercel 5-min cap on its own. This helper does ONE
+ * GetObject from S3 and parses the same CSV format Athena writes,
+ * typically in 5-30s for any size.
+ */
+export async function fetchQueryResultsViaS3(
+  queryId: string,
+  outputCsvKey?: string,
+): Promise<QueryResult> {
+  const csvKey = outputCsvKey || `athena-results/${queryId}.csv`;
+
   const { GetObjectCommand } = await import('@aws-sdk/client-s3');
   const response = await s3Client.send(new GetObjectCommand({
     Bucket: BUCKET,
-    Key: outputCsvKey,
+    Key: csvKey,
   }));
 
   const csvText = await response.Body?.transformToString();
@@ -457,7 +477,7 @@ export async function runQueryViaS3(sql: string): Promise<QueryResult> {
     rows.push(row);
   }
 
-  console.log(`✅ runQueryViaS3: ${rows.length} rows parsed from ${outputCsvKey} (query ${queryId})`);
+  console.log(`✅ fetchQueryResultsViaS3: ${rows.length} rows parsed from ${csvKey} (query ${queryId})`);
   return { columns, rows };
 }
 

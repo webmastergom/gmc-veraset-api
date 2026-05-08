@@ -9,7 +9,7 @@
  * ORDER BY device_days DESC LIMIT n — biases toward heavy users; omit for full coverage.
  */
 
-import { ensureTableForDataset, runQuery, getTableName, startQueryAsync, checkQueryStatus, fetchQueryResults } from './athena';
+import { ensureTableForDataset, runQuery, getTableName, startQueryAsync, checkQueryStatus, fetchQueryResults, fetchQueryResultsViaS3 } from './athena';
 import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
 import { localTimestamp, tzForCountry } from './timezones';
 import type {
@@ -262,12 +262,26 @@ async function analyzeFullSchemaFast(
     const elapsed = Math.round((Date.now() - t0) / 1000);
     if (!devicesDone) {
       const s = await checkQueryStatus(devicesQId);
-      if (s.state === 'SUCCEEDED') { devicesDone = true; devicesRes = await fetchQueryResults(devicesQId); }
+      // devicesQuery returns one row per (ad_id, zip) — can be millions.
+      // Stream from S3 (single GetObject) instead of paginating the
+      // GetQueryResults API (1000 rows/page, multi-minute round-trips).
+      if (s.state === 'SUCCEEDED') {
+        devicesDone = true;
+        report({
+          step: 'running_queries',
+          percent: 60,
+          message: '⚡ Devices query done · streaming result CSV from S3…',
+          detail: 'avoiding paginated GetQueryResults API (slow for million-row results)',
+        });
+        devicesRes = await fetchQueryResultsViaS3(devicesQId);
+      }
       else if (s.state === 'FAILED') throw new Error(`Devices query failed: ${s.error}`);
     }
     if (!h3Done) {
       const s = await checkQueryStatus(h3QId);
-      if (s.state === 'SUCCEEDED') { h3Done = true; h3Res = await fetchQueryResults(h3QId); }
+      // H3 hotspots are aggregated per (zip, h3) — bounded result set,
+      // but we use the S3 path anyway for consistency.
+      if (s.state === 'SUCCEEDED') { h3Done = true; h3Res = await fetchQueryResultsViaS3(h3QId); }
       else if (s.state === 'FAILED') {
         // H3 is optional enrichment — don't block on it.
         console.warn(`[POSTAL-MAID-FAST] H3 query failed: ${s.error} (continuing without hotspots)`);
@@ -1003,12 +1017,27 @@ export async function analyzePostalMaid(
 
     if (!totalDone) {
       const s = await checkQueryStatus(totalQId);
+      // totalQuery is a single COUNT(*) — the paginated API is fine.
       if (s.state === 'SUCCEEDED') { totalDone = true; totalRes = await fetchQueryResults(totalQId); }
       else if (s.state === 'FAILED') throw new Error(`Total devices query failed: ${s.error}`);
     }
     if (!maidsDone) {
       const s = await checkQueryStatus(maidsQId);
-      if (s.state === 'SUCCEEDED') { maidsDone = true; maidsRes = await fetchQueryResults(maidsQId); }
+      // maidsQuery returns one row per (ad_id, origin coord) — millions
+      // for big megajobs. fetchQueryResults paginates the GetQueryResults
+      // API at 1000 rows / page (~5 min wall-clock for 5M rows), which
+      // alone exhausts the Vercel cap. Read the result CSV directly from
+      // S3 instead — single GetObject, ~5-30s for any size.
+      if (s.state === 'SUCCEEDED') {
+        maidsDone = true;
+        report({
+          step: 'running_queries',
+          percent: 55,
+          message: 'Athena origins query done · streaming result CSV from S3…',
+          detail: 'avoiding paginated GetQueryResults API (slow for million-row results)',
+        });
+        maidsRes = await fetchQueryResultsViaS3(maidsQId);
+      }
       else if (s.state === 'FAILED') throw new Error(`Origins query failed: ${s.error}`);
     }
 
