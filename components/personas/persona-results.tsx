@@ -30,6 +30,10 @@ import {
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
+  UserPlus,
+  Loader2,
+  CheckCircle2,
+  XCircle,
 } from 'lucide-react';
 import type {
   PersonaReport,
@@ -237,15 +241,131 @@ function PersonasTab({ report }: { report: PersonaReport }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
       {sorted.map((p) => (
-        <PersonaCard key={p.id} persona={p} totalDevices={report.scorecard.totalDevices} />
+        <PersonaCard
+          key={p.id}
+          persona={p}
+          totalDevices={report.scorecard.totalDevices}
+          runId={report.runId}
+        />
       ))}
     </div>
   );
 }
 
-function PersonaCard({ persona, totalDevices }: { persona: PersonaCluster; totalDevices: number }) {
+// ── Look-alike enrichment state ────────────────────────────────────────
+//
+// Each persona card can spawn up to 3 lookalike pipelines (zip/traits/brands).
+// We keep a tiny per-card state map keyed by mode. The pipeline runs server-
+// side in /api/personas/{runId}/lookalikes/poll — we just POST repeatedly
+// until phase === 'done' or 'error'.
+type LookalikeMode = 'zip' | 'traits' | 'brands';
+type LookalikePhase = 'starting' | 'ctas_launch' | 'ctas_polling' | 'register' | 'done' | 'error';
+
+interface LookalikeUiState {
+  phase: LookalikePhase;
+  maidCount?: number;
+  attributeValue?: string;
+  error?: string;
+}
+
+const LOOKALIKE_MODE_META: Record<LookalikeMode, { label: string; sub: string; emoji: string }> = {
+  zip: {
+    label: 'By home ZIP',
+    sub: 'Live in the same neighborhoods',
+    emoji: '📍',
+  },
+  traits: {
+    label: 'By mobility traits',
+    sub: 'Similar dwell, hour, weekend, gyration',
+    emoji: '🧭',
+  },
+  brands: {
+    label: 'By brand mix',
+    sub: 'Visit the same brand POIs',
+    emoji: '🏷️',
+  },
+};
+
+function PersonaCard({
+  persona,
+  totalDevices,
+  runId,
+}: {
+  persona: PersonaCluster;
+  totalDevices: number;
+  runId: string;
+}) {
   const color = PERSONA_COLORS[persona.id % PERSONA_COLORS.length];
   const radarData = persona.radarAxes.map((a) => ({ axis: a.label, value: a.value }));
+
+  // Per-mode lookalike pipeline state. Persists across re-renders; if the
+  // user navigates away and back, the server-side state machine remembers
+  // where it left off (we POST without `reset`).
+  const [lookalikes, setLookalikes] = useState<Partial<Record<LookalikeMode, LookalikeUiState>>>({});
+  const isPipelineActive = (mode: LookalikeMode) => {
+    const s = lookalikes[mode];
+    return !!s && s.phase !== 'done' && s.phase !== 'error';
+  };
+
+  const runLookalike = async (mode: LookalikeMode) => {
+    if (isPipelineActive(mode)) return;
+    setLookalikes((prev) => ({ ...prev, [mode]: { phase: 'starting' } }));
+    // Poll loop — bounded; the server itself advances multiple phases per
+    // POST so we usually finish in 2-3 round trips for ZIP, more for
+    // traits/brands when the CTAS scans a lot of feature rows.
+    const startedAt = Date.now();
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    let firstCall = true;
+    while (Date.now() - startedAt < TIMEOUT_MS) {
+      let res: Response;
+      try {
+        res = await fetch(`/api/personas/${runId}/lookalikes/poll`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            personaId: persona.id,
+            mode,
+            // Reset on the very first call so a re-click starts fresh.
+            reset: firstCall,
+          }),
+        });
+      } catch (e: any) {
+        setLookalikes((prev) => ({
+          ...prev,
+          [mode]: { phase: 'error', error: e?.message || 'Network error' },
+        }));
+        return;
+      }
+      firstCall = false;
+      if (!res.ok) {
+        const txt = await res.text().catch(() => res.statusText);
+        setLookalikes((prev) => ({
+          ...prev,
+          [mode]: { phase: 'error', error: `${res.status}: ${txt.slice(0, 200)}` },
+        }));
+        return;
+      }
+      const data = await res.json();
+      setLookalikes((prev) => ({
+        ...prev,
+        [mode]: {
+          phase: data.phase,
+          maidCount: data.maidCount,
+          attributeValue: data.attributeValue,
+          error: data.error,
+        },
+      }));
+      if (data.phase === 'done' || data.phase === 'error') return;
+      // Backoff: 1.5s while polling Athena, faster during local phases.
+      const delay = data.phase === 'ctas_polling' ? 2500 : 800;
+      await new Promise((r) => setTimeout(r, delay));
+    }
+    setLookalikes((prev) => ({
+      ...prev,
+      [mode]: { phase: 'error', error: 'Lookalike timed out after 5 min' },
+    }));
+  };
 
   return (
     <div className="border rounded-lg overflow-hidden bg-card flex flex-col">
@@ -330,9 +450,93 @@ function PersonaCard({ persona, totalDevices }: { persona: PersonaCluster; total
             </div>
           </div>
         )}
+
+        {/* ── Look-alike enrichment — three modes that produce a new
+              Master MAIDs contribution. Each click kicks off a server-side
+              CTAS pipeline; in-flight state is shown inline. */}
+        <div className="border-t pt-3 mt-1">
+          <div className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+            <UserPlus className="h-3.5 w-3.5" />
+            <span className="font-medium">Find look-alikes</span>
+            <span className="opacity-70">— enrich segment</span>
+          </div>
+          <div className="space-y-1.5">
+            {(['zip', 'traits', 'brands'] as const).map((mode) => {
+              const state = lookalikes[mode];
+              const meta = LOOKALIKE_MODE_META[mode];
+              const active = isPipelineActive(mode);
+              const done = state?.phase === 'done';
+              const err = state?.phase === 'error';
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => runLookalike(mode)}
+                  disabled={active}
+                  className={`w-full text-left rounded-md border px-2.5 py-2 text-xs transition-colors ${
+                    err
+                      ? 'border-rose-500/40 bg-rose-500/5 hover:bg-rose-500/10'
+                      : done
+                      ? 'border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/10'
+                      : active
+                      ? 'border-blue-500/40 bg-blue-500/5'
+                      : 'border-border hover:bg-muted/40'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-base leading-none">{meta.emoji}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium flex items-center gap-1.5">
+                        {meta.label}
+                        {done && <CheckCircle2 className="h-3 w-3 text-emerald-500" />}
+                        {err && <XCircle className="h-3 w-3 text-rose-500" />}
+                        {active && <Loader2 className="h-3 w-3 animate-spin text-blue-500" />}
+                      </div>
+                      <div className="text-[10px] text-muted-foreground truncate">
+                        {err
+                          ? state?.error || 'Failed'
+                          : done
+                          ? `${fmtNum(state?.maidCount || 0)} MAIDs found`
+                          : active
+                          ? phaseLabel(state?.phase || 'starting')
+                          : meta.sub}
+                      </div>
+                    </div>
+                    {done && state?.maidCount != null && (
+                      <span className="text-[10px] tabular-nums text-emerald-500 font-semibold">
+                        +{((state.maidCount / Math.max(1, persona.deviceCount)) * 100).toFixed(0)}%
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          {Object.values(lookalikes).some((s) => s?.phase === 'done') && (
+            <div className="text-[10px] text-muted-foreground mt-1.5 italic">
+              Saved as <code>persona_lookalike</code> in Master MAIDs.
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
+}
+
+/** Map the pipeline phase to a short user-readable string. */
+function phaseLabel(phase: LookalikePhase): string {
+  switch (phase) {
+    case 'starting':
+      return 'Looking up persona…';
+    case 'ctas_launch':
+      return 'Launching Athena query…';
+    case 'ctas_polling':
+      return 'Athena scanning features…';
+    case 'register':
+      return 'Registering Master MAIDs…';
+    default:
+      return phase;
+  }
 }
 
 // ── RFM tab ──────────────────────────────────────────────────────────

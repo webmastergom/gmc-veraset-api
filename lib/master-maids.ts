@@ -25,7 +25,7 @@ function normalizeCC(cc: string): string {
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment' | 'persona';
+export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment' | 'persona' | 'persona_lookalike';
 
 /**
  * Each contribution is an Athena table backed by Parquet.
@@ -344,6 +344,16 @@ export function buildConsolidationFromTables(
         case 'persona':
           selects.push(`
             SELECT ad_id, 'persona' as attr_type, '${c.attributeValue.replace(/'/g, "''")}' as attr_value,
+                   CAST(NULL AS DOUBLE) as dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+        case 'persona_lookalike':
+          // Same shape as 'persona' — single ad_id column. The attr_value
+          // carries the source name + persona name + mode, which is what
+          // shows up in the master-maids UI Attribute Breakdown.
+          selects.push(`
+            SELECT ad_id, 'persona_lookalike' as attr_type, '${c.attributeValue.replace(/'/g, "''")}' as attr_value,
                    CAST(NULL AS DOUBLE) as dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
             FROM ${c.athenaTable}
           `);
