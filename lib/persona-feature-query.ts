@@ -108,17 +108,28 @@ export function buildFeatureCTAS(args: {
    *  through when tz is empty or 'UTC' to keep query plans unchanged. */
   const lts = (col: string) => localTimestamp(col, localTz);
 
-  const hourClause = buildHourFilterClause(filters);
-  const gpsClause = buildGpsOnlyClause(filters);
-  const scoreClause = buildCircleScoreClause(filters);
-  const dowClause = buildDayOfWeekClause(filters);
+  // CRITICAL: inject localTz into the filter object so the clause builders
+  // (hour / dow / employee / resident) extract HOUR() and DAY_OF_WEEK() in
+  // LOCAL time — same TZ used by the bucket aggregation below. Without this
+  // the filter applies in UTC while buckets are local → user sets 8-20 in
+  // MX and Evening reports 0% / Night reports 8% (UTC 8-20 = MX 02-14, so
+  // MX evening pings are filtered out and MX 02-04 night pings sneak in).
+  const filtersWithTz: (VisitorFilter & { dwell?: DwellFilter }) | undefined =
+    filters || localTz
+      ? { ...(filters || {}), localTz: localTz || filters?.localTz }
+      : undefined;
+
+  const hourClause = buildHourFilterClause(filtersWithTz);
+  const gpsClause = buildGpsOnlyClause(filtersWithTz);
+  const scoreClause = buildCircleScoreClause(filtersWithTz);
+  const dowClause = buildDayOfWeekClause(filtersWithTz);
 
   // Build the all_pings UNION over sub-job tables.
   const allPingsUnion = syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
-      const empClause = buildEmployeeExclusionClause(filters, table);
-      const resClause = buildResidentExclusionClause(filters, table);
+      const empClause = buildEmployeeExclusionClause(filtersWithTz, table);
+      const resClause = buildResidentExclusionClause(filtersWithTz, table);
       return `
         SELECT
           ad_id, date, utc_timestamp,
