@@ -723,15 +723,39 @@ export async function analyzePostalMaidMegaJob(
         .join('\n      UNION ALL\n      ')}
     )`;
 
+    // CRITICAL: when the user leaves date fields blank, fall back to the
+    // megajob's CATALOG range (sourceScope.dateRange). Without this, Athena
+    // scans EVERY partition of every sub-job table (potentially many months
+    // of data the megajob doesn't even cover) and the run blows past the
+    // Vercel 5-min cap. The UI tells users "leaving dates blank uses the
+    // catalog range" — this is what makes that promise true.
+    const catalogFrom = megaJob.sourceScope?.dateRange?.from;
+    const catalogTo = megaJob.sourceScope?.dateRange?.to;
+    const effectiveFrom = filters.dateFrom || catalogFrom;
+    const effectiveTo = filters.dateTo || catalogTo;
     const dateConditions: string[] = [];
-    if (filters.dateFrom) dateConditions.push(`date >= '${filters.dateFrom}'`);
-    if (filters.dateTo) dateConditions.push(`date <= '${filters.dateTo}'`);
+    if (effectiveFrom) dateConditions.push(`date >= '${effectiveFrom}'`);
+    if (effectiveTo) dateConditions.push(`date <= '${effectiveTo}'`);
     const dateWhere = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+    if (effectiveFrom || effectiveTo) {
+      console.log(
+        `[POSTAL-MAID-MEGAJOB] partition prune: date >= ${effectiveFrom || '∞'} AND date <= ${effectiveTo || '∞'} ` +
+          `(user-supplied=${!!(filters.dateFrom || filters.dateTo)}, catalog=${catalogFrom}..${catalogTo})`,
+      );
+    }
+    // Push the effective range into filters so analyzePostalMaid (BASIC
+    // megajob fork) and analyzeFullSchemaFast both see the partition prune
+    // through any internal recompute of dateWhere.
+    const filtersWithDefaults: PostalMaidFilters = {
+      ...filters,
+      dateFrom: effectiveFrom,
+      dateTo: effectiveTo,
+    };
 
     if (isFull) {
       return await analyzeFullSchemaFast(
         megaJob.name || megaJobId,
-        filters,
+        filtersWithDefaults,
         report,
         totalDevicesInDataset,
         tableNames[0], // unused when megajobOpts is set
@@ -747,7 +771,7 @@ export async function analyzePostalMaidMegaJob(
     // name so log lines + result.dataset are human-readable.
     return await analyzePostalMaid(
       megaJob.name || megaJobId,
-      filters,
+      filtersWithDefaults,
       report,
       { tableExpr, maidsTableName },
     );
@@ -791,6 +815,33 @@ export async function analyzePostalMaid(
   const requestedPostalCodes = new Set(
     filters.postalCodes.map(pc => normalizePostalForCountry(filters.country, pc)),
   );
+
+  // ── Default the date range to the dataset's catalog range ─────────────
+  // The UI tells users "leaving dates blank uses the catalog range" — make
+  // that promise true so Athena can do partition pruning instead of
+  // scanning every date partition. In megajob mode the caller already
+  // populated filters.dateFrom/dateTo from the megajob's sourceScope, so
+  // this block is a no-op for that path.
+  if (!megajobOpts && (!filters.dateFrom || !filters.dateTo)) {
+    try {
+      const { getAllJobsSummary } = await import('./jobs');
+      const jobs = await getAllJobsSummary().catch(() => []);
+      const matching = jobs.find((j: any) => {
+        const folderId = j.s3DestPath?.replace('s3://', '').replace(/.*\//, '').replace(/\/$/, '') || '';
+        return folderId === datasetName;
+      });
+      const r = (matching as any)?.dateRange;
+      if (r?.from && !filters.dateFrom) filters = { ...filters, dateFrom: r.from };
+      if (r?.to && !filters.dateTo) filters = { ...filters, dateTo: r.to };
+      if (r?.from || r?.to) {
+        console.log(
+          `[POSTAL-MAID] partition prune from catalog: date >= ${filters.dateFrom || '∞'} AND date <= ${filters.dateTo || '∞'}`,
+        );
+      }
+    } catch (e: any) {
+      console.warn('[POSTAL-MAID] catalog range lookup failed:', e?.message || e);
+    }
+  }
 
   // In megajob mode, the FROM clause is the UNION-ALL expression and the
   // POI-visitor set comes from the pre-computed MAIDs CSV. Otherwise it's

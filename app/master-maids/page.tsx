@@ -232,6 +232,16 @@ export default function MasterMaidsPage() {
     window.open(url, '_blank')
   }
 
+  const handleDownloadContribution = (cc: string, contributionId: string) => {
+    // Per-contribution download: streams the CSV from the specific Athena
+    // table of THIS contribution (one CTAS = one row in this table). Different
+    // from handleDownloadCluster which UNIONs all contributions sharing the
+    // same (type, value) — useful when an attr has been re-imported and you
+    // only want one source's MAIDs.
+    const url = `/api/master-maids/${cc}/download-contribution?id=${encodeURIComponent(contributionId)}`
+    window.open(url, '_blank')
+  }
+
   const handleRemoveContribution = async (cc: string, id: string) => {
     try {
       await fetch(`/api/master-maids/${cc}?id=${id}`, {
@@ -524,7 +534,19 @@ export default function MasterMaidsPage() {
                                     <TableCell className="text-xs text-muted-foreground">
                                       {formatDate(contrib.registeredAt)}
                                     </TableCell>
-                                    <TableCell>
+                                    <TableCell className="flex items-center gap-1 justify-end pr-1">
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-6 w-6 p-0 text-muted-foreground hover:text-theme-accent"
+                                        title={`Download MAIDs for this contribution (${contrib.attributeType}=${contrib.attributeValue || '(empty)'})`}
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleDownloadContribution(c.country, contrib.id)
+                                        }}
+                                      >
+                                        <Download className="h-3 w-3" />
+                                      </Button>
                                       <Button
                                         size="sm"
                                         variant="ghost"
