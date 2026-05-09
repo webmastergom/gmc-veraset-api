@@ -300,7 +300,9 @@ export interface PersonaReport {
 
 export type PersonaPhase =
   | 'starting'
-  | 'feature_ctas'
+  | 'visitor_pings_ctas'    // NEW Stage 1: materialize visitor_pings per source
+  | 'visitor_pings_polling' // wait for Stage 1, then fan out Stage 2
+  | 'feature_ctas'          // Stage 2: build feature vector from visitor_pings
   | 'feature_polling'
   | 'enrichment_ctas'
   | 'enrichment_polling'
@@ -330,8 +332,23 @@ export interface PersonaState {
   phase: PersonaPhase;
   runId: string;
   config: PersonaRunConfig;
-  /** Feature CTAS table per source. */
+  /** Stage 1: visitor_pings CTAS per source — pre-materialized table of
+   *  all sub-job pings of devices that visited at least one POI, with an
+   *  is_at_poi flag. Stage 2 reads from this instead of re-scanning the
+   *  raw sub-jobs (which exhausted Athena resources for big runs). */
+  visitorPingsCtas?: Record<string, { queryId: string; tableName: string }>;
+  /** Stage 2: feature CTAS table per source. */
   featureCtas?: Record<string, { queryId: string; tableName: string }>;
+  /** Per-source extra metadata captured during Stage 1, needed when
+   *  Stage 2 launches (poiToBrand, dateRangeTo, country, sourceMegajobId,
+   *  etc.). Persisted in S3 to survive multi-invoke polling. */
+  sourceMeta?: Record<string, {
+    sourceId: string;
+    label: string;
+    rangeTo: string;
+    country: string;
+    poiToBrand: Array<{ poiId: string; brand: string }>;
+  }>;
   /** SELECT * download queries per source. */
   downloadQueries?: Record<string, { queryId: string; csvKey: string }>;
   enrichmentCtas?: { queryId: string; tableName: string };

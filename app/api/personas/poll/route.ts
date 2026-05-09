@@ -43,7 +43,7 @@ import { getJob } from '@/lib/jobs';
 import { getPOICollection } from '@/lib/poi-storage';
 import { resolveBrand } from '@/lib/persona-brand-lookup';
 import { discoverBrands, type PoiNameLookup } from '@/lib/persona-brand-discovery';
-import { buildFeatureCTAS, extractPoiCoords } from '@/lib/persona-feature-query';
+import { buildFeatureCTAS, buildVisitorPingsCTAS, extractPoiCoords } from '@/lib/persona-feature-query';
 import { runClusteringPipeline } from '@/lib/persona-clusterer';
 import { computeRfm } from '@/lib/persona-rfm';
 import { computeCohabitation } from '@/lib/persona-cohabitation';
@@ -154,11 +154,25 @@ async function resolveJobSource(jobId: string): Promise<ResolvedSource> {
   return { sourceId: jobId, syncedJobs, collectionIds: colIds, rangeTo, label: job.name || jobId, country };
 }
 
+/**
+ * Per-source resolved metadata needed by Stage 2 (feature CTAS). We save
+ * this in PersonaState during Stage 1 launch so Stage 2 doesn't have to
+ * re-resolve POI collections + brand discovery + timezone (which can be
+ * 10s of seconds for large megajobs and would slow the stage transition).
+ */
+interface PerSourceMeta {
+  sourceId: string;
+  label: string;
+  rangeTo: string;
+  country: string;
+  poiToBrand: Array<{ poiId: string; brand: string }>;
+}
+
 async function fireFeatureCtasForSource(args: {
   source: ResolvedSource;
   runId: string;
   filters: any;
-}): Promise<{ queryId: string; tableName: string }> {
+}): Promise<{ queryId: string; tableName: string; meta: PerSourceMeta }> {
   const { source, runId, filters } = args;
 
   // Ensure all dataset tables exist.
@@ -266,40 +280,85 @@ async function fireFeatureCtasForSource(args: {
   // list with no `AS`). Inlining sidesteps both grammars.
   console.log(`[PERSONAS ${runId}] Brand mapping (${poiToBrand.length} POIs) will be inlined for source ${source.label}`);
 
-  // Feature CTAS uses a per-attempt timestamp suffix so two concurrent
-  // phaseStarting calls (frontend retries during a long Vercel cycle)
-  // don't collide on table creation. The state machine persists the
-  // chosen tableName so downstream phases reuse it.
+  // STAGE 1: visitor_pings CTAS. Materializes the per-source pings
+  // table that Stage 2 reads from. Light query plan (single UNION ALL
+  // scan + spatial-grid JOIN + ad_id filter to visitors) — fits Athena
+  // resource budget for any megajob the original feature CTAS would
+  // have OOM'd on.
   const safeId = source.sourceId.replace(/-/g, '_').slice(0, 24);
   const attemptTs = Math.floor(Date.now() / 1000).toString(36); // ~7 chars
-  const featureTableBase = `persona_features_${safeId}_${runId.slice(0, 8)}_${attemptTs}`;
-  const featureTable = featureTableBase.length > 60 ? featureTableBase.slice(0, 60) : featureTableBase;
-  try { await runQuery(`DROP TABLE IF EXISTS ${featureTable}`); } catch {}
-  const featureS3 = `s3://${BUCKET}/athena-temp/${featureTable}/`;
+  const visitorPingsBase = `persona_visitor_pings_${safeId}_${runId.slice(0, 8)}_${attemptTs}`;
+  const visitorPingsTable = visitorPingsBase.length > 60 ? visitorPingsBase.slice(0, 60) : visitorPingsBase;
+  try { await runQuery(`DROP TABLE IF EXISTS ${visitorPingsTable}`); } catch {}
+  const visitorPingsS3 = `s3://${BUCKET}/athena-temp/${visitorPingsTable}/`;
 
   // Resolve local timezone from the source's country so that hour
   // buckets + DAY_OF_WEEK reflect local time (not UTC). Without this,
   // MX afternoon visits (UTC 22:00+) get bucketed as "Night" and ALL
-  // personas show peak-hour = Night.
+  // personas show peak-hour = Night. Used in Stage 1 (filters) AND
+  // Stage 2 (bucket aggregation).
   const localTz = tzForCountry(source.country);
   if (localTz !== 'UTC') {
     console.log(`[PERSONAS ${runId}] Source ${source.label} (country=${source.country}) → tz=${localTz}`);
   }
 
-  const sql = buildFeatureCTAS({
-    ctasTable: featureTable,
-    ctasS3Path: featureS3,
+  const sql = buildVisitorPingsCTAS({
+    ctasTable: visitorPingsTable,
+    ctasS3Path: visitorPingsS3,
     syncedJobs: source.syncedJobs,
     poiCoords,
-    poiToBrand,
-    dateRangeTo: source.rangeTo,
-    sourceMegajobId: source.sourceId,
     localTz,
     filters,
   });
 
   const queryId = await startQueryAsync(sql);
-  console.log(`[PERSONAS ${runId}] Feature CTAS started for ${source.label}: queryId=${queryId}`);
+  console.log(`[PERSONAS ${runId}] Stage 1 (visitor_pings) CTAS started for ${source.label}: queryId=${queryId}, table=${visitorPingsTable}`);
+  return {
+    queryId,
+    tableName: visitorPingsTable,
+    meta: {
+      sourceId: source.sourceId,
+      label: source.label,
+      rangeTo: source.rangeTo,
+      country: source.country || '',
+      poiToBrand,
+    },
+  };
+}
+
+/**
+ * STAGE 2 launcher: builds + fires the feature CTAS for ONE source,
+ * reading from the pre-materialized visitor_pings table. Called from
+ * phaseVisitorPingsPolling once Stage 1 has finished for all sources.
+ */
+async function fireFeatureCtasFromVisitorPings(args: {
+  visitorPingsTable: string;
+  meta: PerSourceMeta;
+  runId: string;
+  filters: any;
+}): Promise<{ queryId: string; tableName: string }> {
+  const { visitorPingsTable, meta, runId, filters } = args;
+  const safeId = meta.sourceId.replace(/-/g, '_').slice(0, 24);
+  const attemptTs = Math.floor(Date.now() / 1000).toString(36);
+  const featureTableBase = `persona_features_${safeId}_${runId.slice(0, 8)}_${attemptTs}`;
+  const featureTable = featureTableBase.length > 60 ? featureTableBase.slice(0, 60) : featureTableBase;
+  try { await runQuery(`DROP TABLE IF EXISTS ${featureTable}`); } catch {}
+  const featureS3 = `s3://${BUCKET}/athena-temp/${featureTable}/`;
+
+  const localTz = tzForCountry(meta.country);
+  const sql = buildFeatureCTAS({
+    ctasTable: featureTable,
+    ctasS3Path: featureS3,
+    visitorPingsTable,
+    poiToBrand: meta.poiToBrand,
+    dateRangeTo: meta.rangeTo,
+    sourceMegajobId: meta.sourceId,
+    localTz,
+    filters,
+  });
+
+  const queryId = await startQueryAsync(sql);
+  console.log(`[PERSONAS ${runId}] Stage 2 (feature) CTAS started for ${meta.label}: queryId=${queryId}, table=${featureTable}, reads from ${visitorPingsTable}`);
   return { queryId, tableName: featureTable };
 }
 
@@ -307,30 +366,104 @@ async function phaseStarting(state: PersonaState): Promise<PersonaState> {
   const { config, runId } = state;
   console.log(`[PERSONAS ${runId}] starting: megaJobs=${config.megaJobIds.join(',')} jobs=${(config.jobIds || []).join(',')}`);
 
-  const featureCtas: Record<string, { queryId: string; tableName: string }> = {};
+  // STAGE 1 launch — fire visitor_pings CTAS per source. Each one is a
+  // single UNION ALL scan + spatial-grid JOIN + visitor filter, MUCH
+  // simpler than the original 20-CTE feature query and well within
+  // Athena's resource budget at any scale.
+  const visitorPingsCtas: Record<string, { queryId: string; tableName: string }> = {};
+  const sourceMeta: NonNullable<PersonaState['sourceMeta']> = {};
 
   for (const megaJobId of config.megaJobIds) {
     const source = await resolveMegaJobSource(megaJobId);
-    featureCtas[source.sourceId] = await fireFeatureCtasForSource({ source, runId, filters: config.filters as any });
+    const fired = await fireFeatureCtasForSource({ source, runId, filters: config.filters as any });
+    visitorPingsCtas[source.sourceId] = { queryId: fired.queryId, tableName: fired.tableName };
+    sourceMeta[source.sourceId] = fired.meta;
   }
   for (const jobId of config.jobIds || []) {
     const source = await resolveJobSource(jobId);
-    featureCtas[source.sourceId] = await fireFeatureCtasForSource({ source, runId, filters: config.filters as any });
+    const fired = await fireFeatureCtasForSource({ source, runId, filters: config.filters as any });
+    visitorPingsCtas[source.sourceId] = { queryId: fired.queryId, tableName: fired.tableName };
+    sourceMeta[source.sourceId] = fired.meta;
   }
 
-  if (Object.keys(featureCtas).length === 0) {
+  if (Object.keys(visitorPingsCtas).length === 0) {
     throw new Error('No sources resolved (megaJobIds + jobIds both empty?)');
+  }
+
+  return {
+    ...state,
+    phase: 'visitor_pings_polling',
+    visitorPingsCtas,
+    sourceMeta,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+// ─── Phase: feature_polling ──────────────────────────────────────────
+
+/**
+ * Stage 1 polling: wait for all visitor_pings CTASes to finish, then
+ * fan out Stage 2 (feature CTAS reading from each visitor_pings table).
+ * The split exists so each Athena query is simple enough to stay within
+ * the workgroup's per-query resource budget — the original monolithic
+ * feature CTAS exhausted resources at ~120 GB scanned per source.
+ */
+async function phaseVisitorPingsPolling(state: PersonaState): Promise<PersonaState> {
+  if (!state.visitorPingsCtas) throw new Error('No visitorPingsCtas in state');
+  const entries = Object.entries(state.visitorPingsCtas);
+  const queryIds = entries.map(([, v]) => v.queryId);
+  const statuses = await Promise.all(queryIds.map((q) => checkQueryStatus(q)));
+  const anyFailed = statuses.find((s) => s.state === 'FAILED' || s.state === 'CANCELLED');
+  if (anyFailed) throw new Error(`Stage 1 (visitor_pings) CTAS failed: ${anyFailed.error || 'unknown'}`);
+  const allDone = statuses.every((s) => s.state === 'SUCCEEDED');
+
+  const totalScannedGB = statuses.reduce((s, x) => s + ((x.statistics?.dataScannedBytes || 0) / 1e9), 0);
+  const doneCount = statuses.filter((s) => s.state === 'SUCCEEDED').length;
+  const perSource: Record<string, string> = {};
+  entries.forEach(([src], i) => {
+    const st = statuses[i];
+    perSource[src] = `${st.state} · ${((st.statistics?.dataScannedBytes || 0) / 1e9).toFixed(1)} GB scanned`;
+  });
+  const subProgress = {
+    label: allDone ? 'Stage 1 done · firing feature CTAS' : `Stage 1 (visitor pings): ${doneCount}/${statuses.length} sources done`,
+    ratio: doneCount / Math.max(1, statuses.length),
+    details: `${totalScannedGB.toFixed(1)} GB scanned · 2-stage pipeline avoids the resource-exhaust failure at this scale`,
+    perSource,
+  };
+
+  if (!allDone) {
+    return { ...state, subProgress, updatedAt: new Date().toISOString() };
+  }
+
+  // ── Fan out Stage 2: one feature CTAS per source, reading from the
+  //    pre-materialized visitor_pings table.
+  if (!state.sourceMeta) throw new Error('Stage 1 finished but sourceMeta missing — cannot fire Stage 2');
+  const featureCtas: Record<string, { queryId: string; tableName: string }> = {};
+  for (const [sourceId, vp] of entries) {
+    const meta = state.sourceMeta[sourceId];
+    if (!meta) {
+      console.warn(`[PERSONAS ${state.runId}] No sourceMeta for ${sourceId} — skipping Stage 2`);
+      continue;
+    }
+    featureCtas[sourceId] = await fireFeatureCtasFromVisitorPings({
+      visitorPingsTable: vp.tableName,
+      meta,
+      runId: state.runId,
+      filters: state.config.filters as any,
+    });
   }
 
   return {
     ...state,
     phase: 'feature_polling',
     featureCtas,
+    subProgress: {
+      ...subProgress,
+      label: 'Stage 2 (feature CTAS) launched',
+    },
     updatedAt: new Date().toISOString(),
   };
 }
-
-// ─── Phase: feature_polling ──────────────────────────────────────────
 
 async function phaseFeaturePolling(state: PersonaState): Promise<PersonaState> {
   if (!state.featureCtas) throw new Error('No featureCtas in state');
@@ -1090,12 +1223,21 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         case 'starting':
           state = await phaseStarting(state);
           break;
+        case 'visitor_pings_polling':
+          state = await phaseVisitorPingsPolling(state);
+          break;
         case 'feature_polling':
           state = await phaseFeaturePolling(state);
           break;
         // Legacy state for runs created before the download split — auto-promote.
         case 'feature_ctas' as any:
           state = { ...state, phase: 'feature_polling' };
+          break;
+        // Legacy state for runs created before the visitor_pings split.
+        // The new pipeline launches Stage 1 from `starting` and uses
+        // `visitor_pings_polling` for what was previously `feature_ctas`.
+        case 'visitor_pings_ctas' as any:
+          state = { ...state, phase: 'visitor_pings_polling' };
           break;
         case 'download_query':
           state = await phaseDownloadQuery(state);
@@ -1164,12 +1306,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 function phasePercent(phase: PersonaPhase): number {
   return ({
     starting: 5,
-    feature_ctas: 10,
-    feature_polling: 25,
-    enrichment_ctas: 30,
-    enrichment_polling: 35,
-    download_query: 45,
-    download_polling: 55,
+    visitor_pings_ctas: 7,
+    visitor_pings_polling: 18,
+    feature_ctas: 22,
+    feature_polling: 32,
+    enrichment_ctas: 38,
+    enrichment_polling: 42,
+    download_query: 48,
+    download_polling: 56,
     download_read: 65,
     clustering: 75,
     aggregation: 82,
@@ -1183,8 +1327,10 @@ function phasePercent(phase: PersonaPhase): number {
 function phaseMessage(phase: PersonaPhase): string {
   return ({
     starting: 'Resolving POIs and brands…',
-    feature_ctas: 'Launching feature CTAS in Athena…',
-    feature_polling: 'Aggregating per-device features in Athena',
+    visitor_pings_ctas: 'Launching Stage 1 (visitor pings) in Athena…',
+    visitor_pings_polling: 'Stage 1: materializing per-source visitor pings',
+    feature_ctas: 'Launching Stage 2 (feature CTAS) in Athena…',
+    feature_polling: 'Stage 2: aggregating per-device features in Athena',
     enrichment_ctas: 'Building enrichment tables…',
     enrichment_polling: 'Waiting for enrichment…',
     download_query: 'Launching feature-vector download…',

@@ -75,45 +75,37 @@ function sqlQuote(s: string): string {
   return `'${String(s).replace(/'/g, "''")}'`;
 }
 
-export function buildFeatureCTAS(args: {
+/**
+ * STAGE 1 — Materialize the `visitor_pings` table: all sub-job pings of
+ * devices that visited at least one POI, decorated with an `is_at_poi`
+ * flag for downstream "qualified visit" aggregation.
+ *
+ * Why: the original feature CTAS chained ~20 CTEs into one query. Each
+ * downstream CTE that references `all_pings` (home_zip_pre,
+ * home_coord_pre, poi_unnest, mobility) forces Athena to re-scan the
+ * sub-job UNION ALL. With ~5 references and a 244 GB scan per source,
+ * that's 5 × 244 GB = 1.22 TB of intermediate work — enough to blow
+ * past Athena's per-query resource budget ("Query exhausted resources
+ * at this scale factor").
+ *
+ * After this CTAS, the feature-vector query reads from a single small
+ * Parquet table (only pings of visitors, ~5-10% of the raw scan), so
+ * no CTE references the big sub-jobs anymore.
+ *
+ * The CTAS itself does TWO scans of all_pings (one for the spatial
+ * JOIN to compute at_poi_pings, one for the LEFT JOIN to flag pings).
+ * Athena handles 2 scans comfortably; it's the 5+ that exhaust.
+ */
+export function buildVisitorPingsCTAS(args: {
   ctasTable: string;
   ctasS3Path: string;
   syncedJobs: Job[];
   poiCoords: PoiCoord[];
-  /** Inline brand mapping (poiId → brand slug). Materializes as a VALUES CTE
-   *  inside the CTAS — no external table. Bounded by POI count which is
-   *  typically <5k for persona runs. */
-  poiToBrand: Array<{ poiId: string; brand: string }>;
-  dateRangeTo: string;
-  sourceMegajobId: string;
-  /** IANA timezone for the source country. Hour buckets + DAY_OF_WEEK are
-   *  computed in this local time (Veraset stores pings in UTC). Default:
-   *  'UTC' — keeps legacy behaviour when caller doesn't specify. */
   localTz?: string;
   filters?: VisitorFilter & { dwell?: DwellFilter };
 }): string {
-  const {
-    ctasTable,
-    ctasS3Path,
-    syncedJobs,
-    poiCoords,
-    poiToBrand,
-    dateRangeTo,
-    sourceMegajobId,
-    localTz,
-    filters,
-  } = args;
-  /** Local-time expression for hour-of-day / day-of-week extraction.
-   *  Wraps utc_timestamp with at_timezone(...) when tz is set; passes
-   *  through when tz is empty or 'UTC' to keep query plans unchanged. */
-  const lts = (col: string) => localTimestamp(col, localTz);
+  const { ctasTable, ctasS3Path, syncedJobs, poiCoords, localTz, filters } = args;
 
-  // CRITICAL: inject localTz into the filter object so the clause builders
-  // (hour / dow / employee / resident) extract HOUR() and DAY_OF_WEEK() in
-  // LOCAL time — same TZ used by the bucket aggregation below. Without this
-  // the filter applies in UTC while buckets are local → user sets 8-20 in
-  // MX and Evening reports 0% / Night reports 8% (UTC 8-20 = MX 02-14, so
-  // MX evening pings are filtered out and MX 02-04 night pings sneak in).
   const filtersWithTz: (VisitorFilter & { dwell?: DwellFilter }) | undefined =
     filters || localTz
       ? { ...(filters || {}), localTz: localTz || filters?.localTz }
@@ -124,7 +116,6 @@ export function buildFeatureCTAS(args: {
   const scoreClause = buildCircleScoreClause(filtersWithTz);
   const dowClause = buildDayOfWeekClause(filtersWithTz);
 
-  // Build the all_pings UNION over sub-job tables.
   const allPingsUnion = syncedJobs
     .map((job) => {
       const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
@@ -157,7 +148,7 @@ export function buildFeatureCTAS(args: {
     })
     .join('\n      UNION ALL\n      ');
 
-  const sql = `
+  return `
     CREATE TABLE ${ctasTable}
     WITH (format='PARQUET', parquet_compression='SNAPPY',
           external_location='${ctasS3Path}')
@@ -167,6 +158,165 @@ export function buildFeatureCTAS(args: {
       ${allPingsUnion}
     ),
     ${buildAtPoiPingsCTE('all_pings', poiCoords)},
+    visitor_ad_ids AS (
+      SELECT DISTINCT ad_id FROM at_poi_pings
+    )
+    SELECT
+      p.ad_id, p.date, p.utc_timestamp,
+      p.lat, p.lng,
+      p.poi_ids,
+      p.native_zip, p.native_region, p.h3_cell,
+      p.ping_origin_type, p.ping_circle_score,
+      -- is_at_poi: TRUE when this ping is one of the at_poi_pings
+      -- rows (matched (ad_id, date, utc_timestamp, lat, lng) by JOIN).
+      -- Used downstream as the "qualified visit" filter — only at-POI
+      -- pings count toward the visit-day aggregation.
+      (atp.ad_id IS NOT NULL) as is_at_poi
+    FROM all_pings p
+    INNER JOIN visitor_ad_ids v ON p.ad_id = v.ad_id
+    LEFT JOIN at_poi_pings atp
+      ON atp.ad_id = p.ad_id
+      AND atp.date = p.date
+      AND atp.utc_timestamp = p.utc_timestamp
+      AND atp.lat = p.lat
+      AND atp.lng = p.lng
+  `;
+}
+
+export function buildFeatureCTAS(args: {
+  ctasTable: string;
+  ctasS3Path: string;
+  /** When set, the feature CTAS reads from this pre-materialized table
+   *  (output of buildVisitorPingsCTAS) instead of UNION-ing the raw
+   *  sub-job tables. This is the path the persona pipeline uses in
+   *  production — the in-line UNION ALL caused 5+ re-scans of the raw
+   *  244 GB sub-job data and exhausted Athena resources for big runs.
+   *  When set, syncedJobs/poiCoords are NOT used. */
+  visitorPingsTable?: string;
+  /** Required only when visitorPingsTable is NOT set (legacy path). */
+  syncedJobs?: Job[];
+  poiCoords?: PoiCoord[];
+  /** Inline brand mapping (poiId → brand slug). Materializes as a VALUES CTE
+   *  inside the CTAS — no external table. Bounded by POI count which is
+   *  typically <5k for persona runs. */
+  poiToBrand: Array<{ poiId: string; brand: string }>;
+  dateRangeTo: string;
+  sourceMegajobId: string;
+  /** IANA timezone for the source country. Hour buckets + DAY_OF_WEEK are
+   *  computed in this local time (Veraset stores pings in UTC). Default:
+   *  'UTC' — keeps legacy behaviour when caller doesn't specify. */
+  localTz?: string;
+  filters?: VisitorFilter & { dwell?: DwellFilter };
+}): string {
+  const {
+    ctasTable,
+    ctasS3Path,
+    visitorPingsTable,
+    syncedJobs,
+    poiCoords,
+    poiToBrand,
+    dateRangeTo,
+    sourceMegajobId,
+    localTz,
+    filters,
+  } = args;
+  /** Local-time expression for hour-of-day / day-of-week extraction.
+   *  Wraps utc_timestamp with at_timezone(...) when tz is set; passes
+   *  through when tz is empty or 'UTC' to keep query plans unchanged. */
+  const lts = (col: string) => localTimestamp(col, localTz);
+
+  // CRITICAL: inject localTz into the filter object so the clause builders
+  // (hour / dow / employee / resident) extract HOUR() and DAY_OF_WEEK() in
+  // LOCAL time — same TZ used by the bucket aggregation below. Without this
+  // the filter applies in UTC while buckets are local → user sets 8-20 in
+  // MX and Evening reports 0% / Night reports 8% (UTC 8-20 = MX 02-14, so
+  // MX evening pings are filtered out and MX 02-04 night pings sneak in).
+  const filtersWithTz: (VisitorFilter & { dwell?: DwellFilter }) | undefined =
+    filters || localTz
+      ? { ...(filters || {}), localTz: localTz || filters?.localTz }
+      : undefined;
+
+  const hourClause = buildHourFilterClause(filtersWithTz);
+  const gpsClause = buildGpsOnlyClause(filtersWithTz);
+  const scoreClause = buildCircleScoreClause(filtersWithTz);
+  const dowClause = buildDayOfWeekClause(filtersWithTz);
+
+  // Build the WITH-prelude. Two paths:
+  //
+  //  A. Recommended (visitorPingsTable set): read from a pre-materialized
+  //     visitor_pings table. all_pings is a small SELECT, at_poi_pings is
+  //     a SELECT DISTINCT on the same table filtered by is_at_poi. This
+  //     is what the persona pipeline uses in production — the CTE in-line
+  //     scan is too heavy for big megajobs.
+  //
+  //  B. Legacy (syncedJobs + poiCoords): UNION the raw sub-jobs in-line
+  //     and run buildAtPoiPingsCTE for the spatial join. Kept as a
+  //     fallback / for tests / for callers that haven't migrated to the
+  //     2-stage pipeline.
+  let pingsPrelude: string;
+  if (visitorPingsTable) {
+    pingsPrelude = `
+    all_pings AS (
+      SELECT ad_id, date, utc_timestamp, lat, lng,
+             poi_ids, native_zip, native_region, h3_cell,
+             ping_origin_type, ping_circle_score
+      FROM ${visitorPingsTable}
+    ),
+    at_poi_pings AS (
+      SELECT DISTINCT ad_id, date, utc_timestamp, lat, lng
+      FROM ${visitorPingsTable}
+      WHERE is_at_poi
+    )`;
+  } else {
+    if (!syncedJobs || !poiCoords) {
+      throw new Error(
+        'buildFeatureCTAS requires either visitorPingsTable (recommended) or both syncedJobs + poiCoords (legacy)',
+      );
+    }
+    const allPingsUnion = syncedJobs
+      .map((job) => {
+        const table = getTableName(job.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+        const empClause = buildEmployeeExclusionClause(filtersWithTz, table);
+        const resClause = buildResidentExclusionClause(filtersWithTz, table);
+        return `
+        SELECT
+          ad_id, date, utc_timestamp,
+          TRY_CAST(latitude AS DOUBLE) as lat,
+          TRY_CAST(longitude AS DOUBLE) as lng,
+          horizontal_accuracy,
+          poi_ids,
+          TRY(geo_fields['zipcode']) as native_zip,
+          TRY(geo_fields['region']) as native_region,
+          TRY(geo_fields['h3_res10']) as h3_cell,
+          TRY(quality_fields['ping_origin_type']) as ping_origin_type,
+          TRY_CAST(quality_fields['ping_circle_score'] AS DOUBLE) as ping_circle_score
+        FROM ${table}
+        WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
+          AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
+          AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})
+          ${hourClause}
+          ${gpsClause}
+          ${scoreClause}
+          ${dowClause}
+          ${empClause}
+          ${resClause}
+        `;
+      })
+      .join('\n      UNION ALL\n      ');
+    pingsPrelude = `
+    all_pings AS (
+      ${allPingsUnion}
+    ),
+    ${buildAtPoiPingsCTE('all_pings', poiCoords)}`;
+  }
+
+  const sql = `
+    CREATE TABLE ${ctasTable}
+    WITH (format='PARQUET', parquet_compression='SNAPPY',
+          external_location='${ctasS3Path}')
+    AS
+    WITH${pingsPrelude},
     -- Per (ad_id, date): one row with first/last ping, dwell, hour bucket, dow.
     -- arrival_hour and dow are computed in LOCAL time (at_timezone wrapper)
     -- so MX afternoon visits don't end up in the UTC night bucket.
