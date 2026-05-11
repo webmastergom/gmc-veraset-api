@@ -437,12 +437,14 @@ export default function LaboratoryPage() {
 
   const downloadSegmentCSV = () => {
     if (!result) return;
-    const headers = ['ad_id', 'matched_steps', 'total_visits', 'avg_dwell_minutes', 'categories'];
-    const rows = result.segment.devices.map(d => [
-      d.adId, d.matchedSteps, d.totalVisits, d.avgDwellMinutes,
-      d.categories.join(';'),
-    ].join(','));
-    downloadBlob([headers.join(','), ...rows].join('\n'), `segment_${selectedCountry.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.csv`);
+    // MAID-only export: matches the format used everywhere else in the app
+    // (ZCS, NSE brackets, master-maids cluster/contribution, dataset
+    // Download MAIDs, audience-runner segment). Per-device enrichment
+    // (matched_steps, total_visits, avg_dwell_minutes, categories) stays
+    // visible in the UI but is not shipped in the CSV — activation tools
+    // (Karlsgate, audience pickers, ad-tech) only want the MAID list.
+    const lines = ['ad_id', ...result.segment.devices.map((d) => d.adId)];
+    downloadBlob(lines.join('\n'), `segment_${selectedCountry.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.csv`);
   };
 
   function downloadBlob(content: string, filename: string) {

@@ -614,12 +614,14 @@ async function persistAudienceResult(
     ContentType: 'application/json',
   }));
 
-  // Store segment CSV (all ad_ids)
+  // Store segment CSV — one ad_id per line, ready to feed into activation
+  // tools (Karlsgate, audience pickers, ad-tech). Enriched per-device data
+  // (matched_steps, total_visits, avg_dwell_minutes, categories) is still
+  // available on the result object and rendered in the UI; we just don't
+  // ship it in the export because downstream pipelines either ignore the
+  // extra columns or reject the file as malformed.
   const csvKey = `${prefix}/${timestamp}-segment.csv`;
-  const csvContent = 'ad_id,matched_steps,total_visits,avg_dwell_minutes,categories\n' +
-    allDevices.map(d =>
-      `${d.adId},${d.matchedSteps},${d.totalVisits},${d.avgDwellMinutes},"${d.categories.join(';')}"`
-    ).join('\n');
+  const csvContent = 'ad_id\n' + allDevices.map((d) => d.adId).join('\n');
   await s3Client.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: csvKey,
