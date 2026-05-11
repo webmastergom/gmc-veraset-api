@@ -132,7 +132,19 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   // Resolve runId: either provided (continuation) or computed from config (new run).
-  let runId: string = body?.runId || '';
+  // CRITICAL: runId is concatenated into S3 paths (zcs-state/<runId>,
+  // postal-maid-spill/zcs-<runId>, etc.). Reject anything that could
+  // path-traverse or break S3 key syntax. Valid runIds we generate are
+  // 'zcs-' + 16-hex sha1 prefix; we accept any safe-looking string for
+  // forward compatibility but with strict character + length checks.
+  const rawRunId: string = body?.runId || '';
+  if (rawRunId && !/^[a-zA-Z0-9_-]{1,128}$/.test(rawRunId)) {
+    return NextResponse.json(
+      { error: 'Invalid runId format (expected alphanumeric / _ / -, max 128 chars)' },
+      { status: 400 },
+    );
+  }
+  let runId: string = rawRunId;
   const reset = !!body?.reset;
   const hasNewConfig =
     !!body?.country &&
