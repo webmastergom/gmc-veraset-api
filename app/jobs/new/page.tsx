@@ -44,7 +44,15 @@ export default function NewJobPage() {
       to: "",
     },
     radius: 10,
-    schema: "BASIC",
+    // Default to FULL: gives us geo_fields[zipcode/region/city/h3_res10]
+    // and quality_fields[ping_origin_type/ping_circle_score] right in the
+    // parquets, which:
+    //   - lets ZCS skip the Node-side reverse-geocode pipeline (FAST path)
+    //   - feeds Personas with richer per-device traits
+    //   - keeps the cost difference vs BASIC small (~30%) for typical use
+    // BASIC was the historical default — kept selectable for budget runs
+    // where the user knows they only need lat/lng/timestamp.
+    schema: "FULL",
   })
 
   useEffect(() => {
@@ -590,7 +598,7 @@ export default function NewJobPage() {
             poiCollectionIds: [collectionId],
             dateRange: { from: formData.dateRange!.from, to: formData.dateRange!.to },
             radius: formData.radius || 10,
-            schema: formData.schema || 'BASIC',
+            schema: formData.schema || 'FULL',
             type: formData.type || 'pings',
           }),
         })
@@ -1039,12 +1047,15 @@ export default function NewJobPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="BASIC">BASIC (Recommended)</SelectItem>
-                  <SelectItem value="FULL">FULL</SelectItem>
+                  <SelectItem value="FULL">FULL (Recommended)</SelectItem>
+                  <SelectItem value="BASIC">BASIC</SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-sm text-muted-foreground">
-                BASIC schema includes: ad_id, utc_timestamp, latitude, longitude, poi_ids
+                <strong>FULL</strong>: BASIC + <code>geo_fields</code> (zipcode, region, city, h3_res10)
+                + <code>quality_fields</code> (ping_origin_type, ping_circle_score). Needed for the
+                ZCS fast path and richer Persona traits. <strong>BASIC</strong>: ad_id, utc_timestamp,
+                latitude, longitude, poi_ids only.
               </p>
             </div>
 

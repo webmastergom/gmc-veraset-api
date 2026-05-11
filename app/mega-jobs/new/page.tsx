@@ -35,7 +35,11 @@ export default function NewMegaJobPage() {
   const [selectedCollections, setSelectedCollections] = useState<string[]>([])
   const [jobType, setJobType] = useState('pings')
   const [radius, setRadius] = useState(1000)
-  const [schema, setSchema] = useState<'BASIC' | 'FULL'>('BASIC')
+  // Default to FULL — see app/jobs/new/page.tsx for the rationale.
+  // BASIC was the historical default but the ZCS fast path + richer
+  // Persona traits both depend on FULL's geo_fields/quality_fields.
+  // Kept selectable for budget runs.
+  const [schema, setSchema] = useState<'BASIC' | 'FULL'>('FULL')
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [splitPreview, setSplitPreview] = useState<any>(null)
@@ -300,8 +304,8 @@ export default function NewMegaJobPage() {
                       value={schema}
                       onChange={(e) => setSchema(e.target.value as 'BASIC' | 'FULL')}
                     >
-                      <option value="BASIC">Basic</option>
-                      <option value="FULL">Full</option>
+                      <option value="FULL">Full (recommended — geo + quality fields)</option>
+                      <option value="BASIC">Basic (lat/lng only — cheaper but limits ZCS/Personas)</option>
                     </select>
                   </div>
                 </div>

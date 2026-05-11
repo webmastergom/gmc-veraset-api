@@ -71,7 +71,12 @@ export const createJobSchema = z.object({
   poiCollectionId: z.string().optional(),
   dateRange: dateRangeSchema,
   radius: z.number().min(1).max(1000).optional().default(10),
-  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
+  // Default FULL: gives us geo_fields (zipcode/region/city/h3_res10) +
+  // quality_fields (ping_origin_type/ping_circle_score) which the ZCS
+  // fast path and Personas pipeline both require. BASIC was the legacy
+  // default but it leaves all the analytics features running their
+  // slower fallback paths. Callers can still explicitly request BASIC.
+  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('FULL'),
   verasetConfig: z.object({
     type: z.enum(['pings', 'devices', 'aggregate', 'cohort', 'pings_by_device']).optional(),
     date_range: z.object({
@@ -127,7 +132,12 @@ export const externalCreateJobSchema = z.object({
     to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   }),
   radius: z.number().min(1).max(1000).optional().default(10),
-  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
+  // Default FULL: gives us geo_fields (zipcode/region/city/h3_res10) +
+  // quality_fields (ping_origin_type/ping_circle_score) which the ZCS
+  // fast path and Personas pipeline both require. BASIC was the legacy
+  // default but it leaves all the analytics features running their
+  // slower fallback paths. Callers can still explicitly request BASIC.
+  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('FULL'),
   pois: z.array(externalPoiSchema).min(1).max(25000),
   webhook_url: z.string().url().startsWith('https://').optional(),
   }).refine(
@@ -164,7 +174,12 @@ export const createMegaJobAutoSplitSchema = z.object({
     { message: 'to must be after from', path: ['to'] }
   ),
   radius: z.number().min(1).max(1000).optional().default(10),
-  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('BASIC'),
+  // Default FULL: gives us geo_fields (zipcode/region/city/h3_res10) +
+  // quality_fields (ping_origin_type/ping_circle_score) which the ZCS
+  // fast path and Personas pipeline both require. BASIC was the legacy
+  // default but it leaves all the analytics features running their
+  // slower fallback paths. Callers can still explicitly request BASIC.
+  schema: z.enum(['BASIC', 'ENHANCED', 'FULL']).optional().default('FULL'),
   type: z.enum(['pings', 'devices', 'aggregate', 'cohort', 'pings_by_device']).optional().default('pings'),
 })
 

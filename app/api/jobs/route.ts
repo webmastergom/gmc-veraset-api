@@ -162,23 +162,26 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
     
     // 3. Build Veraset payload
+    // Default schema is FULL (not BASIC) — see lib/validation.ts for the
+    // rationale. Veraset returns FULL parquets with the extra geo_fields/
+    // quality_fields the ZCS fast path + Personas pipeline depend on.
     const verasetPayload: Record<string, any> = verasetConfig || {
       type,
       date_range: dateRange,
       pois: validatedBody.pois || [],
-      schema_type: schema || 'BASIC', // Veraset API expects 'schema_type', not 'schema'
+      schema_type: schema || 'FULL', // Veraset API expects 'schema_type', not 'schema'
     };
 
     // Extract type to determine endpoint (type is NOT sent to Veraset, only used for endpoint selection)
     const { type: jobType = 'pings', ...verasetBodyObj } = verasetPayload;
-    
+
     // CRITICAL: Ensure schema_type is set correctly (convert 'schema' to 'schema_type' if present)
     if (verasetBodyObj.schema && !verasetBodyObj.schema_type) {
       verasetBodyObj.schema_type = verasetBodyObj.schema;
       delete verasetBodyObj.schema;
     }
     if (!verasetBodyObj.schema_type) {
-      verasetBodyObj.schema_type = schema || 'BASIC';
+      verasetBodyObj.schema_type = schema || 'FULL';
     }
     
     // Validate POI data — fast spot-check of first + last POI (no per-POI loop)
@@ -262,7 +265,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     if (userFromDate !== verasetFromDate || userToDate !== verasetToDate) {
       verificationIssues.push(`Date range mismatch: user=${userFromDate}→${userToDate} payload=${verasetFromDate}→${verasetToDate}`);
     }
-    if ((schema || 'BASIC') !== verasetBodyObj.schema_type) {
+    if ((schema || 'FULL') !== verasetBodyObj.schema_type) {
       verificationIssues.push(`Schema mismatch: user=${schema} payload=${verasetBodyObj.schema_type}`);
     }
     
@@ -372,7 +375,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       poiNames: poiNames || undefined,
       verasetPayload: {
         date_range: verasetBodyObj.date_range,
-        schema_type: verasetBodyObj.schema_type || 'BASIC',
+        // Default to FULL — matches the Zod default + frontend default.
+        // This audit field records exactly what we sent to Veraset; if
+        // schema_type was somehow stripped upstream, default to FULL so
+        // the audit and the actual sync agree.
+        schema_type: verasetBodyObj.schema_type || 'FULL',
         geo_radius: verasetBodyObj.geo_radius,
         place_key: verasetBodyObj.place_key,
       },
