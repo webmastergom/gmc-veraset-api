@@ -181,8 +181,15 @@ async function readJson<T>(key: string): Promise<T | null> {
     const r = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const txt = await r.Body?.transformToString();
     return txt ? (JSON.parse(txt) as T) : null;
-  } catch {
-    return null;
+  } catch (e: any) {
+    // Differentiate "file doesn't exist yet" from "S3 broke" — only the first
+    // is a normal flow (caller asked too early). Other errors should surface
+    // so the caller can decide whether to retry or abort.
+    if (e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    console.error(`[ZCS] readJson(${key}) error: ${e?.message || e}`);
+    throw e;
   }
 }
 
@@ -202,9 +209,14 @@ export async function phaseStarting(state: ZcsState): Promise<ZcsState> {
   if (!config.postalCodes?.length) {
     throw new Error('At least one postal code required');
   }
-  const normalizedPostals = config.postalCodes.map((p) =>
-    normalizePostalForCountry(config.country, p),
-  );
+  const normalizedPostals = config.postalCodes
+    .map((p) => normalizePostalForCountry(config.country, p))
+    .filter((p) => p.length > 0); // drop empties after normalization
+  if (normalizedPostals.length === 0) {
+    throw new Error(
+      'All postal codes were empty after normalization. Check the input format.',
+    );
+  }
   return {
     ...state,
     phase: 'prepare_table',
@@ -271,19 +283,21 @@ async function prepareMegaJob(state: ZcsState): Promise<ZcsState> {
   const megaJobSaysFull = megaJobScopeSchema === 'FULL' || megaJobScopeSchema === 'ENHANCED';
   let isFull = declaredFull || (declaredSchemas.length === 0 && megaJobSaysFull);
   if (!isFull && !declaredBasic && !megaJobSaysFull) {
-    // Sniff each sub-job until one has geo_fields populated
-    for (const t of tableNames) {
+    // Sniff sub-job tables in parallel — sequential was eating 50s+ for
+    // megajobs with many sub-jobs. We resolve as soon as ANY sniff returns
+    // a non-null zipcode (Promise.race-ish via a rejection trick); if all
+    // resolve null, isFull stays false → BASIC path.
+    const sniffPromises = tableNames.map(async (t) => {
       const sql = `SELECT geo_fields['zipcode'] AS z FROM ${t} WHERE geo_fields['zipcode'] IS NOT NULL AND geo_fields['zipcode'] != '' LIMIT 1`;
       try {
         const r = await runQuery(sql);
-        if (r.rows.length > 0 && r.rows[0]?.z) {
-          isFull = true;
-          break;
-        }
+        return r.rows.length > 0 && !!r.rows[0]?.z;
       } catch {
-        /* sniff error → try next */
+        return false;
       }
-    }
+    });
+    const results = await Promise.all(sniffPromises);
+    if (results.some((r) => r === true)) isFull = true;
   }
   const schemaSource = declaredFull
     ? 'FULL (sub-jobs declared)'
@@ -359,6 +373,11 @@ async function prepareMegaJob(state: ZcsState): Promise<ZcsState> {
   return {
     ...state,
     phase: 'launch_queries',
+    // Upgrade the opaque "megajob:<id>" label set by the POST handler to
+    // the human-readable megajob name. Frontend / result.dataset surfaces
+    // this everywhere — without the upgrade the user sees a UUID instead
+    // of "France Grid 50k April 2026".
+    sourceLabel: megaJob.name || state.sourceLabel,
     isFull,
     schemaSource,
     effectiveDateFrom: effectiveFrom,
@@ -401,30 +420,26 @@ async function prepareSingleDataset(state: ZcsState): Promise<ZcsState> {
   }
   const dateWhere = buildDateWhere(effectiveFrom, effectiveTo);
 
-  // Schema sniff
-  let isFull = false;
-  try {
-    const r = await runQuery(`
+  // Run sniff + total-count in parallel — they don't depend on each other
+  // and each is a single Athena call (~2-5s). Sequential was a free 5s of
+  // dead time in the preamble.
+  const [sniffRes, totalRes] = await Promise.all([
+    runQuery(`
       SELECT geo_fields['zipcode'] AS z FROM ${tableName}
       WHERE geo_fields['zipcode'] IS NOT NULL AND geo_fields['zipcode'] != ''
       LIMIT 1
-    `);
-    isFull = r.rows.length > 0 && !!r.rows[0]?.z;
-  } catch {
-    isFull = false;
-  }
+    `).catch(() => ({ rows: [] as Record<string, string>[] })),
+    runQuery(`
+      SELECT COUNT(DISTINCT ad_id) as total_devices
+      FROM ${tableName}
+      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+      WHERE poi_id IS NOT NULL AND poi_id != ''
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${dateWhere}
+    `),
+  ]);
+  const isFull = sniffRes.rows.length > 0 && !!sniffRes.rows[0]?.z;
   const schemaSource = isFull ? 'FULL (sniffed)' : 'BASIC (sniffed/fallback)';
-
-  // Total devices count — quick CROSS JOIN UNNEST to find POI visitors
-  const totalQuery = `
-    SELECT COUNT(DISTINCT ad_id) as total_devices
-    FROM ${tableName}
-    CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-    WHERE poi_id IS NOT NULL AND poi_id != ''
-      AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-      ${dateWhere}
-  `;
-  const totalRes = await runQuery(totalQuery);
   const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
   if (totalDevicesInDataset === 0) {
     const result = buildEmptyResult(state.sourceLabel, config, 0);
@@ -643,33 +658,56 @@ export async function phasePollingQueries(state: ZcsState): Promise<ZcsState> {
     (s, x) => s + ((x.statistics?.dataScannedBytes || 0) / 1e9),
     0,
   );
-  const doneCount = statuses.filter((s) => s.state === 'SUCCEEDED').length;
-
-  // Any failure → throw with the Athena error message
-  const failed = statuses.findIndex((s) => s.state === 'FAILED' || s.state === 'CANCELLED');
-  if (failed !== -1) {
-    const [label] = entries[failed];
+  // Critical-vs-optional: 'devices' (FULL) and 'origins' (BASIC) are
+  // critical — failure aborts the run. 'h3' is optional enrichment
+  // (sub-zip hotspot map); the analyzer original tolerated failure
+  // here so we preserve that. The aggregate_full phase's h3 stream is
+  // already wrapped in try/catch so a missing h3 CSV is handled.
+  const OPTIONAL_QUERIES = new Set(['h3']);
+  const criticalFailed = statuses.findIndex((s, i) => {
+    const label = entries[i][0];
+    return (s.state === 'FAILED' || s.state === 'CANCELLED') && !OPTIONAL_QUERIES.has(label);
+  });
+  if (criticalFailed !== -1) {
+    const [label] = entries[criticalFailed];
     throw new Error(
-      `Athena query "${label}" ${statuses[failed].state}: ${statuses[failed].error || 'unknown'}`,
+      `Athena query "${label}" ${statuses[criticalFailed].state}: ${statuses[criticalFailed].error || 'unknown'}`,
     );
   }
 
+  // For our purposes a query is "done" if SUCCEEDED, or if it's an
+  // OPTIONAL query that FAILED — both let us proceed.
+  const isQueryDone = (s: any, label: string) =>
+    s.state === 'SUCCEEDED' ||
+    ((s.state === 'FAILED' || s.state === 'CANCELLED') && OPTIONAL_QUERIES.has(label));
+  const doneFlags = statuses.map((s, i) => isQueryDone(s, entries[i][0]));
+  const doneCount = doneFlags.filter(Boolean).length;
+  const allDone = doneCount === entries.length;
+
   const subProgress = {
-    label:
-      doneCount === entries.length
-        ? `Athena queries done · ${elapsed}s · ${totalScannedGB.toFixed(1)} GB scanned`
-        : `Athena: ${doneCount}/${entries.length} query/queries done · ${elapsed}s · ${totalScannedGB.toFixed(1)} GB scanned`,
+    label: allDone
+      ? `Athena queries done · ${elapsed}s · ${totalScannedGB.toFixed(1)} GB scanned`
+      : `Athena: ${doneCount}/${entries.length} query/queries done · ${elapsed}s · ${totalScannedGB.toFixed(1)} GB scanned`,
     percent: 18 + Math.round((doneCount / entries.length) * 30),
     details: entries
-      .map(([k, q], i) => `${statuses[i].state === 'SUCCEEDED' ? '✅' : '⏳'} ${k}`)
+      .map(([k], i) => {
+        const s = statuses[i];
+        const icon =
+          s.state === 'SUCCEEDED'
+            ? '✅'
+            : (s.state === 'FAILED' || s.state === 'CANCELLED') && OPTIONAL_QUERIES.has(k)
+              ? '⚠️'
+              : '⏳';
+        return `${icon} ${k}`;
+      })
       .join('  '),
   };
 
-  if (doneCount < entries.length) {
+  if (!allDone) {
     return { ...state, subProgress, updatedAt: new Date().toISOString() };
   }
 
-  // All done — advance to next phase based on schema
+  // All critical done — advance based on schema
   return {
     ...state,
     phase: state.isFull ? 'aggregate_full' : 'pass1_basic',
