@@ -134,7 +134,15 @@ function geocodeS3Key(runId: string): string {
   return `zcs-geocode/${runId}.json`;
 }
 function resultS3Key(runId: string): string {
-  return `zcs-result/${runId}`;
+  // CRITICAL: this key is consumed by /api/zip-code-signals/spill, which
+  // validates `key.startsWith('postal-maid-spill/')` and reads via
+  // getConfig() (which prepends `config/` and appends `.json`). So:
+  //   - The key MUST start with 'postal-maid-spill/' or the endpoint
+  //     rejects it with 400 "Invalid key".
+  //   - The result MUST be written with putConfig() (not raw PutObject)
+  //     so the path matches what getConfig() expects.
+  // See phaseAggregateFull / phasePass2Basic where putConfig is used.
+  return `postal-maid-spill/zcs-${runId}`;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -329,7 +337,9 @@ async function prepareMegaJob(state: ZcsState): Promise<ZcsState> {
   if (totalDevicesInDataset === 0) {
     // Early-exit: empty megajob → write empty result and finish
     const result = buildEmptyResult(state.sourceLabel, config, 0);
-    await writeJson(resultS3Key(runId), result);
+    // Use putConfig (not writeJson) so the file lands at the path the
+  // spill endpoint reads via getConfig — see comment on resultS3Key.
+  await putConfig(resultS3Key(runId), result, { compact: true });
     return {
       ...state,
       phase: 'done',
@@ -418,7 +428,9 @@ async function prepareSingleDataset(state: ZcsState): Promise<ZcsState> {
   const totalDevicesInDataset = parseInt(String(totalRes.rows[0]?.total_devices)) || 0;
   if (totalDevicesInDataset === 0) {
     const result = buildEmptyResult(state.sourceLabel, config, 0);
-    await writeJson(resultS3Key(runId), result);
+    // Use putConfig (not writeJson) so the file lands at the path the
+  // spill endpoint reads via getConfig — see comment on resultS3Key.
+  await putConfig(resultS3Key(runId), result, { compact: true });
     return {
       ...state,
       phase: 'done',
@@ -931,7 +943,9 @@ export async function phaseAggregateFull(state: ZcsState): Promise<ZcsState> {
     },
   };
 
-  await writeJson(resultS3Key(runId), result);
+  // Use putConfig (not writeJson) so the file lands at the path the
+  // spill endpoint reads via getConfig — see comment on resultS3Key.
+  await putConfig(resultS3Key(runId), result, { compact: true });
 
   return {
     ...state,
@@ -1139,7 +1153,9 @@ export async function phasePass2Basic(state: ZcsState): Promise<ZcsState> {
     devices,
     postalCodeBreakdown,
   };
-  await writeJson(resultS3Key(runId), result);
+  // Use putConfig (not writeJson) so the file lands at the path the
+  // spill endpoint reads via getConfig — see comment on resultS3Key.
+  await putConfig(resultS3Key(runId), result, { compact: true });
 
   return {
     ...state,
@@ -1208,5 +1224,7 @@ function topNKeys<K>(m: Map<K, number>, n: number): Array<[K, number]> {
 // ── Result accessor ─────────────────────────────────────────────────
 
 export async function readResult(runId: string): Promise<PostalMaidResult | null> {
-  return await readJson<PostalMaidResult>(resultS3Key(runId));
+  // Use getConfig (matches the putConfig write side + the spill endpoint
+  // read side) so all three readers see the same bytes.
+  return await getConfig<PostalMaidResult>(resultS3Key(runId));
 }

@@ -42,7 +42,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createHash } from 'crypto';
 import { isAuthenticated } from '@/lib/auth';
-import { getConfig, putConfig } from '@/lib/s3-config';
+import { getConfig, putConfig, invalidateCache } from '@/lib/s3-config';
 import {
   type ZcsState,
   type ZcsRunConfig,
@@ -151,9 +151,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     };
     runId = configToRunId(cfg);
 
-    // Reset if requested OR if no prior state
+    // Reset on user request, or if a previous run ended in error (we never
+    // want to keep showing a stuck 'error' state when the user clicks Run
+    // again). New successful runs are idempotent on the same runId.
+    invalidateCache(stateKey(runId));
     let existing = await getConfig<ZcsState>(stateKey(runId));
-    if (reset || !existing) {
+    if (reset || !existing || existing.phase === 'error') {
       const initial: ZcsState = {
         phase: 'starting',
         runId,
@@ -170,6 +173,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'runId or full config required' }, { status: 400 });
   }
 
+  // Always invalidate before reading — Vercel functions reuse process instances
+  // and the in-memory cache can outlive the state file between invocations.
+  invalidateCache(stateKey(runId));
   let state = await getConfig<ZcsState>(stateKey(runId));
   if (!state) {
     return NextResponse.json({ error: 'Run not found' }, { status: 404 });
