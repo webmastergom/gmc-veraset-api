@@ -54,6 +54,7 @@ import {
   phaseLaunchQueries,
   phasePollingQueries,
   phaseAggregateFull,
+  phaseAggregateBasic,
   phasePass1Basic,
   phaseGeocoding,
   phasePass2Basic,
@@ -98,12 +99,16 @@ async function advance(state: ZcsState): Promise<ZcsState> {
       return await phasePollingQueries(state);
     case 'aggregate_full':
       return await phaseAggregateFull(state);
+    case 'aggregate_basic':
+      return await phaseAggregateBasic(state);
+    // Legacy phases — auto-promote in-flight state from the old 3-phase
+    // BASIC pipeline. The Athena queries those phases launched are now
+    // useless (different SQL shape), so we restart at launch_queries.
     case 'pass1_basic':
-      return await phasePass1Basic(state);
     case 'geocoding':
-      return await phaseGeocoding(state);
     case 'pass2_basic':
-      return await phasePass2Basic(state);
+      console.log(`[ZCS-POLL] auto-promoting legacy phase ${state.phase} → launch_queries`);
+      return { ...state, phase: 'launch_queries' as ZcsPhase, queryIds: undefined };
     case 'done':
     case 'error':
       return state;
@@ -118,6 +123,7 @@ const PHASE_LABEL: Record<ZcsPhase, string> = {
   launch_queries: 'Launching Athena queries…',
   polling_queries: 'Waiting for Athena…',
   aggregate_full: 'Streaming result + building signatures…',
+  aggregate_basic: 'Streaming matched devices from Athena…',
   pass1_basic: 'Pass 1: collecting unique origin coords…',
   geocoding: 'Reverse-geocoding coords to postal codes…',
   pass2_basic: 'Pass 2: matching devices to target postal codes…',
@@ -296,6 +302,7 @@ function phaseDefaultPercent(p: ZcsPhase): number {
     launch_queries: 15,
     polling_queries: 30,
     aggregate_full: 80,
+    aggregate_basic: 80,
     pass1_basic: 50,
     geocoding: 70,
     pass2_basic: 90,

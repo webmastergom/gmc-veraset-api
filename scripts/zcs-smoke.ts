@@ -21,10 +21,8 @@ import {
   phaseLaunchQueries,
   phasePollingQueries,
   phaseAggregateFull,
-  phasePass1Basic,
-  phaseGeocoding,
-  phasePass2Basic,
-} from './lib/zcs-multiphase';
+  phaseAggregateBasic,
+} from '../lib/zcs-multiphase';
 
 const CASES: Array<{ name: string; cfg: ZcsRunConfig }> = [
   {
@@ -62,12 +60,8 @@ async function runOne(state: ZcsState) {
           state = await phasePollingQueries(state); break;
         case 'aggregate_full':
           state = await phaseAggregateFull(state); break;
-        case 'pass1_basic':
-          state = await phasePass1Basic(state); break;
-        case 'geocoding':
-          state = await phaseGeocoding(state); break;
-        case 'pass2_basic':
-          state = await phasePass2Basic(state); break;
+        case 'aggregate_basic':
+          state = await phaseAggregateBasic(state); break;
       }
     } catch (e: any) {
       console.error(`  ❌ ${before} threw after ${Date.now() - t0}ms:`);

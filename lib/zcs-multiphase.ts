@@ -63,9 +63,13 @@ export type ZcsPhase =
   | 'launch_queries'
   | 'polling_queries'
   | 'aggregate_full'   // FULL: stream devices+h3 → build signatures
-  | 'pass1_basic'      // BASIC: stream origins → collect coords
-  | 'geocoding'        // BASIC: reverse-geocode unique coords
-  | 'pass2_basic'      // BASIC: stream origins again → match devices
+  | 'aggregate_basic'  // BASIC (new): stream pre-matched (ad_id, zip, days) → done
+  // Legacy 3-phase BASIC path (pass1+geocode+pass2). Kept for runs that
+  // started before the JOIN-in-Athena rewrite landed; we auto-promote
+  // their state to aggregate_basic on next poll.
+  | 'pass1_basic'
+  | 'geocoding'
+  | 'pass2_basic'
   | 'done'
   | 'error';
 
@@ -88,6 +92,12 @@ export interface ZcsState {
   sourceLabel: string;
   /** Mode flag — controls FULL vs BASIC branches. */
   isFull?: boolean;
+  /** Athena external table name for the country's geocode cache
+   *  (BASIC path only — used to JOIN postal codes into the origins
+   *  query so Node never sees unmatched rows). Set by ensureGeocodeTable.
+   *  When null, the BASIC path can't push the match to Athena and would
+   *  have to fall back to the legacy 3-phase pass1/geocode/pass2 flow. */
+  geocodeTable?: string | null;
   /** Human-readable schema-decision source (for activity log). */
   schemaSource?: string;
   /** Effective date range after fallback to catalog/sub-jobs. */
@@ -201,6 +211,75 @@ async function readJson<T>(key: string): Promise<T | null> {
     console.error(`[ZCS] readJson(${key}) error: ${e?.message || e}`);
     throw e;
   }
+}
+
+/**
+ * Ensure the country's geocode cache CSV is available to Athena as an
+ * external table. Pushes the reverse-geocode step DOWN into Athena: the
+ * origins query joins on this table and filters by target zipcodes
+ * upfront, so we never have to stream millions of unmatched rows to
+ * Node (which previously took 20+ minutes for France 50k).
+ *
+ * The cache CSV at config/geocode-cache/{CC}.csv has rows:
+ *   lat_key,lng_key,zipcode
+ * where lat_key = Math.round(lat * 10) and lng_key = Math.round(lng * 10).
+ * 1-decimal degree (~11 km) precision — matches the resolution of
+ * batchReverseGeocode's fast path.
+ *
+ * The Athena table is created at a stable per-country location so
+ * concurrent runs share it. Idempotent: re-creating is a no-op.
+ */
+async function ensureGeocodeTable(country: string): Promise<string | null> {
+  const cc = country.toUpperCase();
+  const srcKey = `config/geocode-cache/${cc}.csv`;
+
+  // Verify the source CSV exists in S3.
+  try {
+    await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: srcKey }));
+  } catch (e: any) {
+    if (e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) {
+      console.warn(`[ZCS] No geocode cache at ${srcKey} for ${cc} — BASIC path will fall back to Node-side geocoding`);
+      return null;
+    }
+    throw e;
+  }
+
+  // Copy to a fresh Athena-friendly prefix (must be a folder containing
+  // just the CSV — Athena's external-table LOCATION can't point at a
+  // single file). Use a stable per-country path so the table is shared
+  // across runs of the same country.
+  const athenaPrefix = `athena-temp/zcs-geocode/${cc.toLowerCase()}/`;
+  const athenaKey = `${athenaPrefix}data.csv`;
+  try {
+    await s3Client.send(
+      new CopyObjectCommand({
+        Bucket: BUCKET,
+        Key: athenaKey,
+        CopySource: `${BUCKET}/${srcKey}`,
+      }),
+    );
+  } catch (e: any) {
+    // If the destination already exists, S3 lets us overwrite. If
+    // CopySource is missing or auth fails, surface.
+    if (!/AccessDenied/i.test(e?.message || '')) {
+      // Only re-throw on real errors. Athena reads will tell us if the
+      // path is bad anyway.
+      console.warn(`[ZCS] geocode CSV copy warn: ${e?.message}`);
+    }
+  }
+
+  // Idempotent DDL — IF NOT EXISTS so concurrent runs don't fight.
+  const tableName = `zcs_geocode_${cc.toLowerCase()}`;
+  await runQuery(`
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${tableName} (
+      lat_key INT, lng_key INT, zipcode STRING
+    )
+    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+    STORED AS TEXTFILE
+    LOCATION 's3://${BUCKET}/${athenaPrefix}'
+  `);
+  return tableName;
 }
 
 // ── Phase: starting ─────────────────────────────────────────────────
@@ -380,6 +459,11 @@ async function prepareMegaJob(state: ZcsState): Promise<ZcsState> {
     .map((t) => `SELECT ${isFull ? fullColumns : basicColumns} FROM ${t}`)
     .join('\n      UNION ALL\n      ')}\n    )`;
 
+  // For BASIC schema, ensure the country's geocode-cache table is set up
+  // in Athena so the origins query can JOIN + filter zipcodes server-side.
+  // Skip for FULL (already has geo_fields[zipcode] in the parquets).
+  const geocodeTable = isFull ? null : await ensureGeocodeTable(state.config.country);
+
   return {
     ...state,
     phase: 'launch_queries',
@@ -396,6 +480,7 @@ async function prepareMegaJob(state: ZcsState): Promise<ZcsState> {
     totalDevicesInDataset,
     maidsTableName,
     tableExpr,
+    geocodeTable,
     subProgress: {
       label: `Schema: ${schemaSource} · ${isFull ? 'FAST PATH' : 'BASIC path'}`,
       percent: 12,
@@ -465,6 +550,9 @@ async function prepareSingleDataset(state: ZcsState): Promise<ZcsState> {
     };
   }
 
+  // BASIC: prep geocode-cache table for the Athena-side zip JOIN.
+  const geocodeTable = isFull ? null : await ensureGeocodeTable(state.config.country);
+
   return {
     ...state,
     phase: 'launch_queries',
@@ -475,6 +563,7 @@ async function prepareSingleDataset(state: ZcsState): Promise<ZcsState> {
     dateWhere,
     totalDevicesInDataset,
     singleTable: tableName,
+    geocodeTable,
     subProgress: {
       label: `Schema: ${schemaSource} · ${isFull ? 'FAST PATH' : 'BASIC path'}`,
       percent: 12,
@@ -607,7 +696,26 @@ export async function phaseLaunchQueries(state: ZcsState): Promise<ZcsState> {
     queryIds['devices'] = await startQueryAsync(devicesQuery);
     queryIds['h3'] = await startQueryAsync(h3Query);
   } else {
-    // BASIC: single origins query — (ad_id, lat, lng, device_days)
+    // BASIC: origins query JOINs the country's geocode cache to translate
+    // first-ping lat/lng directly into a zipcode at SQL time, then filters
+    // by the user's target ZIPs upfront. Output is ONLY matched rows
+    // (ad_id, zipcode, device_days) — for France 50k typically a few
+    // hundred K rows instead of the 40M unfiltered rows the old design
+    // streamed to Node. Pass1/geocoding/pass2 collapse into a single
+    // small stream + accumulate in `aggregate_basic`.
+    //
+    // Fallback: if no geocode cache exists for the country (geocodeTable
+    // is null), we error out clearly — Node-side geocoding for 24M+
+    // devices is not feasible within Vercel budget. The user can either
+    // pre-build the cache via scripts/generate-geocode-cache or upload
+    // their own.
+    if (!state.geocodeTable) {
+      throw new Error(
+        `BASIC path requires a geocode cache for ${state.config.country}. ` +
+          'Build it via scripts/generate-geocode-cache.ts or upload to ' +
+          `s3://${BUCKET}/config/geocode-cache/${state.config.country}.csv`,
+      );
+    }
     const originsQuery = `
       WITH
       poi_visitors AS (${poiVisitorsCte}),
@@ -628,15 +736,33 @@ export async function phaseLaunchQueries(state: ZcsState): Promise<ZcsState> {
           MIN_BY(lat, utc_timestamp) as origin_lat,
           MIN_BY(lng, utc_timestamp) as origin_lng
         FROM valid_pings GROUP BY ad_id, date
+      ),
+      first_pings_with_keys AS (
+        SELECT
+          ad_id,
+          CAST(ROUND(origin_lat * 10) AS INTEGER) as lat_key,
+          CAST(ROUND(origin_lng * 10) AS INTEGER) as lng_key
+        FROM first_pings
+        WHERE origin_lat IS NOT NULL AND origin_lng IS NOT NULL
+      ),
+      with_zip AS (
+        SELECT f.ad_id, g.zipcode
+        FROM first_pings_with_keys f
+        INNER JOIN ${state.geocodeTable} g
+          -- OpenCSVSerde stores ALL columns as STRING regardless of the
+          -- DDL declaration, so we cast g.lat_key/lng_key to INTEGER for
+          -- the JOIN. Without the cast Athena does a string compare and
+          -- "488" != 488, so zero rows would match.
+          ON CAST(g.lat_key AS INTEGER) = f.lat_key
+          AND CAST(g.lng_key AS INTEGER) = f.lng_key
+        WHERE g.zipcode IN (${requestedSql})
       )
       SELECT
         ad_id,
-        ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
-        ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
+        zipcode,
         COUNT(*) as device_days
-      FROM first_pings
-      WHERE origin_lat IS NOT NULL AND origin_lng IS NOT NULL
-      GROUP BY ad_id, ROUND(origin_lat, ${COORDINATE_PRECISION}), ROUND(origin_lng, ${COORDINATE_PRECISION})
+      FROM with_zip
+      GROUP BY ad_id, zipcode
     `;
     queryIds['origins'] = await startQueryAsync(originsQuery);
   }
@@ -717,10 +843,12 @@ export async function phasePollingQueries(state: ZcsState): Promise<ZcsState> {
     return { ...state, subProgress, updatedAt: new Date().toISOString() };
   }
 
-  // All critical done — advance based on schema
+  // All critical done — advance based on schema. BASIC path now goes
+  // straight to aggregate_basic (single small stream of pre-matched rows)
+  // instead of the legacy pass1+geocoding+pass2 trio.
   return {
     ...state,
-    phase: state.isFull ? 'aggregate_full' : 'pass1_basic',
+    phase: state.isFull ? 'aggregate_full' : 'aggregate_basic',
     subProgress,
     updatedAt: new Date().toISOString(),
   };
@@ -1003,6 +1131,124 @@ export async function phaseAggregateFull(state: ZcsState): Promise<ZcsState> {
       label: `Done · ${devices.length.toLocaleString()} MAIDs matched`,
       percent: 100,
       details: `${postalCodeBreakdown.filter((p) => p.devices > 0).length}/${normalizedPostals?.length || 0} postal codes with data`,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+// ── Phase: aggregate_basic (BASIC path, JOIN-in-Athena rewrite) ─────
+//
+// The BASIC origins query now JOINs the country's geocode cache + filters
+// by target zipcodes inside Athena, so the result CSV contains ONLY
+// matched (ad_id, zipcode, device_days) rows — typically a few hundred K
+// rows for a country-scale megajob (down from ~40M unfiltered rows).
+//
+// This phase streams that small CSV in one pass, building deviceMap +
+// postalBreakdown directly. Replaces the old pass1_basic + geocoding +
+// pass2_basic trio, which together took 20+ minutes locally because
+// they had to stream + parse the unfiltered 40M-row CSV twice and
+// Node-side reverse-geocode 18K unique cells.
+
+export async function phaseAggregateBasic(state: ZcsState): Promise<ZcsState> {
+  const { runId } = state;
+  if (!state.queryIds?.origins) throw new Error('Missing origins query ID');
+
+  const requestedSet = new Set(state.normalizedPostals || []);
+  const deviceMap = new Map<string, { deviceDays: number; postalCodes: Set<string> }>();
+  const postalBreakdown = new Map<string, { devices: Set<string>; deviceDays: number }>();
+  for (const pc of requestedSet) {
+    postalBreakdown.set(pc, { devices: new Set(), deviceDays: 0 });
+  }
+
+  let totalRows = 0;
+  await streamQueryResultsViaS3(state.queryIds.origins, (row) => {
+    totalRows++;
+    const adId = String(row.ad_id || '');
+    const zip = String(row.zipcode || '');
+    const days = parseInt(String(row.device_days)) || 0;
+    if (!adId || !zip) return;
+    // The Athena query already filtered to target zipcodes, but we
+    // re-check defensively (cheap O(1) Set membership).
+    if (!requestedSet.has(zip)) return;
+    const ex = deviceMap.get(adId);
+    if (ex) {
+      ex.deviceDays += days;
+      ex.postalCodes.add(zip);
+    } else {
+      deviceMap.set(adId, { deviceDays: days, postalCodes: new Set([zip]) });
+    }
+    const b = postalBreakdown.get(zip)!;
+    b.devices.add(adId);
+    b.deviceDays += days;
+  });
+
+  const devices: PostalMaidDevice[] = Array.from(deviceMap.entries())
+    .map(([adId, d]) => ({
+      adId,
+      deviceDays: d.deviceDays,
+      postalCodes: Array.from(d.postalCodes),
+    }))
+    .sort((a, b) => b.deviceDays - a.deviceDays);
+  const postalCodeBreakdown = Array.from(postalBreakdown.entries())
+    .map(([postalCode, data]) => ({
+      postalCode,
+      devices: data.devices.size,
+      deviceDays: data.deviceDays,
+    }))
+    .sort((a, b) => b.devices - a.devices);
+
+  const top = postalCodeBreakdown[0];
+  const matchedDeviceDays = devices.reduce((s, d) => s + d.deviceDays, 0);
+  const result: PostalMaidResult = {
+    dataset: state.sourceLabel,
+    analyzedAt: new Date().toISOString(),
+    filters: {
+      postalCodes: state.config.postalCodes,
+      country: state.config.country,
+      dateFrom: state.effectiveDateFrom,
+      dateTo: state.effectiveDateTo,
+      megaJobId: state.config.megaJobId,
+    },
+    methodology: {
+      approach: 'first_ping_per_day_reverse_geocoded',
+      description:
+        'BASIC schema: lat/lng of first ping per day, reverse-geocoded ' +
+        'to postal code via an Athena-side JOIN against the country ' +
+        'geocode cache. Matching done server-side; only matched ' +
+        '(ad_id, postal) rows leave Athena.',
+      accuracyThresholdMeters: ACCURACY_THRESHOLD_METERS,
+      coordinatePrecision: COORDINATE_PRECISION,
+    },
+    coverage: {
+      totalDevicesInDataset: state.totalDevicesInDataset || 0,
+      // totalDeviceDays for matched devices only — we don't know the
+      // global total without scanning the unfiltered output, which is
+      // the whole point of this rewrite. matchedDeviceDays is the only
+      // honest number we have for the BASIC path.
+      totalDeviceDays: matchedDeviceDays,
+      devicesMatchedToPostalCodes: devices.length,
+      matchedDeviceDays,
+      postalCodesRequested: state.normalizedPostals?.length || 0,
+      postalCodesWithDevices: postalCodeBreakdown.filter((p) => p.devices > 0).length,
+    },
+    summary: {
+      totalMaids: devices.length,
+      topPostalCode: top?.postalCode || null,
+      topPostalCodeDevices: top?.devices || 0,
+    },
+    devices,
+    postalCodeBreakdown,
+  };
+  await putConfig(resultS3Key(runId), result, { compact: true });
+
+  return {
+    ...state,
+    phase: 'done',
+    resultKey: resultS3Key(runId),
+    subProgress: {
+      label: `Done · ${devices.length.toLocaleString()} MAIDs matched (${totalRows.toLocaleString()} rows from Athena)`,
+      percent: 100,
+      details: `${postalCodeBreakdown.filter((p) => p.devices > 0).length}/${state.normalizedPostals?.length || 0} postal codes with data · single-stream aggregate`,
     },
     updatedAt: new Date().toISOString(),
   };
