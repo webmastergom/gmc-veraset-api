@@ -369,163 +369,102 @@ export default function ZipCodeSignalsPage() {
     };
 
     try {
-      const response = await fetch('/api/zip-code-signals/analyze/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          // Branch on selectedDatasetId prefix — backend dispatches to
-          // analyzePostalMaid (single dataset) or analyzePostalMaidMegaJob
-          // (megajob, reuses consolidated MAIDs CSV).
-          ...(isMegaJob ? { megaJobId: rawSourceId } : { datasetName: rawSourceId }),
-          postalCodes,
-          country: selectedCountry,
-          dateFrom: effDateFrom || undefined,
-          dateTo: effDateTo || undefined,
-        }),
-        credentials: 'include',
-        signal: abort.signal,
-      });
+      // ── Multi-phase poll (replaces SSE) ─────────────────────────────
+      // The new /api/zip-code-signals/poll endpoint splits the pipeline
+      // into <60s phases persisted in S3. Each POST advances one or more
+      // phases and returns the current state. We poll every 2s until
+      // phase=='done' or 'error'. No more "stream closed without result"
+      // — every phase boundary is observable and recoverable.
+      let runId = '';
+      let lastPhase = '';
+      const POLL_INTERVAL_MS = 2_000;
+      const SOFT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes hard cap
+      const startedAt = Date.now();
 
-      if (!response.ok || !response.body) {
-        throw new Error(`Server error: ${response.status}`);
-      }
+      while (Date.now() - startedAt < SOFT_TIMEOUT_MS) {
+        if (abort.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let gotResult = false;
-      let backendError = '';
+        const reqBody = runId
+          ? { runId }
+          : {
+              ...(isMegaJob ? { megaJobId: rawSourceId } : { datasetName: rawSourceId }),
+              postalCodes,
+              country: selectedCountry,
+              dateFrom: effDateFrom || undefined,
+              dateTo: effDateTo || undefined,
+            };
+        const r = await fetch('/api/zip-code-signals/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+          credentials: 'include',
+          signal: abort.signal,
+        });
+        if (!r.ok) {
+          const errBody = await r.text().catch(() => `HTTP ${r.status}`);
+          throw new Error(errBody.slice(0, 500) || `Server error ${r.status}`);
+        }
+        const data = await r.json();
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        if (!runId && data.runId) runId = data.runId;
 
-        buffer += decoder.decode(value, { stream: true });
-        const messages = buffer.split('\n\n');
-        buffer = messages.pop() || '';
+        // Surface phase transitions in the activity log
+        if (data.phase !== lastPhase) {
+          appendProgressLog({
+            step: data.phase,
+            percent: data.percent ?? 0,
+            message: data.message || data.phase,
+            detail: data.details,
+          });
+          lastPhase = data.phase;
+        }
+        lastProgressRef.current = { percent: data.percent ?? 0, message: data.message };
+        setProgress({ step: data.phase, percent: data.percent ?? 0, message: data.message, detail: data.details });
 
-        for (const msg of messages) {
-          const lines = msg.split('\n');
-          let eventType = '';
-          let dataStr = '';
-          for (const line of lines) {
-            if (line.startsWith('event: ')) eventType = line.slice(7).trim();
-            else if (line.startsWith('data: ')) dataStr += line.slice(6);
-          }
-          if (!eventType || !dataStr) continue;
-          try {
-            const data = JSON.parse(dataStr);
-            if (eventType === 'progress') {
-              if (data.step === 'error') {
-                backendError = data.message || 'Analysis failed';
-                lastProgressRef.current = { percent: 0, message: data.message || 'error' };
-                appendProgressLog({
-                  step: 'error',
-                  percent: 0,
-                  message: data.message || 'Analysis failed',
-                  detail: data.detail,
-                });
-              } else {
-                lastProgressRef.current = {
-                  percent: data.percent,
-                  message: data.message,
-                };
-                setProgress(data);
-                appendProgressLog(data);
-              }
-            } else if (eventType === 'result') {
-              gotResult = true;
-              appendProgressLog({
-                step: 'completed',
-                percent: 100,
-                message: 'Result packet received',
-                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s) in SSE${data?.devicesSpillKey ? ' (preview — loading spill…)' : ''}`,
-              });
-              const merged = await resolveSpillIfNeeded(data as PostalMaidResult);
-              appendProgressLog({
-                step: 'completed',
-                percent: 100,
-                message: 'Result ready',
-                detail: `${merged.devices?.length?.toLocaleString?.() ?? 0} MAID row(s)`,
-              });
-              setResult(merged);
+        if (data.phase === 'done') {
+          appendProgressLog({
+            step: 'completed',
+            percent: 100,
+            message: 'Result ready',
+            detail: data.result?.devices?.length
+              ? `${data.result.devices.length.toLocaleString()} MAID row(s)`
+              : data.resultKey
+                ? `result stored at ${data.resultKey}`
+                : '0 MAID rows',
+          });
+          const merged = data.result
+            ? await resolveSpillIfNeeded(data.result as PostalMaidResult)
+            : null;
+          if (merged) {
+            setResult(merged);
+            setPhase('results');
+            setProgress(null);
+          } else if (data.resultKey) {
+            // Fallback: fetch from spill endpoint by resultKey
+            const fetched = await fetch(
+              `/api/zip-code-signals/spill?key=${encodeURIComponent(data.resultKey)}`,
+              { credentials: 'include' },
+            );
+            if (fetched.ok) {
+              const final = (await fetched.json()) as PostalMaidResult;
+              setResult(final);
               setPhase('results');
               setProgress(null);
-            }
-          } catch (parseErr: unknown) {
-            const pe = parseErr instanceof Error ? parseErr.message : String(parseErr);
-            if (eventType === 'result') {
-              const hint = `Could not parse result JSON (${dataStr.length} chars). The response may be truncated, or the browser ran out of memory.`;
-              backendError = hint;
-              appendProgressLog({
-                step: 'error',
-                percent: 0,
-                message: hint,
-                detail: pe.slice(0, 400),
-              });
             } else {
-              appendProgressLog({
-                step: 'error',
-                percent: 0,
-                message: `Could not parse ${eventType} event`,
-                detail: pe.slice(0, 400),
-              });
+              throw new Error('Result key not retrievable from spill endpoint');
             }
+          } else {
+            throw new Error('Server returned phase=done without a result');
           }
+          return;
         }
-      }
+        if (data.phase === 'error') {
+          throw new Error(data.error || 'Server reported phase=error without a message');
+        }
 
-      // Process remaining buffer
-      if (buffer.trim()) {
-        const lines = buffer.trim().split('\n');
-        let eventType = '';
-        let dataStr = '';
-        for (const line of lines) {
-          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
-          else if (line.startsWith('data: ')) dataStr += line.slice(6);
-        }
-        if (eventType && dataStr) {
-          try {
-            const data = JSON.parse(dataStr);
-            if (eventType === 'progress' && data.step === 'error') {
-              backendError = data.message || 'Analysis failed';
-              appendProgressLog({
-                step: 'error',
-                percent: 0,
-                message: data.message || 'Analysis failed',
-                detail: data.detail,
-              });
-            } else if (eventType === 'result') {
-              gotResult = true;
-              appendProgressLog({
-                step: 'completed',
-                percent: 100,
-                message: 'Result packet received (tail buffer)',
-                detail: `${Array.isArray(data?.devices) ? data.devices.length : 0} MAID row(s)${data?.devicesSpillKey ? ' — loading spill…' : ''}`,
-              });
-              const merged = await resolveSpillIfNeeded(data as PostalMaidResult);
-              setResult(merged);
-              setPhase('results');
-              setProgress(null);
-            }
-          } catch (parseErr: unknown) {
-            const pe = parseErr instanceof Error ? parseErr.message : String(parseErr);
-            if (eventType === 'result') {
-              backendError = `Tail buffer: could not parse result (${dataStr.length} chars): ${pe.slice(0, 200)}`;
-              appendProgressLog({ step: 'error', percent: 0, message: backendError, detail: pe.slice(0, 400) });
-            }
-          }
-        }
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       }
-
-      if (!gotResult && backendError) {
-        throw new Error(backendError);
-      }
-      if (!gotResult) {
-        throw new Error(
-          'The server closed the stream without a result. Typical causes: (1) Vercel/server time limit — use the date range (defaults now match the dataset catalog); (2) network timeout; (3) server error — check the activity log for the last step. This is not the same as "zero postal matches."',
-        );
-      }
+      throw new Error('Polling timed out after 30 minutes (client-side soft cap)');
     } catch (err: any) {
       const last = lastProgressRef.current;
       if (err.name === 'AbortError') {
