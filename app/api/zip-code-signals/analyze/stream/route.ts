@@ -8,11 +8,23 @@ import { putConfig } from '@/lib/s3-config';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 /**
- * Vercel Pro: default hard cap is often 300s unless you raise it in
- * Project → Settings → Functions (max 800 on some accounts).
- * Heavy Athena + geocode regularly exceeds a single invocation — see UI note + long-term async job.
+ * Vercel timeout policy:
+ *   - Hobby:      300s hard cap (ignores higher values).
+ *   - Pro:        up to 800s when set explicitly.
+ *   - Enterprise: up to 900s.
+ *
+ * We declare 800 so Pro accounts get the full Pro budget; Hobby clamps
+ * silently. France Grid 50k April 2026 needs ~250-350s end-to-end
+ * (49s preamble + 100-200s Athena origins + 30s pass-1 stream + 30s
+ * geocode + 30s pass-2 stream). The diagnostic timeout below fires at
+ * declared_max - 25s, so on Pro it gives a useful error at 775s rather
+ * than the silent kill at the hard cap.
+ *
+ * Long-term: see /api/zip-code-signals/poll (multi-phase) — each phase
+ * fits in <60s so the whole pipeline is plan-agnostic.
  */
-export const maxDuration = 300;
+export const maxDuration = 800;
+const DECLARED_MAX_S = 800;
 
 const MAX_SSE_PAYLOAD_CHARS = 2_000_000;
 const MAX_DEVICES_INLINE = 60_000;
@@ -107,10 +119,13 @@ export async function POST(request: NextRequest): Promise<Response> {
       // — which is what we're trying to replace with a precise diagnostic.
       let lastProgress: { step?: string; percent?: number; message?: string; detail?: string } | null = null;
 
-      // Hard server-side timeout that fires ~25s BEFORE Vercel's hard cap of
-      // maxDuration=300s. This gives us time to emit a structured `error`
-      // event and close cleanly, instead of getting force-killed mid-write.
-      const SOFT_TIMEOUT_MS = (300 - 25) * 1000; // 275s
+      // Hard server-side timeout that fires ~25s BEFORE Vercel's hard cap.
+      // On Pro this is DECLARED_MAX_S=800, on Hobby it's silently clamped to
+      // 300 — the soft timeout uses the declared value so Pro accounts get
+      // the full budget. Worst case on Hobby: Vercel kills at 300 before
+      // this timer fires, and the user sees the generic "stream closed"
+      // message (same as before this fix).
+      const SOFT_TIMEOUT_MS = (DECLARED_MAX_S - 25) * 1000;
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => {
           const last = lastProgress;
