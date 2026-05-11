@@ -630,7 +630,10 @@ export async function analyzePostalMaidMegaJob(
   const datasetNames = subJobs
     .map((j) => j.s3DestPath?.replace(/\/$/, '').split('/').pop()!)
     .filter(Boolean);
-  for (const ds of datasetNames) await ensureTableForDataset(ds);
+  // Parallelize per-sub-job ensureTableForDataset — sequential was eating
+  // 5-15s on big megajobs (one HEAD + possible CREATE EXTERNAL TABLE per
+  // sub-job) before Athena even started. Promise.all collapses that.
+  await Promise.all(datasetNames.map((ds) => ensureTableForDataset(ds)));
   const tableNames = datasetNames.map((ds) => getTableName(ds));
 
   // Detect FULL schema. Prefer the job-level metadata (schema field set
@@ -733,6 +736,12 @@ export async function analyzePostalMaidMegaJob(
     const maidsTableName = `zcs_maids_${safeId}_${ts}`;
     const maidsPrefix = `athena-temp/zcs-maids/${safeId}/${ts}/`;
     const maidsObjectKey = `${maidsPrefix}data.csv`;
+    // CopyObject must complete before the DDL (LOCATION points at the new
+    // prefix), but the DDL is fast — we can avoid running a separate
+    // COUNT(*) by trusting the CSV exists (it was produced by a prior
+    // consolidation run, validated then). totalDevicesInDataset is only
+    // used for the coverage % stat at the end; we'll compute it inline
+    // from the main query's results later if we need it.
     await s3Client.send(
       new CopyObjectCommand({
         Bucket: BUCKET,
