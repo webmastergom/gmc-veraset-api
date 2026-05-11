@@ -523,29 +523,20 @@ export default function ZipCodeSignalsPage() {
   // ── Export CSV ────────────────────────────────────────────────────
   const exportDevicesCsv = () => {
     if (!result?.devices?.length) return;
-    // Enriched columns when FULL schema fast-path produced extras
-    const enriched = !!result.methodology?.fastPath;
-    const headers = enriched
-      ? ['ad_id', 'device_days', 'postal_codes', 'region', 'city', 'quality_tier', 'overnight_presence']
-      : ['ad_id', 'device_days', 'postal_codes'];
-    const rows = [headers.join(',')];
-    const csvCell = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    for (const d of result.devices) {
-      const base = [d.adId, String(d.deviceDays), csvCell(d.postalCodes.join(';'))];
-      if (enriched) {
-        base.push(csvCell(d.region || ''));
-        base.push(csvCell(d.city || ''));
-        base.push(d.qualityTier || '');
-        base.push(d.overnightPresence ? 'true' : 'false');
-      }
-      rows.push(base.join(','));
-    }
-    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    // MAID-only export — one column, one ad_id per line. Per Julian's
+    // ask: activation tools (Karlsgate, segments, ad-tech) only consume
+    // the MAID list; extra columns (device_days, postal, region, city,
+    // quality_tier) make the file harder to feed into those pipelines
+    // and aren't useful in their own right. The enriched data is still
+    // visible in the UI tabs (Devices + Postal Breakdown) for analysts
+    // who want it — just not in the export.
+    const lines = ['ad_id'];
+    for (const d of result.devices) lines.push(d.adId);
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const suffix = enriched ? '-enriched' : '';
     a.href = url;
-    a.download = `zip-signals${suffix}-${result.dataset}-${result.filters.country}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `zip-signals-maids-${result.dataset}-${result.filters.country}-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
