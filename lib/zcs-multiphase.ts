@@ -43,7 +43,17 @@ import type {
 
 // ── Constants ───────────────────────────────────────────────────────
 const ACCURACY_THRESHOLD_METERS = 500;
-const COORDINATE_PRECISION = 4;
+// 1-decimal degree ≈ 11km cells. Matches the geocoder's own rounding
+// (batchReverseGeocode does Math.round(lat * 10)/10 internally), so the
+// final postal-code assignment precision is 1-decimal regardless.
+// Outputting 4-decimal coords in the SQL was wasted precision that
+// blew up the intermediate coord maps — for France 50k (24M MAIDs,
+// dense urban), 4-decimal produced ~3M unique cells (~450 MB in
+// memory), which got close to the Vercel 1 GB cap during pass1. At
+// 1-decimal we get ~5-10K unique cells nationwide — sub-megabyte.
+// Final accuracy is identical because the geocoder operated at 1dec
+// in both cases.
+const COORDINATE_PRECISION = 1;
 
 // ── State machine ─────────────────────────────────────────────────────
 
@@ -1046,39 +1056,29 @@ export async function phaseGeocoding(state: ZcsState): Promise<ZcsState> {
 
   setCountryFilter([state.config.country.toUpperCase()]);
   try {
-    // Round to 1-decimal precision (~11km) for geocoding — postal-code
-    // matching doesn't need full 4-decimal precision.
-    const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-    for (const [, lat, lng, count] of coordsArr) {
-      const rLat = Math.round(lat * 10) / 10;
-      const rLng = Math.round(lng * 10) / 10;
-      const rKey = `${rLat},${rLng}`;
-      const ex = roundedMap.get(rKey);
-      if (ex) ex.deviceCount += count;
-      else roundedMap.set(rKey, { lat: rLat, lng: rLng, deviceCount: count });
-    }
-    const roundedKeys = Array.from(roundedMap.keys());
-    const roundedPoints = Array.from(roundedMap.values());
-    const classified = await batchReverseGeocode(roundedPoints);
+    // Since COORDINATE_PRECISION=1 the SQL already emits coords at the
+    // geocoder's resolution. We feed them directly to batchReverseGeocode
+    // and build coordToPostal[1dec_key] → postal. Pass2 looks up at the
+    // same 1-decimal precision. Simpler + smaller than the legacy two-
+    // step (4dec dedup → 1dec geocode → 4dec→1dec lookup table).
+    const points = coordsArr.map(([, lat, lng, count]) => ({
+      lat,
+      lng,
+      deviceCount: count,
+    }));
+    const classified = await batchReverseGeocode(points);
 
-    const roundedToPostal = new Map<string, string>();
-    for (let i = 0; i < roundedKeys.length && i < classified.length; i++) {
-      const c = classified[i];
-      if (c.type === 'geojson_local' || c.type === 'nominatim_match') {
-        roundedToPostal.set(roundedKeys[i], normalizePostalForCountry(state.config.country, c.postcode));
-      }
-    }
-
-    // Map full-precision coord-keys to postal codes via rounded lookup.
-    // Only keep entries whose postal matches a requested ZIP (most coords
-    // will not match — drop them now to keep the geocode JSON small).
     const requestedSet = new Set(state.normalizedPostals || []);
     const coordToPostal: Record<string, string> = {};
     let matched = 0;
-    for (const [key, lat, lng] of coordsArr) {
-      const rKey = `${Math.round(lat * 10) / 10},${Math.round(lng * 10) / 10}`;
-      const postal = roundedToPostal.get(rKey);
+    let postalResolved = 0;
+    for (let i = 0; i < coordsArr.length && i < classified.length; i++) {
+      const c = classified[i];
+      if (c.type !== 'geojson_local' && c.type !== 'nominatim_match') continue;
+      postalResolved++;
+      const postal = normalizePostalForCountry(state.config.country, c.postcode);
       if (postal && requestedSet.has(postal)) {
+        const [key] = coordsArr[i];
         coordToPostal[key] = postal;
         matched++;
       }
@@ -1092,7 +1092,7 @@ export async function phaseGeocoding(state: ZcsState): Promise<ZcsState> {
       subProgress: {
         label: `Geocoded ${classified.length.toLocaleString()} unique coords · ${matched.toLocaleString()} match target postal codes`,
         percent: 75,
-        details: `${roundedToPostal.size} postal-resolved · ${matched}/${coordsArr.length} full-precision matches`,
+        details: `${postalResolved} postal-resolved · ${matched}/${coordsArr.length} match`,
       },
       updatedAt: new Date().toISOString(),
     };

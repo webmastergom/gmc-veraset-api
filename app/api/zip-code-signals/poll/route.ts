@@ -60,7 +60,14 @@ import {
 } from '@/lib/zcs-multiphase';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60;
+// Vercel Pro accepts up to 800. ZCS phases on big megajobs (e.g. France
+// Grid 50k with 24M MAIDs → ~5 GB origins CSV) can take 60-120s for the
+// streaming aggregate. Hobby silently clamps to 300, which is still
+// enough for medium runs. The state machine itself is plan-agnostic —
+// if a phase doesn't fit in one invocation, the in-memory work is lost
+// and we retry — but we want to make it fit on the first try where
+// possible.
+export const maxDuration = 800;
 
 // Result inlining: small results go in the JSON response; bigger ones
 // only return the S3 key so the frontend can fetch them via the existing
@@ -193,9 +200,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Run not found' }, { status: 404 });
   }
 
-  // Loop a few advances if time allows (saves frontend round-trips).
-  const MAX_WALL_MS = 50_000; // leave 10s buffer under maxDuration=60
-  const MAX_ADVANCES = 6;
+  // Loop multiple advances if time allows (saves frontend round-trips).
+  // The poll endpoint has maxDuration=800 (Pro plan), so we have plenty
+  // of budget. We still cap MAX_WALL_MS at 700s to leave ~100s of
+  // buffer for the response serialization and Vercel overhead.
+  const MAX_WALL_MS = 700_000;
+  const MAX_ADVANCES = 8;
   let iters = 0;
   while (
     iters < MAX_ADVANCES &&

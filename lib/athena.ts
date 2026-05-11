@@ -129,12 +129,15 @@ export async function runQuery(sql: string): Promise<QueryResult> {
         const statistics = statusRes.QueryExecution?.Statistics;
         
         // Check if this is an "already exists" error - these are expected and should not be logged as errors
-        const isAlreadyExistsError = 
-          reason?.includes('already exists') || 
+        const isAlreadyExistsError =
+          reason?.includes('already exists') ||
           reason?.includes('Partition already exists') ||
           reason?.includes('already exist') ||
           reason?.includes('AlreadyExistsException') ||
-          reason?.includes('AlreadyExists');
+          reason?.includes('AlreadyExists') ||
+          // Hive DDLTask phrasing for the same condition — typically from
+          // `ALTER TABLE ADD COLUMNS (X ...)` when X is already on the table.
+          reason?.includes('Duplicate column name');
         
         if (!isAlreadyExistsError) {
           // Only log real errors
@@ -1212,10 +1215,17 @@ async function backfillFullSchemaColumns(tableName: string): Promise<void> {
       await runQuery(`ALTER TABLE ${tableName} ADD COLUMNS (${name} ${type})`);
       console.log(`[ATHENA] Added column ${name} to ${tableName}`);
     } catch (e: any) {
-      // Athena reports "Column with name X already exists" — that's a no-op for us.
-      // Anything else is unusual but not fatal; surface as warning.
+      // Athena reports this in two different ways depending on the
+      // engine version / table format:
+      //   - "Column with name X already exists" (Trino-style)
+      //   - "Duplicate column name: X"          (Hive DDLTask)
+      // Both mean "this column is already there" → no-op for us. Anything
+      // else is unusual but not fatal; surface as warning.
       const msg = e?.message || String(e);
-      if (!/already exist/i.test(msg)) {
+      const isAlreadyThere =
+        /already exist/i.test(msg) ||
+        /Duplicate column name/i.test(msg);
+      if (!isAlreadyThere) {
         console.warn(`[ATHENA] backfill ${name} on ${tableName}:`, msg.slice(0, 150));
       }
     }
