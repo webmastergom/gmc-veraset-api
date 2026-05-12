@@ -8,8 +8,10 @@
  * A→B and B→A run in parallel.
  *
  * Constraints:
- *   - Capped at 2000 POIs per side (inlined as VALUES into the SQL —
- *     ~180KB worst case, well under Athena's 256KB query limit).
+ *   - Capped at 5000 POIs per side. For small sets (≤MAX_INLINE_POIS)
+ *     POIs are inlined as a VALUES literal in the SQL. Larger sets are
+ *     materialized as an Athena external table backed by a CSV in S3,
+ *     so we don't blow past Athena's 256 KB SQL-text limit.
  *   - Uses the same grid-bucket spatial join as the rest of the
  *     consolidation pipeline so the spatial step is O(N) on pings.
  */
@@ -117,7 +119,17 @@ const STATE_KEY = (id: string) => `compare-reach-state/${id}`;
 const ACCURACY = 500;
 const GRID = 0.01;
 
-/** Build the inline VALUES list for target POIs (≤2000 expected). */
+/** Inline-vs-materialize threshold. Each POI row in the VALUES literal is
+ *  ~110-140 bytes (poi_id + name + 2× CAST(lat/lng AS DOUBLE)). Athena's
+ *  total query-text limit is 256 KB; inlining 1500 POIs uses ~210 KB,
+ *  leaving headroom for the surrounding CTEs. Anything above this is
+ *  materialized as a temp external table. */
+const MAX_INLINE_POIS = 1500;
+const MAX_REACH_POIS = 5000;
+
+/** Build the inline VALUES list for target POIs. Only safe for small sets;
+ *  callers should switch to a materialized external table when pois.length
+ *  exceeds MAX_INLINE_POIS (see `targetPoisCTE`). */
 function poisValues(pois: PoiPosition[]): string {
   // Each row: ('poi-id', 'name with single quotes escaped', lat, lng)
   return pois
@@ -127,6 +139,28 @@ function poisValues(pois: PoiPosition[]): string {
       return `('${id}', '${name}', CAST(${p.lat} AS DOUBLE), CAST(${p.lng} AS DOUBLE))`;
     })
     .join(', ');
+}
+
+/** Build the `target_pois` CTE source. When `externalTable` is provided we
+ *  SELECT from it (large-N path); otherwise we inline the POIs as VALUES.
+ *  Both forms yield the same 4-column shape: (poi_id, poi_name, poi_lat, poi_lng). */
+function targetPoisCTE(pois: PoiPosition[], externalTable?: string): string {
+  if (externalTable) {
+    // OpenCSVSerde stores ALL columns as STRING regardless of the DDL,
+    // so we CAST the numeric ones here. Downstream the spatial join
+    // does arithmetic on poi_lat / poi_lng which needs DOUBLE.
+    return `target_pois AS (
+      SELECT
+        poi_id,
+        poi_name,
+        CAST(poi_lat AS DOUBLE) AS poi_lat,
+        CAST(poi_lng AS DOUBLE) AS poi_lng
+      FROM ${externalTable}
+    )`;
+  }
+  return `target_pois AS (
+      SELECT * FROM (VALUES ${poisValues(pois)}) AS t(poi_id, poi_name, poi_lat, poi_lng)
+    )`;
 }
 
 /**
@@ -211,6 +245,7 @@ function clusterSelectSQL(
   targetPois: PoiPosition[],
   cfg: ReachConfig,
   sourceFilters?: SourceFilters,
+  targetPoisTable?: string,
 ): string {
   return `
     WITH
@@ -228,9 +263,7 @@ function clusterSelectSQL(
         AND TRY_CAST(p.longitude AS DOUBLE) IS NOT NULL
         AND (p.horizontal_accuracy IS NULL OR TRY_CAST(p.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
     ),
-    target_pois AS (
-      SELECT * FROM (VALUES ${poisValues(targetPois)}) AS t(poi_id, poi_name, poi_lat, poi_lng)
-    ),
+    ${targetPoisCTE(targetPois, targetPoisTable)},
     target_poi_buckets AS (
       SELECT poi_id, poi_name, poi_lat, poi_lng,
         CAST(FLOOR(poi_lat / ${GRID}) AS BIGINT) + dlat as lat_bucket,
@@ -267,8 +300,14 @@ function clusterSelectSQL(
   `;
 }
 
-function buildPerPoiCTAS(sourceTable: string, targetPois: PoiPosition[], cfg: ReachConfig, f?: SourceFilters): string {
-  return `${clusterSelectSQL(sourceTable, targetPois, cfg, f)}
+function buildPerPoiCTAS(
+  sourceTable: string,
+  targetPois: PoiPosition[],
+  cfg: ReachConfig,
+  f?: SourceFilters,
+  targetPoisTable?: string,
+): string {
+  return `${clusterSelectSQL(sourceTable, targetPois, cfg, f, targetPoisTable)}
     SELECT
       poi_id,
       poi_name,
@@ -280,14 +319,26 @@ function buildPerPoiCTAS(sourceTable: string, targetPois: PoiPosition[], cfg: Re
   `;
 }
 
-function buildTotalDistinctSQL(sourceTable: string, targetPois: PoiPosition[], cfg: ReachConfig, f?: SourceFilters): string {
-  return `${clusterSelectSQL(sourceTable, targetPois, cfg, f)}
+function buildTotalDistinctSQL(
+  sourceTable: string,
+  targetPois: PoiPosition[],
+  cfg: ReachConfig,
+  f?: SourceFilters,
+  targetPoisTable?: string,
+): string {
+  return `${clusterSelectSQL(sourceTable, targetPois, cfg, f, targetPoisTable)}
     SELECT COUNT(DISTINCT ad_id) as total_potential FROM qualified
   `;
 }
 
-function buildExportMaidsSQL(sourceTable: string, targetPois: PoiPosition[], cfg: ReachConfig, f?: SourceFilters): string {
-  return `${clusterSelectSQL(sourceTable, targetPois, cfg, f)}
+function buildExportMaidsSQL(
+  sourceTable: string,
+  targetPois: PoiPosition[],
+  cfg: ReachConfig,
+  f?: SourceFilters,
+  targetPoisTable?: string,
+): string {
+  return `${clusterSelectSQL(sourceTable, targetPois, cfg, f, targetPoisTable)}
     SELECT DISTINCT ad_id FROM qualified
   `;
 }
@@ -314,6 +365,65 @@ async function loadPois(datasetName: string): Promise<PoiPosition[]> {
     .map((p) => ({ poiId: p.poiId, name: p.name, lat: p.lat as number, lng: p.lng as number }));
 }
 
+/**
+ * Upload the target POIs as a CSV in S3 and register an Athena external
+ * table over it. Used when pois.length > MAX_INLINE_POIS to keep the
+ * SQL text under Athena's 256 KB limit. Returns the table name to use
+ * in clusterSelectSQL.
+ *
+ * The CSV is small (4-col × ≤5000 rows ≈ 200-500 KB) and idempotent on
+ * the same stateId+direction — re-runs overwrite. The Athena table uses
+ * IF NOT EXISTS so concurrent polls don't race.
+ */
+async function materializeReachPois(
+  stateId: string,
+  direction: 'aToB' | 'bToA',
+  pois: PoiPosition[],
+): Promise<string> {
+  const { PutObjectCommand } = await import('@aws-sdk/client-s3');
+  const { s3Client, BUCKET } = await import('@/lib/s3-config');
+  const safeId = stateId.replace(/[^a-z0-9_]/gi, '_').slice(0, 32);
+  const tableName = `compare_reach_pois_${safeId}_${direction}`;
+  const prefix = `athena-temp/compare-reach-pois/${safeId}/${direction}/`;
+  const csvKey = `${prefix}data.csv`;
+
+  // CSV header + rows. Escape commas and quotes in poi_name per RFC 4180.
+  // poi_id rarely contains commas (UUIDs); we still quote it for safety.
+  const csvCell = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  const lines = ['poi_id,poi_name,poi_lat,poi_lng'];
+  for (const p of pois) {
+    lines.push(`${csvCell(p.poiId)},${csvCell(p.name || p.poiId)},${p.lat},${p.lng}`);
+  }
+  await s3Client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: csvKey,
+    Body: lines.join('\n'),
+    ContentType: 'text/csv',
+  }));
+
+  // Drop any leftover table from a previous run so the schema picks up
+  // any structural change (e.g. column added). Best-effort.
+  try {
+    const { runQuery } = await import('@/lib/athena');
+    await runQuery(`DROP TABLE IF EXISTS ${tableName}`);
+  } catch {
+    /* idempotent */
+  }
+  const { runQuery: runQuery2 } = await import('@/lib/athena');
+  await runQuery2(`
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${tableName} (
+      poi_id STRING, poi_name STRING, poi_lat DOUBLE, poi_lng DOUBLE
+    )
+    ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+    WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+    STORED AS TEXTFILE
+    LOCATION 's3://${BUCKET}/${prefix}'
+    TBLPROPERTIES ('skip.header.line.count' = '1')
+  `);
+  console.log(`[REACH] Materialized ${tableName} with ${pois.length} POIs at s3://${BUCKET}/${prefix}`);
+  return tableName;
+}
+
 async function startDirection(
   stateId: string,
   direction: 'aToB' | 'bToA',
@@ -322,18 +432,28 @@ async function startDirection(
   cfg: ReachConfig,
   sourceFilters: SourceFilters,
 ): Promise<DirectionState> {
+  // For big POI sets, materialize as Athena external table. OpenCSVSerde
+  // declares all columns as STRING regardless of the DDL; the spatial
+  // join consumes poi_lat/poi_lng via CAST below (via clusterSelectSQL
+  // → target_pois CTE). Smaller sets stay inlined (faster — no S3 copy
+  // or DDL roundtrip).
+  let targetPoisTable: string | undefined;
+  if (targetPois.length > MAX_INLINE_POIS) {
+    targetPoisTable = await materializeReachPois(stateId, direction, targetPois);
+  }
+
   const ctasTable = tempTableName(`reach_${direction}`, stateId.replace(/-/g, '_'));
-  const perPoiSql = buildPerPoiCTAS(sourceTable, targetPois, cfg, sourceFilters);
+  const perPoiSql = buildPerPoiCTAS(sourceTable, targetPois, cfg, sourceFilters, targetPoisTable);
   // Total distinct visitors and CSV export run in parallel — the SAME source
   // SQL is repeated, so Athena is doing duplicate work. Kept simple for v1;
   // optimize later by reading from the per-POI CTAS once it lands.
   const [ctasQueryId, totalQueryId, exportQueryId] = await Promise.all([
     startCTASAsync(perPoiSql, ctasTable),
-    startQueryAsync(buildTotalDistinctSQL(sourceTable, targetPois, cfg, sourceFilters)),
-    startQueryAsync(buildExportMaidsSQL(sourceTable, targetPois, cfg, sourceFilters)),
+    startQueryAsync(buildTotalDistinctSQL(sourceTable, targetPois, cfg, sourceFilters, targetPoisTable)),
+    startQueryAsync(buildExportMaidsSQL(sourceTable, targetPois, cfg, sourceFilters, targetPoisTable)),
   ]);
 
-  console.log(`[REACH] Started ${direction}: ctas=${ctasQueryId}, total=${totalQueryId}, export=${exportQueryId}, filters=${JSON.stringify(sourceFilters)}`);
+  console.log(`[REACH] Started ${direction}: ctas=${ctasQueryId}, total=${totalQueryId}, export=${exportQueryId}, pois=${targetPois.length}${targetPoisTable ? ' (materialized)' : ' (inline)'}, filters=${JSON.stringify(sourceFilters)}`);
   return { ctasTable, ctasQueryId, totalQueryId, exportQueryId, done: false };
 }
 
@@ -437,8 +557,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       if (poisB.length === 0) {
         return NextResponse.json({ phase: 'error', error: `Dataset B (${datasetB}) has no POIs registered` }, { status: 400 });
       }
-      if (poisA.length > 2000 || poisB.length > 2000) {
-        return NextResponse.json({ phase: 'error', error: `Reach analysis is capped at 2000 POIs per side (A=${poisA.length}, B=${poisB.length}). Use a smaller POI collection.` }, { status: 400 });
+      if (poisA.length > MAX_REACH_POIS || poisB.length > MAX_REACH_POIS) {
+        return NextResponse.json({ phase: 'error', error: `Reach analysis is capped at ${MAX_REACH_POIS} POIs per side (A=${poisA.length}, B=${poisB.length}). Use a smaller POI collection.` }, { status: 400 });
       }
 
       state = {
