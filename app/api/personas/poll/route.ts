@@ -66,11 +66,10 @@ export const maxDuration = 120;
 
 const STATE_KEY = (runId: string) => `persona-state/${runId}`;
 const REPORT_KEY = (runId: string) => `persona-reports/${runId}`;
-// Inter-phase persistence: the parsed feature-vector array (handed off from
-// download_read → clustering) and the cluster assignments + names (handed off
-// from clustering → master_maids_export). Stored separately so each phase
-// runs in its own Vercel function invocation within the 120s budget.
-const FEATURES_KEY = (runId: string) => `persona-features/${runId}`;
+// Inter-phase persistence: cluster assignments + names, handed off from
+// clustering → master_maids_export. (We don't persist the parsed features
+// array — JSON.stringify on a 500k-row DeviceFeatures[] OOMs the function.
+// Features live in memory only for the duration of the clustering phase.)
 const CLUSTER_DATA_KEY = (runId: string) => `persona-cluster-data/${runId}`;
 
 // Hash a config to a stable runId.
@@ -1256,32 +1255,32 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           state = await phaseDownloadQuery(state);
           break;
         case 'download_read': {
-          // Read CSV from S3, parse to DeviceFeatures[], reverse-geocode missing
-          // home_zips. Then hand off to `clustering` via S3 — keeps each Vercel
-          // invocation within its 120s budget (read+cluster+export combined
-          // previously timed out on large megajobs like Doohyoulike at ~350GB).
-          const { state: ns, features } = await phaseDownloadRead(state);
-          await putConfig(FEATURES_KEY(state.runId), features, { compact: true });
+          // No-op transition — defer the actual work to `clustering`. Persisting
+          // the parsed DeviceFeatures[] (which is ~360 MB JSON for 500k devices)
+          // OOMs the Vercel function during JSON.stringify, so we keep features
+          // in memory only for the duration of the clustering phase instead.
           state = {
-            ...ns,
+            ...state,
             phase: 'clustering',
-            subProgress: {
-              label: `Loaded ${features.length.toLocaleString()} feature rows`,
-              details: 'Ready for clustering',
-            },
             updatedAt: new Date().toISOString(),
           };
           break;
         }
         case 'clustering': {
-          // Load features from S3, run k-means + RFM + cohabitation + zip
-          // affinity + insights. Save report (so the UI can render scorecard
-          // immediately) and cluster data (for the export phase).
-          const features = await getConfig<DeviceFeatures[]>(FEATURES_KEY(state.runId));
-          if (!features) throw new Error('Features not found — re-run from download_query');
+          // Read CSV from S3, parse to DeviceFeatures[], reverse-geocode missing
+          // home_zips, then run k-means + RFM + cohabitation + zip affinity +
+          // insights. The features array stays in memory the entire phase —
+          // never serialized to JSON, which keeps us under Vercel's 1024 MB
+          // memory ceiling. This is heavier than ideal (download + cluster in
+          // the same 120s budget) but avoids the OOM we hit trying to persist
+          // features to S3 between phases.
+          const { state: ns, features } = await phaseDownloadRead(state);
           const { state: ns2, report, clusterAssignments, clusterNames } =
-            await phaseClusterAndAggregate(state, features);
+            await phaseClusterAndAggregate(ns, features);
+          // Save report early so frontend can render scorecard while exports finish.
           await putConfig(REPORT_KEY(state.runId), report, { compact: true });
+          // clusterAssignments serializes to ~25 MB for 500k devices — fine for
+          // putConfig. master_maids_export reads it back to write the labels CSV.
           await putConfig(CLUSTER_DATA_KEY(state.runId), {
             clusterAssignmentsObj: Object.fromEntries(clusterAssignments),
             clusterNames,
