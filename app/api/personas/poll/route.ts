@@ -66,6 +66,12 @@ export const maxDuration = 120;
 
 const STATE_KEY = (runId: string) => `persona-state/${runId}`;
 const REPORT_KEY = (runId: string) => `persona-reports/${runId}`;
+// Inter-phase persistence: the parsed feature-vector array (handed off from
+// download_read → clustering) and the cluster assignments + names (handed off
+// from clustering → master_maids_export). Stored separately so each phase
+// runs in its own Vercel function invocation within the 120s budget.
+const FEATURES_KEY = (runId: string) => `persona-features/${runId}`;
+const CLUSTER_DATA_KEY = (runId: string) => `persona-cluster-data/${runId}`;
 
 // Hash a config to a stable runId.
 //
@@ -1250,22 +1256,67 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           state = await phaseDownloadQuery(state);
           break;
         case 'download_read': {
+          // Read CSV from S3, parse to DeviceFeatures[], reverse-geocode missing
+          // home_zips. Then hand off to `clustering` via S3 — keeps each Vercel
+          // invocation within its 120s budget (read+cluster+export combined
+          // previously timed out on large megajobs like Doohyoulike at ~350GB).
           const { state: ns, features } = await phaseDownloadRead(state);
-          const { state: ns2, report, clusterAssignments, clusterNames } = await phaseClusterAndAggregate(ns, features);
-          // Save the report early so frontend can render scorecard while exports finish.
-          await putConfig(REPORT_KEY(state.runId), report, { compact: true });
-          state = await phaseMasterMaidsExport(ns2, report, clusterAssignments, clusterNames);
+          await putConfig(FEATURES_KEY(state.runId), features, { compact: true });
+          state = {
+            ...ns,
+            phase: 'clustering',
+            subProgress: {
+              label: `Loaded ${features.length.toLocaleString()} feature rows`,
+              details: 'Ready for clustering',
+            },
+            updatedAt: new Date().toISOString(),
+          };
           break;
         }
-        case 'clustering':
+        case 'clustering': {
+          // Load features from S3, run k-means + RFM + cohabitation + zip
+          // affinity + insights. Save report (so the UI can render scorecard
+          // immediately) and cluster data (for the export phase).
+          const features = await getConfig<DeviceFeatures[]>(FEATURES_KEY(state.runId));
+          if (!features) throw new Error('Features not found — re-run from download_query');
+          const { state: ns2, report, clusterAssignments, clusterNames } =
+            await phaseClusterAndAggregate(state, features);
+          await putConfig(REPORT_KEY(state.runId), report, { compact: true });
+          await putConfig(CLUSTER_DATA_KEY(state.runId), {
+            clusterAssignmentsObj: Object.fromEntries(clusterAssignments),
+            clusterNames,
+          }, { compact: true });
+          state = {
+            ...ns2,
+            phase: 'master_maids_export',
+            report,
+            updatedAt: new Date().toISOString(),
+          };
+          break;
+        }
         case 'aggregation':
-          // These are intermediate states that should never persist (the
-          // download_read handler does both inline). If we land here, it
-          // means a previous run was killed mid-flight — restart from
-          // download_query so the SELECT fires again.
+          // Legacy intermediate phase from before the split — restart from
+          // download_query if any old runs land here.
           state = { ...state, phase: 'download_query' };
           break;
-        case 'master_maids_export':
+        case 'master_maids_export': {
+          // Kick off the per-persona CTAS exports. phaseMasterMaidsExport
+          // returns state with phase='export_polling'.
+          if (!state.report) throw new Error('No report in state — re-run from clustering');
+          const clusterData = await getConfig<{
+            clusterAssignmentsObj: Record<string, number>;
+            clusterNames: string[];
+          }>(CLUSTER_DATA_KEY(state.runId));
+          if (!clusterData) throw new Error('Cluster data not found — re-run from clustering');
+          const clusterAssignments = new Map(Object.entries(clusterData.clusterAssignmentsObj));
+          state = await phaseMasterMaidsExport(
+            state,
+            state.report,
+            clusterAssignments,
+            clusterData.clusterNames,
+          );
+          break;
+        }
         case 'export_polling':
           state = await phaseExportPolling(state);
           break;

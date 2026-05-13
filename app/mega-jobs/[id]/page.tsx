@@ -11,7 +11,7 @@ import {
   Layers, ExternalLink, Loader2, Play, Download, Users,
   CheckCircle2, XCircle, Clock, Map,
   BarChart3, TrendingUp, MapPin, Navigation,
-  Compass, Timer, Activity, Target,
+  Compass, Timer, Activity, Target, RefreshCw, AlertCircle,
 } from 'lucide-react'
 
 import { CollapsibleCard } from '@/components/mega-jobs/collapsible-card'
@@ -74,6 +74,10 @@ export default function MegaJobDetailPage() {
   const [loading, setLoading] = useState(true)
   const [consolidating, setConsolidating] = useState(false)
   const [consolidateProgress, setConsolidateProgress] = useState<string>('')
+
+  // Batch sync: per-sub-job progress map (jobId → state)
+  const [syncingAll, setSyncingAll] = useState(false)
+  const [syncProgress, setSyncProgress] = useState<Record<string, 'pending' | 'syncing' | 'completed' | 'error'>>({})
 
   // Reports
   const [visitsReport, setVisitsReport] = useState<any>(null)
@@ -270,6 +274,68 @@ export default function MegaJobDetailPage() {
     }
   }
 
+  // ── Batch sync all unsync'd sub-jobs ─────────────────────────────
+  // Fires the existing per-job sync endpoint in parallel for each sub-job
+  // that is Veraset-SUCCESS but not yet copied to our S3. Each call returns
+  // an SSE stream — we read it to detect per-job completed/error.
+  const handleSyncAll = async (jobsToSync: Array<{ jobId: string; s3DestPath: string }>) => {
+    if (jobsToSync.length === 0) return
+    if (!confirm(`Sync ${jobsToSync.length} sub-job(s) in parallel? This may take several minutes.`)) return
+
+    setSyncingAll(true)
+    const initial: Record<string, 'pending' | 'syncing' | 'completed' | 'error'> = {}
+    for (const j of jobsToSync) initial[j.jobId] = 'pending'
+    setSyncProgress(initial)
+
+    await Promise.allSettled(jobsToSync.map(async (job) => {
+      setSyncProgress((p) => ({ ...p, [job.jobId]: 'syncing' }))
+      try {
+        const res = await fetch(`/api/jobs/${job.jobId}/sync`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destPath: job.s3DestPath }),
+        })
+        if (!res.ok) {
+          setSyncProgress((p) => ({ ...p, [job.jobId]: 'error' }))
+          return
+        }
+        const ct = res.headers.get('content-type') || ''
+        if (!ct.includes('text/event-stream')) {
+          // Idempotent short-circuit (already synced) returns JSON, not SSE.
+          setSyncProgress((p) => ({ ...p, [job.jobId]: 'completed' }))
+          return
+        }
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let finalStatus: 'completed' | 'error' = 'error'
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const events = buffer.split('\n\n')
+          buffer = events.pop() || ''
+          for (const ev of events) {
+            const dataLine = ev.split('\n').find((l) => l.startsWith('data:'))
+            if (!dataLine) continue
+            try {
+              const payload = JSON.parse(dataLine.slice(5).trim())
+              if (payload.status === 'completed') finalStatus = 'completed'
+              else if (payload.status === 'error') finalStatus = 'error'
+            } catch { /* heartbeat / non-JSON, ignore */ }
+          }
+        }
+        setSyncProgress((p) => ({ ...p, [job.jobId]: finalStatus }))
+      } catch {
+        setSyncProgress((p) => ({ ...p, [job.jobId]: 'error' }))
+      }
+    }))
+
+    setSyncingAll(false)
+    await loadMegaJob()
+  }
+
   if (loading) {
     return (
       <MainLayout>
@@ -290,6 +356,16 @@ export default function MegaJobDetailPage() {
 
   const canConsolidate = (megaJob.status === 'running' || megaJob.status === 'partial' || megaJob.status === 'completed' || megaJob.status === 'consolidating') && megaJob.progress.synced > 0
   const isCompleted = megaJob.status === 'completed'
+
+  // Sub-jobs that Veraset finished (SUCCESS) but haven't been copied to our S3 yet.
+  // Excludes failed jobs and any without a destPath assigned.
+  const subJobsNeedingSync: Array<{ jobId: string; s3DestPath: string; name?: string }> =
+    (megaJob.subJobs || [])
+      .filter((j: any) => j.status === 'SUCCESS' && !j.syncedAt && j.s3DestPath)
+      .map((j: any) => ({ jobId: j.jobId, s3DestPath: j.s3DestPath, name: j.name }))
+  const syncDoneCount = Object.values(syncProgress).filter((s) => s === 'completed').length
+  const syncErrorCount = Object.values(syncProgress).filter((s) => s === 'error').length
+  const syncTotal = Object.keys(syncProgress).length
 
   // Build POI list from visits report for filter
   const poiOptions = (visitsReport?.visitsByPoi || []).map((v: any) => ({
@@ -334,8 +410,26 @@ export default function MegaJobDetailPage() {
             </div>
           </div>
 
-          {canConsolidate && (
-            <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            {subJobsNeedingSync.length > 0 && (
+              <Button
+                onClick={() => handleSyncAll(subJobsNeedingSync)}
+                disabled={syncingAll}
+                variant="outline"
+                title={`Sync ${subJobsNeedingSync.length} Veraset-ready sub-job(s) to our S3 in parallel`}
+              >
+                {syncingAll ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                )}
+                {syncingAll
+                  ? `Syncing ${syncDoneCount + syncErrorCount}/${syncTotal}...`
+                  : `Sync ${subJobsNeedingSync.length} sub-job${subJobsNeedingSync.length === 1 ? '' : 's'}`}
+              </Button>
+            )}
+            {canConsolidate && (
+              <>
               <div className="flex items-center gap-1">
                 <label className="text-xs text-muted-foreground whitespace-nowrap">Dwell:</label>
                 <select
@@ -510,8 +604,9 @@ export default function MegaJobDetailPage() {
                 )}
                 {megaJob.status === 'consolidating' ? 'Resume consolidation' : isCompleted ? 'Re-consolidate' : 'Consolidate reports'}
               </Button>
-            </div>
-          )}
+              </>
+            )}
+          </div>
         </div>
 
         {consolidateProgress && (
@@ -519,6 +614,37 @@ export default function MegaJobDetailPage() {
             <CardContent className="py-3 text-sm">
               <Loader2 className="h-4 w-4 inline mr-2 animate-spin" />
               {consolidateProgress}
+            </CardContent>
+          </Card>
+        )}
+
+        {syncTotal > 0 && (
+          <Card className="border-blue-500/30">
+            <CardContent className="py-3 text-sm space-y-1">
+              <div className="flex items-center gap-2 font-medium">
+                {syncingAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4 text-green-400" />}
+                Sync: {syncDoneCount} done{syncErrorCount > 0 ? `, ${syncErrorCount} failed` : ''}, {syncTotal} total
+              </div>
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {Object.entries(syncProgress).map(([jobId, st]) => (
+                  <Badge
+                    key={jobId}
+                    variant="outline"
+                    className={
+                      st === 'completed' ? 'bg-green-500/15 text-green-400 border-green-500/40' :
+                      st === 'error' ? 'bg-red-500/15 text-red-400 border-red-500/40' :
+                      st === 'syncing' ? 'bg-yellow-500/15 text-yellow-400 border-yellow-500/40' :
+                      'bg-muted/40 text-muted-foreground'
+                    }
+                    title={jobId}
+                  >
+                    {st === 'syncing' && <Loader2 className="h-3 w-3 mr-1 inline animate-spin" />}
+                    {st === 'completed' && <CheckCircle2 className="h-3 w-3 mr-1 inline" />}
+                    {st === 'error' && <AlertCircle className="h-3 w-3 mr-1 inline" />}
+                    {jobId.slice(0, 8)}
+                  </Badge>
+                ))}
+              </div>
             </CardContent>
           </Card>
         )}
