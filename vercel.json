@@ -5,6 +5,11 @@
   "buildCommand": "rm -rf .next && npm run build",
   "outputDirectory": ".next",
   "framework": "nextjs",
+  "functions": {
+    "app/api/personas/poll/route.ts": {
+      "memory": 3008
+    }
+  },
   "headers": [
     {
       "source": "/api/external/(.*)",
