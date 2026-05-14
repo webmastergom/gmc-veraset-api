@@ -661,10 +661,14 @@ async function streamAthenaCsv<T>(
   return { rows: out, lineCount };
 }
 
-async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaState; features: DeviceFeatures[] }> {
+async function phaseDownloadRead(
+  state: PersonaState,
+  progress?: (step: string) => Promise<void>
+): Promise<{ state: PersonaState; features: DeviceFeatures[] }> {
   if (!state.downloadQueries) throw new Error('No downloadQueries');
   const all: DeviceFeatures[] = [];
   for (const [src, { queryId }] of Object.entries(state.downloadQueries)) {
+    await progress?.(`1a/4 streamAthenaCsv start (src=${src.slice(0,8)})`);
     const { rows } = await streamAthenaCsv(queryId, (r): DeviceFeatures => ({
       ad_id: String(r.ad_id || ''),
       total_visits: parseInt(r.total_visits, 10) || 0,
@@ -692,6 +696,7 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
       source_megajob_id: src,
     }));
     for (const f of rows) all.push(f);
+    await progress?.(`1b/4 streamAthenaCsv done: ${rows.length} rows`);
     console.log(`[PERSONAS ${state.runId}] Streamed ${rows.length} rows for ${src} (queryId=${queryId})`);
   }
 
@@ -706,6 +711,7 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
       && f.home_lat != null && f.home_lng != null
       && Number.isFinite(f.home_lat) && Number.isFinite(f.home_lng)
   );
+  await progress?.(`1c/4 geocode check: ${missing.length} missing zips of ${all.length} total`);
   if (missing.length > 0) {
     try {
       const country = await guessCountry(state);
@@ -749,6 +755,7 @@ async function phaseDownloadRead(state: PersonaState): Promise<{ state: PersonaS
       console.warn(`[PERSONAS ${state.runId}] Reverse-geocode fallback failed: ${e?.message || e}`);
     }
   }
+  await progress?.(`1d/4 phaseDownloadRead done`);
 
   const subProgress = {
     label: `Loaded ${all.length.toLocaleString()} feature rows`,
@@ -1297,7 +1304,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           };
           try {
             await writeStep('1/4 phaseDownloadRead start');
-            const { state: ns, features } = await phaseDownloadRead(state);
+            const { state: ns, features } = await phaseDownloadRead(state, writeStep);
             await writeStep(`2/4 phaseClusterAndAggregate start (${features.length} features)`);
             const { state: ns2, report, clusterAssignments, clusterNames } =
               await phaseClusterAndAggregate(ns, features);
