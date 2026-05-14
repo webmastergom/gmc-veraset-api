@@ -1245,6 +1245,77 @@ async function resolveSourceDisplayName(state: PersonaState): Promise<string> {
   return names.length > 0 ? names.join(' + ') : 'persona-run';
 }
 
+/**
+ * Pre-run validation: every megajob/job in the config must have a
+ * country set, and every distinct country must have NSE population
+ * data uploaded to S3 at `config/nse/{country}.json`. Without NSE
+ * the Density sub-index in zip affinity can't be computed.
+ *
+ * Returns null when everything checks out, otherwise a structured
+ * error payload that the caller surfaces to the frontend as a 400.
+ */
+async function validateConfigPrerequisites(
+  cfg: PersonaRunConfig,
+): Promise<{
+  ok: false;
+  error: string;
+  details: string;
+  missingCountries: string[];
+  sourcesWithoutCountry: Array<{ id: string; name: string; kind: 'megajob' | 'job' }>;
+} | { ok: true }> {
+  const missingCountries: string[] = [];
+  const sourcesWithoutCountry: Array<{ id: string; name: string; kind: 'megajob' | 'job' }> = [];
+  const countries = new Set<string>();
+
+  for (const mjId of cfg.megaJobIds) {
+    const mj = await getMegaJob(mjId);
+    if (!mj) continue;
+    if (mj.country) countries.add(mj.country.toUpperCase());
+    else sourcesWithoutCountry.push({ id: mjId, name: mj.name || mjId.slice(0, 8), kind: 'megajob' });
+  }
+  for (const jId of (cfg.jobIds || [])) {
+    const j = await getJob(jId);
+    if (!j) continue;
+    const country = (j as any).country as string | undefined;
+    if (country) countries.add(country.toUpperCase());
+    else sourcesWithoutCountry.push({ id: jId, name: (j as any).name || jId.slice(0, 8), kind: 'job' });
+  }
+
+  // For each country, check NSE file exists.
+  for (const country of countries) {
+    const records = await getConfig<unknown[]>(`nse/${country}`);
+    if (!records || !Array.isArray(records) || records.length === 0) {
+      missingCountries.push(country);
+    }
+  }
+
+  if (sourcesWithoutCountry.length === 0 && missingCountries.length === 0) {
+    return { ok: true };
+  }
+
+  const lines: string[] = [];
+  if (sourcesWithoutCountry.length > 0) {
+    lines.push(
+      `Set country on these source${sourcesWithoutCountry.length > 1 ? 's' : ''}: ` +
+      sourcesWithoutCountry.map((s) => `${s.kind}/${s.name}`).join(', ')
+    );
+  }
+  if (missingCountries.length > 0) {
+    lines.push(
+      `Upload NSE for ${missingCountries.join(', ')}: POST CSV to /api/nse/{XX} ` +
+      `(columns: postal_code, population, and optionally nse).`
+    );
+  }
+
+  return {
+    ok: false,
+    error: 'Missing prerequisites for persona run',
+    details: lines.join(' '),
+    missingCountries,
+    sourcesWithoutCountry,
+  };
+}
+
 async function guessCountry(state: PersonaState): Promise<string | null> {
   for (const mjId of state.config.megaJobIds) {
     const mj = await getMegaJob(mjId);
@@ -1293,6 +1364,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ error: `Source run ${body.srcRunId} not found` }, { status: 404 });
       }
       const cfg = src.config;
+      const prereq = await validateConfigPrerequisites(cfg);
+      if (!prereq.ok) {
+        return NextResponse.json(prereq, { status: 400 });
+      }
       const newRunId = rerunRunId(cfg);
       const initialState: PersonaState = {
         phase: 'starting',
@@ -1331,6 +1406,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         if (existing?.phase === 'done' && existing.report) {
           return NextResponse.json({ phase: 'done', runId, report: existing.report });
         }
+      }
+      // Validate country + NSE prerequisites BEFORE writing state, so an
+      // invalid config never produces an orphan in-progress run.
+      const prereq = await validateConfigPrerequisites(cfg);
+      if (!prereq.ok) {
+        return NextResponse.json(prereq, { status: 400 });
       }
       // Reset on error or first time (or re-run)
       const initialState: PersonaState = {
