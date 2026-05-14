@@ -41,9 +41,10 @@ import type {
 /** Skip ZIPs below this population — small enough that a few visitors give noisy >>100 indices. */
 const MIN_POPULATION_FOR_DENSITY = 200;
 
-/** Gaussian smoothing bandwidth (km). 15 km gives a few-zip radius —
- *  enough to highlight regional clusters without washing out a city. */
-const SMOOTH_SIGMA_KM = 15;
+/** Gaussian decay bandwidth (km). 12 km is roughly "next 1-2 postal-code
+ *  neighborhoods" — enough to make the heat radiate visibly to immediate
+ *  neighbors without bleeding across an entire city. */
+const SMOOTH_SIGMA_KM = 12;
 
 /** Cutoff in σ-units. exp(-3²/2) ≈ 0.011 — beyond this contribution is noise. */
 const SMOOTH_CUTOFF_SIGMA = 3;
@@ -292,39 +293,66 @@ export function computeZipAffinityPerSource(
 }
 
 /**
- * In-place: for each row with a valid centroid, replace scoreSmoothed
- * with the Gaussian-weighted mean of scoreRaw across all rows within
- * SMOOTH_CUTOFF_SIGMA × SMOOTH_SIGMA_KM. Rows without centroids keep
- * scoreSmoothed = scoreRaw.
+ * Spatial heat field — Gaussian-decayed device-count contributions from
+ * every measured zip, summed at each zip's centroid, then log-normalized
+ * to 0..100.
  *
- * O(N²) worst case but cutoff makes it effectively O(N·K) where K is
- * the average number of zips within the cutoff radius. For ~3000 zips
- * in FR this finishes in ~100 ms.
+ * The previous implementation used a weighted AVERAGE which pulled every
+ * zip toward the local mean — clusters of high-scoring zips ended up
+ * with near-identical scoreSmoothed values (the user reported seeing
+ * the whole top-band compressed to 86..97 with no visible decay). We
+ * want the opposite: a zip near MANY high-count zips should be hottest,
+ * and the heat should fall off with distance.
+ *
+ * For each centroid X:
+ *
+ *   heat(X) = Σ_Y count(Y) × exp(-d(X,Y)² / (2σ²))
+ *
+ * X's own contribution is included (Y=X, d=0, weight=1) so an isolated
+ * high-count zip still has meaningful heat. Then log-normalize globally
+ * so the long tail (which is heavy in catchment distributions) stays
+ * visible:
+ *
+ *   scoreSmoothed = round(100 × log(heat+1) / log(maxHeat+1)), clamped ≥1.
+ *
+ * O(N²) worst case but the cutoff makes it effectively O(N·K).
  */
 function smoothScores(rows: ZipAffinityRow[]): void {
   const cutoffKm = SMOOTH_SIGMA_KM * SMOOTH_CUTOFF_SIGMA;
   const twoSigmaSq = 2 * SMOOTH_SIGMA_KM * SMOOTH_SIGMA_KM;
-  // Pre-extract valid (centroid, score) pairs.
-  const pts: Array<{ idx: number; lat: number; lng: number; score: number }> = [];
+  const pts: Array<{ idx: number; lat: number; lng: number; intensity: number }> = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     if (r.centroidLat != null && r.centroidLng != null
         && Number.isFinite(r.centroidLat) && Number.isFinite(r.centroidLng)) {
-      pts.push({ idx: i, lat: r.centroidLat, lng: r.centroidLng, score: r.scoreRaw });
+      // Use raw unique-device count as the heat-source intensity. A zip
+      // with 50× the visitors of another emits 50× as much "warmth" to
+      // its neighborhood. (Falling back to scoreRaw here would flatten
+      // hotspots because the percentile rank collapses the order-of-
+      // magnitude differences between top-tier and mid-tier zips.)
+      pts.push({ idx: i, lat: r.centroidLat, lng: r.centroidLng, intensity: r.count });
     }
   }
+  if (pts.length === 0) return;
+
+  const heats = new Map<number, number>();
+  let maxHeat = 0;
   for (const p of pts) {
-    let weightSum = 0;
-    let weightedScoreSum = 0;
+    let heat = 0;
     for (const q of pts) {
       const d = distanceKm(p.lat, p.lng, q.lat, q.lng);
       if (d > cutoffKm) continue;
-      const w = Math.exp(-(d * d) / twoSigmaSq);
-      weightSum += w;
-      weightedScoreSum += w * q.score;
+      heat += q.intensity * Math.exp(-(d * d) / twoSigmaSq);
     }
-    rows[p.idx].scoreSmoothed = weightSum > 0
-      ? Math.round(weightedScoreSum / weightSum)
-      : rows[p.idx].scoreRaw;
+    heats.set(p.idx, heat);
+    if (heat > maxHeat) maxHeat = heat;
+  }
+
+  if (maxHeat <= 0) return;
+  const logMax = Math.log(maxHeat + 1);
+  for (const [idx, heat] of heats.entries()) {
+    rows[idx].scoreSmoothed = heat > 0
+      ? Math.max(1, Math.round(100 * Math.log(heat + 1) / logMax))
+      : 0;
   }
 }
