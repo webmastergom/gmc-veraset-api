@@ -350,6 +350,9 @@ export interface PersonaState {
     rangeTo: string;
     country: string;
     poiToBrand: Array<{ poiId: string; brand: string }>;
+    /** Mean of all POI lat/lng for this source. Used as the reference
+     *  point for the distance-decay Lift sub-index in zip affinity. */
+    poiCentroid?: { lat: number; lng: number };
   }>;
   /** SELECT * download queries per source. */
   downloadQueries?: Record<string, { queryId: string; csvKey: string }>;

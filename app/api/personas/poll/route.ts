@@ -184,6 +184,14 @@ interface PerSourceMeta {
   rangeTo: string;
   country: string;
   poiToBrand: Array<{ poiId: string; brand: string }>;
+  /**
+   * Mean of all POI lat/lng for this source — used downstream as the
+   * "reference point" for the Lift sub-index in zip affinity (distance-
+   * weighted expected visitor share). For sources where POIs are spread
+   * across a country, this centroid is a coarse summary; if Lift looks
+   * wrong, upgrade to nearest-POI distance per zip.
+   */
+  poiCentroid?: { lat: number; lng: number };
 }
 
 async function fireFeatureCtasForSource(args: {
@@ -206,6 +214,12 @@ async function fireFeatureCtasForSource(args: {
   if (poiCoords.length === 0) {
     throw new Error(`No POI coords for source ${source.label}`);
   }
+  // Precompute the simple mean centroid — used downstream as the reference
+  // point for the Lift sub-index in zip affinity.
+  const poiCentroid = {
+    lat: poiCoords.reduce((s, p) => s + p.lat, 0) / poiCoords.length,
+    lng: poiCoords.reduce((s, p) => s + p.lng, 0) / poiCoords.length,
+  };
 
   // Resolve brand for each POI using a 3-layer strategy:
   //   1. GeoJSON properties (brand / chain / cadena / marca / concesionaria / …)
@@ -340,6 +354,7 @@ async function fireFeatureCtasForSource(args: {
       rangeTo: source.rangeTo,
       country: source.country || '',
       poiToBrand,
+      poiCentroid,
     },
   };
 }
