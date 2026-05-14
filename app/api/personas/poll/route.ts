@@ -62,7 +62,10 @@ import {
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+// Bumped from 120 → 300 (Vercel Pro max) because the clustering phase combines
+// phaseDownloadRead (~30-40s) + phaseClusterAndAggregate (~60-90s) and was
+// hitting the timeout on large megajobs. 300s gives comfortable headroom.
+export const maxDuration = 300;
 
 const STATE_KEY = (runId: string) => `persona-state/${runId}`;
 const REPORT_KEY = (runId: string) => `persona-reports/${runId}`;
