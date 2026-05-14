@@ -74,6 +74,16 @@ const REPORT_KEY = (runId: string) => `persona-reports/${runId}`;
 // array — JSON.stringify on a 500k-row DeviceFeatures[] OOMs the function.
 // Features live in memory only for the duration of the clustering phase.)
 const CLUSTER_DATA_KEY = (runId: string) => `persona-cluster-data/${runId}`;
+// Multi-phase geocoding:
+//   geocode_cells stream-aggregates unique 0.1° lat/lng cells from devices
+//   with missing home_zip and persists the cellMap (small) here.
+//   geocode_lookup loads the cellMap, reverse-geocodes the unique cells, and
+//   persists the cell→zip map here. clustering re-streams the CSV and uses
+//   the cell→zip map to fill home_zip for devices that lacked it. Splitting
+//   keeps the 600k-device cellMap + the country GeoJSON from co-existing in
+//   memory (which OOMs the Vercel function even at 3008 MB).
+const CELLS_KEY = (runId: string) => `persona-cells/${runId}`;
+const CELL_ZIP_KEY = (runId: string) => `persona-cell-zip/${runId}`;
 
 // Hash a config to a stable runId.
 //
@@ -657,121 +667,201 @@ async function streamAthenaCsv<T>(
   return { rows: out, lineCount };
 }
 
+/** Round lat/lng to 1 decimal (~11 km cells) for cell-key dedupe. */
+function cellKey(lat: number, lng: number): string {
+  return `${lat.toFixed(1)},${lng.toFixed(1)}`;
+}
+
 async function phaseDownloadRead(
   state: PersonaState,
+  cellToZip: Map<string, string> | null,
   progress?: (step: string) => Promise<void>
 ): Promise<{ state: PersonaState; features: DeviceFeatures[] }> {
   if (!state.downloadQueries) throw new Error('No downloadQueries');
   const all: DeviceFeatures[] = [];
+  let cellLookupHits = 0;
   for (const [src, { queryId }] of Object.entries(state.downloadQueries)) {
-    await progress?.(`1a/4 streamAthenaCsv start (src=${src.slice(0,8)})`);
-    const { rows } = await streamAthenaCsv(queryId, (r): DeviceFeatures => ({
-      ad_id: String(r.ad_id || ''),
-      total_visits: parseInt(r.total_visits, 10) || 0,
-      total_dwell_min: parseFloat(r.total_dwell_min) || 0,
-      recency_days: parseInt(r.recency_days, 10) || 0,
-      avg_dwell_min: parseFloat(r.avg_dwell_min) || 0,
-      morning_share: parseFloat(r.morning_share) || 0,
-      midday_share: parseFloat(r.midday_share) || 0,
-      afternoon_share: parseFloat(r.afternoon_share) || 0,
-      evening_share: parseFloat(r.evening_share) || 0,
-      night_share: parseFloat(r.night_share) || 0,
-      weekend_share: parseFloat(r.weekend_share) || 0,
-      friday_evening_share: parseFloat(r.friday_evening_share) || 0,
-      gyration_km: parseFloat(r.gyration_km) || 0,
-      unique_h3_cells: parseInt(r.unique_h3_cells, 10) || 0,
-      home_zip: String(r.home_zip || '').trim(),
-      home_region: String(r.home_region || '').trim(),
-      home_lat: r.home_lat ? parseFloat(r.home_lat) : null,
-      home_lng: r.home_lng ? parseFloat(r.home_lng) : null,
-      gps_share: parseFloat(r.gps_share) || 0,
-      avg_circle_score: parseFloat(r.avg_circle_score) || 0,
-      brand_visits: parseBrandJson(r.brand_visits_json),
-      brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
-      tier_high_quality: r.tier_high_quality === 'true',
-      source_megajob_id: src,
-    }));
+    await progress?.(`1a/3 streamAthenaCsv start (src=${src.slice(0,8)})`);
+    const { rows } = await streamAthenaCsv(queryId, (r): DeviceFeatures => {
+      // Resolve home_zip in one pass: prefer the CTAS-native value, fall
+      // back to the pre-computed cell→zip map when missing. No second
+      // pass over the features array, no 600k-string adZip map.
+      let homeZip = String(r.home_zip || '').trim();
+      const lat = r.home_lat ? parseFloat(r.home_lat) : null;
+      const lng = r.home_lng ? parseFloat(r.home_lng) : null;
+      if (!homeZip && cellToZip && lat != null && lng != null
+          && Number.isFinite(lat) && Number.isFinite(lng)) {
+        const zipFromCell = cellToZip.get(cellKey(lat, lng));
+        if (zipFromCell) {
+          homeZip = zipFromCell;
+          cellLookupHits++;
+        }
+      }
+      return {
+        ad_id: String(r.ad_id || ''),
+        total_visits: parseInt(r.total_visits, 10) || 0,
+        total_dwell_min: parseFloat(r.total_dwell_min) || 0,
+        recency_days: parseInt(r.recency_days, 10) || 0,
+        avg_dwell_min: parseFloat(r.avg_dwell_min) || 0,
+        morning_share: parseFloat(r.morning_share) || 0,
+        midday_share: parseFloat(r.midday_share) || 0,
+        afternoon_share: parseFloat(r.afternoon_share) || 0,
+        evening_share: parseFloat(r.evening_share) || 0,
+        night_share: parseFloat(r.night_share) || 0,
+        weekend_share: parseFloat(r.weekend_share) || 0,
+        friday_evening_share: parseFloat(r.friday_evening_share) || 0,
+        gyration_km: parseFloat(r.gyration_km) || 0,
+        unique_h3_cells: parseInt(r.unique_h3_cells, 10) || 0,
+        home_zip: homeZip,
+        home_region: String(r.home_region || '').trim(),
+        home_lat: lat,
+        home_lng: lng,
+        gps_share: parseFloat(r.gps_share) || 0,
+        avg_circle_score: parseFloat(r.avg_circle_score) || 0,
+        brand_visits: parseBrandJson(r.brand_visits_json),
+        brand_loyalty_hhi: parseFloat(r.brand_loyalty_hhi) || 0,
+        tier_high_quality: r.tier_high_quality === 'true',
+        source_megajob_id: src,
+      };
+    });
     for (const f of rows) all.push(f);
-    await progress?.(`1b/4 streamAthenaCsv done: ${rows.length} rows`);
-    console.log(`[PERSONAS ${state.runId}] Streamed ${rows.length} rows for ${src} (queryId=${queryId})`);
+    await progress?.(`1b/3 streamAthenaCsv done: ${rows.length} rows (${cellLookupHits} zips resolved via cellMap)`);
+    console.log(`[PERSONAS ${state.runId}] Streamed ${rows.length} rows for ${src} (queryId=${queryId}, cellLookupHits=${cellLookupHits})`);
   }
-
-  // Reverse-geocode fallback for devices missing home_zip (BASIC schema, or
-  // FULL with sparse zipcode coverage). We use the home_lat/home_lng pair
-  // we materialized in the feature CTAS — these are night-mode (with
-  // any-hour fallback) averages of the device's location, so they
-  // approximate the residential address. Reverse-geocoding through
-  // lib/reverse-geocode resolves them to local postal codes.
-  const missing = all.filter(
-    (f) => (!f.home_zip || !f.home_zip.trim())
-      && f.home_lat != null && f.home_lng != null
-      && Number.isFinite(f.home_lat) && Number.isFinite(f.home_lng)
-  );
-  await progress?.(`1c/4 geocode check: ${missing.length} missing zips of ${all.length} total`);
-  // Bail on the geocoding fallback for very large datasets. The FR/MX/etc.
-  // GeoJSON catalogs plus a 600k-device cellMap reliably OOM-kill the Vercel
-  // function before our try/catch can run. Without home_zip, zip-based
-  // breakdowns (topZips, zipAffinity, NSE) will be empty but clustering,
-  // RFM, and persona discovery still work fully.
-  const GEOCODE_FALLBACK_LIMIT = 200_000;
-  if (missing.length > GEOCODE_FALLBACK_LIMIT) {
-    console.warn(
-      `[PERSONAS ${state.runId}] Skipping reverse-geocode fallback: ` +
-      `${missing.length} missing > ${GEOCODE_FALLBACK_LIMIT} limit (would OOM the function)`,
-    );
-    await progress?.(`1c/4 geocode SKIPPED (${missing.length} > ${GEOCODE_FALLBACK_LIMIT} limit)`);
-  } else if (missing.length > 0) {
-    try {
-      const country = await guessCountry(state);
-      if (country) setCountryFilter([country]);
-      // Round to 1 decimal (~11km cells) so we batch-geocode at most a
-      // few thousand unique points instead of millions of devices.
-      const cellMap = new Map<string, { lat: number; lng: number; ads: string[] }>();
-      for (const f of missing) {
-        const key = `${(f.home_lat as number).toFixed(1)},${(f.home_lng as number).toFixed(1)}`;
-        let cell = cellMap.get(key);
-        if (!cell) {
-          cell = { lat: f.home_lat as number, lng: f.home_lng as number, ads: [] };
-          cellMap.set(key, cell);
-        }
-        cell.ads.push(f.ad_id);
-      }
-      const points = Array.from(cellMap.values()).map((c) => ({
-        lat: c.lat, lng: c.lng, deviceCount: c.ads.length,
-      }));
-      const results = await batchReverseGeocode(points);
-      const adZip = new Map<string, string>();
-      const cells = Array.from(cellMap.values());
-      for (let i = 0; i < cells.length; i++) {
-        const r = results[i];
-        if (r.type === 'geojson_local' && r.postcode) {
-          for (const ad of cells[i].ads) adZip.set(ad, r.postcode);
-        }
-      }
-      let resolvedCount = 0;
-      for (const f of all) {
-        if ((!f.home_zip || !f.home_zip.trim()) && adZip.has(f.ad_id)) {
-          f.home_zip = adZip.get(f.ad_id) || '';
-          if (f.home_zip) resolvedCount++;
-        }
-      }
-      console.log(
-        `[PERSONAS ${state.runId}] Reverse-geocoded ${resolvedCount}/${missing.length} ` +
-        `missing home_zip via ${cellMap.size} unique cells (country=${country || 'auto'})`
-      );
-    } catch (e: any) {
-      console.warn(`[PERSONAS ${state.runId}] Reverse-geocode fallback failed: ${e?.message || e}`);
-    }
-  }
-  await progress?.(`1d/4 phaseDownloadRead done`);
+  await progress?.(`1c/3 phaseDownloadRead done: ${all.length} features ready`);
 
   const subProgress = {
     label: `Loaded ${all.length.toLocaleString()} feature rows`,
-    details: 'Ready for clustering',
+    details: cellToZip
+      ? `${cellLookupHits.toLocaleString()} home_zips resolved via reverse-geocode cellMap`
+      : 'Ready for clustering',
   };
   return {
     state: { ...state, phase: 'clustering', subProgress, updatedAt: new Date().toISOString() },
     features: all,
+  };
+}
+
+// ─── Phase: geocode_cells (multi-phase reverse-geocoding, step 1/2) ──
+//
+// Stream the SELECT * CSV for each source with a lightweight parser that
+// only extracts home_zip + home_lat + home_lng. Aggregate the unique
+// 0.1° lat/lng cells of devices that lack home_zip into a single Map
+// keyed by `lat.toFixed(1),lng.toFixed(1)`. Persist the small cellMap
+// to S3 for geocode_lookup to consume.
+//
+// Memory budget: ~50 MB (stream buffer + Map of a few thousand cells).
+// Never materializes the full DeviceFeatures array.
+
+interface CellsArtifact {
+  /** Total rows seen across all sources. */
+  totalRows: number;
+  /** Devices that need reverse-geocode (no native zip, valid lat/lng). */
+  missingRows: number;
+  /** Unique 0.1° cells with at least one missing-zip device. */
+  cells: Array<{ key: string; lat: number; lng: number; deviceCount: number }>;
+}
+
+async function phaseGeocodeCells(state: PersonaState): Promise<PersonaState> {
+  if (!state.downloadQueries) throw new Error('No downloadQueries');
+  const cellMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+  let totalRows = 0;
+  let missingRows = 0;
+  for (const [, { queryId }] of Object.entries(state.downloadQueries)) {
+    await streamAthenaCsv(queryId, (r): null => {
+      totalRows++;
+      const homeZip = String(r.home_zip || '').trim();
+      if (homeZip) return null;
+      const lat = r.home_lat ? parseFloat(r.home_lat) : NaN;
+      const lng = r.home_lng ? parseFloat(r.home_lng) : NaN;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+      missingRows++;
+      const roundedLat = Math.round(lat * 10) / 10;
+      const roundedLng = Math.round(lng * 10) / 10;
+      const key = `${roundedLat.toFixed(1)},${roundedLng.toFixed(1)}`;
+      const cell = cellMap.get(key);
+      if (cell) {
+        cell.deviceCount++;
+      } else {
+        cellMap.set(key, { lat: roundedLat, lng: roundedLng, deviceCount: 1 });
+      }
+      return null;
+    });
+  }
+  const artifact: CellsArtifact = {
+    totalRows,
+    missingRows,
+    cells: Array.from(cellMap.entries()).map(([key, c]) => ({
+      key, lat: c.lat, lng: c.lng, deviceCount: c.deviceCount,
+    })),
+  };
+  await putConfig(CELLS_KEY(state.runId), artifact, { compact: true });
+  console.log(
+    `[PERSONAS ${state.runId}] geocode_cells: ${totalRows} rows, ` +
+    `${missingRows} missing zips → ${artifact.cells.length} unique 0.1° cells`,
+  );
+  return {
+    ...state,
+    phase: 'geocode_lookup',
+    subProgress: {
+      label: `Aggregated ${artifact.cells.length.toLocaleString()} unique cells`,
+      details: `${missingRows.toLocaleString()} devices need reverse-geocode of ${totalRows.toLocaleString()} total`,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+// ─── Phase: geocode_lookup (multi-phase reverse-geocoding, step 2/2) ─
+//
+// Load the cellMap, reverse-geocode the unique cells (small input —
+// usually a few thousand points), and persist the cell→zip map for
+// clustering to consume during its CSV re-stream.
+
+async function phaseGeocodeLookup(state: PersonaState): Promise<PersonaState> {
+  const artifact = await getConfig<CellsArtifact>(CELLS_KEY(state.runId));
+  if (!artifact) throw new Error('Cell artifact not found — re-run from geocode_cells');
+  const cellToZip: Record<string, string> = {};
+  if (artifact.cells.length === 0) {
+    // All devices already had home_zip from the CTAS — nothing to do.
+    await putConfig(CELL_ZIP_KEY(state.runId), cellToZip, { compact: true });
+    return {
+      ...state,
+      phase: 'clustering',
+      subProgress: { label: 'No reverse-geocoding needed', details: 'All devices have home_zip from CTAS' },
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  const country = await guessCountry(state);
+  if (country) setCountryFilter([country]);
+  try {
+    const points = artifact.cells.map((c) => ({
+      lat: c.lat, lng: c.lng, deviceCount: c.deviceCount,
+    }));
+    const results = await batchReverseGeocode(points);
+    let resolved = 0;
+    for (let i = 0; i < artifact.cells.length; i++) {
+      const r = results[i];
+      if ((r.type === 'geojson_local' || r.type === 'nominatim_match') && r.postcode) {
+        cellToZip[artifact.cells[i].key] = r.postcode;
+        resolved++;
+      }
+    }
+    console.log(
+      `[PERSONAS ${state.runId}] geocode_lookup: ${resolved}/${artifact.cells.length} cells resolved ` +
+      `(country=${country || 'auto'})`,
+    );
+  } finally {
+    if (country) setCountryFilter(null);
+  }
+  await putConfig(CELL_ZIP_KEY(state.runId), cellToZip, { compact: true });
+  return {
+    ...state,
+    phase: 'clustering',
+    subProgress: {
+      label: `Resolved ${Object.keys(cellToZip).length.toLocaleString()} cell→zip mappings`,
+      details: `Country: ${country || 'auto'}`,
+    },
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -1272,30 +1362,27 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         case 'download' as any:
           state = await phaseDownloadQuery(state);
           break;
-        case 'download_read': {
-          // No-op transition — defer the actual work to `clustering`. Persisting
-          // the parsed DeviceFeatures[] (which is ~360 MB JSON for 500k devices)
-          // OOMs the Vercel function during JSON.stringify, so we keep features
-          // in memory only for the duration of the clustering phase instead.
-          state = {
-            ...state,
-            phase: 'clustering',
-            updatedAt: new Date().toISOString(),
-          };
+        case 'download_read':
+          // No-op transition: route to multi-phase geocoding. Stage 1
+          // (geocode_cells) re-streams the CSV with a lightweight parser
+          // that only extracts home_zip + lat/lng, then aggregates unique
+          // 0.1° cells of devices missing home_zip. Splitting the
+          // reverse-geocode out of the heavy clustering function gives the
+          // country GeoJSON + cellMap their own memory budget.
+          state = { ...state, phase: 'geocode_cells', updatedAt: new Date().toISOString() };
           break;
-        }
+        case 'geocode_cells':
+          state = await phaseGeocodeCells(state);
+          break;
+        case 'geocode_lookup':
+          state = await phaseGeocodeLookup(state);
+          break;
         case 'clustering': {
-          // Read CSV from S3, parse to DeviceFeatures[], reverse-geocode missing
-          // home_zips, then run k-means + RFM + cohabitation + zip affinity +
-          // insights. The features array stays in memory the entire phase —
-          // never serialized to JSON, which keeps us under Vercel's 1024 MB
-          // memory ceiling. This is heavier than ideal (download + cluster in
-          // the same 120s budget) but avoids the OOM we hit trying to persist
-          // features to S3 between phases.
-          // Diagnostic step tracking: write each step to state.subProgress so a
-          // hard crash (OOM, segfault, Vercel kill) leaves a breadcrumb in S3
-          // even when the outer catch doesn't get to run. Each writeStep call
-          // is best-effort; failures are swallowed.
+          // Read CSV from S3, parse to DeviceFeatures[] (with pre-computed
+          // cell→zip map for missing zips from the geocoding phases), then
+          // run k-means + RFM + cohabitation + zip affinity + insights.
+          // Diagnostic step tracking: write each step to state.subProgress
+          // so a hard crash (OOM, Vercel kill) leaves a breadcrumb in S3.
           let currentStep = 'init';
           const stateRunId = state.runId;
           const baseState = state;
@@ -1311,8 +1398,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
             } catch {}
           };
           try {
-            await writeStep('1/4 phaseDownloadRead start');
-            const { state: ns, features } = await phaseDownloadRead(state, writeStep);
+            await writeStep('0/4 load cell→zip map');
+            // Tolerate a missing cell-zip artifact (e.g. resumed from older
+            // state). Without it, devices without native home_zip will just
+            // have empty home_zip — clustering still works.
+            const cellToZipObj = (await getConfig<Record<string, string>>(CELL_ZIP_KEY(state.runId))) || {};
+            const cellToZip = new Map(Object.entries(cellToZipObj));
+            await writeStep(`1/4 phaseDownloadRead start (cellMap: ${cellToZip.size} entries)`);
+            const { state: ns, features } = await phaseDownloadRead(state, cellToZip, writeStep);
             await writeStep(`2/4 phaseClusterAndAggregate start (${features.length} features)`);
             const { state: ns2, report, clusterAssignments, clusterNames } =
               await phaseClusterAndAggregate(ns, features);
@@ -1415,8 +1508,10 @@ function phasePercent(phase: PersonaPhase): number {
     enrichment_polling: 42,
     download_query: 48,
     download_polling: 56,
-    download_read: 65,
-    clustering: 75,
+    download_read: 60,
+    geocode_cells: 64,
+    geocode_lookup: 70,
+    clustering: 78,
     aggregation: 82,
     master_maids_export: 88,
     export_polling: 95,
@@ -1436,7 +1531,9 @@ function phaseMessage(phase: PersonaPhase): string {
     enrichment_polling: 'Waiting for enrichment…',
     download_query: 'Launching feature-vector download…',
     download_polling: 'Streaming feature vectors from Athena',
-    download_read: 'Loading feature vectors into memory',
+    download_read: 'Preparing feature vectors…',
+    geocode_cells: 'Aggregating geographic cells from devices',
+    geocode_lookup: 'Reverse-geocoding cells to postal codes',
     clustering: 'Discovering clusters with k-means',
     aggregation: 'Aggregating per-persona stats + insights',
     master_maids_export: 'Exporting personas to Master MAIDs',

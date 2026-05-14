@@ -308,8 +308,10 @@ export type PersonaPhase =
   | 'enrichment_polling'
   | 'download_query'      // launch SELECT * async
   | 'download_polling'    // wait for SELECT to finish
-  | 'download_read'       // stream CSV from S3 + parse
-  | 'clustering'
+  | 'download_read'       // stream CSV from S3 + parse (now: no-op transition to geocode_cells)
+  | 'geocode_cells'       // stream CSV (lite) → aggregate unique 0.1° cells → S3
+  | 'geocode_lookup'      // load cellMap → batchReverseGeocode unique cells → cell→zip map to S3
+  | 'clustering'          // stream CSV → features with zip lookup → k-means + report
   | 'aggregation'
   | 'master_maids_export'
   | 'export_polling'
