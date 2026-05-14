@@ -108,13 +108,21 @@ export async function GET(
       const report = await getConsolidatedReport<ConsolidatedCatchmentReport>(id, 'catchment');
       if (!report) return NextResponse.json({ error: 'Catchment report not found' }, { status: 404 });
 
-      // affinity_index_0_100: device_days normalized to the top zip (0..100).
-      // Lets users see at a glance which zips dominate the catchment without
-      // computing a max over all rows themselves.
+      // affinity_index_0_100: LOGARITHMIC normalization of device_days against
+      // the top zip. Catchment distributions are heavy-tailed (one dominant
+      // origin + a long tail of smaller zips), so a linear scale to max
+      // floors most of the tail to 0 — making the column useless for
+      // visualization. log keeps the top at 100 and lifts mid/low-tier
+      // zips into the visible 5..70 range. Any zip with device_days > 0
+      // is clamped to at least 1 so "has activity" is always distinguishable
+      // from "no activity".
       const maxDeviceDays = report.byZipCode.reduce((m, z) => Math.max(m, z.deviceDays), 0) || 1;
+      const logMax = Math.log(maxDeviceDays + 1);
       const header = 'postal_code,city,country,devices,share_percentage,affinity_index_0_100';
       const rows = report.byZipCode.map((z) => {
-        const affinity = Math.round(100 * z.deviceDays / maxDeviceDays);
+        const affinity = z.deviceDays > 0
+          ? Math.max(1, Math.round(100 * Math.log(z.deviceDays + 1) / logMax))
+          : 0;
         return `${escCsv(z.zipCode)},${escCsv(z.city)},${escCsv(z.country)},${z.deviceDays},${z.sharePercentage ?? 0},${affinity}`;
       });
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-catchment.csv`);

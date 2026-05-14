@@ -1062,9 +1062,12 @@ export default function DatasetAnalysisPage() {
                   onClick={() => {
                     const total = catchmentReport.totalDeviceDays || 1;
                     const sorted = [...catchmentReport.byZipCode].sort((a, b) => b.deviceDays - a.deviceDays);
-                    // Top zip's device_days = 100; everyone else scales linearly.
-                    // Gives an at-a-glance "intensity" column for the catchment.
+                    // Logarithmic normalization vs top zip. Linear-to-max
+                    // collapsed the long tail (most zips → 0) because catchment
+                    // distributions are heavy-tailed. log preserves the top
+                    // at 100 and lifts mid/low-tier zips into visible 5..70.
                     const maxDays = sorted[0]?.deviceDays || 1;
+                    const logMax = Math.log(maxDays + 1);
                     const cleanZip = (z: string) => z.replace(/^["']+|["']+$/g, '').replace(/^[A-Z]{2}[-\s]/, '');
                     downloadCsv(
                       `${datasetName}-catchment-zipcodes.csv`,
@@ -1075,7 +1078,9 @@ export default function DatasetAnalysisPage() {
                         z.country,
                         z.deviceDays,
                         ((z.deviceDays / total) * 100).toFixed(2),
-                        Math.round(100 * z.deviceDays / maxDays),
+                        z.deviceDays > 0
+                          ? Math.max(1, Math.round(100 * Math.log(z.deviceDays + 1) / logMax))
+                          : 0,
                         z.lat,
                         z.lng,
                       ])
