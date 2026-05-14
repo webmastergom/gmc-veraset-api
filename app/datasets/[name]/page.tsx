@@ -1062,16 +1062,20 @@ export default function DatasetAnalysisPage() {
                   onClick={() => {
                     const total = catchmentReport.totalDeviceDays || 1;
                     const sorted = [...catchmentReport.byZipCode].sort((a, b) => b.deviceDays - a.deviceDays);
+                    // Top zip's device_days = 100; everyone else scales linearly.
+                    // Gives an at-a-glance "intensity" column for the catchment.
+                    const maxDays = sorted[0]?.deviceDays || 1;
                     const cleanZip = (z: string) => z.replace(/^["']+|["']+$/g, '').replace(/^[A-Z]{2}[-\s]/, '');
                     downloadCsv(
                       `${datasetName}-catchment-zipcodes.csv`,
-                      ['zip_code', 'city', 'country', 'device_days', 'share_pct', 'lat', 'lng'],
+                      ['zip_code', 'city', 'country', 'device_days', 'share_pct', 'affinity_index_0_100', 'lat', 'lng'],
                       sorted.map((z) => [
                         cleanZip(z.zipCode),
                         z.city,
                         z.country,
                         z.deviceDays,
                         ((z.deviceDays / total) * 100).toFixed(2),
+                        Math.round(100 * z.deviceDays / maxDays),
                         z.lat,
                         z.lng,
                       ])
