@@ -939,47 +939,75 @@ async function computeAffinityReport(
     }
   }
 
-  // ── Step 2: Score "hot" CPs at 85-100 ──────────────────────────
-  const zips = Array.from(zipMap.values()).filter(z => z.zipCode !== 'UNKNOWN');
-  const maxDwell = Math.max(1, ...zips.map(z => z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0));
-  const maxFreq = Math.max(1, ...zips.map(z => z.freqCount > 0 ? z.freqSum / z.freqCount : 0));
+  // ── Step 2: Build heat field — unified scoring across hot + adjacent ──
+  //
+  // The previous implementation hard-clamped hot CPs to 85..100 and
+  // scored adjacent CPs in fixed distance rings (65-84 / 40-64 / 15-39 /
+  // 1-14). Two problems:
+  //   - Hot CPs were compressed into a 16-point band with almost no
+  //     differentiation (user's complaint: "solo veo 86 a 97").
+  //   - The split between hot and adjacent was an artificial step;
+  //     the same physical model (heat radiating from sources) describes
+  //     both better.
+  //
+  // Replace with a Gaussian heat field. Each measured zip is a heat
+  // source with intensity proportional to visit volume × engagement.
+  // Every zip (measured + neighboring polygons in the country GeoJSON)
+  // gets a heat value = Σ intensity × exp(-d²/2σ²). Then log-normalize
+  // globally to 0..100 so the long tail stays visible.
+  const SIGMA_KM = 12;
+  const CUTOFF_KM = SIGMA_KM * 3;
+  const twoSigmaSq = 2 * SIGMA_KM * SIGMA_KM;
 
-  const hotCps: AffinityByZip[] = zips.map(z => {
+  const zips = Array.from(zipMap.values()).filter(z => z.zipCode !== 'UNKNOWN');
+
+  // Heat-source intensity per measured zip. Volume (totalVisitDays) is
+  // the primary signal; engagement (dwell + freq) is a multiplicative
+  // booster via log1p so it doesn't dominate at extreme values.
+  type HotSource = typeof zips[0] & {
+    avgDwell: number; avgFreq: number; intensity: number;
+  };
+  const hotSources: HotSource[] = zips.map(z => {
     const avgDwell = z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0;
     const avgFreq = z.freqCount > 0 ? z.freqSum / z.freqCount : 1;
-    const rawScore = (avgDwell / maxDwell) * 0.5 + (avgFreq / maxFreq) * 0.5;
-    // Scale to 85-100
-    const affinityIndex = Math.round(85 + rawScore * 15);
-
-    return {
-      zipCode: z.zipCode, city: z.city, country: z.country,
-      lat: z.lat, lng: z.lng,
-      uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
-      avgDwellMinutes: Math.round(avgDwell * 10) / 10,
-      avgFrequency: Math.round(avgFreq * 100) / 100,
-      affinityIndex,
-    };
+    // engagement multiplier: log1p(dwell/30)+log1p(freq/2) — both grow
+    // with the signal but neither alone can swamp the other.
+    const engagementBoost = 1 + Math.log1p(avgDwell / 30) + Math.log1p(avgFreq / 2);
+    const intensity = Math.max(1, z.totalVisitDays) * engagementBoost;
+    return { ...z, avgDwell, avgFreq, intensity };
   });
 
-  // ── Step 3: Geographic decay — adjacent CPs scored progressively lower ──
-  const adjacentCps: AffinityByZip[] = [];
+  const heatAt = (lat: number, lng: number): number => {
+    let heat = 0;
+    for (const q of hotSources) {
+      const d = haversineKm(lat, lng, q.lat, q.lng);
+      if (d > CUTOFF_KM) continue;
+      heat += q.intensity * Math.exp(-(d * d) / twoSigmaSq);
+    }
+    return heat;
+  };
 
-  if (country && hotCps.length > 0) {
+  // Heat at every measured zip's own centroid (includes self-contribution).
+  const hotWithHeat = hotSources.map(z => ({ ...z, heat: heatAt(z.lat, z.lng) }));
+
+  // ── Step 3: Neighboring polygons from country GeoJSON ──────────
+  type AdjacentRaw = {
+    zipCode: string; city: string; country: string;
+    lat: number; lng: number; heat: number;
+  };
+  const adjacentRaw: AdjacentRaw[] = [];
+  if (country && hotSources.length > 0) {
     try {
       const fs = await import('fs');
       const path = await import('path');
       const geojsonPath = path.join(process.cwd(), 'data', 'geojson', `${country}.geojson`);
-
       if (fs.existsSync(geojsonPath)) {
         const geojson = JSON.parse(fs.readFileSync(geojsonPath, 'utf-8'));
-        const hotSet = new Set(hotCps.map(h => h.zipCode));
-
-        // Compute centroid for each GeoJSON feature
+        const hotSet = new Set(hotSources.map(h => h.zipCode));
         for (const feature of geojson.features) {
           const cp = feature.properties?.postal_code || feature.properties?.postcode || '';
           if (!cp || hotSet.has(cp)) continue;
 
-          // Quick centroid from bbox or first coordinate
           let cLat = 0, cLng = 0;
           if (feature.properties?.latitude && feature.properties?.longitude) {
             cLat = parseFloat(feature.properties.latitude);
@@ -988,58 +1016,57 @@ async function computeAffinityReport(
             cLat = (feature.bbox[1] + feature.bbox[3]) / 2;
             cLng = (feature.bbox[0] + feature.bbox[2]) / 2;
           } else {
-            // Extract from geometry
             const coords = feature.geometry?.coordinates;
             if (!coords) continue;
-            const flat = feature.geometry.type === 'MultiPolygon'
-              ? coords[0][0] : coords[0];
+            const flat = feature.geometry.type === 'MultiPolygon' ? coords[0][0] : coords[0];
             if (!flat?.length) continue;
             const sumLat = flat.reduce((s: number, c: number[]) => s + c[1], 0);
             const sumLng = flat.reduce((s: number, c: number[]) => s + c[0], 0);
             cLat = sumLat / flat.length;
             cLng = sumLng / flat.length;
           }
-
           if (!cLat || !cLng) continue;
 
-          // Find distance to nearest hot CP
-          let minDist = Infinity;
-          for (const hot of hotCps) {
-            const d = haversineKm(cLat, cLng, hot.lat, hot.lng);
-            if (d < minDist) minDist = d;
-          }
-
-          // Decay by distance rings
-          let score = 0;
-          if (minDist <= 5) {
-            score = Math.round(65 + (1 - minDist / 5) * 19);        // 65-84
-          } else if (minDist <= 15) {
-            score = Math.round(40 + (1 - (minDist - 5) / 10) * 24); // 40-64
-          } else if (minDist <= 30) {
-            score = Math.round(15 + (1 - (minDist - 15) / 15) * 24); // 15-39
-          } else if (minDist <= 50) {
-            score = Math.round(1 + (1 - (minDist - 30) / 20) * 13);  // 1-14
-          }
-
-          if (score > 0) {
-            const city = feature.properties?.city || feature.properties?.estado || '';
-            adjacentCps.push({
-              zipCode: cp, city, country: country,
-              lat: cLat, lng: cLng,
-              uniqueDevices: 0, totalVisitDays: 0,
-              avgDwellMinutes: 0, avgFrequency: 0,
-              affinityIndex: score,
-            });
-          }
+          const heat = heatAt(cLat, cLng);
+          if (heat <= 0) continue; // outside cutoff of every source
+          const city = feature.properties?.city || feature.properties?.estado || '';
+          adjacentRaw.push({ zipCode: cp, city, country, lat: cLat, lng: cLng, heat });
         }
-        console.log(`[DS-REPORT] Affinity decay: ${hotCps.length} hot + ${adjacentCps.length} adjacent CPs`);
       }
     } catch (e: any) {
-      console.warn(`[DS-REPORT] Affinity decay failed: ${e.message}`);
+      console.warn(`[DS-REPORT] Affinity adjacent compute failed: ${e.message}`);
     }
   }
 
-  // ── Merge hot + adjacent, sort by affinity ─────────────────────
+  // ── Step 4: Normalize all heats globally to 0..100 ────────────
+  const maxHeat = Math.max(
+    1,
+    ...hotWithHeat.map(z => z.heat),
+    ...adjacentRaw.map(a => a.heat),
+  );
+  const logMax = Math.log(maxHeat + 1);
+  const scoreFor = (heat: number): number =>
+    heat > 0 ? Math.max(1, Math.round(100 * Math.log(heat + 1) / logMax)) : 0;
+
+  const hotCps: AffinityByZip[] = hotWithHeat.map(z => ({
+    zipCode: z.zipCode, city: z.city, country: z.country,
+    lat: z.lat, lng: z.lng,
+    uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
+    avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
+    avgFrequency: Math.round(z.avgFreq * 100) / 100,
+    affinityIndex: scoreFor(z.heat),
+  }));
+
+  const adjacentCps: AffinityByZip[] = adjacentRaw.map(a => ({
+    zipCode: a.zipCode, city: a.city, country: a.country,
+    lat: a.lat, lng: a.lng,
+    uniqueDevices: 0, totalVisitDays: 0,
+    avgDwellMinutes: 0, avgFrequency: 0,
+    affinityIndex: scoreFor(a.heat),
+  }));
+
+  console.log(`[DS-REPORT] Affinity: ${hotCps.length} hot + ${adjacentCps.length} adjacent CPs (maxHeat=${maxHeat.toFixed(0)})`);
+
   const allCps = [...hotCps, ...adjacentCps];
   allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
 

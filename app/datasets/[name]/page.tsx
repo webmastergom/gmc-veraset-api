@@ -1194,8 +1194,10 @@ export default function DatasetAnalysisPage() {
               icon={<Target className="h-4 w-4" />}
             >
               <p className="text-sm text-muted-foreground mb-4">
-                Affinity = 50% dwell time + 50% visit frequency. Scale 0-100.
-                {' '}{affinityReport.byZipCode.length} postal codes analyzed.
+                Affinity = Gaussian heat field over zip centroids. Each measured zip emits
+                intensity proportional to visit volume × engagement (dwell + frequency);
+                neighboring zips inherit decay-weighted heat (σ=12 km). Log-normalized 0-100.
+                {' '}{affinityReport.byZipCode.length} postal codes scored.
               </p>
               <div className="flex justify-end mb-2">
                 <Button
