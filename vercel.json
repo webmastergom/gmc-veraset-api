@@ -8,6 +8,9 @@
   "functions": {
     "app/api/personas/poll/route.ts": {
       "memory": 3008
+    },
+    "app/api/geojson/catchment/route.ts": {
+      "memory": 3008
     }
   },
   "headers": [
