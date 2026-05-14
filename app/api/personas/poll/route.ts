@@ -616,48 +616,44 @@ function parseCsvLine(line: string): string[] {
 
 /**
  * Stream the Athena result CSV from S3 (athena-results/{queryId}.csv).
- * Avoids loading the full 200-300 MB string into memory by parsing
- * line-by-line off the S3 body stream.
+ * Uses Node's readline over the S3 body stream — properly handles
+ * backpressure and never accumulates more than one line worth of bytes
+ * outside the output array. The previous string-buffer implementation
+ * appears to OOM-kill the Vercel function on 150+ MB CSVs even at 3008
+ * MB allocation (likely V8 heap fragmentation from the repeated
+ * `buffer = buffer.slice(...)` cycle).
  */
 async function streamAthenaCsv<T>(
   queryId: string,
   parseRow: (record: Record<string, string>) => T,
 ): Promise<{ rows: T[]; lineCount: number }> {
   const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+  const { createInterface } = await import('readline');
   const obj = await s3Client.send(new GetObjectCommand({
     Bucket: BUCKET,
     Key: `athena-results/${queryId}.csv`,
   }));
   if (!obj.Body) throw new Error(`Empty body for athena-results/${queryId}.csv`);
-  const body = obj.Body as any; // Node.js Readable stream
-  let buffer = '';
+  // AWS SDK v3 returns a Node Readable in the Lambda/Vercel runtime.
+  const stream = obj.Body as unknown as NodeJS.ReadableStream;
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
   let header: string[] | null = null;
   const out: T[] = [];
   let lineCount = 0;
 
-  const handleLine = (line: string) => {
-    if (!line) return;
+  for await (const line of rl) {
+    if (!line) continue;
     if (!header) {
       header = parseCsvLine(line);
-      return;
+      continue;
     }
     const cells = parseCsvLine(line);
     const rec: Record<string, string> = {};
     for (let i = 0; i < header.length; i++) rec[header[i]] = cells[i] ?? '';
     out.push(parseRow(rec));
     lineCount++;
-  };
-
-  for await (const chunk of body) {
-    buffer += chunk.toString('utf-8');
-    let nl = buffer.indexOf('\n');
-    while (nl >= 0) {
-      handleLine(buffer.slice(0, nl).replace(/\r$/, ''));
-      buffer = buffer.slice(nl + 1);
-      nl = buffer.indexOf('\n');
-    }
   }
-  if (buffer.trim()) handleLine(buffer.trim());
   return { rows: out, lineCount };
 }
 
