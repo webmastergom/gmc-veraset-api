@@ -765,8 +765,18 @@ function CohabitationTab({ entries, brands }: { entries: CohabitationEntry[]; br
 
 // ── Zip Affinity tab ─────────────────────────────────────────────────
 
-type AffinityMode = 'pop' | 'volume';
-type ZipSortKey = 'zip' | 'affinityIndex' | 'count' | 'population';
+type AffinityMode = 'composite' | 'pop' | 'volume';
+type ZipSortKey =
+  | 'zip'
+  | 'affinityIndex'      // legacy: uses pop or volume based on mode
+  | 'scoreRaw'
+  | 'scoreSmoothed'
+  | 'volumePct'
+  | 'densityPct'
+  | 'loyaltyPct'
+  | 'liftPct'
+  | 'count'
+  | 'population';
 
 function ZipAffinityTab({
   sources,
@@ -777,22 +787,26 @@ function ZipAffinityTab({
 }) {
   const [activeSourceId, setActiveSourceId] = useState<string>(sources[0]?.sourceId || '');
   const [search, setSearch] = useState<string>('');
-  const [sortKey, setSortKey] = useState<ZipSortKey>('affinityIndex');
+  const [sortKey, setSortKey] = useState<ZipSortKey>('scoreRaw');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
 
   const active = sources.find((s) => s.sourceId === activeSourceId) || sources[0];
 
-  // Default to population-weighted when this source has it; volume otherwise.
-  const [mode, setMode] = useState<AffinityMode>(active?.hasPopulation ? 'pop' : 'volume');
+  // Default to the new composite score. Legacy 'pop' and 'volume' modes
+  // are kept for users who want the old single-axis lens.
+  const [mode, setMode] = useState<AffinityMode>('composite');
 
-  // Switch mode automatically when the user switches source to one without pop.
+  // Switch out of population mode automatically when source has no NSE.
   useEffect(() => {
     if (!active) return;
-    if (mode === 'pop' && !active.hasPopulation) setMode('volume');
+    if (mode === 'pop' && !active.hasPopulation) setMode('composite');
   }, [activeSourceId, active, mode]);
 
-  const indexFor = (r: ZipAffinityRow) =>
-    mode === 'pop' ? r.affinityIndexPop : r.affinityIndexVolume;
+  const indexFor = (r: ZipAffinityRow): number => {
+    if (mode === 'composite') return r.scoreRaw;
+    if (mode === 'pop') return r.affinityIndexPop;
+    return r.affinityIndexVolume;
+  };
 
   const filtered = useMemo(() => {
     if (!active) return [];
@@ -807,9 +821,13 @@ function ZipAffinityTab({
       } else if (sortKey === 'zip') {
         av = a.zip;
         bv = b.zip;
+      } else if (sortKey === 'densityPct') {
+        // Treat undefined density as -1 so it sorts to the bottom in desc.
+        av = a.densityPct ?? -1;
+        bv = b.densityPct ?? -1;
       } else {
-        av = a[sortKey] as number;
-        bv = b[sortKey] as number;
+        av = (a[sortKey] as number) ?? 0;
+        bv = (b[sortKey] as number) ?? 0;
       }
       if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * dir;
       return ((av as number) - (bv as number)) * dir;
@@ -831,10 +849,30 @@ function ZipAffinityTab({
   const downloadCsv = () => {
     if (!active) return;
     const rows = filtered;
-    const lines = ['Zip Code,Affinity Index'];
+    const lines = [
+      // Composite score (raw + smoothed) + all 4 sub-indices + raw counts
+      // and centroid. Analysts can pivot off any column.
+      'zip_code,score_raw,score_smoothed,volume_pct,density_pct,loyalty_pct,lift_pct,visitors,population,centroid_lat,centroid_lng,distance_to_poi_km'
+    ];
     for (const r of rows) {
       const z = /[",\n]/.test(r.zip) ? `"${r.zip.replace(/"/g, '""')}"` : r.zip;
-      lines.push(`${z},${indexFor(r)}`);
+      const num = (v: number | undefined | null) => (v == null ? '' : String(v));
+      lines.push(
+        [
+          z,
+          r.scoreRaw,
+          r.scoreSmoothed,
+          r.volumePct,
+          num(r.densityPct),
+          r.loyaltyPct,
+          r.liftPct,
+          r.count,
+          r.population || '',
+          num(r.centroidLat),
+          num(r.centroidLng),
+          num(r.distanceToPoiKm != null ? Math.round(r.distanceToPoiKm * 10) / 10 : undefined),
+        ].join(',')
+      );
     }
     const csv = lines.join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -842,7 +880,7 @@ function ZipAffinityTab({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `zip-affinity-${mode}_${safeLabel}_${runId.slice(0, 8)}.csv`;
+    a.download = `zip-affinity_${safeLabel}_${runId.slice(0, 8)}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -898,9 +936,11 @@ function ZipAffinityTab({
   };
 
   const modeDescription =
-    mode === 'pop'
-      ? 'Population-weighted index 0..100. 100 = ZIP over-delivers visitors vs its size (at or above baseline); <100 = under-indexes. Saturated at 100 so the scale aligns with the volume index.'
-      : 'Volume index 0..100 — share of the top ZIP\'s visitor count. Best for coverage / media buying where audience size matters most.';
+    mode === 'composite'
+      ? 'Composite Score (0..100): geometric mean of four percentile-ranked sub-indices — Volume, Density, Loyalty, Lift. A zip mediocre on any one axis is penalized hard, which forces real spread (no more "everything is high"). See sub-index columns below.'
+      : mode === 'pop'
+      ? 'Population-weighted index 0..100 (legacy). 100 = ZIP over-delivers visitors vs its size (at or above baseline); <100 = under-indexes. Equivalent to Density Pct in the new composite.'
+      : 'Volume-only index 0..100 (legacy). Share of the top ZIP\'s visitor count. Best for coverage / media buying where audience size matters most. Equivalent to Volume Pct in the new composite.';
 
   return (
     <div className="space-y-3">
@@ -929,22 +969,34 @@ function ZipAffinityTab({
         </div>
       )}
 
-      {/* Mode toggle */}
+      {/* Mode toggle — composite is the new default; pop/volume kept for legacy */}
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-xs text-muted-foreground">Index by:</span>
+        <span className="text-xs text-muted-foreground">Headline by:</span>
         <div className="inline-flex rounded-md border border-border overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setMode('composite')}
+            className={`px-3 py-1 text-xs font-medium transition-colors ${
+              mode === 'composite'
+                ? 'bg-primary text-primary-foreground'
+                : 'bg-muted/30 text-muted-foreground hover:bg-muted'
+            }`}
+            title="Geometric mean of Volume × Density × Loyalty × Lift (all percentile-ranked)"
+          >
+            Composite (new)
+          </button>
           <button
             type="button"
             onClick={() => setMode('pop')}
             disabled={!active.hasPopulation}
-            className={`px-3 py-1 text-xs font-medium transition-colors ${
+            className={`px-3 py-1 text-xs font-medium transition-colors border-l border-border ${
               mode === 'pop'
                 ? 'bg-primary text-primary-foreground'
                 : 'bg-muted/30 text-muted-foreground hover:bg-muted'
             } ${!active.hasPopulation ? 'opacity-40 cursor-not-allowed' : ''}`}
-            title={active.hasPopulation ? 'CPG-style: visitors per resident, normalized vs baseline' : `No population data uploaded for ${active.country || 'this country'}. Upload via /datasets → NSE modal.`}
+            title={active.hasPopulation ? 'Legacy: visitors per resident, percentile-ranked. Equivalent to Density Pct.' : `No population data uploaded for ${active.country || 'this country'}.`}
           >
-            Population-weighted
+            Density only
           </button>
           <button
             type="button"
@@ -954,14 +1006,14 @@ function ZipAffinityTab({
                 ? 'bg-primary text-primary-foreground'
                 : 'bg-muted/30 text-muted-foreground hover:bg-muted'
             }`}
-            title="Raw visitor count normalized to top ZIP (0..100)"
+            title="Legacy: visitor count percentile rank. Equivalent to Volume Pct."
           >
-            Volume-only
+            Volume only
           </button>
         </div>
         {!active.hasPopulation && (
           <span className="text-xs text-amber-500/80">
-            ⚠ No population data for {active.country || 'this country'} — pop-weighted unavailable. Upload via the dataset NSE modal.
+            ⚠ No population data for {active.country || 'this country'} — Density sub-index unavailable. Upload via /api/nse/{active.country || 'XX'}.
           </span>
         )}
       </div>
@@ -995,19 +1047,44 @@ function ZipAffinityTab({
         <table className="w-full text-sm">
           <thead className="bg-muted/30 text-xs uppercase tracking-wider text-muted-foreground sticky top-0">
             <tr>
-              <SortHeader columnKey="zip" align="left">Zip Code</SortHeader>
-              <SortHeader columnKey="affinityIndex" align="right">Affinity Index</SortHeader>
+              <SortHeader columnKey="zip" align="left">Zip</SortHeader>
+              <SortHeader columnKey="affinityIndex" align="right">
+                {mode === 'composite' ? 'Score' : mode === 'pop' ? 'Density' : 'Volume'}
+              </SortHeader>
+              {mode === 'composite' && (
+                <SortHeader columnKey="scoreSmoothed" align="right">
+                  <span title="Gaussian-smoothed score (σ=15 km) — for continuous heatmap views">
+                    Smoothed
+                  </span>
+                </SortHeader>
+              )}
+              <SortHeader columnKey="volumePct" align="right">
+                <span title="Volume percentile — how many visitors come from this zip">Vol</span>
+              </SortHeader>
+              <SortHeader columnKey="densityPct" align="right">
+                <span title="Density percentile — visitors per resident (requires NSE)">Den</span>
+              </SortHeader>
+              <SortHeader columnKey="loyaltyPct" align="right">
+                <span title="Loyalty percentile — engagement (dwell × visit frequency)">Loy</span>
+              </SortHeader>
+              <SortHeader columnKey="liftPct" align="right">
+                <span title="Lift percentile — over-delivery vs distance-decay expectation">Lift</span>
+              </SortHeader>
               <SortHeader columnKey="count" align="right">Visitors</SortHeader>
               {active.hasPopulation && (
                 <SortHeader columnKey="population" align="right">Population</SortHeader>
               )}
-              <th className="text-left px-3 py-2 w-1/3">Score</th>
+              <th className="text-left px-3 py-2 w-1/4">Score bar</th>
             </tr>
           </thead>
           <tbody>
             {filtered.map((r) => {
               const idx = indexFor(r);
               const isFallback = mode === 'pop' && r.noPopulation;
+              const subCell = (v: number | undefined) =>
+                v == null
+                  ? <span className="text-muted-foreground/50" title="No data">—</span>
+                  : <span className="tabular-nums">{v}</span>;
               return (
                 <tr key={r.zip} className="border-t border-border/50 hover:bg-muted/30">
                   <td className="px-3 py-2 font-mono text-xs">{r.zip}</td>
@@ -1024,6 +1101,15 @@ function ZipAffinityTab({
                       )}
                     </div>
                   </td>
+                  {mode === 'composite' && (
+                    <td className="px-3 py-2 text-right tabular-nums text-muted-foreground" title="Gaussian-smoothed score">
+                      {r.scoreSmoothed}
+                    </td>
+                  )}
+                  <td className="px-3 py-2 text-right text-muted-foreground">{subCell(r.volumePct)}</td>
+                  <td className="px-3 py-2 text-right text-muted-foreground">{subCell(r.densityPct)}</td>
+                  <td className="px-3 py-2 text-right text-muted-foreground">{subCell(r.loyaltyPct)}</td>
+                  <td className="px-3 py-2 text-right text-muted-foreground">{subCell(r.liftPct)}</td>
                   <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
                     {fmtNum(r.count)}
                   </td>
@@ -1041,7 +1127,6 @@ function ZipAffinityTab({
                           backgroundColor: barColor(idx),
                         }}
                       />
-                      {/* Reference line at index=100 (the "average" baseline) */}
                       {mode === 'pop' && (
                         <div
                           className="absolute top-0 h-full w-px bg-foreground/40"
