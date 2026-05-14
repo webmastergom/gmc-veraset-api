@@ -708,7 +708,19 @@ async function phaseDownloadRead(
       && Number.isFinite(f.home_lat) && Number.isFinite(f.home_lng)
   );
   await progress?.(`1c/4 geocode check: ${missing.length} missing zips of ${all.length} total`);
-  if (missing.length > 0) {
+  // Bail on the geocoding fallback for very large datasets. The FR/MX/etc.
+  // GeoJSON catalogs plus a 600k-device cellMap reliably OOM-kill the Vercel
+  // function before our try/catch can run. Without home_zip, zip-based
+  // breakdowns (topZips, zipAffinity, NSE) will be empty but clustering,
+  // RFM, and persona discovery still work fully.
+  const GEOCODE_FALLBACK_LIMIT = 200_000;
+  if (missing.length > GEOCODE_FALLBACK_LIMIT) {
+    console.warn(
+      `[PERSONAS ${state.runId}] Skipping reverse-geocode fallback: ` +
+      `${missing.length} missing > ${GEOCODE_FALLBACK_LIMIT} limit (would OOM the function)`,
+    );
+    await progress?.(`1c/4 geocode SKIPPED (${missing.length} > ${GEOCODE_FALLBACK_LIMIT} limit)`);
+  } else if (missing.length > 0) {
     try {
       const country = await guessCountry(state);
       if (country) setCountryFilter([country]);
