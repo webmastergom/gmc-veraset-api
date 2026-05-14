@@ -1277,23 +1277,56 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           // memory ceiling. This is heavier than ideal (download + cluster in
           // the same 120s budget) but avoids the OOM we hit trying to persist
           // features to S3 between phases.
-          const { state: ns, features } = await phaseDownloadRead(state);
-          const { state: ns2, report, clusterAssignments, clusterNames } =
-            await phaseClusterAndAggregate(ns, features);
-          // Save report early so frontend can render scorecard while exports finish.
-          await putConfig(REPORT_KEY(state.runId), report, { compact: true });
-          // clusterAssignments serializes to ~25 MB for 500k devices — fine for
-          // putConfig. master_maids_export reads it back to write the labels CSV.
-          await putConfig(CLUSTER_DATA_KEY(state.runId), {
-            clusterAssignmentsObj: Object.fromEntries(clusterAssignments),
-            clusterNames,
-          }, { compact: true });
-          state = {
-            ...ns2,
-            phase: 'master_maids_export',
-            report,
-            updatedAt: new Date().toISOString(),
+          // Diagnostic step tracking: write each step to state.subProgress so a
+          // hard crash (OOM, segfault, Vercel kill) leaves a breadcrumb in S3
+          // even when the outer catch doesn't get to run. Each writeStep call
+          // is best-effort; failures are swallowed.
+          let currentStep = 'init';
+          const stateRunId = state.runId;
+          const baseState = state;
+          const writeStep = async (step: string) => {
+            currentStep = step;
+            console.log(`[PERSONAS ${stateRunId}] clustering step: ${step}`);
+            try {
+              await putConfig(STATE_KEY(stateRunId), {
+                ...baseState,
+                subProgress: { label: `clustering: ${step}`, details: new Date().toISOString() },
+                updatedAt: new Date().toISOString(),
+              } as any, { compact: true });
+            } catch {}
           };
+          try {
+            await writeStep('1/4 phaseDownloadRead start');
+            const { state: ns, features } = await phaseDownloadRead(state);
+            await writeStep(`2/4 phaseClusterAndAggregate start (${features.length} features)`);
+            const { state: ns2, report, clusterAssignments, clusterNames } =
+              await phaseClusterAndAggregate(ns, features);
+            await writeStep(`3/4 saving report + cluster data (${clusterAssignments.size} assignments, ${clusterNames.length} clusters)`);
+            await putConfig(REPORT_KEY(state.runId), report, { compact: true });
+            await putConfig(CLUSTER_DATA_KEY(state.runId), {
+              clusterAssignmentsObj: Object.fromEntries(clusterAssignments),
+              clusterNames,
+            }, { compact: true });
+            await writeStep('4/4 done');
+            state = {
+              ...ns2,
+              phase: 'master_maids_export',
+              report,
+              updatedAt: new Date().toISOString(),
+            };
+          } catch (e: any) {
+            const errMsg = `[clustering crashed at ${currentStep}] ${e?.message || String(e)}\n${(e?.stack || '').slice(0, 500)}`;
+            console.error(errMsg);
+            try {
+              await putConfig(STATE_KEY(state.runId), {
+                ...state,
+                phase: 'error',
+                error: errMsg,
+                updatedAt: new Date().toISOString(),
+              } as any, { compact: true });
+            } catch {}
+            throw e;
+          }
           break;
         }
         case 'aggregation':
