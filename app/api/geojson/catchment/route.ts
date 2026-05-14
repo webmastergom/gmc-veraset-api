@@ -17,7 +17,17 @@ const SKIP_COUNTRIES = new Set(['US']);
 // candidate countries below in order — first hit wins. This list is small
 // on purpose (only countries we have GeoJSON for); large catalogs like MX
 // are skipped during the fallback to avoid scanning 36k features per zip.
-const FALLBACK_COUNTRIES_FOR_UNKNOWN = ['SV', 'HN', 'GT', 'CR', 'NI', 'PA', 'CO', 'EC', 'CL', 'AR', 'ES', 'FR', 'DE', 'BE', 'IT', 'IE', 'UK', 'DO'];
+const FALLBACK_COUNTRIES_FOR_UNKNOWN = [
+  // Central America / Caribbean (small files, cheap to scan)
+  'SV', 'HN', 'GT', 'CR', 'NI', 'PA', 'DO',
+  // South America
+  'CO', 'EC', 'CL', 'AR', 'BO', 'PE', 'PY',
+  // Europe
+  'ES', 'FR', 'DE', 'BE', 'IT', 'IE', 'UK', 'NL', 'PT', 'SE',
+  // MX last because it's the biggest (36k features) — scanning it eats
+  // most of the budget, so only fall through if no earlier country matched.
+  'MX',
+];
 
 interface ZipDeviceDays {
   zipCode: string;

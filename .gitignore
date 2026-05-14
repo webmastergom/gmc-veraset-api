@@ -29,9 +29,16 @@ Thumbs.db
 *.log
 npm-debug.log*
 
-# GeoJSON country data (271MB — copied from cloud-garritz, not tracked in git)
-# Deploy via `cp ~/dev/py/GMC/cloud-garritz/src/data/geojson/*.geojson data/geojson/`
-data/geojson/
+# GeoJSON country data — canonical 2-letter ISO files (XX.geojson) ARE
+# tracked so the catchment polygon endpoint works in Vercel without a
+# manual copy step. US.geojson is intentionally excluded (~92 MB, not
+# used by SKIP_COUNTRIES). Auxiliary variants (zoom levels, backups,
+# etc.) are still ignored to keep repo size manageable.
+data/geojson/US.geojson
+data/geojson/*-z*.geojson
+data/geojson/*.backup
+data/geojson/*.backup.geojson
+data/geojson/*-highres*
 
 # TypeScript
 *.tsbuildinfo
