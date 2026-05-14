@@ -981,7 +981,15 @@ async function phaseClusterAndAggregate(
     const popMap = popMapByCountry.get(country);
     if (popMap && popMap.size > 0) populationLookup.bySource.set(sourceId, popMap);
   }
-  const zipAffinity = computeZipAffinityPerSource(features, sourceLabels, populationLookup, sourceCountries);
+  // POI centroids per source — needed for the Lift sub-index distance
+  // decay. Pulled from sourceMeta (persisted during Stage 1).
+  const poiCentroidLookup = { bySource: new Map<string, { lat: number; lng: number }>() };
+  for (const [sourceId, meta] of Object.entries(state.sourceMeta || {})) {
+    if (meta?.poiCentroid) poiCentroidLookup.bySource.set(sourceId, meta.poiCentroid);
+  }
+  const zipAffinity = computeZipAffinityPerSource(
+    features, sourceLabels, populationLookup, sourceCountries, poiCentroidLookup,
+  );
   if (zipAffinity.length > 0) {
     const zipsTotal = zipAffinity.reduce((s, x) => s + x.rows.length, 0);
     const withPop = zipAffinity.filter((s) => s.hasPopulation).length;

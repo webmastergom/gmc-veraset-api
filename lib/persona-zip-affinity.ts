@@ -1,18 +1,35 @@
 /**
- * ZIP affinity score per source — two complementary lenses:
+ * ZIP affinity score per source — multi-dimensional composite.
  *
- *   - Population-weighted (CPG-style index vs baseline). Visitors per
- *     resident, normalized to the source's expected baseline. Best for
- *     understanding which ZIPs DISPROPORTIONATELY engage with the POI
- *     set, regardless of size. Reads as: 100 = proportional to size,
- *     150 = over-indexes 1.5×, <50 = under-indexes.
+ * The previous single Affinity Index (volume-normalized to top zip) ran
+ * uniformly high because the underlying distribution is heavy-tailed —
+ * most zips clustered near the top score, no real discrimination.
  *
- *   - Volume-only (the original 0..100 share-of-top metric). Best for
- *     coverage / media-buying when raw audience size is what matters.
+ * The composite replaces that with four percentile-ranked sub-indices,
+ * each capturing a distinct angle of "affinity":
  *
- * Both are computed; the UI toggles between them. Computed in Node
- * from the home_zip column of the persona feature vector — no extra
- * Athena query.
+ *   Volume   — percentile_rank(unique device count from zip).
+ *              "How many visitors come from here?"
+ *
+ *   Density  — percentile_rank(devices / population). REQUIRES NSE upload
+ *              for the country. "Oversampled vs the zip's demographic size?"
+ *
+ *   Loyalty  — percentile_rank(mean_dwell × log1p(mean_visits)).
+ *              "How engaged are devices from this zip?"
+ *
+ *   Lift     — percentile_rank(visitor_share / expected_share_at_distance),
+ *              where expected_share decays with distance from POI centroid.
+ *              "Does this zip over-deliver relative to its distance?"
+ *
+ * Headline (scoreRaw) = geometric mean of available sub-indices.
+ * Multiplicative composition forces real spread — a zip mediocre on any
+ * dimension is penalized hard. Geometric mean stays in 0..100.
+ *
+ * Headline smoothed (scoreSmoothed) = Gaussian-weighted spatial average
+ * of scoreRaw across nearby zips (default σ = 15 km, cutoff at 3σ).
+ * Useful for continuous-surface heatmap visualizations. The four
+ * sub-indices stay RAW — analysts inspecting a specific zip want its
+ * own values, not contaminated by neighbors.
  */
 
 import type {
@@ -22,37 +39,109 @@ import type {
 } from './persona-types';
 
 /** Skip ZIPs below this population — small enough that a few visitors give noisy >>100 indices. */
-const MIN_POPULATION_FOR_POP_INDEX = 200;
+const MIN_POPULATION_FOR_DENSITY = 200;
 
-/** Cap the population-weighted index at 100 — readable as a 0-100 score
- *  where 100 = at-or-above baseline (ZIP over-delivers vs its size) and
- *  values <100 = under-indexing. Same scale as the volume-only index so
- *  the two modes align in the UI. */
-const POP_INDEX_CAP = 100;
+/** Gaussian smoothing bandwidth (km). 15 km gives a few-zip radius —
+ *  enough to highlight regional clusters without washing out a city. */
+const SMOOTH_SIGMA_KM = 15;
+
+/** Cutoff in σ-units. exp(-3²/2) ≈ 0.011 — beyond this contribution is noise. */
+const SMOOTH_CUTOFF_SIGMA = 3;
 
 export interface PopulationLookup {
   /**
    * Map from sourceId → (postalCode → population). Built by the caller
-   * from per-country NSE uploads. Missing entries fall back to volume-only.
+   * from per-country NSE uploads. Missing entries imply Density is
+   * skipped for that source.
    */
   bySource: Map<string, Map<string, number>>;
 }
 
+export interface PoiCentroidLookup {
+  /** Map from sourceId → POI centroid (mean lat/lng of POIs). */
+  bySource: Map<string, { lat: number; lng: number }>;
+}
+
+/** Per-zip raw aggregates derived from DeviceFeatures. */
+interface ZipAgg {
+  count: number;            // distinct device count
+  sumDwell: number;         // sum of total_dwell_min
+  sumVisits: number;        // sum of total_visits
+  sumLat: number;           // sum of home_lat (for centroid)
+  sumLng: number;           // sum of home_lng
+  coordCount: number;       // number of devices with valid lat/lng
+}
+
+/** Convert a sorted array of numbers into a percentile-rank lookup.
+ *  For value v, returns 100 * (rank_of_v / N), with ties getting the
+ *  average rank. Result is 0..100 with guaranteed spread by construction. */
+function buildPercentileLookup(values: number[]): (v: number) => number {
+  if (values.length === 0) return () => 0;
+  // Sort ascending. For ties, fractional ranks are computed per group.
+  const sorted = [...values].sort((a, b) => a - b);
+  // For lookup, do a binary search to find first index >= v, then count
+  // the run of equal values to compute an average rank within the tie group.
+  return (v: number): number => {
+    let lo = 0, hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid] < v) lo = mid + 1;
+      else hi = mid;
+    }
+    // lo = first index with sorted[lo] >= v
+    let hiTie = lo;
+    while (hiTie < sorted.length && sorted[hiTie] === v) hiTie++;
+    if (hiTie === lo) {
+      // v not present; lo is the strict rank of values < v
+      return (lo / sorted.length) * 100;
+    }
+    // tied group [lo, hiTie); average rank
+    const avgRank = (lo + hiTie - 1) / 2 + 0.5;
+    return Math.max(0, Math.min(100, (avgRank / sorted.length) * 100));
+  };
+}
+
+/** Haversine distance in km between two lat/lng points. */
+function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const R = 6371; // mean Earth radius km
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const lat1 = toRad(aLat), lat2 = toRad(bLat);
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+}
+
+/** Geometric mean over a set of values in (0, 100]. Zero values are
+ *  clamped to 0.5 to avoid annihilating the entire score when one
+ *  dimension scores at the very bottom — a hard "0" multiplied in is
+ *  too punitive on a continuous percentile. Returns 0..100. */
+function geometricMean(values: number[]): number {
+  if (values.length === 0) return 0;
+  let logSum = 0;
+  for (const v of values) {
+    const clamped = Math.max(0.5, v);
+    logSum += Math.log(clamped);
+  }
+  return Math.exp(logSum / values.length);
+}
+
 /**
- * Group features by (source_megajob_id, home_zip), count uniques,
- * and produce a ZIP affinity table per source. Both
- * volume-only and population-weighted indices are computed.
- *
- * Devices without a resolved home_zip are dropped.
+ * Main entrypoint — compute per-source ZIP affinity with the 4-dim
+ * composite. The first three arguments match the legacy signature; the
+ * fourth (poiCentroids) is new and required to compute Lift. If a
+ * source has no poiCentroid, Lift falls back to the volume score for
+ * that source's rows.
  */
 export function computeZipAffinityPerSource(
   features: DeviceFeatures[],
   sourceLabels: Record<string, string>,
   populationLookup?: PopulationLookup,
-  sourceCountries?: Record<string, string>
+  sourceCountries?: Record<string, string>,
+  poiCentroids?: PoiCentroidLookup,
 ): SourceZipAffinity[] {
-  // source → (zip → unique adIds)
-  const bySource = new Map<string, Map<string, Set<string>>>();
+  // ── Step 1: aggregate per (source, zip) ────────────────────────────
+  const bySource = new Map<string, Map<string, ZipAgg>>();
   for (const f of features) {
     const zip = (f.home_zip || '').trim();
     if (!zip) continue;
@@ -63,67 +152,130 @@ export function computeZipAffinityPerSource(
       zipMap = new Map();
       bySource.set(src, zipMap);
     }
-    let ids = zipMap.get(zip);
-    if (!ids) {
-      ids = new Set();
-      zipMap.set(zip, ids);
+    let agg = zipMap.get(zip);
+    if (!agg) {
+      agg = { count: 0, sumDwell: 0, sumVisits: 0, sumLat: 0, sumLng: 0, coordCount: 0 };
+      zipMap.set(zip, agg);
     }
-    ids.add(f.ad_id);
+    agg.count++;
+    agg.sumDwell += f.total_dwell_min || 0;
+    agg.sumVisits += f.total_visits || 0;
+    if (f.home_lat != null && f.home_lng != null
+        && Number.isFinite(f.home_lat) && Number.isFinite(f.home_lng)) {
+      agg.sumLat += f.home_lat;
+      agg.sumLng += f.home_lng;
+      agg.coordCount++;
+    }
   }
 
   const out: SourceZipAffinity[] = [];
   for (const [sourceId, zipMap] of bySource.entries()) {
-    let totalDevices = 0;
-    const counts: { zip: string; count: number }[] = [];
-    for (const [zip, ids] of zipMap.entries()) {
-      counts.push({ zip, count: ids.size });
-      totalDevices += ids.size;
-    }
-    if (counts.length === 0) continue;
-
-    // Volume-only: normalize to top ZIP. Same formula as before.
-    counts.sort((a, b) => b.count - a.count);
-    const topCount = counts[0].count || 1;
-
-    // Population lookup for this source (may be missing if no NSE uploaded
-    // for the country). Compute pop_share denominator from pops we DO have
-    // — using the pop-uploaded ZIPs as the universe of comparison.
+    if (zipMap.size === 0) continue;
     const popMap = populationLookup?.bySource.get(sourceId);
-    let totalPopWithVisitors = 0;
-    if (popMap) {
-      for (const c of counts) {
-        const pop = popMap.get(c.zip) || 0;
-        if (pop >= MIN_POPULATION_FOR_POP_INDEX) totalPopWithVisitors += pop;
-      }
+    const poiCentroid = poiCentroids?.bySource.get(sourceId);
+    let totalDevices = 0;
+    const zipEntries: Array<{ zip: string; agg: ZipAgg; centroidLat?: number; centroidLng?: number; distanceKm?: number }> = [];
+    for (const [zip, agg] of zipMap.entries()) {
+      totalDevices += agg.count;
+      const centroidLat = agg.coordCount > 0 ? agg.sumLat / agg.coordCount : undefined;
+      const centroidLng = agg.coordCount > 0 ? agg.sumLng / agg.coordCount : undefined;
+      const distance = (poiCentroid && centroidLat != null && centroidLng != null)
+        ? distanceKm(centroidLat, centroidLng, poiCentroid.lat, poiCentroid.lng)
+        : undefined;
+      zipEntries.push({ zip, agg, centroidLat, centroidLng, distanceKm: distance });
     }
 
-    let hasPopulation = false;
-    const rows: ZipAffinityRow[] = counts.map((c) => {
-      const pop = popMap?.get(c.zip) || 0;
-      const volumeIndex = Math.max(0, Math.min(100, Math.round((c.count / topCount) * 100)));
-      let popIndex = volumeIndex; // fallback when no population
-      let noPop = true;
-      if (pop >= MIN_POPULATION_FOR_POP_INDEX && totalPopWithVisitors > 0 && totalDevices > 0) {
-        // CPG-style: (visitor_share) / (pop_share) × 100
-        const visitorShare = c.count / totalDevices;
-        const popShare = pop / totalPopWithVisitors;
-        const raw = popShare > 0 ? (visitorShare / popShare) * 100 : 0;
-        popIndex = Math.max(0, Math.min(POP_INDEX_CAP, Math.round(raw)));
-        noPop = false;
-        hasPopulation = true;
+    // ── Step 2: compute raw sub-index values for each zip ─────────────
+    const volumeValues: number[] = [];
+    const densityValues: number[] = [];
+    const densityZipIdx: number[] = []; // indices of zips with population
+    const loyaltyValues: number[] = [];
+    const liftValues: number[] = [];
+    const liftZipIdx: number[] = [];    // indices of zips with distance info
+
+    // Distance-decay scale for Lift's expected_share: half-life of ~30 km.
+    // expected_share(d) = exp(-d / scale). At d=0 (POI itself), share=1;
+    // at d=30 km, share≈0.37; at d=60 km, share≈0.14.
+    const LIFT_DECAY_SCALE_KM = 30;
+
+    zipEntries.forEach((e, i) => {
+      volumeValues.push(e.agg.count);
+      const meanDwell = e.agg.count > 0 ? e.agg.sumDwell / e.agg.count : 0;
+      const meanVisits = e.agg.count > 0 ? e.agg.sumVisits / e.agg.count : 0;
+      loyaltyValues.push(meanDwell * Math.log1p(meanVisits));
+      const pop = popMap?.get(e.zip) || 0;
+      if (pop >= MIN_POPULATION_FOR_DENSITY) {
+        densityValues.push(e.agg.count / pop);
+        densityZipIdx.push(i);
       }
+      if (e.distanceKm != null && totalDevices > 0) {
+        const visitorShare = e.agg.count / totalDevices;
+        const expectedShare = Math.exp(-e.distanceKm / LIFT_DECAY_SCALE_KM);
+        // Lift ratio (capped at large value to prevent log explosions
+        // at extreme distances). Use the ratio directly — percentile
+        // rank handles distribution.
+        const lift = expectedShare > 0 ? visitorShare / expectedShare : 0;
+        liftValues.push(lift);
+        liftZipIdx.push(i);
+      }
+    });
+
+    const volumeRank = buildPercentileLookup(volumeValues);
+    const densityRank = densityValues.length > 0 ? buildPercentileLookup(densityValues) : null;
+    const loyaltyRank = buildPercentileLookup(loyaltyValues);
+    const liftRank = liftValues.length > 0 ? buildPercentileLookup(liftValues) : null;
+
+    const hasPopulation = !!densityRank;
+
+    // Build a map from zip → density value (for ranking) so we can look
+    // up the per-zip raw value when computing densityPct.
+    const densityByIdx = new Map<number, number>();
+    densityZipIdx.forEach((idx, k) => densityByIdx.set(idx, densityValues[k]));
+    const liftByIdx = new Map<number, number>();
+    liftZipIdx.forEach((idx, k) => liftByIdx.set(idx, liftValues[k]));
+
+    // ── Step 3: build rows with sub-indices + raw composite ───────────
+    const rows: ZipAffinityRow[] = zipEntries.map((e, i) => {
+      const meanDwell = e.agg.count > 0 ? e.agg.sumDwell / e.agg.count : 0;
+      const meanVisits = e.agg.count > 0 ? e.agg.sumVisits / e.agg.count : 0;
+      const volumePct = Math.round(volumeRank(e.agg.count));
+      const loyaltyPct = Math.round(loyaltyRank(meanDwell * Math.log1p(meanVisits)));
+      const densityPct = densityByIdx.has(i) && densityRank
+        ? Math.round(densityRank(densityByIdx.get(i)!))
+        : undefined;
+      const liftPct = liftByIdx.has(i) && liftRank
+        ? Math.round(liftRank(liftByIdx.get(i)!))
+        : volumePct; // fallback when distance unavailable — use volume rank
+
+      const subScores = [volumePct, loyaltyPct, liftPct];
+      if (densityPct !== undefined) subScores.push(densityPct);
+      const scoreRaw = Math.round(geometricMean(subScores));
+
+      const pop = popMap?.get(e.zip) || 0;
       return {
-        zip: c.zip,
-        count: c.count,
+        zip: e.zip,
+        count: e.agg.count,
         population: pop,
-        affinityIndexPop: popIndex,
-        affinityIndexVolume: volumeIndex,
-        noPopulation: noPop,
+        centroidLat: e.centroidLat,
+        centroidLng: e.centroidLng,
+        distanceToPoiKm: e.distanceKm,
+        volumePct,
+        densityPct,
+        loyaltyPct,
+        liftPct,
+        scoreRaw,
+        scoreSmoothed: scoreRaw, // placeholder — filled in by smoothScores below
+        // Legacy fields, populated for UI backwards compat.
+        affinityIndexPop: densityPct ?? volumePct,
+        affinityIndexVolume: volumePct,
+        noPopulation: densityPct === undefined,
       };
     });
 
-    // Sort desc by population-weighted index (the new default).
-    rows.sort((a, b) => b.affinityIndexPop - a.affinityIndexPop);
+    // ── Step 4: Gaussian-smoothed headline over zip centroids ─────────
+    smoothScores(rows);
+
+    rows.sort((a, b) => b.scoreRaw - a.scoreRaw);
 
     out.push({
       sourceId,
@@ -135,7 +287,44 @@ export function computeZipAffinityPerSource(
     });
   }
 
-  // Stable order: largest source first.
   out.sort((a, b) => b.totalDevicesWithZip - a.totalDevicesWithZip);
   return out;
+}
+
+/**
+ * In-place: for each row with a valid centroid, replace scoreSmoothed
+ * with the Gaussian-weighted mean of scoreRaw across all rows within
+ * SMOOTH_CUTOFF_SIGMA × SMOOTH_SIGMA_KM. Rows without centroids keep
+ * scoreSmoothed = scoreRaw.
+ *
+ * O(N²) worst case but cutoff makes it effectively O(N·K) where K is
+ * the average number of zips within the cutoff radius. For ~3000 zips
+ * in FR this finishes in ~100 ms.
+ */
+function smoothScores(rows: ZipAffinityRow[]): void {
+  const cutoffKm = SMOOTH_SIGMA_KM * SMOOTH_CUTOFF_SIGMA;
+  const twoSigmaSq = 2 * SMOOTH_SIGMA_KM * SMOOTH_SIGMA_KM;
+  // Pre-extract valid (centroid, score) pairs.
+  const pts: Array<{ idx: number; lat: number; lng: number; score: number }> = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.centroidLat != null && r.centroidLng != null
+        && Number.isFinite(r.centroidLat) && Number.isFinite(r.centroidLng)) {
+      pts.push({ idx: i, lat: r.centroidLat, lng: r.centroidLng, score: r.scoreRaw });
+    }
+  }
+  for (const p of pts) {
+    let weightSum = 0;
+    let weightedScoreSum = 0;
+    for (const q of pts) {
+      const d = distanceKm(p.lat, p.lng, q.lat, q.lng);
+      if (d > cutoffKm) continue;
+      const w = Math.exp(-(d * d) / twoSigmaSq);
+      weightSum += w;
+      weightedScoreSum += w * q.score;
+    }
+    rows[p.idx].scoreSmoothed = weightSum > 0
+      ? Math.round(weightedScoreSum / weightSum)
+      : rows[p.idx].scoreRaw;
+  }
 }

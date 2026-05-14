@@ -219,11 +219,44 @@ export interface ZipAffinityRow {
   count: number;
   /** Population of the ZIP (from the country's NSE upload). 0 if unknown. */
   population: number;
-  /** Population-weighted index (CPG-style "vs baseline"). Capped at 300. */
+  /** Weighted centroid (lat, lng) of devices from this zip — derived from
+   *  home_lat/home_lng on the feature rows. Used for spatial decay in the
+   *  smoothed headline. Empty when no valid coords were available. */
+  centroidLat?: number;
+  centroidLng?: number;
+  /** Distance from the zip centroid to the source's POI centroid, in km.
+   *  Inputs the Lift sub-index (devices that come from far have a lower
+   *  expected share, so high visitor share at distance ranks higher). */
+  distanceToPoiKm?: number;
+
+  // ── Four sub-indices, each a percentile rank within the source (0..100) ──
+  /** Volume: percentile_rank(count). High = many visitors come from here. */
+  volumePct: number;
+  /** Density: percentile_rank(count / population). High = oversampled vs
+   *  the ZIP's demographic size. Requires NSE; otherwise NaN/undefined. */
+  densityPct?: number;
+  /** Loyalty: percentile_rank(mean_dwell × log(mean_visits)). High =
+   *  devices from this zip have stronger engagement at the POIs. */
+  loyaltyPct: number;
+  /** Lift: percentile_rank(visitor_share / expected_share_at_distance).
+   *  High = zip over-delivers visitors relative to what a simple
+   *  distance-decay model predicts. */
+  liftPct: number;
+
+  /** Headline: geometric mean of the available sub-indices (0..100).
+   *  Multiplicative composition forces real spread — a zip mediocre on
+   *  any dimension is penalized hard. */
+  scoreRaw: number;
+  /** Same as scoreRaw but smoothed via Gaussian decay (σ=15 km default)
+   *  over zip centroids — useful for continuous-surface heatmaps. */
+  scoreSmoothed: number;
+
+  // ── Legacy fields, kept for backwards compatibility with existing UI ──
+  /** @deprecated Population-weighted index (0..100). Equals densityPct now. */
   affinityIndexPop: number;
-  /** Volume-only index (visitors normalized to top ZIP, 0..100). */
+  /** @deprecated Volume-only index (0..100). Equals volumePct now. */
   affinityIndexVolume: number;
-  /** True when no population was available — affinityIndexPop falls back to volume. */
+  /** @deprecated True when no population was available. Equals (densityPct === undefined). */
   noPopulation: boolean;
 }
 
@@ -234,11 +267,11 @@ export interface SourceZipAffinity {
   sourceLabel: string;
   /** Country (ISO2) for which the population lookup was applied. Empty when none. */
   country: string;
-  /** Sorted desc by affinityIndexPop (top first). */
+  /** Sorted desc by scoreRaw. */
   rows: ZipAffinityRow[];
   /** Sum of all visitor counts (for "X% of base" labels). */
   totalDevicesWithZip: number;
-  /** True when at least one row used a population-weighted index. */
+  /** True when population data was used to compute Density. */
   hasPopulation: boolean;
 }
 
