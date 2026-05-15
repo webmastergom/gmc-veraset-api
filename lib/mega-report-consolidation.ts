@@ -106,9 +106,21 @@ export interface ConsolidatedCatchmentReport {
     lng: number;
     deviceDays: number;
     sharePercentage: number;
+    /** Smallest 70/80/90% cumulative-capture ring this zip is part of.
+     *  null = beyond the 90% capture ring (the long tail). Lets the UI
+     *  color zips by trade-area tier without recomputing the cumulative. */
+    captureRing: 70 | 80 | 90 | null;
   }>;
   /** Departure hour distribution */
   departureByHour: Array<{ hour: number; deviceDays: number }>;
+  /** Trade-area capture rings: how many top zips concentrate 70/80/90%
+   *  of total device-days. Headline number for sales decks — "the top
+   *  N zips deliver M% of your audience". */
+  captureRings: {
+    p70: { zips: number; deviceDays: number; share: number };
+    p80: { zips: number; deviceDays: number; share: number };
+    p90: { zips: number; deviceDays: number; share: number };
+  };
 }
 
 export interface ConsolidatedAffinityReport {
@@ -603,17 +615,58 @@ export function buildCatchmentReport(
     hourMap.set(hour, (hourMap.get(hour) || 0) + deviceDays);
   }
 
+  // Sort + compute cumulative capture so each zip can be tagged with the
+  // smallest 70/80/90% trade-area ring it belongs to. Single pass after
+  // the desc sort.
+  const sorted = Array.from(byZip.values()).sort((a, b) => b.deviceDays - a.deviceDays);
+  let cumDeviceDays = 0;
+  let p70zips = 0, p70days = 0;
+  let p80zips = 0, p80days = 0;
+  let p90zips = 0, p90days = 0;
+  const byZipCode = sorted.map((v) => {
+    const share = totalDeviceDays > 0 ? (v.deviceDays / totalDeviceDays) : 0;
+    cumDeviceDays += v.deviceDays;
+    const cumShare = totalDeviceDays > 0 ? cumDeviceDays / totalDeviceDays : 0;
+    // Each zip belongs to the SMALLEST ring where its inclusion keeps
+    // cumulative share at or above the threshold — i.e. the first zip
+    // that pushes cum past 70% (and every zip before it) is "p70".
+    let captureRing: 70 | 80 | 90 | null = null;
+    if (cumShare <= 0.7 || (cumShare > 0.7 && cumDeviceDays - v.deviceDays < totalDeviceDays * 0.7)) {
+      captureRing = 70;
+      p70zips++; p70days += v.deviceDays;
+      p80zips++; p80days += v.deviceDays;
+      p90zips++; p90days += v.deviceDays;
+    } else if (cumShare <= 0.8 || (cumShare > 0.8 && cumDeviceDays - v.deviceDays < totalDeviceDays * 0.8)) {
+      captureRing = 80;
+      p80zips++; p80days += v.deviceDays;
+      p90zips++; p90days += v.deviceDays;
+    } else if (cumShare <= 0.9 || (cumShare > 0.9 && cumDeviceDays - v.deviceDays < totalDeviceDays * 0.9)) {
+      captureRing = 90;
+      p90zips++; p90days += v.deviceDays;
+    }
+    return {
+      zipCode: v.zip, city: v.city, country: v.country, lat: v.lat, lng: v.lng,
+      deviceDays: v.deviceDays,
+      sharePercentage: Math.round(share * 10000) / 100,
+      captureRing,
+    };
+  });
+
+  const shareOf = (days: number) => totalDeviceDays > 0
+    ? Math.round((days / totalDeviceDays) * 10000) / 100
+    : 0;
+
   return {
     megaJobId,
     analyzedAt: new Date().toISOString(),
     totalDeviceDays,
-    byZipCode: Array.from(byZip.values())
-      .map((v) => ({
-        zipCode: v.zip, city: v.city, country: v.country, lat: v.lat, lng: v.lng, deviceDays: v.deviceDays,
-        sharePercentage: totalDeviceDays > 0 ? Math.round((v.deviceDays / totalDeviceDays) * 10000) / 100 : 0,
-      }))
-      .sort((a, b) => b.deviceDays - a.deviceDays),
+    byZipCode,
     departureByHour: Array.from({ length: 24 }, (_, h) => ({ hour: h, deviceDays: hourMap.get(h) || 0 })),
+    captureRings: {
+      p70: { zips: p70zips, deviceDays: p70days, share: shareOf(p70days) },
+      p80: { zips: p80zips, deviceDays: p80days, share: shareOf(p80days) },
+      p90: { zips: p90zips, deviceDays: p90days, share: shareOf(p90days) },
+    },
   };
 }
 

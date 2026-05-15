@@ -20,6 +20,7 @@ import { SummaryCards } from '@/components/mega-jobs/summary-cards'
 import { MegaDailyChart } from '@/components/mega-jobs/daily-chart'
 import { CatchmentPie } from '@/components/mega-jobs/catchment-pie'
 import { CatchmentMap } from '@/components/mega-jobs/catchment-map'
+import { CaptureRingsSummary } from '@/components/analysis/capture-rings-summary'
 import { ODTables } from '@/components/mega-jobs/od-tables'
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar'
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
@@ -837,6 +838,11 @@ export default function MegaJobDetailPage() {
                   {catchmentReport.totalDeviceDays.toLocaleString()} total device-days across{' '}
                   {catchmentReport.byZipCode.length} zip codes
                 </p>
+                <CaptureRingsSummary
+                  totalZips={catchmentReport.byZipCode.length}
+                  totalDeviceDays={catchmentReport.totalDeviceDays}
+                  captureRings={catchmentReport.captureRings}
+                />
                 <CatchmentPie data={catchmentReport.byZipCode} />
               </CollapsibleCard>
             )}

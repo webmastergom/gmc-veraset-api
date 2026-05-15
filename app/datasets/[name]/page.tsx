@@ -55,6 +55,7 @@ import { useToast } from '@/hooks/use-toast';
 import { CollapsibleCard } from '@/components/mega-jobs/collapsible-card';
 import { MegaDailyChart } from '@/components/mega-jobs/daily-chart';
 import { CatchmentPie } from '@/components/mega-jobs/catchment-pie';
+import { CaptureRingsSummary } from '@/components/analysis/capture-rings-summary';
 import { CatchmentMap } from '@/components/mega-jobs/catchment-map';
 import { NseModal } from './nse-modal';
 import { CategoryMaidModal } from './category-maid-modal';
@@ -1071,7 +1072,7 @@ export default function DatasetAnalysisPage() {
                     const cleanZip = (z: string) => z.replace(/^["']+|["']+$/g, '').replace(/^[A-Z]{2}[-\s]/, '');
                     downloadCsv(
                       `${datasetName}-catchment-zipcodes.csv`,
-                      ['zip_code', 'city', 'country', 'device_days', 'share_pct', 'affinity_index_0_100', 'lat', 'lng'],
+                      ['zip_code', 'city', 'country', 'device_days', 'share_pct', 'affinity_index_0_100', 'capture_ring', 'lat', 'lng'],
                       sorted.map((z) => [
                         cleanZip(z.zipCode),
                         z.city,
@@ -1081,6 +1082,7 @@ export default function DatasetAnalysisPage() {
                         z.deviceDays > 0
                           ? Math.max(1, Math.round(100 * Math.log(z.deviceDays + 1) / logMax))
                           : 0,
+                        (z as any).captureRing ?? '',
                         z.lat,
                         z.lng,
                       ])
@@ -1095,6 +1097,11 @@ export default function DatasetAnalysisPage() {
                   Methodology: residence assigned by first ping of the day per device. A device is counted at a location only if its first daily signal appears at the same rounded coordinate (~11km) on 3 or more distinct days. Reverse-geocoded to postal code via local GeoJSON.
                 </p>
               </div>
+              <CaptureRingsSummary
+                totalZips={catchmentReport.byZipCode.length}
+                totalDeviceDays={catchmentReport.totalDeviceDays || 0}
+                captureRings={catchmentReport.captureRings}
+              />
               <CatchmentPie data={catchmentReport.byZipCode} />
             </CollapsibleCard>
           )}

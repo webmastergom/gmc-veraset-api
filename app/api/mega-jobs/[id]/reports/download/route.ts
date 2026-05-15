@@ -118,12 +118,15 @@ export async function GET(
       // from "no activity".
       const maxDeviceDays = report.byZipCode.reduce((m, z) => Math.max(m, z.deviceDays), 0) || 1;
       const logMax = Math.log(maxDeviceDays + 1);
-      const header = 'postal_code,city,country,devices,share_percentage,affinity_index_0_100';
+      const header = 'postal_code,city,country,devices,share_percentage,affinity_index_0_100,capture_ring';
       const rows = report.byZipCode.map((z) => {
         const affinity = z.deviceDays > 0
           ? Math.max(1, Math.round(100 * Math.log(z.deviceDays + 1) / logMax))
           : 0;
-        return `${escCsv(z.zipCode)},${escCsv(z.city)},${escCsv(z.country)},${z.deviceDays},${z.sharePercentage ?? 0},${affinity}`;
+        // capture_ring is one of 70/80/90 (top zips that cumulatively
+        // capture that % of device-days), or empty for the long tail.
+        const ring = (z as any).captureRing ?? '';
+        return `${escCsv(z.zipCode)},${escCsv(z.city)},${escCsv(z.country)},${z.deviceDays},${z.sharePercentage ?? 0},${affinity},${ring}`;
       });
       return csvResponse([header, ...rows].join('\n'), `mega-job-${id}-catchment.csv`);
     }
