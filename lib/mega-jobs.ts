@@ -237,33 +237,49 @@ export function computeSplitPlan(
   dateRange: { from: string; to: string },
   totalPois: number
 ): SplitPlan {
-  // Date chunks — calendar-month aligned
   const dateChunks: DateChunk[] = [];
   const startDate = new Date(dateRange.from + 'T00:00:00Z');
   const endDate = new Date(dateRange.to + 'T00:00:00Z');
 
-  let chunkStart = new Date(startDate);
-  while (chunkStart <= endDate) {
-    // Last day of chunkStart's month (UTC)
-    const monthEnd = new Date(Date.UTC(
-      chunkStart.getUTCFullYear(),
-      chunkStart.getUTCMonth() + 1,
-      0, // day 0 of next month = last day of this month
-    ));
-    let chunkEnd = monthEnd > endDate ? new Date(endDate) : monthEnd;
+  // FAST PATH: if the whole range fits in one Veraset job (≤ MAX_DAYS),
+  // don't split. The previous implementation would still create two
+  // sub-jobs whenever the range crossed a month boundary — e.g. an
+  // 18-day window from Apr 13 to Apr 30 plus a 14-day window from May 1
+  // to May 14 (32 days total) became two billable jobs even when the
+  // user's intent was a single contiguous window. The calendar-month
+  // alignment only matters when we are FORCED to split (> 31 days).
+  const totalDays = Math.floor(
+    (endDate.getTime() - startDate.getTime()) / (24 * 3600 * 1000)
+  ) + 1;
+  if (totalDays <= MAX_DAYS) {
+    dateChunks.push({ from: fmt(startDate), to: fmt(endDate) });
+  } else {
+    // SPLIT PATH: range exceeds MAX_DAYS — align chunks to calendar
+    // months so reporting periods are clean. Each chunk is still clamped
+    // to MAX_DAYS as a safety net.
+    let chunkStart = new Date(startDate);
+    while (chunkStart <= endDate) {
+      // Last day of chunkStart's month (UTC)
+      const monthEnd = new Date(Date.UTC(
+        chunkStart.getUTCFullYear(),
+        chunkStart.getUTCMonth() + 1,
+        0, // day 0 of next month = last day of this month
+      ));
+      let chunkEnd = monthEnd > endDate ? new Date(endDate) : monthEnd;
 
-    // Safety clamp: never exceed MAX_DAYS in a single chunk.
-    const span = Math.floor((chunkEnd.getTime() - chunkStart.getTime()) / (24 * 3600 * 1000)) + 1;
-    if (span > MAX_DAYS) {
-      chunkEnd = new Date(chunkStart);
-      chunkEnd.setUTCDate(chunkEnd.getUTCDate() + MAX_DAYS - 1);
+      // Safety clamp: never exceed MAX_DAYS in a single chunk.
+      const span = Math.floor((chunkEnd.getTime() - chunkStart.getTime()) / (24 * 3600 * 1000)) + 1;
+      if (span > MAX_DAYS) {
+        chunkEnd = new Date(chunkStart);
+        chunkEnd.setUTCDate(chunkEnd.getUTCDate() + MAX_DAYS - 1);
+      }
+
+      dateChunks.push({ from: fmt(chunkStart), to: fmt(chunkEnd) });
+
+      // Next chunk starts the day after this chunk ends
+      chunkStart = new Date(chunkEnd);
+      chunkStart.setUTCDate(chunkStart.getUTCDate() + 1);
     }
-
-    dateChunks.push({ from: fmt(chunkStart), to: fmt(chunkEnd) });
-
-    // Next chunk starts the day after this chunk ends
-    chunkStart = new Date(chunkEnd);
-    chunkStart.setUTCDate(chunkStart.getUTCDate() + 1);
   }
 
   // POI chunks
