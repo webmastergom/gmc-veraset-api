@@ -135,6 +135,11 @@ export interface ConsolidatedAffinityReport {
     uniqueDevices: number;
     avgDwell: number;
     avgFrequency: number;
+    /** Weighted-mean origin coordinates for the zip — needed by the
+     *  Affinity Heatmap (CatchmentMap) renderer. Without these the map
+     *  draws nothing and the section appears blank. */
+    lat: number;
+    lng: number;
   }>;
 }
 
@@ -745,11 +750,13 @@ export function buildAffinityReport(
   coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
   defaultCountry?: string,
 ): ConsolidatedAffinityReport {
-  // Aggregate by postal code
+  // Aggregate by postal code. Also accumulate visit-weighted lat/lng sums
+  // so the output rows can carry a representative centroid for map rendering.
   const byZip = new Map<string, {
     city: string; country: string;
     totalVisits: number; uniqueDevices: number;
     dwellSum: number; freqSum: number; rowCount: number;
+    latSum: number; lngSum: number; latLngWeight: number;
   }>();
   const fallbackCountry = defaultCountry || 'UNKNOWN';
 
@@ -771,6 +778,8 @@ export function buildAffinityReport(
     const uniqueDevices = parseInt(row.unique_devices, 10) || 0;
     const avgDwell = parseFloat(row.avg_dwell) || 0;
     const avgFreq = parseFloat(row.avg_frequency) || 1;
+    const validCoord = Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0);
+    const coordWeight = validCoord ? Math.max(1, totalVisits) : 0;
 
     const existing = byZip.get(zipKey);
     if (existing) {
@@ -779,6 +788,9 @@ export function buildAffinityReport(
       existing.dwellSum += avgDwell * totalVisits;
       existing.freqSum += avgFreq * totalVisits;
       existing.rowCount += totalVisits;
+      existing.latSum += lat * coordWeight;
+      existing.lngSum += lng * coordWeight;
+      existing.latLngWeight += coordWeight;
     } else {
       byZip.set(zipKey, {
         city: geo.city, country: geo.country,
@@ -786,6 +798,9 @@ export function buildAffinityReport(
         dwellSum: avgDwell * totalVisits,
         freqSum: avgFreq * totalVisits,
         rowCount: totalVisits,
+        latSum: lat * coordWeight,
+        lngSum: lng * coordWeight,
+        latLngWeight: coordWeight,
       });
     }
   }
@@ -795,7 +810,9 @@ export function buildAffinityReport(
     const [postalCode] = key.split('|');
     const avgDwell = v.rowCount > 0 ? v.dwellSum / v.rowCount : 0;
     const avgFrequency = v.rowCount > 0 ? v.freqSum / v.rowCount : 1;
-    return { postalCode, city: v.city, country: v.country, totalVisits: v.totalVisits, uniqueDevices: v.uniqueDevices, avgDwell, avgFrequency };
+    const lat = v.latLngWeight > 0 ? v.latSum / v.latLngWeight : 0;
+    const lng = v.latLngWeight > 0 ? v.lngSum / v.latLngWeight : 0;
+    return { postalCode, city: v.city, country: v.country, totalVisits: v.totalVisits, uniqueDevices: v.uniqueDevices, avgDwell, avgFrequency, lat, lng };
   });
 
   // Normalize visit count to max
@@ -814,6 +831,8 @@ export function buildAffinityReport(
       uniqueDevices: e.uniqueDevices,
       avgDwell: Math.round(e.avgDwell * 10) / 10,
       avgFrequency: Math.round(e.avgFrequency * 100) / 100,
+      lat: Math.round(e.lat * 10000) / 10000,
+      lng: Math.round(e.lng * 10000) / 10000,
     };
   }).sort((a, b) => b.affinityIndex - a.affinityIndex);
 
