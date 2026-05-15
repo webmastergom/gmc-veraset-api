@@ -291,12 +291,37 @@ export async function POST(
       }));
       const csvText = await obj.Body!.transformToString('utf-8');
       const lines = csvText.split('\n').filter((l) => l.length > 0);
-      const header = lines[0].split(',').map((c) => c.replace(/^"|"$/g, ''));
+      // RFC 4180-style CSV parser that respects quoted strings and doubled
+      // quote escapes. The previous regex-based version (`/(?:"((?:[^"]|"")*)")|([^,]*)/g`)
+      // emitted phantom empty matches between every real cell, which made
+      // the zip-code column inherit the latitude value. Symptom on the
+      // user's export: rows like "7.5,UNKNOWN,FR,..." where 7.5 is a lat.
+      const parseCsvLine = (line: string): string[] => {
+        const cells: string[] = [];
+        let cur = '';
+        let inQuote = false;
+        for (let i = 0; i < line.length; i++) {
+          const c = line[i];
+          if (inQuote) {
+            if (c === '"') {
+              if (line[i + 1] === '"') { cur += '"'; i++; }
+              else { inQuote = false; }
+            } else {
+              cur += c;
+            }
+          } else {
+            if (c === ',') { cells.push(cur); cur = ''; }
+            else if (c === '"') { inQuote = true; }
+            else { cur += c; }
+          }
+        }
+        cells.push(cur);
+        return cells;
+      };
+      const header = parseCsvLine(lines[0]);
       const rows: any[] = [];
       for (let i = 1; i < lines.length; i++) {
-        const cells = lines[i].match(/(?:"((?:[^"]|"")*)")|([^,]*)/g)?.map((c) =>
-          c.replace(/^"|"$/g, '').replace(/""/g, '"')
-        ) || [];
+        const cells = parseCsvLine(lines[i]);
         const rec: Record<string, string> = {};
         for (let j = 0; j < header.length; j++) rec[header[j]] = cells[j] ?? '';
         rows.push(rec);
