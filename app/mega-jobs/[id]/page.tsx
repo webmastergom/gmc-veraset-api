@@ -21,6 +21,8 @@ import { MegaDailyChart } from '@/components/mega-jobs/daily-chart'
 import { CatchmentPie } from '@/components/mega-jobs/catchment-pie'
 import { CatchmentMap } from '@/components/mega-jobs/catchment-map'
 import { CaptureRingsSummary } from '@/components/analysis/capture-rings-summary'
+import { ExecutiveSummaryCard } from '@/components/analysis/executive-summary-card'
+import { buildExecutiveSummary } from '@/lib/executive-summary'
 import { ODTables } from '@/components/mega-jobs/od-tables'
 import { MobilityBar } from '@/components/mega-jobs/mobility-bar'
 import { HourlyChart } from '@/components/mega-jobs/hourly-chart'
@@ -388,6 +390,91 @@ export default function MegaJobDetailPage() {
     to: temporalReport?.daily?.[temporalReport.daily.length - 1]?.date || '—',
   }
   const totalPois = visitsReport?.totalPois || 0
+
+  // Executive summary inputs — derive from the reports already loaded.
+  // Built client-side so it always reflects the current state of the
+  // page (no extra S3 round-trip, regenerates if the user changes filters).
+  const execSummary = (() => {
+    if (!catchmentReport && !temporalReport) return null;
+    // Peak hour: index of max devices/pings across the 24-hour distribution.
+    let peakHour: { hour: number; share: number } | undefined;
+    const hourly = hourlyReport?.hourly || [];
+    if (hourly.length > 0) {
+      const total = hourly.reduce((s: number, h: any) => s + (h.devices || h.pings || 0), 0);
+      let max = -1, maxIdx = 0;
+      for (const h of hourly) {
+        const v = h.devices || h.pings || 0;
+        if (v > max) { max = v; maxIdx = h.hour; }
+      }
+      if (total > 0) peakHour = { hour: maxIdx, share: (max / total) * 100 };
+    }
+    // Weekend share from dayhour heatmap (dow 6=Sat, 7=Sun in our convention).
+    let weekendShare: number | undefined;
+    let peakDow: { dow: number; share: number } | undefined;
+    const cells = dayhourReport?.cells || [];
+    if (cells.length > 0) {
+      let total = 0;
+      const dowTotals: Record<number, number> = {};
+      for (const c of cells) {
+        total += c.devices || c.pings || 0;
+        dowTotals[c.dow] = (dowTotals[c.dow] || 0) + (c.devices || c.pings || 0);
+      }
+      if (total > 0) {
+        const weekend = (dowTotals[6] || 0) + (dowTotals[7] || 0);
+        weekendShare = (weekend / total) * 100;
+        let max = -1, maxDow = 1;
+        for (const [d, v] of Object.entries(dowTotals)) {
+          if (v > max) { max = v; maxDow = parseInt(d, 10); }
+        }
+        peakDow = { dow: maxDow, share: (max / total) * 100 };
+      }
+    }
+    // Top mobility category — sum across before+after if categorical report exists.
+    let topMobilityCategory: { category: string; share: number } | undefined;
+    const mobCats = mobilityReport?.categories || [];
+    if (mobCats.length > 0) {
+      const total = mobCats.reduce((s: number, m: any) => s + (m.deviceDays || m.device_days || 0), 0);
+      const top = mobCats.reduce(
+        (best: any, m: any) => ((m.deviceDays || 0) > (best?.deviceDays || 0) ? m : best),
+        null,
+      );
+      if (top && total > 0) {
+        topMobilityCategory = { category: top.category, share: ((top.deviceDays || 0) / total) * 100 };
+      }
+    }
+    // Average dwell from affinity report (weighted by uniqueDevices).
+    let avgDwellMinutes: number | undefined;
+    const affRows = affinityReport?.byZipCode || [];
+    if (affRows.length > 0) {
+      let dwellSum = 0, weight = 0;
+      for (const r of affRows) {
+        const d = r.avgDwell ?? r.avgDwellMinutes ?? 0;
+        const w = r.uniqueDevices || 1;
+        dwellSum += d * w; weight += w;
+      }
+      if (weight > 0) avgDwellMinutes = dwellSum / weight;
+    }
+    const topZipEntry = catchmentReport?.byZipCode?.[0];
+    return buildExecutiveSummary({
+      subjectLabel: megaJob?.name || 'Mega-job analysis',
+      totalPois: totalPois || undefined,
+      dateRange: dateRange.from !== '—' ? dateRange : undefined,
+      country: megaJob?.country || undefined,
+      totalUniqueDevices: totalDevices || undefined,
+      totalDeviceDays: catchmentReport?.totalDeviceDays || undefined,
+      totalPings: totalPings || undefined,
+      totalZips: catchmentReport?.byZipCode?.length || undefined,
+      captureRings: catchmentReport?.captureRings || undefined,
+      topZip: topZipEntry
+        ? { zip: topZipEntry.zipCode, city: topZipEntry.city, share: topZipEntry.sharePercentage }
+        : undefined,
+      peakHour,
+      peakDow,
+      weekendShare,
+      avgDwellMinutes,
+      topMobilityCategory,
+    });
+  })();
 
   return (
     <MainLayout>
@@ -779,6 +866,9 @@ export default function MegaJobDetailPage() {
                 />
               </div>
             </div>
+
+            {/* 1.5. Executive Summary (auto-generated, English, copy-paste ready) */}
+            {execSummary && <ExecutiveSummaryCard summary={execSummary} />}
 
             {/* 2. Daily Activity Chart */}
             {temporalReport?.daily && (
