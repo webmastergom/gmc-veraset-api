@@ -12,6 +12,7 @@ import {
   computeAffinityReport,
   affinityReportToCsv,
   buildCategoryAffinityLabel,
+  type BaselineZip,
 } from '@/lib/affinity-builder';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { getJob } from '@/lib/jobs';
@@ -324,11 +325,36 @@ export async function POST(
         }
       }
 
+      // Load main dataset affinity as baseline so we score lift over
+      // population density (not raw density). Falls back to legacy heat
+      // mode if no main affinity has been generated yet.
+      let baseline: BaselineZip[] | undefined;
+      try {
+        const main = await getConfig<any>(`dataset-reports/${datasetName}/affinity`);
+        const baseRows: any[] = Array.isArray(main?.byZipCode) ? main.byZipCode : [];
+        baseline = baseRows
+          .filter((z) =>
+            Number.isFinite(z?.lat) && Number.isFinite(z?.lng) &&
+            (z?.uniqueDevices ?? 0) > 0,
+          )
+          .map((z) => ({
+            zipCode: String(z.zipCode ?? z.postalCode ?? ''),
+            lat: z.lat,
+            lng: z.lng,
+            uniqueDevices: z.uniqueDevices,
+          }));
+        if (baseline.length === 0) baseline = undefined;
+        console.log(`[DS-CATEGORY-AFFINITY] baseline: ${baseline ? baseline.length + ' zips' : 'none — falling back to legacy heat mode'}`);
+      } catch (e: any) {
+        console.warn(`[DS-CATEGORY-AFFINITY] baseline load failed: ${e?.message || e}`);
+      }
+
       const report = await computeAffinityReport(
         `dataset-${datasetName}-category-affinity`,
         rows,
         coordToZip,
         state.country,
+        baseline,
       );
       const useful = report.byZipCode.filter((r) => r.uniqueDevices > 0 || r.affinityIndex > 0);
       const csvBody = affinityReportToCsv({ ...report, byZipCode: useful });

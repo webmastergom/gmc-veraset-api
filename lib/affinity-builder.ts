@@ -73,6 +73,18 @@ export interface AffinityReport {
   byZipCode: AffinityByZip[];
 }
 
+/** Baseline population reference (e.g. the job's main affinity report).
+ *  When provided, scoring switches from raw heat to *lift over baseline*
+ *  — i.e. where this category is over- or under-indexed relative to
+ *  overall device density. Without it, every category-affinity map
+ *  collapses to the same "where most people live" pattern. */
+export interface BaselineZip {
+  zipCode: string;
+  lat: number;
+  lng: number;
+  uniqueDevices: number;
+}
+
 /** Haversine distance in km between two points. */
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371;
@@ -93,6 +105,7 @@ export async function computeAffinityReport(
   rows: any[],
   coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
   country?: string,
+  baseline?: BaselineZip[],
 ): Promise<AffinityReport> {
   // ── Step 1: Aggregate raw data by postal code ──────────────────
   const zipMap = new Map<string, {
@@ -163,6 +176,152 @@ export async function computeAffinityReport(
   };
 
   const hotWithHeat = hotSources.map(z => ({ ...z, heat: heatAt(z.lat, z.lng) }));
+
+  // ── Lift mode: score = over-indexing vs a baseline population ────
+  //
+  // Without this, every category map collapses to the same population-
+  // density pattern (top zips are wherever most devices live, period).
+  // With it, score reflects where the category is concentrated *relative
+  // to* baseline. A zip with 3× the category share for its population
+  // size scores high even if it isn't the most populous.
+  //
+  // Math:
+  //   heat_cat(p)  = Σ_q intensity_q × g(dist(p, q))   over cat sources
+  //   heat_base(p) = Σ_b devices_b × g(dist(p, b))     over baseline
+  //   lift(p) = heat_cat(p) / (heat_base(p) + ε)
+  //   score   = clamp(50 + 20·log2(lift / medianLift), 0, 100)
+  //
+  // Anchoring on the median lift means the "typical" zip scores ~50,
+  // a 2× over-indexed zip scores ~70, and a 4× over-indexed zip caps at
+  // 100. Under-indexed zips score below 50 → readable contrast.
+  if (baseline && baseline.length > 0) {
+    const baseSources = baseline
+      .filter(b => Number.isFinite(b.lat) && Number.isFinite(b.lng) && b.uniqueDevices > 0)
+      .map(b => ({ lat: b.lat, lng: b.lng, intensity: b.uniqueDevices }));
+
+    const baseHeatAt = (lat: number, lng: number): number => {
+      let h = 0;
+      for (const q of baseSources) {
+        const d = haversineKm(lat, lng, q.lat, q.lng);
+        if (d > CUTOFF_KM) continue;
+        h += q.intensity * Math.exp(-(d * d) / twoSigmaSq);
+      }
+      return h;
+    };
+
+    const liftedHot = hotSources.map(z => {
+      const heatCat = heatAt(z.lat, z.lng);
+      const heatBase = baseHeatAt(z.lat, z.lng);
+      return { ...z, heatCat, heatBase };
+    });
+
+    // Regularize the baseline so tiny-base zips don't blow up the ratio.
+    // ε = 1% of max baseline heat: small enough to preserve real signal,
+    // large enough to clip outliers from sparse rural zips.
+    const maxBase = Math.max(1, ...liftedHot.map(z => z.heatBase));
+    const eps = maxBase * 0.01;
+
+    const liftFor = (heatCat: number, heatBase: number): number =>
+      heatCat <= 0 ? 0 : heatCat / (heatBase + eps);
+
+    // Median lift across measured zips → anchor point for "expected".
+    const measuredLifts = liftedHot
+      .map(z => liftFor(z.heatCat, z.heatBase))
+      .filter(l => l > 0)
+      .sort((a, b) => a - b);
+    const medianLift = measuredLifts.length > 0
+      ? measuredLifts[Math.floor(measuredLifts.length / 2)]
+      : 1;
+
+    const scoreFor = (lift: number): number => {
+      if (lift <= 0 || !Number.isFinite(lift) || medianLift <= 0) return 0;
+      const s = 50 + 20 * Math.log2(lift / medianLift);
+      return Math.max(0, Math.min(100, Math.round(s)));
+    };
+
+    const hotCps: AffinityByZip[] = liftedHot.map(z => ({
+      zipCode: z.zipCode, city: z.city, country: z.country,
+      lat: z.lat, lng: z.lng,
+      uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
+      avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
+      avgFrequency: Math.round(z.avgFreq * 100) / 100,
+      affinityIndex: scoreFor(liftFor(z.heatCat, z.heatBase)),
+    }));
+
+    // Adjacent polygons — only paint zips that have real category heat
+    // and aren't dramatically under-indexed. This is what kills the
+    // "central Paris all reads 100" bleed: with lift, a population-dense
+    // zip with proportional category heat scores ~50, not 100.
+    type AdjacentRaw = {
+      zipCode: string; city: string; country: string;
+      lat: number; lng: number; lift: number;
+    };
+    const adjacentRaw: AdjacentRaw[] = [];
+    if (country && hotSources.length > 0) {
+      try {
+        const geojsonPath = path.join(process.cwd(), 'data', 'geojson', `${country}.geojson`);
+        if (fs.existsSync(geojsonPath)) {
+          const geojson = JSON.parse(fs.readFileSync(geojsonPath, 'utf-8'));
+          const hotSet = new Set(hotSources.map(h => h.zipCode));
+          for (const feature of geojson.features) {
+            const cp = feature.properties?.postal_code || feature.properties?.postcode || '';
+            if (!cp || hotSet.has(cp)) continue;
+
+            let cLat = 0, cLng = 0;
+            if (feature.properties?.latitude && feature.properties?.longitude) {
+              cLat = parseFloat(feature.properties.latitude);
+              cLng = parseFloat(feature.properties.longitude);
+            } else if (feature.bbox) {
+              cLat = (feature.bbox[1] + feature.bbox[3]) / 2;
+              cLng = (feature.bbox[0] + feature.bbox[2]) / 2;
+            } else {
+              const coords = feature.geometry?.coordinates;
+              if (!coords) continue;
+              const flat = feature.geometry.type === 'MultiPolygon' ? coords[0][0] : coords[0];
+              if (!flat?.length) continue;
+              const sumLat = flat.reduce((s: number, c: number[]) => s + c[1], 0);
+              const sumLng = flat.reduce((s: number, c: number[]) => s + c[0], 0);
+              cLat = sumLat / flat.length;
+              cLng = sumLng / flat.length;
+            }
+            if (!cLat || !cLng) continue;
+
+            const heatCat = heatAt(cLat, cLng);
+            if (heatCat <= 0) continue;
+            const heatBase = baseHeatAt(cLat, cLng);
+            const lift = liftFor(heatCat, heatBase);
+            // Drop adjacents under half the median lift — they'd just
+            // clutter the map at 20-30 score and dilute the signal.
+            if (lift < medianLift * 0.5) continue;
+
+            const city = feature.properties?.city || feature.properties?.estado || '';
+            adjacentRaw.push({ zipCode: cp, city, country, lat: cLat, lng: cLng, lift });
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[AFFINITY-LIFT] Adjacent compute failed: ${e.message}`);
+      }
+    }
+
+    const adjacentCps: AffinityByZip[] = adjacentRaw.map(a => ({
+      zipCode: a.zipCode, city: a.city, country: a.country,
+      lat: a.lat, lng: a.lng,
+      uniqueDevices: 0, totalVisitDays: 0,
+      avgDwellMinutes: 0, avgFrequency: 0,
+      affinityIndex: scoreFor(a.lift),
+    }));
+
+    console.log(`[AFFINITY-LIFT] ${subject}: ${hotCps.length} hot + ${adjacentCps.length} adjacent (medianLift=${medianLift.toExponential(2)})`);
+
+    const allCps = [...hotCps, ...adjacentCps];
+    allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
+
+    return {
+      analyzedAt: new Date().toISOString(),
+      subject,
+      byZipCode: allCps,
+    };
+  }
 
   // ── Step 3: Adjacent polygons from country GeoJSON ─────────────
   type AdjacentRaw = {

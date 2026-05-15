@@ -14,6 +14,7 @@ import {
   computeAffinityReport,
   affinityReportToCsv,
   buildCategoryAffinityLabel,
+  type BaselineZip,
 } from '@/lib/affinity-builder';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
@@ -396,11 +397,36 @@ export async function POST(
         }
       }
 
+      // Load main megajob affinity as baseline so we score lift over
+      // population density (not raw density). Note: megajob affinity uses
+      // `postalCode` while the dataset version uses `zipCode` — handle both.
+      let baseline: BaselineZip[] | undefined;
+      try {
+        const main = await getConfig<any>(`mega-reports/${id}/affinity`);
+        const baseRows: any[] = Array.isArray(main?.byZipCode) ? main.byZipCode : [];
+        baseline = baseRows
+          .filter((z) =>
+            Number.isFinite(z?.lat) && Number.isFinite(z?.lng) &&
+            (z?.uniqueDevices ?? 0) > 0,
+          )
+          .map((z) => ({
+            zipCode: String(z.zipCode ?? z.postalCode ?? ''),
+            lat: z.lat,
+            lng: z.lng,
+            uniqueDevices: z.uniqueDevices,
+          }));
+        if (baseline.length === 0) baseline = undefined;
+        console.log(`[MEGA-CATEGORY-AFFINITY] baseline: ${baseline ? baseline.length + ' zips' : 'none — falling back to legacy heat mode'}`);
+      } catch (e: any) {
+        console.warn(`[MEGA-CATEGORY-AFFINITY] baseline load failed: ${e?.message || e}`);
+      }
+
       const report = await computeAffinityReport(
         `mega-${id}-category-affinity`,
         rows,
         coordToZip,
         state.country,
+        baseline,
       );
 
       // Drop the long tail of zero-engagement rows to keep CSV tight.
