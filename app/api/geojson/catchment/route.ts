@@ -33,6 +33,10 @@ interface ZipDeviceDays {
   zipCode: string;
   deviceDays: number;
   city: string;
+  /** Trade-area capture ring (70/80/90) the zip belongs to, or null for
+   *  the long tail. Optional — included in feature.properties when present
+   *  so the client can color the choropleth by ring instead of by heat. */
+  captureRing?: 70 | 80 | 90 | null;
 }
 
 /**
@@ -84,7 +88,7 @@ function loadCountryGeoJSON(country: string): any | null {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const entries: Array<{ zipCode: string; deviceDays: number; city: string; country: string }> = body.entries || [];
+    const entries: Array<{ zipCode: string; deviceDays: number; city: string; country: string; captureRing?: 70 | 80 | 90 | null }> = body.entries || [];
 
     if (!entries.length) {
       return NextResponse.json({ type: 'FeatureCollection', features: [] });
@@ -96,7 +100,7 @@ export async function POST(req: NextRequest) {
     const unknownPool: ZipDeviceDays[] = [];
     for (const e of entries) {
       const cc = (e.country || '').toUpperCase();
-      const zd: ZipDeviceDays = { zipCode: normZip(e.zipCode), deviceDays: e.deviceDays, city: e.city };
+      const zd: ZipDeviceDays = { zipCode: normZip(e.zipCode), deviceDays: e.deviceDays, city: e.city, captureRing: e.captureRing ?? null };
       if (!cc || cc === 'UNKNOWN') {
         unknownPool.push(zd);
         continue;
@@ -110,11 +114,17 @@ export async function POST(req: NextRequest) {
 
     // ── Pass 1: known countries ────────────────────────────────────────
     for (const [country, zipEntries] of byCountry) {
-      const lookup = new Map<string, { deviceDays: number; city: string }>();
+      const lookup = new Map<string, { deviceDays: number; city: string; captureRing?: 70 | 80 | 90 | null }>();
       for (const z of zipEntries) {
         const existing = lookup.get(z.zipCode);
-        if (existing) existing.deviceDays += z.deviceDays;
-        else lookup.set(z.zipCode, { deviceDays: z.deviceDays, city: z.city });
+        if (existing) {
+          existing.deviceDays += z.deviceDays;
+          // Keep the smallest (most "in-tier") capture ring when the same
+          // zip code appears under multiple aggregated entries.
+          if (z.captureRing != null && (existing.captureRing == null || z.captureRing < existing.captureRing)) {
+            existing.captureRing = z.captureRing;
+          }
+        } else lookup.set(z.zipCode, { deviceDays: z.deviceDays, city: z.city, captureRing: z.captureRing ?? null });
       }
       const geojson = loadCountryGeoJSON(country);
       if (!geojson) {
@@ -131,7 +141,7 @@ export async function POST(req: NextRequest) {
           allFeatures.push({
             type: 'Feature',
             geometry: feature.geometry,
-            properties: { zipCode: pc, city: entry.city, country, deviceDays: entry.deviceDays },
+            properties: { zipCode: pc, city: entry.city, country, deviceDays: entry.deviceDays, captureRing: entry.captureRing ?? null },
           });
           matched++;
         }
@@ -142,11 +152,15 @@ export async function POST(req: NextRequest) {
     // ── Pass 2: rows with UNKNOWN country — try fallback countries ─────
     if (unknownPool.length > 0) {
       console.log(`[GEOJSON-CATCHMENT] ${unknownPool.length} entries have UNKNOWN country, trying fallback list`);
-      const remaining = new Map<string, { deviceDays: number; city: string }>();
+      const remaining = new Map<string, { deviceDays: number; city: string; captureRing?: 70 | 80 | 90 | null }>();
       for (const z of unknownPool) {
         const existing = remaining.get(z.zipCode);
-        if (existing) existing.deviceDays += z.deviceDays;
-        else remaining.set(z.zipCode, { deviceDays: z.deviceDays, city: z.city });
+        if (existing) {
+          existing.deviceDays += z.deviceDays;
+          if (z.captureRing != null && (existing.captureRing == null || z.captureRing < existing.captureRing)) {
+            existing.captureRing = z.captureRing;
+          }
+        } else remaining.set(z.zipCode, { deviceDays: z.deviceDays, city: z.city, captureRing: z.captureRing ?? null });
       }
       for (const country of FALLBACK_COUNTRIES_FOR_UNKNOWN) {
         if (remaining.size === 0) break;
@@ -161,7 +175,7 @@ export async function POST(req: NextRequest) {
             allFeatures.push({
               type: 'Feature',
               geometry: feature.geometry,
-              properties: { zipCode: pc, city: entry.city, country, deviceDays: entry.deviceDays },
+              properties: { zipCode: pc, city: entry.city, country, deviceDays: entry.deviceDays, captureRing: entry.captureRing ?? null },
             });
             remaining.delete(pc);
             matched++;

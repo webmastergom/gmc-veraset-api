@@ -11,10 +11,31 @@ interface ZipEntry {
   lat: number;
   lng: number;
   deviceDays: number;
+  /** Trade-area capture ring tier. When present, the map can be toggled
+   *  to color polygons by ring (70/80/90) instead of by raw heat. */
+  captureRing?: 70 | 80 | 90 | null;
 }
 
 interface CatchmentMapProps {
   data: ZipEntry[];
+}
+
+type ViewMode = 'heat' | 'trade-area';
+
+/** Trade-area ring colors. Sequential green→amber→orange→gray maps to
+ *  "core" / "secondary" / "fringe" / "outside trade area". */
+function getRingColor(ring: 70 | 80 | 90 | null | undefined): string {
+  if (ring === 70) return '#10b981'; // emerald — core
+  if (ring === 80) return '#f59e0b'; // amber — secondary
+  if (ring === 90) return '#f97316'; // orange — fringe
+  return '#6b7280';                  // gray — long tail
+}
+
+function ringLabel(ring: 70 | 80 | 90 | null | undefined): string {
+  if (ring === 70) return '70% capture (core)';
+  if (ring === 80) return '80% capture (secondary)';
+  if (ring === 90) return '90% capture (fringe)';
+  return 'Long tail';
 }
 
 /**
@@ -55,6 +76,14 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
   const [showMarkers, setShowMarkers] = useState(false);
   const markersLayerRef = useRef<any>(null);
   const [loading, setLoading] = useState(false);
+  // Switch between continuous heat (device-days gradient) and discrete
+  // trade-area rings (70/80/90% capture). Default = heat.
+  const [viewMode, setViewMode] = useState<ViewMode>('heat');
+  const hasRings = data.some((d) => d.captureRing != null);
+  const choroplethLayerRef = useRef<any>(null);
+  const legendRef = useRef<any>(null);
+  const LRef = useRef<any>(null);
+  const maxValRef = useRef<number>(1);
 
   useEffect(() => {
     if (!mapRef.current || typeof window === 'undefined') return;
@@ -101,6 +130,7 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
           deviceDays: d.deviceDays,
           city: d.city,
           country: d.country,
+          captureRing: d.captureRing ?? null,
         }));
 
         const res = await fetch('/api/geojson/catchment', {
@@ -118,35 +148,37 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
       if (cancelled || !mapRef.current) return;
       setLoading(false);
 
-      // ── Render GeoJSON choropleth ──────────────────────────────────
+      // ── Render GeoJSON choropleth (heat or trade-area) ─────────────
+      LRef.current = L;
+      maxValRef.current = maxVal;
       if (geojsonData?.features?.length) {
-        // Track which zip codes have polygons
         for (const f of geojsonData.features) {
           matchedZips.add(f.properties.zipCode);
         }
 
-        L.geoJSON(geojsonData, {
+        const choropleth = L.geoJSON(geojsonData, {
           style: (feature: any) => {
-            const dd = feature?.properties?.deviceDays || 0;
-            return {
-              fillColor: getHeatColor(dd, maxVal),
-              fillOpacity: 0.7,
-              color: '#333',
-              weight: 0.5,
-            };
+            const p = feature?.properties || {};
+            const dd = p.deviceDays || 0;
+            const fillColor = viewMode === 'trade-area'
+              ? getRingColor(p.captureRing)
+              : getHeatColor(dd, maxVal);
+            return { fillColor, fillOpacity: 0.7, color: '#333', weight: 0.5 };
           },
           onEachFeature: (feature: any, layer: any) => {
             const p = feature.properties;
+            const ringRow = p.captureRing != null
+              ? `<br/><span style="opacity:0.75">${ringLabel(p.captureRing)}</span>`
+              : '';
             layer.bindPopup(
-              `<strong>${p.zipCode}</strong><br/>${p.city || ''}, ${p.country || ''}<br/><b>${(p.deviceDays || 0).toLocaleString()}</b> device-days`
+              `<strong>${p.zipCode}</strong><br/>${p.city || ''}, ${p.country || ''}<br/><b>${(p.deviceDays || 0).toLocaleString()}</b> device-days${ringRow}`
             );
           },
         }).addTo(map);
+        choroplethLayerRef.current = choropleth;
 
-        // Fit bounds to GeoJSON if we got polygons
         if (geojsonData.features.length > 5) {
-          const gjLayer = L.geoJSON(geojsonData);
-          const gjBounds = gjLayer.getBounds();
+          const gjBounds = choropleth.getBounds();
           if (gjBounds.isValid()) {
             map.fitBounds(gjBounds, { padding: [30, 30] });
           }
@@ -182,32 +214,48 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
       unmatchedGroup.addTo(map);
       markersLayerRef.current = { all: allMarkersGroup, unmatched: unmatchedGroup };
 
-      // ── Legend ──────────────────────────────────────────────────────
-      const legend = new (L.Control.extend({
+      // ── Legend (rebuilt on mode change via the effect below) ───────
+      const buildLegend = (mode: ViewMode) => new (L.Control.extend({
         onAdd: () => {
           const div = L.DomUtil.create('div', 'leaflet-control');
           div.style.cssText =
             'background: rgba(0,0,0,0.8); padding: 8px 12px; border-radius: 6px; color: #fff; font-size: 12px;';
-
-          const steps = 5;
-          let gradient = '';
-          for (let i = 0; i <= steps; i++) {
-            const val = (maxVal / steps) * i;
-            gradient += `<span style="display:inline-block;width:${100 / (steps + 1)}%;height:14px;background:${getHeatColor(val, maxVal)}"></span>`;
+          if (mode === 'trade-area') {
+            const tiers: Array<[70 | 80 | 90 | null, string]> = [
+              [70, 'Core (top 70%)'],
+              [80, 'Secondary (70–80%)'],
+              [90, 'Fringe (80–90%)'],
+              [null, 'Long tail'],
+            ];
+            const rows = tiers.map(([r, label]) =>
+              `<div style="display:flex;align-items:center;gap:6px;margin-top:2px;">
+                <span style="display:inline-block;width:14px;height:14px;background:${getRingColor(r)};border:1px solid #555"></span>
+                <span>${label}</span>
+              </div>`
+            ).join('');
+            div.innerHTML = `<div style="margin-bottom:4px;font-weight:600;">Trade Area</div>${rows}`;
+          } else {
+            const steps = 5;
+            let gradient = '';
+            for (let i = 0; i <= steps; i++) {
+              const val = (maxVal / steps) * i;
+              gradient += `<span style="display:inline-block;width:${100 / (steps + 1)}%;height:14px;background:${getHeatColor(val, maxVal)}"></span>`;
+            }
+            div.innerHTML = `
+              <div style="margin-bottom:4px;font-weight:600;">Device-Days</div>
+              <div style="display:flex;">${gradient}</div>
+              <div style="display:flex;justify-content:space-between;margin-top:2px;">
+                <span>0</span>
+                <span>${maxVal.toLocaleString()}</span>
+              </div>
+            `;
           }
-
-          div.innerHTML = `
-            <div style="margin-bottom:4px;font-weight:600;">Device-Days</div>
-            <div style="display:flex;">${gradient}</div>
-            <div style="display:flex;justify-content:space-between;margin-top:2px;">
-              <span>0</span>
-              <span>${maxVal.toLocaleString()}</span>
-            </div>
-          `;
           return div;
         },
       }))({ position: 'bottomright' });
+      const legend = buildLegend(viewMode);
       legend.addTo(map);
+      legendRef.current = { instance: legend, build: buildLegend };
     });
 
     return () => {
@@ -236,6 +284,30 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
     }
   }, [showMarkers]);
 
+  // Re-style polygons + rebuild legend when viewMode flips. No re-fetch
+  // of the GeoJSON, no map remount — just an instant color swap.
+  useEffect(() => {
+    const map = mapInstance.current;
+    const choropleth = choroplethLayerRef.current;
+    const legendInfo = legendRef.current;
+    const maxVal = maxValRef.current;
+    if (!map || !choropleth) return;
+    choropleth.setStyle((feature: any) => {
+      const p = feature?.properties || {};
+      const dd = p.deviceDays || 0;
+      const fillColor = viewMode === 'trade-area'
+        ? getRingColor(p.captureRing)
+        : getHeatColor(dd, maxVal);
+      return { fillColor, fillOpacity: 0.7, color: '#333', weight: 0.5 };
+    });
+    if (legendInfo?.instance && legendInfo?.build) {
+      legendInfo.instance.remove();
+      const fresh = legendInfo.build(viewMode);
+      fresh.addTo(map);
+      legendRef.current = { instance: fresh, build: legendInfo.build };
+    }
+  }, [viewMode]);
+
   if (!data?.length) {
     return (
       <div className="h-[500px] flex items-center justify-center text-muted-foreground">
@@ -251,12 +323,42 @@ function CatchmentMapInner({ data }: CatchmentMapProps) {
           Loading polygons...
         </div>
       )}
-      <button
-        onClick={() => setShowMarkers((v) => !v)}
-        className="absolute top-2 left-2 z-[1000] bg-background/90 px-3 py-1.5 rounded text-xs font-medium border border-border hover:bg-accent transition-colors"
-      >
-        {showMarkers ? 'Hide markers' : 'Show markers'}
-      </button>
+      <div className="absolute top-2 left-2 z-[1000] flex items-center gap-2">
+        <button
+          onClick={() => setShowMarkers((v) => !v)}
+          className="bg-background/90 px-3 py-1.5 rounded text-xs font-medium border border-border hover:bg-accent transition-colors"
+        >
+          {showMarkers ? 'Hide markers' : 'Show markers'}
+        </button>
+        {hasRings && (
+          <div className="inline-flex rounded-md border border-border bg-background/90 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setViewMode('heat')}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                viewMode === 'heat'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-accent'
+              }`}
+              title="Continuous heat gradient by device-days"
+            >
+              Heat
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('trade-area')}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors border-l border-border ${
+                viewMode === 'trade-area'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-accent'
+              }`}
+              title="Discrete colors by 70/80/90% capture ring"
+            >
+              Trade Area
+            </button>
+          </div>
+        )}
+      </div>
       <div ref={mapRef} className="h-[500px] w-full rounded-lg" />
     </div>
   );
