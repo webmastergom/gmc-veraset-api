@@ -861,221 +861,23 @@ function buildMobilitySQL(table: string, minDwell = 0, maxDwell = 0, poiCoords?:
     ORDER BY timing, device_days DESC`;
 }
 
-// ── Affinity index computation ────────────────────────────────────────
+// ── Affinity index computation (shared with megajob category-affinity export) ──
 
-interface AffinityByZip {
-  zipCode: string;
-  city: string;
-  country: string;
-  lat: number;
-  lng: number;
-  uniqueDevices: number;
-  totalVisitDays: number;
-  avgDwellMinutes: number;
-  avgFrequency: number;
-  affinityIndex: number;  // 0-100
-}
+import { computeAffinityReport as computeAffinityReportShared, type AffinityByZip } from '@/lib/affinity-builder';
 
-/** Haversine distance in km between two points */
-function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLng = (lng2 - lng1) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
+/** Wrapper that preserves the legacy { datasetName } shape on the report
+ *  object. New callers should use the shared `computeAffinityReportShared`
+ *  directly. */
 async function computeAffinityReport(
   datasetName: string,
   rows: any[],
   coordToZip: Map<string, { zipCode: string; city: string; country: string }>,
   country?: string,
 ): Promise<{ analyzedAt: string; datasetName: string; byZipCode: AffinityByZip[] }> {
-  // ── Step 1: Aggregate raw data by postal code ──────────────────
-  const zipMap = new Map<string, {
-    zipCode: string; city: string; country: string;
-    lat: number; lng: number;
-    uniqueDevices: number; totalVisitDays: number;
-    dwellSum: number; dwellCount: number;
-    freqSum: number; freqCount: number;
-  }>();
-
-  const fallbackCountry = country || 'UNKNOWN';
-  for (const row of rows) {
-    const lat = parseFloat(row.origin_lat) || 0;
-    const lng = parseFloat(row.origin_lng) || 0;
-    const key = `${lat},${lng}`;
-    const nativeZip = String(row.native_zip || '').trim();
-    const nativeCity = String(row.native_city || '').trim();
-    // FULL-schema bypass: prefer native_zip from geo_fields when present.
-    const geo = nativeZip
-      ? { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: fallbackCountry }
-      : (coordToZip.get(key) || { zipCode: 'UNKNOWN', city: 'UNKNOWN', country: 'UNKNOWN' });
-    const zk = geo.zipCode;
-
-    const devices = parseInt(row.unique_devices, 10) || 0;
-    const visitDays = parseInt(row.total_visit_days, 10) || 0;
-    const avgDwell = parseFloat(row.avg_dwell_minutes) || 0;
-    const avgFreq = parseFloat(row.avg_frequency) || 1;
-
-    const existing = zipMap.get(zk);
-    if (existing) {
-      existing.uniqueDevices += devices;
-      existing.totalVisitDays += visitDays;
-      existing.dwellSum += avgDwell * devices;
-      existing.dwellCount += devices;
-      existing.freqSum += avgFreq * devices;
-      existing.freqCount += devices;
-    } else {
-      zipMap.set(zk, {
-        zipCode: zk, city: geo.city, country: geo.country,
-        lat, lng,
-        uniqueDevices: devices, totalVisitDays: visitDays,
-        dwellSum: avgDwell * devices, dwellCount: devices,
-        freqSum: avgFreq * devices, freqCount: devices,
-      });
-    }
-  }
-
-  // ── Step 2: Build heat field — unified scoring across hot + adjacent ──
-  //
-  // The previous implementation hard-clamped hot CPs to 85..100 and
-  // scored adjacent CPs in fixed distance rings (65-84 / 40-64 / 15-39 /
-  // 1-14). Two problems:
-  //   - Hot CPs were compressed into a 16-point band with almost no
-  //     differentiation (user's complaint: "solo veo 86 a 97").
-  //   - The split between hot and adjacent was an artificial step;
-  //     the same physical model (heat radiating from sources) describes
-  //     both better.
-  //
-  // Replace with a Gaussian heat field. Each measured zip is a heat
-  // source with intensity proportional to visit volume × engagement.
-  // Every zip (measured + neighboring polygons in the country GeoJSON)
-  // gets a heat value = Σ intensity × exp(-d²/2σ²). Then log-normalize
-  // globally to 0..100 so the long tail stays visible.
-  const SIGMA_KM = 12;
-  const CUTOFF_KM = SIGMA_KM * 3;
-  const twoSigmaSq = 2 * SIGMA_KM * SIGMA_KM;
-
-  const zips = Array.from(zipMap.values()).filter(z => z.zipCode !== 'UNKNOWN');
-
-  // Heat-source intensity per measured zip. Volume (totalVisitDays) is
-  // the primary signal; engagement (dwell + freq) is a multiplicative
-  // booster via log1p so it doesn't dominate at extreme values.
-  type HotSource = typeof zips[0] & {
-    avgDwell: number; avgFreq: number; intensity: number;
-  };
-  const hotSources: HotSource[] = zips.map(z => {
-    const avgDwell = z.dwellCount > 0 ? z.dwellSum / z.dwellCount : 0;
-    const avgFreq = z.freqCount > 0 ? z.freqSum / z.freqCount : 1;
-    // engagement multiplier: log1p(dwell/30)+log1p(freq/2) — both grow
-    // with the signal but neither alone can swamp the other.
-    const engagementBoost = 1 + Math.log1p(avgDwell / 30) + Math.log1p(avgFreq / 2);
-    const intensity = Math.max(1, z.totalVisitDays) * engagementBoost;
-    return { ...z, avgDwell, avgFreq, intensity };
-  });
-
-  const heatAt = (lat: number, lng: number): number => {
-    let heat = 0;
-    for (const q of hotSources) {
-      const d = haversineKm(lat, lng, q.lat, q.lng);
-      if (d > CUTOFF_KM) continue;
-      heat += q.intensity * Math.exp(-(d * d) / twoSigmaSq);
-    }
-    return heat;
-  };
-
-  // Heat at every measured zip's own centroid (includes self-contribution).
-  const hotWithHeat = hotSources.map(z => ({ ...z, heat: heatAt(z.lat, z.lng) }));
-
-  // ── Step 3: Neighboring polygons from country GeoJSON ──────────
-  type AdjacentRaw = {
-    zipCode: string; city: string; country: string;
-    lat: number; lng: number; heat: number;
-  };
-  const adjacentRaw: AdjacentRaw[] = [];
-  if (country && hotSources.length > 0) {
-    try {
-      const fs = await import('fs');
-      const path = await import('path');
-      const geojsonPath = path.join(process.cwd(), 'data', 'geojson', `${country}.geojson`);
-      if (fs.existsSync(geojsonPath)) {
-        const geojson = JSON.parse(fs.readFileSync(geojsonPath, 'utf-8'));
-        const hotSet = new Set(hotSources.map(h => h.zipCode));
-        for (const feature of geojson.features) {
-          const cp = feature.properties?.postal_code || feature.properties?.postcode || '';
-          if (!cp || hotSet.has(cp)) continue;
-
-          let cLat = 0, cLng = 0;
-          if (feature.properties?.latitude && feature.properties?.longitude) {
-            cLat = parseFloat(feature.properties.latitude);
-            cLng = parseFloat(feature.properties.longitude);
-          } else if (feature.bbox) {
-            cLat = (feature.bbox[1] + feature.bbox[3]) / 2;
-            cLng = (feature.bbox[0] + feature.bbox[2]) / 2;
-          } else {
-            const coords = feature.geometry?.coordinates;
-            if (!coords) continue;
-            const flat = feature.geometry.type === 'MultiPolygon' ? coords[0][0] : coords[0];
-            if (!flat?.length) continue;
-            const sumLat = flat.reduce((s: number, c: number[]) => s + c[1], 0);
-            const sumLng = flat.reduce((s: number, c: number[]) => s + c[0], 0);
-            cLat = sumLat / flat.length;
-            cLng = sumLng / flat.length;
-          }
-          if (!cLat || !cLng) continue;
-
-          const heat = heatAt(cLat, cLng);
-          if (heat <= 0) continue; // outside cutoff of every source
-          const city = feature.properties?.city || feature.properties?.estado || '';
-          adjacentRaw.push({ zipCode: cp, city, country, lat: cLat, lng: cLng, heat });
-        }
-      }
-    } catch (e: any) {
-      console.warn(`[DS-REPORT] Affinity adjacent compute failed: ${e.message}`);
-    }
-  }
-
-  // ── Step 4: Normalize all heats globally to 0..100 ────────────
-  const maxHeat = Math.max(
-    1,
-    ...hotWithHeat.map(z => z.heat),
-    ...adjacentRaw.map(a => a.heat),
-  );
-  const logMax = Math.log(maxHeat + 1);
-  const scoreFor = (heat: number): number =>
-    heat > 0 ? Math.max(1, Math.round(100 * Math.log(heat + 1) / logMax)) : 0;
-
-  const hotCps: AffinityByZip[] = hotWithHeat.map(z => ({
-    zipCode: z.zipCode, city: z.city, country: z.country,
-    lat: z.lat, lng: z.lng,
-    uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
-    avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
-    avgFrequency: Math.round(z.avgFreq * 100) / 100,
-    affinityIndex: scoreFor(z.heat),
-  }));
-
-  const adjacentCps: AffinityByZip[] = adjacentRaw.map(a => ({
-    zipCode: a.zipCode, city: a.city, country: a.country,
-    lat: a.lat, lng: a.lng,
-    uniqueDevices: 0, totalVisitDays: 0,
-    avgDwellMinutes: 0, avgFrequency: 0,
-    affinityIndex: scoreFor(a.heat),
-  }));
-
-  console.log(`[DS-REPORT] Affinity: ${hotCps.length} hot + ${adjacentCps.length} adjacent CPs (maxHeat=${maxHeat.toFixed(0)})`);
-
-  const allCps = [...hotCps, ...adjacentCps];
-  allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
-
-  return {
-    analyzedAt: new Date().toISOString(),
-    datasetName,
-    byZipCode: allCps,
-  };
+  const report = await computeAffinityReportShared(datasetName, rows, coordToZip, country);
+  return { analyzedAt: report.analyzedAt, datasetName, byZipCode: report.byZipCode };
 }
+
 
 // ── Main handler ──────────────────────────────────────────────────────
 
