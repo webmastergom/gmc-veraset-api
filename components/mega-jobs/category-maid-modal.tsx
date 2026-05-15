@@ -211,7 +211,12 @@ export function MegaCategoryMaidModal({
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ctasTable: result.ctasTable, country }),
+        body: JSON.stringify({
+          ctasTable: result.ctasTable,
+          country,
+          groupKey: selectedGroup || 'custom',
+          categories: Array.from(selectedCategories),
+        }),
       });
       while (data.phase !== 'done' && data.phase !== 'error') {
         setAffinityProgress(data.progress?.message || 'Processing…');

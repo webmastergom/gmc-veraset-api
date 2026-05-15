@@ -21,14 +21,42 @@ interface AffinityExportState {
   phase: 'querying' | 'polling' | 'processing' | 'done' | 'error';
   ctasTable?: string;
   country?: string;
+  groupKey?: string;
+  categories?: string[];
+  slug?: string;
   queryId?: string;
   affinityQueryId?: string;
   error?: string;
   result?: {
     csvKey: string;
+    /** Slug used to persist the report at
+     *  config/mega-reports/{megaJobId}/category-affinity/{slug}.json — drives
+     *  the dropdown menu on the Affinity Heatmap map. */
+    slug: string;
+    label: string;
     totalZips: number;
     totalDevicesWithZip: number;
   };
+}
+
+/** Build a filesystem-safe slug from a category group + count + timestamp.
+ *  Used as the JSON file name under config/mega-reports/{id}/category-affinity/. */
+function buildAffinitySlug(groupKey: string | undefined, categories: string[] | undefined): string {
+  const base = (groupKey && groupKey !== 'custom' ? groupKey : (categories?.[0] || 'custom'))
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32) || 'custom';
+  const n = categories?.length ?? 0;
+  const ts = Math.floor(Date.now() / 1000).toString(36);
+  return `${base}_${n}cat_${ts}`;
+}
+
+function buildAffinityLabel(groupKey: string | undefined, categories: string[] | undefined): string {
+  const head = groupKey && groupKey !== 'custom' ? groupKey : (categories?.[0] || 'Custom');
+  const niceHead = head.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  const n = categories?.length ?? 0;
+  return n > 1 ? `${niceHead} (${n} categories)` : niceHead;
 }
 
 /**
@@ -52,10 +80,12 @@ function buildCategoryAffinitySQL(ctasTable: string, subTables: string[]): strin
   // Each sub-job's all_pings SELECT — utc_date and timestamp come from the
   // Veraset parquet schema. We join on ad_id IN cat_maids to keep the scan
   // tight (Athena pushes the filter into the parquet scan when possible).
+  // Column is `date` (the partition key), NOT `utc_date`. utc_timestamp
+  // is the precise ping time; date is the YYYY-MM-DD partition string.
   const subPingsUnion = subTables.map((t) => `
     SELECT
       ad_id,
-      utc_date as date,
+      date,
       utc_timestamp,
       TRY_CAST(latitude AS DOUBLE) as lat,
       TRY_CAST(longitude AS DOUBLE) as lng,
@@ -203,17 +233,23 @@ export async function POST(
       }
 
       const country = (body.country || megaJob.country || '').toUpperCase();
+      const groupKey: string | undefined = typeof body.groupKey === 'string' ? body.groupKey : undefined;
+      const categories: string[] | undefined = Array.isArray(body.categories) ? body.categories : undefined;
+      const slug = buildAffinitySlug(groupKey, categories);
 
       await Promise.all(subDatasetNames.map((ds) => ensureTableForDataset(ds)));
       const subTables = subDatasetNames.map((ds) => getTableName(ds));
       const sql = buildCategoryAffinitySQL(ctasTable, subTables);
       const queryId = await startQueryAsync(sql);
-      console.log(`[MEGA-CATEGORY-AFFINITY] Started queryId=${queryId} for megajob=${id}, ctas=${ctasTable}, sub-tables=${subTables.length}`);
+      console.log(`[MEGA-CATEGORY-AFFINITY] Started queryId=${queryId} for megajob=${id}, slug=${slug}, ctas=${ctasTable}, sub-tables=${subTables.length}`);
 
       state = {
         phase: 'polling',
         ctasTable,
         country,
+        groupKey,
+        categories,
+        slug,
         queryId,
       };
       await putConfig(STATE_KEY(id), state, { compact: true });
@@ -295,8 +331,30 @@ export async function POST(
       const totalDevicesWithZip = useful
         .filter((r) => r.uniqueDevices > 0)
         .reduce((s, r) => s + r.uniqueDevices, 0);
+
+      // Persist the report under config/mega-reports/{id}/category-affinity/{slug}.json
+      // so the megajob page can list + render it via the new select menu on
+      // the Affinity Heatmap card.
+      const slug = state.slug || buildAffinitySlug(state.groupKey, state.categories);
+      const label = buildAffinityLabel(state.groupKey, state.categories);
+      const reportJson = {
+        slug,
+        label,
+        groupKey: state.groupKey || null,
+        categories: state.categories || [],
+        country: state.country || null,
+        generatedAt: new Date().toISOString(),
+        totalZips: useful.length,
+        totalDevicesWithZip,
+        csvKey,
+        byZipCode: useful,
+      };
+      await putConfig(`mega-reports/${id}/category-affinity/${slug}`, reportJson, { compact: true });
+
       const result = {
         csvKey,
+        slug,
+        label,
         totalZips: useful.length,
         totalDevicesWithZip,
       };

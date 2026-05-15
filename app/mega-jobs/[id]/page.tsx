@@ -91,6 +91,17 @@ export default function MegaJobDetailPage() {
   const [catchmentReport, setCatchmentReport] = useState<any>(null)
   const [mobilityReport, setMobilityReport] = useState<any>(null)
   const [affinityReport, setAffinityReport] = useState<any>(null)
+  // Category-affinity exports (zero or more, generated via MAIDs by Category
+  // modal). Each entry = { slug, label, totalZips, ... } — the dropdown on
+  // the Affinity Heatmap card switches between these and the main megajob
+  // affinity. Per-zip rows are fetched on demand when a slug is selected.
+  const [categoryAffinityList, setCategoryAffinityList] = useState<Array<{
+    slug: string; label: string; categories: string[]; generatedAt: string;
+    totalZips: number; totalDevicesWithZip: number;
+  }>>([])
+  const [selectedAffinityKey, setSelectedAffinityKey] = useState<string>('main')
+  const [categoryAffinityData, setCategoryAffinityData] = useState<any>(null)
+  const [loadingCategoryAffinity, setLoadingCategoryAffinity] = useState(false)
 
   // Dwell filter (numeric minutes, 0 = no limit) — matches dataset page UX
   const [dwellMin, setDwellMin] = useState<number>(0)
@@ -208,7 +219,34 @@ export default function MegaJobDetailPage() {
         .then((data) => setters[type](data))
         .catch(() => { })
     }
+
+    // Category-affinity index — separate listing endpoint that returns
+    // metadata for any exports generated via the MAIDs-by-Category modal.
+    fetch(`/api/mega-jobs/${id}/category-affinity/list`, { credentials: 'include' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => setCategoryAffinityList(data?.items || []))
+      .catch(() => { })
   }, [megaJob?.status, id, reportVersion])
+
+  // When the user picks a category-affinity slug from the dropdown,
+  // fetch its full report (lazy — we don't want to pay for every export's
+  // payload on page load).
+  useEffect(() => {
+    if (selectedAffinityKey === 'main') {
+      setCategoryAffinityData(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingCategoryAffinity(true);
+    fetch(`/api/mega-jobs/${id}/category-affinity/${encodeURIComponent(selectedAffinityKey)}`, {
+      credentials: 'include',
+    })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => { if (!cancelled) setCategoryAffinityData(data); })
+      .catch(() => { if (!cancelled) setCategoryAffinityData(null); })
+      .finally(() => { if (!cancelled) setLoadingCategoryAffinity(false); });
+    return () => { cancelled = true; };
+  }, [id, selectedAffinityKey])
 
   // ── Consolidation ───────────────────────────────────────────────
   const handleConsolidate = async (resume = false) => {
@@ -1052,25 +1090,64 @@ export default function MegaJobDetailPage() {
             )}
 
             {/* 9. Affinity Heatmap */}
-            {affinityReport?.byZipCode?.length > 0 && (
+            {(affinityReport?.byZipCode?.length > 0 || categoryAffinityList.length > 0) && (
               <CollapsibleCard
                 title="Affinity Heatmap"
                 icon={<Target className="h-4 w-4" />}
                 defaultOpen={false}
               >
-                <CatchmentMap
-                  // Megajob ConsolidatedAffinityReport uses `postalCode` (not `zipCode`),
-                  // `avgDwell`/`totalVisits` (not `avgDwellMinutes`/`totalVisitDays`).
-                  // Map to the field names CatchmentMap expects.
-                  data={affinityReport.byZipCode.map((z: any) => ({
-                    zipCode: z.postalCode,
+                {/* Selector: switch between the main megajob affinity and any
+                    category-MAIDs affinity exports generated via the modal. */}
+                {categoryAffinityList.length > 0 && (
+                  <div className="mb-3 flex items-center gap-2 flex-wrap">
+                    <label className="text-xs text-muted-foreground">Affinity source:</label>
+                    <select
+                      value={selectedAffinityKey}
+                      onChange={(e) => setSelectedAffinityKey(e.target.value)}
+                      className="h-8 px-2 rounded-md border border-input bg-background text-xs"
+                    >
+                      <option value="main">Main megajob affinity</option>
+                      {categoryAffinityList.map((item) => (
+                        <option key={item.slug} value={item.slug}>
+                          {item.label} · {item.totalZips} zips
+                        </option>
+                      ))}
+                    </select>
+                    {loadingCategoryAffinity && (
+                      <span className="text-xs text-muted-foreground">Loading…</span>
+                    )}
+                  </div>
+                )}
+
+                {(() => {
+                  // Resolve the data shape based on the current selection. The
+                  // legacy main affinity uses `postalCode`/`affinityIndex`; the
+                  // new category-affinity exports already match AffinityByZip
+                  // (`zipCode`, lat/lng, affinityIndex). Both feed CatchmentMap
+                  // via the same `deviceDays` slot (which here doubles as the
+                  // heat-color signal — the column name is legacy).
+                  const rows: any[] = selectedAffinityKey === 'main'
+                    ? (affinityReport?.byZipCode || [])
+                    : (categoryAffinityData?.byZipCode || []);
+                  if (rows.length === 0) {
+                    return (
+                      <div className="h-[400px] flex items-center justify-center text-muted-foreground text-sm">
+                        {loadingCategoryAffinity
+                          ? 'Loading affinity data…'
+                          : 'No affinity data for the selected source.'}
+                      </div>
+                    );
+                  }
+                  const mapped = rows.map((z: any) => ({
+                    zipCode: z.zipCode ?? z.postalCode,
                     city: z.city,
                     country: z.country,
                     lat: z.lat,
                     lng: z.lng,
                     deviceDays: z.affinityIndex,
-                  }))}
-                />
+                  }));
+                  return <CatchmentMap data={mapped} />;
+                })()}
               </CollapsibleCard>
             )}
 
