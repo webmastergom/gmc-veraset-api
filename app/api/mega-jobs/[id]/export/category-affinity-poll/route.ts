@@ -10,7 +10,11 @@ import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { getMegaJob } from '@/lib/mega-jobs';
 import { getJob } from '@/lib/jobs';
-import { computeAffinityReport, affinityReportToCsv } from '@/lib/affinity-builder';
+import {
+  computeAffinityReport,
+  affinityReportToCsv,
+  buildCategoryAffinityLabel,
+} from '@/lib/affinity-builder';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
@@ -53,12 +57,7 @@ function buildAffinitySlug(groupKey: string | undefined, categories: string[] | 
   return `${base}_${n}cat_${ts}`;
 }
 
-function buildAffinityLabel(groupKey: string | undefined, categories: string[] | undefined): string {
-  const head = groupKey && groupKey !== 'custom' ? groupKey : (categories?.[0] || 'Custom');
-  const niceHead = head.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-  const n = categories?.length ?? 0;
-  return n > 1 ? `${niceHead} (${n} categories)` : niceHead;
-}
+const buildAffinityLabel = buildCategoryAffinityLabel;
 
 /**
  * Build the affinity-export SQL. Joins the category-MAIDs CTAS table

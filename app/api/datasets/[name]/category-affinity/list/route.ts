@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { s3Client, BUCKET } from '@/lib/s3-config';
 import { ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { buildCategoryAffinityLabel } from '@/lib/affinity-builder';
 
 export const dynamic = 'force-dynamic';
 
@@ -45,11 +46,15 @@ export async function GET(
         const got = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key! }));
         const text = await got.Body!.transformToString('utf-8');
         const parsed = JSON.parse(text);
+        // Always re-derive the display label from groupKey + categories so
+        // existing reports pick up naming-convention changes without having
+        // to rewrite every S3 object.
+        const cats = Array.isArray(parsed.categories) ? parsed.categories : [];
         items.push({
           slug: parsed.slug || obj.Key!.split('/').pop()!.replace(/\.json$/, ''),
-          label: parsed.label || parsed.slug || 'Untitled',
+          label: buildCategoryAffinityLabel(parsed.groupKey ?? null, cats),
           groupKey: parsed.groupKey ?? null,
-          categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+          categories: cats,
           country: parsed.country ?? null,
           generatedAt: parsed.generatedAt || (obj.LastModified?.toISOString() ?? ''),
           totalZips: typeof parsed.totalZips === 'number' ? parsed.totalZips : 0,

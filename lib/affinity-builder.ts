@@ -24,6 +24,35 @@
 
 import fs from 'fs';
 import path from 'path';
+import { CATEGORY_GROUPS, CATEGORY_LABELS } from './laboratory-types';
+
+/**
+ * Human-readable label for a category-affinity export. Used both at
+ * write time (stored in the report JSON) and at list time (re-derived
+ * so old reports pick up the new naming convention without rewriting
+ * every S3 object).
+ */
+export function buildCategoryAffinityLabel(
+  groupKey: string | undefined | null,
+  categories: string[] | undefined | null,
+): string {
+  const prettify = (s: string) =>
+    s.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  const n = categories?.length ?? 0;
+  if (n === 1 && categories) {
+    const cat = categories[0];
+    const nice = CATEGORY_LABELS[cat] || prettify(cat);
+    return `MAIDs by Category: ${nice}`;
+  }
+  if (groupKey && groupKey !== 'custom' && CATEGORY_GROUPS[groupKey]) {
+    const group = CATEGORY_GROUPS[groupKey];
+    if (n > 0 && n < group.categories.length) {
+      return `MAIDs by Category: ${group.label} (${n} subcategories)`;
+    }
+    return `MAIDs by Category: ${group.label}`;
+  }
+  return `MAIDs by Category: Custom (${n} categories)`;
+}
 
 export interface AffinityByZip {
   zipCode: string;
