@@ -11,6 +11,7 @@ import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { getMegaJob } from '@/lib/mega-jobs';
 import { getJob } from '@/lib/jobs';
 import { computeAffinityReport, affinityReportToCsv } from '@/lib/affinity-builder';
+import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -302,16 +303,79 @@ export async function POST(
       }
       console.log(`[MEGA-CATEGORY-AFFINITY] Parsed ${rows.length} rows from result CSV`);
 
-      // Build affinity using the shared lib (Gaussian heat field + log normalize).
-      // coordToZip empty: rely on FULL-schema native_zip when present;
-      // otherwise the zip falls back to 'UNKNOWN' and gets filtered out of
-      // the heat field. (For unresolved zips a future enhancement could
-      // batch reverse-geocode here, but for category exports the FULL
-      // schema bypass is typically already populated.)
+      // Build coordToZip — first from FULL-schema native_zip when present,
+      // then batch reverse-geocode the remaining coordinates so we don't
+      // lose tail rows to UNKNOWN. The previous version passed an empty
+      // map which made ~all rows UNKNOWN on BASIC schema or sparse FULL.
+      const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
+      const coordsToGeocode = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+      for (const row of rows) {
+        const lat = parseFloat(row.origin_lat);
+        const lng = parseFloat(row.origin_lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+        const key = `${lat},${lng}`;
+        const nativeZip = String(row.native_zip || '').trim();
+        if (nativeZip) {
+          if (!coordToZip.has(key)) {
+            coordToZip.set(key, {
+              zipCode: nativeZip,
+              city: String(row.native_city || '').trim() || 'UNKNOWN',
+              country: state.country || 'UNKNOWN',
+            });
+          }
+        } else if (!coordsToGeocode.has(key)) {
+          coordsToGeocode.set(key, {
+            lat, lng,
+            deviceCount: parseInt(row.unique_devices, 10) || 1,
+          });
+        }
+      }
+      console.log(
+        `[MEGA-CATEGORY-AFFINITY] native_zip resolved=${coordToZip.size}, ` +
+        `pending reverse-geocode=${coordsToGeocode.size}`,
+      );
+
+      if (coordsToGeocode.size > 0) {
+        try {
+          if (state.country) setCountryFilter([state.country]);
+          // Round to 1 decimal (~11 km cells) so we geocode thousands not
+          // hundreds-of-thousands of unique points.
+          const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
+          for (const p of coordsToGeocode.values()) {
+            const rl = Math.round(p.lat * 10) / 10;
+            const rn = Math.round(p.lng * 10) / 10;
+            const rk = `${rl},${rn}`;
+            const ex = roundedMap.get(rk);
+            if (ex) ex.deviceCount += p.deviceCount;
+            else roundedMap.set(rk, { lat: rl, lng: rn, deviceCount: p.deviceCount });
+          }
+          const geocoded = await batchReverseGeocode(Array.from(roundedMap.values()));
+          const rKeys = Array.from(roundedMap.keys());
+          let matched = 0;
+          for (const [key, p] of coordsToGeocode.entries()) {
+            if (coordToZip.has(key)) continue;
+            const roundKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            const idx = rKeys.indexOf(roundKey);
+            if (idx >= 0 && idx < geocoded.length) {
+              const g = geocoded[idx];
+              if (g.type === 'geojson_local' || g.type === 'nominatim_match') {
+                coordToZip.set(key, { zipCode: g.postcode, city: g.city, country: g.country });
+                matched++;
+              }
+            }
+          }
+          console.log(`[MEGA-CATEGORY-AFFINITY] reverse-geocoded ${matched}/${coordsToGeocode.size} coords (${roundedMap.size} unique cells, country=${state.country || 'auto'})`);
+        } catch (e: any) {
+          console.warn(`[MEGA-CATEGORY-AFFINITY] reverse-geocode failed: ${e?.message || e}`);
+        } finally {
+          setCountryFilter(null);
+        }
+      }
+
       const report = await computeAffinityReport(
         `mega-${id}-category-affinity`,
         rows,
-        new Map(),
+        coordToZip,
         state.country,
       );
 
