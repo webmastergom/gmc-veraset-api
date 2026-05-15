@@ -169,6 +169,17 @@ export default function DatasetAnalysisPage() {
   const [mobilityReport, setMobilityReport] = useState<any>(null);
   const [temporalReport, setTemporalReport] = useState<any>(null);
   const [affinityReport, setAffinityReport] = useState<any>(null);
+  // Category-affinity exports (zero or more, generated via MAIDs by Category
+  // modal). Each entry = { slug, label, totalZips, ... } — the dropdown on
+  // the Affinity Heatmap card switches between these and the main dataset
+  // affinity. Per-zip rows are fetched on demand when a slug is selected.
+  const [categoryAffinityList, setCategoryAffinityList] = useState<Array<{
+    slug: string; label: string; categories: string[]; generatedAt: string;
+    totalZips: number; totalDevicesWithZip: number;
+  }>>([]);
+  const [selectedAffinityKey, setSelectedAffinityKey] = useState<string>('main');
+  const [categoryAffinityData, setCategoryAffinityData] = useState<any>(null);
+  const [loadingCategoryAffinity, setLoadingCategoryAffinity] = useState(false);
   const [reportVersion, setReportVersion] = useState(0);
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([]);
   const [nseModalOpen, setNseModalOpen] = useState(false);
@@ -227,6 +238,35 @@ export default function DatasetAnalysisPage() {
   useEffect(() => {
     loadReportsForFilters(dwellMin, dwellMax);
   }, [datasetName, reportVersion]);
+
+  // Category-affinity index — separate listing endpoint that returns
+  // metadata for any exports generated via the MAIDs-by-Category modal.
+  useEffect(() => {
+    fetch(`/api/datasets/${datasetName}/category-affinity/list`, { credentials: 'include' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => setCategoryAffinityList(data?.items || []))
+      .catch(() => { });
+  }, [datasetName, reportVersion]);
+
+  // When the user picks a category-affinity slug from the dropdown,
+  // fetch its full report (lazy — we don't want to pay for every export's
+  // payload on page load).
+  useEffect(() => {
+    if (selectedAffinityKey === 'main') {
+      setCategoryAffinityData(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingCategoryAffinity(true);
+    fetch(`/api/datasets/${datasetName}/category-affinity/${encodeURIComponent(selectedAffinityKey)}`, {
+      credentials: 'include',
+    })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => { if (!cancelled) setCategoryAffinityData(data); })
+      .catch(() => { if (!cancelled) setCategoryAffinityData(null); })
+      .finally(() => { if (!cancelled) setLoadingCategoryAffinity(false); });
+    return () => { cancelled = true; };
+  }, [datasetName, selectedAffinityKey]);
 
   // ── Run analysis (basic stats) ──────────────────────────────────
   const runAnalysisOnly = async () => {
@@ -1264,21 +1304,62 @@ export default function DatasetAnalysisPage() {
           )}
 
           {/* Affinity Heatmap */}
-          {affinityReport?.byZipCode?.length > 0 && (
+          {(affinityReport?.byZipCode?.length > 0 || categoryAffinityList.length > 0) && (
             <CollapsibleCard
               title="Affinity Heatmap"
               icon={<Target className="h-4 w-4" />}
             >
-              <CatchmentMap
-                data={affinityReport.byZipCode.map((z: any) => ({
-                  zipCode: z.zipCode,
+              {/* Selector: switch between the main dataset affinity and any
+                  category-MAIDs affinity exports generated via the modal. */}
+              {categoryAffinityList.length > 0 && (
+                <div className="mb-3 flex items-center gap-2 flex-wrap">
+                  <label className="text-xs text-muted-foreground">Affinity source:</label>
+                  <select
+                    value={selectedAffinityKey}
+                    onChange={(e) => setSelectedAffinityKey(e.target.value)}
+                    className="h-8 px-2 rounded-md border border-input bg-background text-xs"
+                  >
+                    <option value="main">Main dataset affinity</option>
+                    {categoryAffinityList.map((item) => (
+                      <option key={item.slug} value={item.slug}>
+                        {item.label} · {item.totalZips} zips
+                      </option>
+                    ))}
+                  </select>
+                  {loadingCategoryAffinity && (
+                    <span className="text-xs text-muted-foreground">Loading…</span>
+                  )}
+                </div>
+              )}
+
+              {(() => {
+                // Resolve the data shape based on the current selection. The
+                // legacy main affinity uses `zipCode`/`affinityIndex`; the
+                // new category-affinity exports already match the same shape.
+                // Both feed CatchmentMap via the `deviceDays` slot (column
+                // name is legacy — here it doubles as the heat-color signal).
+                const rows: any[] = selectedAffinityKey === 'main'
+                  ? (affinityReport?.byZipCode || [])
+                  : (categoryAffinityData?.byZipCode || []);
+                if (rows.length === 0) {
+                  return (
+                    <div className="h-[400px] flex items-center justify-center text-muted-foreground text-sm">
+                      {loadingCategoryAffinity
+                        ? 'Loading affinity data…'
+                        : 'No affinity data for the selected source.'}
+                    </div>
+                  );
+                }
+                const mapped = rows.map((z: any) => ({
+                  zipCode: z.zipCode ?? z.postalCode,
                   city: z.city,
                   country: z.country,
                   lat: z.lat,
                   lng: z.lng,
                   deviceDays: z.affinityIndex,
-                }))}
-              />
+                }));
+                return <CatchmentMap data={mapped} />;
+              })()}
             </CollapsibleCard>
           )}
 

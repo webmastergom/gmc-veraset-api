@@ -46,6 +46,10 @@ interface CategoryExportState {
   result?: {
     maidCount: number;
     downloadKey: string;
+    /** Athena CTAS table with `(ad_id, category, dwell_minutes)`. Exposed
+     *  so the dataset's CategoryMaidModal can trigger a follow-up affinity
+     *  export against it without re-running the spatial join. */
+    ctasTable?: string;
     pois: PoiInfo[];
   };
 }
@@ -478,7 +482,7 @@ export async function POST(
         }
       }
 
-      const result = { maidCount, downloadKey: '', pois: state.pois || [] };
+      const result = { maidCount, downloadKey: '', ctasTable, pois: state.pois || [] };
 
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });

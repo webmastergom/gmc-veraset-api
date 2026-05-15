@@ -36,14 +36,33 @@ interface CategoryMaidModalProps {
   hourTo?: number;
 }
 
+interface CategoryResult {
+  maidCount: number;
+  downloadKey: string;
+  /** Athena CTAS table name — needed to kick off the follow-up
+   *  affinity export. */
+  ctasTable?: string;
+  pois: { name: string; category: string; lat: number; lng: number }[];
+}
+
+interface AffinityResult {
+  csvKey: string;
+  totalZips: number;
+  totalDevicesWithZip: number;
+}
+
 export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwellMin = 0, dwellMax = 0, hourFrom = 0, hourTo = 23 }: CategoryMaidModalProps) {
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
   const [minDwell, setMinDwell] = useState(5);
   const [computing, setComputing] = useState(false);
   const [computeProgress, setComputeProgress] = useState<string | null>(null);
-  const [result, setResult] = useState<{ maidCount: number; downloadKey: string; pois: { name: string; category: string; lat: number; lng: number }[] } | null>(null);
+  const [result, setResult] = useState<CategoryResult | null>(null);
   const [showPois, setShowPois] = useState(false);
+  // Follow-up affinity export — opt-in; one click after MAIDs are ready.
+  const [affinityComputing, setAffinityComputing] = useState(false);
+  const [affinityProgress, setAffinityProgress] = useState<string | null>(null);
+  const [affinityResult, setAffinityResult] = useState<AffinityResult | null>(null);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
   const [country, setCountry] = useState<string | null>(jobCountry || null);
   const [loadingCountry, setLoadingCountry] = useState(false);
@@ -95,7 +114,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwel
       setSelectedGroup(groupKey);
       setSelectedCategories(new Set(group.categories));
     }
-    setResult(null);
+    setResult(null); setAffinityResult(null);
   };
 
   const toggleCategory = (cat: string) => {
@@ -106,7 +125,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwel
       next.add(cat);
     }
     setSelectedCategories(next);
-    setResult(null);
+    setResult(null); setAffinityResult(null);
   };
 
   const toggleExpandGroup = (groupKey: string) => {
@@ -134,7 +153,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwel
 
     setComputing(true);
     setComputeProgress('Starting spatial join...');
-    setResult(null);
+    setResult(null); setAffinityResult(null);
 
     try {
       let data = await safePollFetch(`/api/datasets/${datasetName}/export/category-poll`, {
@@ -182,6 +201,49 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwel
     link.href = result.downloadKey;
     link.download = `${datasetName}-category-${selectedGroup || 'custom'}.csv`;
     link.click();
+  };
+
+  const handleGenerateAffinity = async () => {
+    if (!result?.ctasTable || !country) {
+      toast({ title: 'Affinity unavailable', description: 'Run the MAIDs search first.', variant: 'destructive' });
+      return;
+    }
+    setAffinityComputing(true);
+    setAffinityProgress('Computing per-zip affinity…');
+    try {
+      let data = await safePollFetch(`/api/datasets/${datasetName}/export/category-affinity-poll`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ctasTable: result.ctasTable,
+          country,
+          groupKey: selectedGroup || 'custom',
+          categories: Array.from(selectedCategories),
+        }),
+      });
+      while (data.phase !== 'done' && data.phase !== 'error') {
+        setAffinityProgress(data.progress?.message || 'Processing…');
+        await new Promise((r) => setTimeout(r, 4000));
+        data = await safePollFetch(`/api/datasets/${datasetName}/export/category-affinity-poll`, {
+          method: 'POST',
+          credentials: 'include',
+        });
+      }
+      if (data.phase === 'error') throw new Error(data.error || 'Affinity export failed');
+      setAffinityResult(data.result);
+      toast({ title: 'Affinity CSV ready', description: `${data.result?.totalZips || 0} zips · ${(data.result?.totalDevicesWithZip || 0).toLocaleString()} devices` });
+    } catch (e: any) {
+      toast({ title: 'Affinity export failed', description: e.message, variant: 'destructive' });
+    } finally {
+      setAffinityComputing(false);
+      setAffinityProgress(null);
+    }
+  };
+
+  const downloadAffinityCsv = () => {
+    if (!affinityResult) return;
+    window.location.href = `/api/datasets/${datasetName}/export/category-affinity-poll`;
   };
 
   const groupEntries = Object.entries(CATEGORY_GROUPS);
@@ -279,7 +341,7 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwel
               </label>
               <select
                 value={minDwell}
-                onChange={e => { setMinDwell(Number(e.target.value)); setResult(null); }}
+                onChange={e => { setMinDwell(Number(e.target.value)); setResult(null); setAffinityResult(null); }}
                 className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
               >
                 {DWELL_OPTIONS.map(opt => (
@@ -325,6 +387,36 @@ export function CategoryMaidModal({ open, onClose, datasetName, jobCountry, dwel
                     </Button>
                   )}
                 </div>
+
+                {/* Affinity CSV export (opt-in, runs a second Athena query) */}
+                {result.ctasTable && (
+                  <div className="border-t border-border/40 pt-3">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="text-xs text-muted-foreground flex-1 min-w-0">
+                        Affinity by postal code — Gaussian heat-field score, same format as the dataset affinity index CSV.
+                      </div>
+                      {!affinityResult ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={handleGenerateAffinity}
+                          disabled={affinityComputing}
+                        >
+                          {affinityComputing ? (
+                            <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> {affinityProgress || 'Computing…'}</>
+                          ) : (
+                            <><Target className="mr-1.5 h-3.5 w-3.5" /> Generate Affinity CSV</>
+                          )}
+                        </Button>
+                      ) : (
+                        <Button variant="outline" size="sm" onClick={downloadAffinityCsv}>
+                          <Download className="mr-1.5 h-3.5 w-3.5" />
+                          Download Affinity CSV ({affinityResult.totalZips} zips)
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {/* POI List */}
                 {result.pois && result.pois.length > 0 && (
