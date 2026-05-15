@@ -66,7 +66,7 @@ export function CaptureRingsSummary({
         ))}
       </div>
       <p className="text-xs text-muted-foreground italic">
-        Trade-area rings show the smallest set of top zips that cumulatively account for 70/80/90% of device-days — the "addressable core" for geo-targeted campaigns.
+        Trade-area rings show the smallest set of top zips that cumulatively account for 70/80/90% of device-days — the &ldquo;addressable core&rdquo; for geo-targeted campaigns.
       </p>
     </div>
   );
