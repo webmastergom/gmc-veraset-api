@@ -29,6 +29,7 @@ interface AffinityExportState {
   country?: string;
   groupKey?: string;
   categories?: string[];
+  matchMode?: 'OR' | 'AND';
   slug?: string;
   queryId?: string;
   affinityQueryId?: string;
@@ -47,15 +48,20 @@ interface AffinityExportState {
 
 /** Build a filesystem-safe slug from a category group + count + timestamp.
  *  Used as the JSON file name under config/mega-reports/{id}/category-affinity/. */
-function buildAffinitySlug(groupKey: string | undefined, categories: string[] | undefined): string {
+function buildAffinitySlug(
+  groupKey: string | undefined,
+  categories: string[] | undefined,
+  matchMode?: 'OR' | 'AND',
+): string {
   const base = (groupKey && groupKey !== 'custom' ? groupKey : (categories?.[0] || 'custom'))
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 32) || 'custom';
   const n = categories?.length ?? 0;
+  const modeBit = matchMode === 'AND' && n >= 2 ? '_and' : '';
   const ts = Math.floor(Date.now() / 1000).toString(36);
-  return `${base}_${n}cat_${ts}`;
+  return `${base}${modeBit}_${n}cat_${ts}`;
 }
 
 const buildAffinityLabel = buildCategoryAffinityLabel;
@@ -236,13 +242,14 @@ export async function POST(
       const country = (body.country || megaJob.country || '').toUpperCase();
       const groupKey: string | undefined = typeof body.groupKey === 'string' ? body.groupKey : undefined;
       const categories: string[] | undefined = Array.isArray(body.categories) ? body.categories : undefined;
-      const slug = buildAffinitySlug(groupKey, categories);
+      const matchMode: 'OR' | 'AND' = body.matchMode === 'AND' ? 'AND' : 'OR';
+      const slug = buildAffinitySlug(groupKey, categories, matchMode);
 
       await Promise.all(subDatasetNames.map((ds) => ensureTableForDataset(ds)));
       const subTables = subDatasetNames.map((ds) => getTableName(ds));
       const sql = buildCategoryAffinitySQL(ctasTable, subTables);
       const queryId = await startQueryAsync(sql);
-      console.log(`[MEGA-CATEGORY-AFFINITY] Started queryId=${queryId} for megajob=${id}, slug=${slug}, ctas=${ctasTable}, sub-tables=${subTables.length}`);
+      console.log(`[MEGA-CATEGORY-AFFINITY] Started queryId=${queryId} for megajob=${id}, slug=${slug}, ctas=${ctasTable}, sub-tables=${subTables.length}, matchMode=${matchMode}`);
 
       state = {
         phase: 'polling',
@@ -250,6 +257,7 @@ export async function POST(
         country,
         groupKey,
         categories,
+        matchMode,
         slug,
         queryId,
       };
@@ -449,13 +457,14 @@ export async function POST(
       // Persist the report under config/mega-reports/{id}/category-affinity/{slug}.json
       // so the megajob page can list + render it via the new select menu on
       // the Affinity Heatmap card.
-      const slug = state.slug || buildAffinitySlug(state.groupKey, state.categories);
-      const label = buildAffinityLabel(state.groupKey, state.categories);
+      const slug = state.slug || buildAffinitySlug(state.groupKey, state.categories, state.matchMode);
+      const label = buildAffinityLabel(state.groupKey, state.categories, state.matchMode);
       const reportJson = {
         slug,
         label,
         groupKey: state.groupKey || null,
         categories: state.categories || [],
+        matchMode: state.matchMode || 'OR',
         country: state.country || null,
         generatedAt: new Date().toISOString(),
         totalZips: useful.length,

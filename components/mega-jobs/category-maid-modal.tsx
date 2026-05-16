@@ -63,6 +63,9 @@ export function MegaCategoryMaidModal({
 }: MegaCategoryMaidModalProps) {
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
+  // OR: device visited ANY of the selected categories (default — broader audience)
+  // AND: device visited EVERY selected category (intersection — narrower, lookalike)
+  const [matchMode, setMatchMode] = useState<'OR' | 'AND'>('OR');
   const [minDwell, setMinDwell] = useState(5);
   const [computing, setComputing] = useState(false);
   const [computeProgress, setComputeProgress] = useState<string | null>(null);
@@ -129,6 +132,21 @@ export function MegaCategoryMaidModal({
     if (next.has(cat)) next.delete(cat);
     else next.add(cat);
     setSelectedCategories(next);
+    // Derive selectedGroup from the new selection — if all picked cats
+    // belong to one group, set that as the group (so labels come out
+    // nice: "MAIDs by Category: Retail & Shopping (3 subcategories)").
+    // Otherwise null → "Custom (N categories)".
+    if (next.size === 0) {
+      setSelectedGroup(null);
+    } else {
+      const groups = new Set<string>();
+      for (const c of next) {
+        for (const [gk, g] of Object.entries(CATEGORY_GROUPS)) {
+          if (g.categories.includes(c as PoiCategory)) { groups.add(gk); break; }
+        }
+      }
+      setSelectedGroup(groups.size === 1 ? Array.from(groups)[0] : null);
+    }
     setResult(null); setAffinityResult(null);
   };
 
@@ -167,6 +185,7 @@ export function MegaCategoryMaidModal({
         body: JSON.stringify({
           categories: Array.from(selectedCategories),
           groupKey: selectedGroup || 'custom',
+          matchMode,
           minDwell,
           maxDwell: dwellMax,
           hourFrom,
@@ -216,6 +235,7 @@ export function MegaCategoryMaidModal({
           country,
           groupKey: selectedGroup || 'custom',
           categories: Array.from(selectedCategories),
+          matchMode,
         }),
       });
       while (data.phase !== 'done' && data.phase !== 'error') {
@@ -298,17 +318,18 @@ export function MegaCategoryMaidModal({
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0 shrink-0"
-                          onClick={() => {
-                            if (!isSelected) handleSelectGroup(key);
-                            toggleExpandGroup(key);
-                          }}
+                          onClick={() => toggleExpandGroup(key)}
                         >
                           {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                         </Button>
                       </div>
 
-                      {/* Individual categories within expanded group */}
-                      {isExpanded && isSelected && (
+                      {/* Individual categories within expanded group.
+                          Shown whenever expanded (no longer requires the
+                          group to be select-all'd) so the user can pick a
+                          single subcategory without first deselecting all
+                          the others. */}
+                      {isExpanded && (
                         <div className="ml-4 mt-1 mb-2 flex flex-wrap gap-1">
                           {group.categories.map(cat => (
                             <button
@@ -330,6 +351,38 @@ export function MegaCategoryMaidModal({
                 })}
               </div>
             </div>
+
+            {/* Match Mode (OR / AND) — controls whether a device must have
+                visited ANY (OR, broader audience) or EVERY (AND, intersection
+                for lookalikes / co-visit insights) of the selected categories. */}
+            {selectedCategories.size >= 2 && (
+              <div>
+                <label className="text-sm font-medium text-muted-foreground mb-1 block">
+                  Match Mode
+                </label>
+                <div className="inline-flex rounded-md border border-input overflow-hidden text-sm">
+                  <button
+                    type="button"
+                    onClick={() => { setMatchMode('OR'); setResult(null); setAffinityResult(null); }}
+                    className={`px-3 py-1.5 ${matchMode === 'OR' ? 'bg-primary text-primary-foreground' : 'bg-background hover:bg-muted'}`}
+                  >
+                    OR <span className="opacity-70 ml-1">(any)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setMatchMode('AND'); setResult(null); setAffinityResult(null); }}
+                    className={`px-3 py-1.5 border-l border-input ${matchMode === 'AND' ? 'bg-primary text-primary-foreground' : 'bg-background hover:bg-muted'}`}
+                  >
+                    AND <span className="opacity-70 ml-1">(all)</span>
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {matchMode === 'OR'
+                    ? 'Device visited at least one of the selected categories.'
+                    : 'Device visited every selected category at least once — intersection audience.'}
+                </p>
+              </div>
+            )}
 
             {/* Dwell Time Selector */}
             <div>

@@ -28,6 +28,7 @@ interface AffinityExportState {
   country?: string;
   groupKey?: string;
   categories?: string[];
+  matchMode?: 'OR' | 'AND';
   slug?: string;
   queryId?: string;
   error?: string;
@@ -40,15 +41,20 @@ interface AffinityExportState {
   };
 }
 
-function buildAffinitySlug(groupKey: string | undefined, categories: string[] | undefined): string {
+function buildAffinitySlug(
+  groupKey: string | undefined,
+  categories: string[] | undefined,
+  matchMode?: 'OR' | 'AND',
+): string {
   const base = (groupKey && groupKey !== 'custom' ? groupKey : (categories?.[0] || 'custom'))
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 32) || 'custom';
   const n = categories?.length ?? 0;
+  const modeBit = matchMode === 'AND' && n >= 2 ? '_and' : '';
   const ts = Math.floor(Date.now() / 1000).toString(36);
-  return `${base}_${n}cat_${ts}`;
+  return `${base}${modeBit}_${n}cat_${ts}`;
 }
 
 const buildAffinityLabel = buildCategoryAffinityLabel;
@@ -190,15 +196,16 @@ export async function POST(
       }
       const groupKey: string | undefined = typeof body.groupKey === 'string' ? body.groupKey : undefined;
       const categories: string[] | undefined = Array.isArray(body.categories) ? body.categories : undefined;
-      const slug = buildAffinitySlug(groupKey, categories);
+      const matchMode: 'OR' | 'AND' = body.matchMode === 'AND' ? 'AND' : 'OR';
+      const slug = buildAffinitySlug(groupKey, categories, matchMode);
 
       await ensureTableForDataset(datasetName);
       const table = getTableName(datasetName);
       const sql = buildCategoryAffinitySQL(ctasTable, table);
       const queryId = await startQueryAsync(sql);
-      console.log(`[DS-CATEGORY-AFFINITY] Started queryId=${queryId} for dataset=${datasetName}, slug=${slug}, ctas=${ctasTable}`);
+      console.log(`[DS-CATEGORY-AFFINITY] Started queryId=${queryId} for dataset=${datasetName}, slug=${slug}, ctas=${ctasTable}, matchMode=${matchMode}`);
 
-      state = { phase: 'polling', ctasTable, country, groupKey, categories, slug, queryId };
+      state = { phase: 'polling', ctasTable, country, groupKey, categories, matchMode, slug, queryId };
       await putConfig(STATE_KEY(datasetName), state, { compact: true });
 
       return NextResponse.json({
@@ -359,8 +366,8 @@ export async function POST(
       const useful = report.byZipCode.filter((r) => r.uniqueDevices > 0 || r.affinityIndex > 0);
       const csvBody = affinityReportToCsv({ ...report, byZipCode: useful });
 
-      const slug = state.slug || buildAffinitySlug(state.groupKey, state.categories);
-      const label = buildAffinityLabel(state.groupKey, state.categories);
+      const slug = state.slug || buildAffinitySlug(state.groupKey, state.categories, state.matchMode);
+      const label = buildAffinityLabel(state.groupKey, state.categories, state.matchMode);
       const ts = Math.floor(Date.now() / 1000).toString(36);
       const csvKey = `athena-results/dataset-${datasetName}_category_affinity_${ts}.csv`;
       await s3Client.send(new PutObjectCommand({
@@ -379,6 +386,7 @@ export async function POST(
         label,
         groupKey: state.groupKey || null,
         categories: state.categories || [],
+        matchMode: state.matchMode || 'OR',
         country: state.country || null,
         generatedAt: new Date().toISOString(),
         totalZips: useful.length,

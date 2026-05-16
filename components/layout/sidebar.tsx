@@ -21,6 +21,7 @@ import {
   Fingerprint,
   Route,
   Sparkles,
+  Target,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -38,6 +39,7 @@ const navigation = [
   { name: 'Master MAIDs', href: '/master-maids', icon: Fingerprint },
   { name: 'Personas', href: '/personas', icon: Sparkles },
   { name: 'Zip Code Signals', href: '/zip-code-signals', icon: MapPinned },
+  { name: 'Affinity Library', href: '/affinity-library', icon: Target },
   { name: 'Audit', href: '/audit', icon: ShieldCheck },
   { name: 'API Keys', href: '/api-keys', icon: Key },
   { name: 'Settings', href: '/settings', icon: Settings },

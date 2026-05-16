@@ -11,6 +11,7 @@ interface CategoryAffinityListItem {
   label: string;
   groupKey: string | null;
   categories: string[];
+  matchMode: 'OR' | 'AND';
   country: string | null;
   generatedAt: string;
   totalZips: number;
@@ -50,11 +51,13 @@ export async function GET(
         // existing reports pick up naming-convention changes without having
         // to rewrite every S3 object.
         const cats = Array.isArray(parsed.categories) ? parsed.categories : [];
+        const matchMode: 'OR' | 'AND' = parsed.matchMode === 'AND' ? 'AND' : 'OR';
         items.push({
           slug: parsed.slug || obj.Key!.split('/').pop()!.replace(/\.json$/, ''),
-          label: buildCategoryAffinityLabel(parsed.groupKey ?? null, cats),
+          label: buildCategoryAffinityLabel(parsed.groupKey ?? null, cats, matchMode),
           groupKey: parsed.groupKey ?? null,
           categories: cats,
+          matchMode,
           country: parsed.country ?? null,
           generatedAt: parsed.generatedAt || (obj.LastModified?.toISOString() ?? ''),
           totalZips: typeof parsed.totalZips === 'number' ? parsed.totalZips : 0,

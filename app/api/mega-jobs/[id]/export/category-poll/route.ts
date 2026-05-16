@@ -40,6 +40,9 @@ interface CategoryExportState {
   country: string;
   categories: string[];
   groupKey: string;
+  /** OR: device visited any selected category (default).
+   *  AND: device visited every selected category at least once. */
+  matchMode?: 'OR' | 'AND';
   minDwell: number;
   dateRange?: { from: string; to: string };
   subDatasetNames?: string[];
@@ -84,6 +87,7 @@ function buildConsolidatedSpatialJoinSelect(
   maxDwell = 0,
   hourFrom = 0,
   hourTo = 23,
+  matchMode: 'OR' | 'AND' = 'OR',
 ): string {
   const catFilter = `AND p.category IN (${categories.map(c => `'${c}'`).join(',')})`;
   const countryFilter = country ? `AND p.country = '${toIsoCountry(country)}'` : '';
@@ -175,11 +179,19 @@ function buildConsolidatedSpatialJoinSelect(
         ROUND(DATE_DIFF('second', MIN(utc_timestamp), MAX(utc_timestamp)) / 60.0, 1) as dwell_minutes
       FROM matched
       GROUP BY ad_id, date, category
+    ),
+    per_pair AS (
+      SELECT ad_id, category, MAX(dwell_minutes) as dwell_minutes
+      FROM visits v
+      ${dwellFilter}
+      GROUP BY ad_id, category
     )
-    SELECT ad_id, category, MAX(dwell_minutes) as dwell_minutes
-    FROM visits v
-    ${dwellFilter}
-    GROUP BY ad_id, category
+    -- AND mode: only ad_ids that hit every selected category at least once.
+    -- (Identity for OR or 1-category — wraps the CTE without filtering.)
+    SELECT ad_id, category, dwell_minutes FROM per_pair
+    ${matchMode === 'AND' && categories.length >= 2
+      ? `WHERE ad_id IN (SELECT ad_id FROM per_pair GROUP BY ad_id HAVING COUNT(DISTINCT category) = ${categories.length})`
+      : ''}
   `;
 }
 
@@ -192,8 +204,9 @@ function buildCategoryMaidCTAS(
   maxDwell = 0,
   hourFrom = 0,
   hourTo = 23,
+  matchMode: 'OR' | 'AND' = 'OR',
 ): string {
-  const selectSql = buildConsolidatedSpatialJoinSelect(subTables, categories, country, minDwell, maxDwell, hourFrom, hourTo);
+  const selectSql = buildConsolidatedSpatialJoinSelect(subTables, categories, country, minDwell, maxDwell, hourFrom, hourTo, matchMode);
   return `
     CREATE TABLE ${ctasTableName}
     WITH (
@@ -263,6 +276,7 @@ export async function POST(
       const hourFrom: number = parseInt(body.hourFrom, 10) || 0;
       const hourTo: number = body.hourTo != null ? parseInt(body.hourTo, 10) : 23;
       const groupKey: string = body.groupKey || 'custom';
+      const matchMode: 'OR' | 'AND' = body.matchMode === 'AND' ? 'AND' : 'OR';
 
       if (!categories.length) {
         return NextResponse.json({ error: 'categories required' }, { status: 400 });
@@ -290,8 +304,10 @@ export async function POST(
       // CTAS table: include megajob id slice for uniqueness
       const cc = country.toUpperCase();
       const shortId = id.replace(/-/g, '').slice(0, 12);
-      const ctasTable = masterTableName(cc, 'cat_' + (groupKey || 'custom'), `mega_${shortId}`);
-      const ctasSql = buildCategoryMaidCTAS(subTables, categories, country, minDwell, ctasTable, maxDwell, hourFrom, hourTo);
+      // Include matchMode in the CTAS name so OR and AND runs of the
+      // same group don't trample each other's cached parquet.
+      const ctasTable = masterTableName(cc, 'cat_' + (groupKey || 'custom') + (matchMode === 'AND' ? '_and' : ''), `mega_${shortId}`);
+      const ctasSql = buildCategoryMaidCTAS(subTables, categories, country, minDwell, ctasTable, maxDwell, hourFrom, hourTo, matchMode);
       const poiSql = buildPoiListQuery(categories, country);
 
       const [queryId, poiQueryId] = await Promise.all([
@@ -321,6 +337,7 @@ export async function POST(
         country,
         categories,
         groupKey,
+        matchMode,
         minDwell,
         dateRange,
         subDatasetNames,

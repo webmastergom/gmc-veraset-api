@@ -35,10 +35,14 @@ import { CATEGORY_GROUPS, CATEGORY_LABELS } from './laboratory-types';
 export function buildCategoryAffinityLabel(
   groupKey: string | undefined | null,
   categories: string[] | undefined | null,
+  matchMode?: 'OR' | 'AND' | null,
 ): string {
   const prettify = (s: string) =>
     s.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   const n = categories?.length ?? 0;
+  // Mode suffix is only informative for multi-cat AND — OR is the default
+  // for everything and 1-cat selections collapse to the same audience either way.
+  const modeSuffix = matchMode === 'AND' && n >= 2 ? ' [AND]' : '';
   if (n === 1 && categories) {
     const cat = categories[0];
     const nice = CATEGORY_LABELS[cat] || prettify(cat);
@@ -47,11 +51,11 @@ export function buildCategoryAffinityLabel(
   if (groupKey && groupKey !== 'custom' && CATEGORY_GROUPS[groupKey]) {
     const group = CATEGORY_GROUPS[groupKey];
     if (n > 0 && n < group.categories.length) {
-      return `MAIDs by Category: ${group.label} (${n} subcategories)`;
+      return `MAIDs by Category: ${group.label} (${n} subcategories)${modeSuffix}`;
     }
-    return `MAIDs by Category: ${group.label}`;
+    return `MAIDs by Category: ${group.label}${modeSuffix}`;
   }
-  return `MAIDs by Category: Custom (${n} categories)`;
+  return `MAIDs by Category: Custom (${n} categories)${modeSuffix}`;
 }
 
 export interface AffinityByZip {

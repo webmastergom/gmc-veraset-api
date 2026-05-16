@@ -1329,6 +1329,15 @@ export default function DatasetAnalysisPage() {
                   {loadingCategoryAffinity && (
                     <span className="text-xs text-muted-foreground">Loading…</span>
                   )}
+                  {selectedAffinityKey !== 'main' && (
+                    <a
+                      href={`/api/datasets/${datasetName}/category-affinity/${encodeURIComponent(selectedAffinityKey)}/download`}
+                      className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-input hover:bg-muted"
+                    >
+                      <Download className="h-3 w-3" />
+                      Download CSV
+                    </a>
+                  )}
                 </div>
               )}
 
