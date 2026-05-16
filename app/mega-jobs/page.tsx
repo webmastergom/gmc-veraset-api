@@ -1,12 +1,13 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { MainLayout } from '@/components/layout/main-layout'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
-import { Plus, Layers, Calendar, MapPin, ArrowRight } from 'lucide-react'
+import { Plus, Layers, Calendar, MapPin, ArrowRight, Search, X } from 'lucide-react'
 
 interface MegaJobSummary {
   megaJobId: string
@@ -31,6 +32,7 @@ const statusColors: Record<string, string> = {
 export default function MegaJobsPage() {
   const [megaJobs, setMegaJobs] = useState<MegaJobSummary[]>([])
   const [loading, setLoading] = useState(true)
+  const [query, setQuery] = useState('')
 
   useEffect(() => {
     fetch('/api/mega-jobs', { credentials: 'include' })
@@ -39,6 +41,18 @@ export default function MegaJobsPage() {
       .catch(() => setMegaJobs([]))
       .finally(() => setLoading(false))
   }, [])
+
+  // Filter on name + status + mode (case-insensitive). Memoized so we
+  // only re-filter when megajobs or the query change.
+  const filteredMegaJobs = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return megaJobs
+    return megaJobs.filter((mj) =>
+      mj.name.toLowerCase().includes(q) ||
+      mj.status.toLowerCase().includes(q) ||
+      mj.mode.toLowerCase().includes(q)
+    )
+  }, [megaJobs, query])
 
   return (
     <MainLayout>
@@ -59,6 +73,33 @@ export default function MegaJobsPage() {
           </Link>
         </div>
 
+        {/* Search box — filters by name, status, or mode. Appears only
+            once megajobs have loaded so it doesn't shift the layout
+            while the initial fetch is in flight. */}
+        {!loading && megaJobs.length > 0 && (
+          <div className="relative">
+            <Search className="h-4 w-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+            <Input
+              type="search"
+              placeholder={`Search ${megaJobs.length} mega-job${megaJobs.length === 1 ? '' : 's'} by name, status, or mode…`}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              className="pl-9 pr-9"
+              aria-label="Search mega-jobs"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                aria-label="Clear search"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        )}
+
         {loading ? (
           <p className="text-muted-foreground">Loading...</p>
         ) : megaJobs.length === 0 ? (
@@ -74,38 +115,60 @@ export default function MegaJobsPage() {
               </Link>
             </CardContent>
           </Card>
-        ) : (
-          <div className="grid gap-4">
-            {megaJobs.map((mj) => (
-              <Link key={mj.megaJobId} href={`/mega-jobs/${mj.megaJobId}`}>
-                <Card className="hover:border-primary/50 transition-colors cursor-pointer">
-                  <CardContent className="py-4">
-                    <div className="flex items-center justify-between">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-3">
-                          <h3 className="font-semibold text-lg">{mj.name}</h3>
-                          <Badge className={statusColors[mj.status] || 'bg-gray-500/20 text-gray-400'}>
-                            {mj.status}
-                          </Badge>
-                          <Badge variant="outline">
-                            {mj.mode === 'auto-split' ? 'Auto-split' : 'Manual group'}
-                          </Badge>
-                        </div>
-                        <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
-                          <span>
-                            {mj.progress.synced}/{mj.progress.total} sub-jobs synced
-                            {mj.progress.failed > 0 && ` (${mj.progress.failed} failed)`}
-                          </span>
-                          <span>{new Date(mj.createdAt).toLocaleDateString()}</span>
-                        </div>
-                      </div>
-                      <ArrowRight className="h-5 w-5 text-muted-foreground" />
-                    </div>
-                  </CardContent>
-                </Card>
-              </Link>
-            ))}
+        ) : filteredMegaJobs.length === 0 ? (
+          <div className="text-center py-16 text-muted-foreground">
+            <p className="text-lg">No mega-jobs match &ldquo;{query}&rdquo;</p>
+            <p className="text-sm mt-2">
+              Try a shorter or different keyword, or{' '}
+              <button
+                type="button"
+                className="underline hover:text-foreground"
+                onClick={() => setQuery('')}
+              >
+                clear the search
+              </button>
+              .
+            </p>
           </div>
+        ) : (
+          <>
+            <div className="grid gap-4">
+              {filteredMegaJobs.map((mj) => (
+                <Link key={mj.megaJobId} href={`/mega-jobs/${mj.megaJobId}`}>
+                  <Card className="hover:border-primary/50 transition-colors cursor-pointer">
+                    <CardContent className="py-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-3">
+                            <h3 className="font-semibold text-lg">{mj.name}</h3>
+                            <Badge className={statusColors[mj.status] || 'bg-gray-500/20 text-gray-400'}>
+                              {mj.status}
+                            </Badge>
+                            <Badge variant="outline">
+                              {mj.mode === 'auto-split' ? 'Auto-split' : 'Manual group'}
+                            </Badge>
+                          </div>
+                          <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
+                            <span>
+                              {mj.progress.synced}/{mj.progress.total} sub-jobs synced
+                              {mj.progress.failed > 0 && ` (${mj.progress.failed} failed)`}
+                            </span>
+                            <span>{new Date(mj.createdAt).toLocaleDateString()}</span>
+                          </div>
+                        </div>
+                        <ArrowRight className="h-5 w-5 text-muted-foreground" />
+                      </div>
+                    </CardContent>
+                  </Card>
+                </Link>
+              ))}
+            </div>
+            {query && (
+              <p className="text-sm text-muted-foreground mt-3">
+                Showing {filteredMegaJobs.length} of {megaJobs.length}
+              </p>
+            )}
+          </>
         )}
       </div>
     </MainLayout>
