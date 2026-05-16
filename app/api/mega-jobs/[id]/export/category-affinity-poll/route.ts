@@ -30,6 +30,9 @@ interface AffinityExportState {
   groupKey?: string;
   categories?: string[];
   matchMode?: 'OR' | 'AND';
+  /** Total MAIDs from the category-poll CTAS — sent in the body so we
+   *  can report zip-placement coverage without an extra Athena query. */
+  totalMaids?: number;
   slug?: string;
   queryId?: string;
   affinityQueryId?: string;
@@ -43,6 +46,7 @@ interface AffinityExportState {
     label: string;
     totalZips: number;
     totalDevicesWithZip: number;
+    totalMaids?: number;
   };
 }
 
@@ -243,6 +247,7 @@ export async function POST(
       const groupKey: string | undefined = typeof body.groupKey === 'string' ? body.groupKey : undefined;
       const categories: string[] | undefined = Array.isArray(body.categories) ? body.categories : undefined;
       const matchMode: 'OR' | 'AND' = body.matchMode === 'AND' ? 'AND' : 'OR';
+      const totalMaids: number | undefined = typeof body.totalMaids === 'number' && body.totalMaids > 0 ? body.totalMaids : undefined;
       const slug = buildAffinitySlug(groupKey, categories, matchMode);
 
       await Promise.all(subDatasetNames.map((ds) => ensureTableForDataset(ds)));
@@ -258,6 +263,7 @@ export async function POST(
         groupKey,
         categories,
         matchMode,
+        totalMaids,
         slug,
         queryId,
       };
@@ -469,6 +475,7 @@ export async function POST(
         generatedAt: new Date().toISOString(),
         totalZips: useful.length,
         totalDevicesWithZip,
+        totalMaids: state.totalMaids,
         csvKey,
         byZipCode: useful,
       };
@@ -480,6 +487,7 @@ export async function POST(
         label,
         totalZips: useful.length,
         totalDevicesWithZip,
+        totalMaids: state.totalMaids,
       };
       state = { ...state, phase: 'done', result };
       await putConfig(STATE_KEY(id), state, { compact: true });

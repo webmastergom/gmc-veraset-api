@@ -16,6 +16,9 @@ interface CategoryAffinityListItem {
   generatedAt: string;
   totalZips: number;
   totalDevicesWithZip: number;
+  /** Total MAIDs from the originating category-poll, for coverage display.
+   *  Missing on reports generated before this field was added. */
+  totalMaids?: number;
 }
 
 /**
@@ -65,6 +68,7 @@ export async function GET(
           generatedAt: parsed.generatedAt || (obj.LastModified?.toISOString() ?? ''),
           totalZips: typeof parsed.totalZips === 'number' ? parsed.totalZips : 0,
           totalDevicesWithZip: typeof parsed.totalDevicesWithZip === 'number' ? parsed.totalDevicesWithZip : 0,
+          totalMaids: typeof parsed.totalMaids === 'number' && parsed.totalMaids > 0 ? parsed.totalMaids : undefined,
         });
       } catch {
         // Tolerate one bad file — keep listing the rest.

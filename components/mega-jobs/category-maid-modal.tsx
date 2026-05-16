@@ -236,6 +236,8 @@ export function MegaCategoryMaidModal({
           groupKey: selectedGroup || 'custom',
           categories: Array.from(selectedCategories),
           matchMode,
+          // Coverage context — lets the library show "X / Y (Z%)".
+          totalMaids: result.maidCount,
         }),
       });
       while (data.phase !== 'done' && data.phase !== 'error') {
@@ -248,7 +250,10 @@ export function MegaCategoryMaidModal({
       }
       if (data.phase === 'error') throw new Error(data.error || 'Affinity export failed');
       setAffinityResult(data.result);
-      toast({ title: 'Affinity CSV ready', description: `${data.result?.totalZips || 0} zips · ${(data.result?.totalDevicesWithZip || 0).toLocaleString()} devices` });
+      const placed = data.result?.totalDevicesWithZip || 0;
+      const total = data.result?.totalMaids || 0;
+      const coverage = total > 0 ? ` (${Math.round((placed / total) * 100)}% of ${total.toLocaleString()})` : '';
+      toast({ title: 'Affinity CSV ready', description: `${data.result?.totalZips || 0} zips · ${placed.toLocaleString()} devices placed${coverage}` });
     } catch (e: any) {
       toast({ title: 'Affinity export failed', description: e.message, variant: 'destructive' });
     } finally {

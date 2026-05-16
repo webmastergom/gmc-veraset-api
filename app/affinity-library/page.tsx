@@ -23,6 +23,7 @@ interface LibraryItem {
   generatedAt: string
   totalZips: number
   totalDevicesWithZip: number
+  totalMaids?: number
   downloadUrl: string
 }
 
@@ -152,7 +153,9 @@ export default function AffinityLibraryPage() {
                       <th className="text-left px-4 py-2 font-medium">Country</th>
                       <th className="text-left px-4 py-2 font-medium">Mode</th>
                       <th className="text-right px-4 py-2 font-medium">Zips</th>
-                      <th className="text-right px-4 py-2 font-medium">Devices</th>
+                      <th className="text-right px-4 py-2 font-medium" title="Devices placed by zip — and coverage % of the originating MAID count when known">
+                        Devices (placed)
+                      </th>
                       <th className="text-left px-4 py-2 font-medium">Generated</th>
                       <th className="text-right px-4 py-2 font-medium">Actions</th>
                     </tr>
@@ -185,7 +188,14 @@ export default function AffinityLibraryPage() {
                           </Badge>
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums">{it.totalZips.toLocaleString()}</td>
-                        <td className="px-4 py-2 text-right tabular-nums">{it.totalDevicesWithZip.toLocaleString()}</td>
+                        <td className="px-4 py-2 text-right tabular-nums">
+                          {it.totalDevicesWithZip.toLocaleString()}
+                          {it.totalMaids && it.totalMaids > 0 && (
+                            <span className="ml-1 text-xs text-muted-foreground">
+                              / {it.totalMaids.toLocaleString()} ({Math.round((it.totalDevicesWithZip / it.totalMaids) * 100)}%)
+                            </span>
+                          )}
+                        </td>
                         <td className="px-4 py-2 text-muted-foreground whitespace-nowrap">
                           {it.generatedAt ? new Date(it.generatedAt).toLocaleString() : '—'}
                         </td>
