@@ -100,9 +100,33 @@ function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): nu
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Legacy main-affinity σ — used when there's no baseline (the job's own
+// affinity report). One σ for both because the legacy "heat" signal IS
+// the only signal — no ratio.
 const SIGMA_KM = 12;
 const CUTOFF_KM = SIGMA_KM * 3;
 const twoSigmaSq = 2 * SIGMA_KM * SIGMA_KM;
+
+// ── Lift-mode sigmas (asymmetric) ───────────────────────────────────
+// σ_cat = 3km → category heat concentrates at neighborhood scale.
+// σ_base = 8km → population baseline smoothes to metro/district scale.
+// The ratio heat_cat/heat_base then reads as "this neighborhood vs
+// the surrounding metro" — which is the question we actually want
+// answered. With a single σ=12km, the city collapses into a uniform
+// blob and every category map ends up correlating r≈0.92 with each
+// other (we measured this on Spain-Canarias automotive).
+const SIGMA_CAT_KM = 3;
+const SIGMA_BASE_KM = 8;
+const CUTOFF_CAT_KM = SIGMA_CAT_KM * 3;
+const CUTOFF_BASE_KM = SIGMA_BASE_KM * 3;
+const twoSigmaCatSq = 2 * SIGMA_CAT_KM * SIGMA_CAT_KM;
+const twoSigmaBaseSq = 2 * SIGMA_BASE_KM * SIGMA_BASE_KM;
+
+// Min-baseline gate: zips whose smoothed baseline heat is under
+// `BASE_GATE_FRAC × maxBase` are dropped (adjacents) or scored 0
+// (measured zips kept in CSV so device counts still surface). 5% kills
+// the rural sample-size noise without touching real metro signal.
+const BASE_GATE_FRAC = 0.05;
 
 export async function computeAffinityReport(
   subject: string,
@@ -203,18 +227,30 @@ export async function computeAffinityReport(
       .filter(b => Number.isFinite(b.lat) && Number.isFinite(b.lng) && b.uniqueDevices > 0)
       .map(b => ({ lat: b.lat, lng: b.lng, intensity: b.uniqueDevices }));
 
+    // Asymmetric heat fields — see SIGMA_CAT_KM / SIGMA_BASE_KM comment.
+    // catHeatAt shadows the outer `heatAt` within lift-mode scope so the
+    // legacy mode (no baseline) keeps the wider σ_KM = 12.
+    const catHeatAt = (lat: number, lng: number): number => {
+      let heat = 0;
+      for (const q of hotSources) {
+        const d = haversineKm(lat, lng, q.lat, q.lng);
+        if (d > CUTOFF_CAT_KM) continue;
+        heat += q.intensity * Math.exp(-(d * d) / twoSigmaCatSq);
+      }
+      return heat;
+    };
     const baseHeatAt = (lat: number, lng: number): number => {
       let h = 0;
       for (const q of baseSources) {
         const d = haversineKm(lat, lng, q.lat, q.lng);
-        if (d > CUTOFF_KM) continue;
-        h += q.intensity * Math.exp(-(d * d) / twoSigmaSq);
+        if (d > CUTOFF_BASE_KM) continue;
+        h += q.intensity * Math.exp(-(d * d) / twoSigmaBaseSq);
       }
       return h;
     };
 
     const liftedHot = hotSources.map(z => {
-      const heatCat = heatAt(z.lat, z.lng);
+      const heatCat = catHeatAt(z.lat, z.lng);
       const heatBase = baseHeatAt(z.lat, z.lng);
       return { ...z, heatCat, heatBase };
     });
@@ -224,12 +260,17 @@ export async function computeAffinityReport(
     // large enough to clip outliers from sparse rural zips.
     const maxBase = Math.max(1, ...liftedHot.map(z => z.heatBase));
     const eps = maxBase * 0.01;
+    // Sample-size gate — see BASE_GATE_FRAC. Zips with baseline heat
+    // below this are too sparse to estimate lift reliably.
+    const baseGate = maxBase * BASE_GATE_FRAC;
 
     const liftFor = (heatCat: number, heatBase: number): number =>
       heatCat <= 0 ? 0 : heatCat / (heatBase + eps);
 
-    // Median lift across measured zips → anchor point for "expected".
+    // Median lift across measured zips that ALSO pass the baseline gate
+    // (so the anchor isn't dragged by sparse rural noise).
     const measuredLifts = liftedHot
+      .filter(z => z.heatBase >= baseGate)
       .map(z => liftFor(z.heatCat, z.heatBase))
       .filter(l => l > 0)
       .sort((a, b) => a - b);
@@ -243,19 +284,26 @@ export async function computeAffinityReport(
       return Math.max(0, Math.min(100, Math.round(s)));
     };
 
-    const hotCps: AffinityByZip[] = liftedHot.map(z => ({
-      zipCode: z.zipCode, city: z.city, country: z.country,
-      lat: z.lat, lng: z.lng,
-      uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
-      avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
-      avgFrequency: Math.round(z.avgFreq * 100) / 100,
-      affinityIndex: scoreFor(liftFor(z.heatCat, z.heatBase)),
-    }));
+    let gatedCount = 0;
+    const hotCps: AffinityByZip[] = liftedHot.map(z => {
+      // Keep the row (device counts are real data the user paid for)
+      // but score 0 so the map doesn't paint sparse-baseline noise.
+      const gated = z.heatBase < baseGate;
+      if (gated) gatedCount++;
+      return {
+        zipCode: z.zipCode, city: z.city, country: z.country,
+        lat: z.lat, lng: z.lng,
+        uniqueDevices: z.uniqueDevices, totalVisitDays: z.totalVisitDays,
+        avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
+        avgFrequency: Math.round(z.avgFreq * 100) / 100,
+        affinityIndex: gated ? 0 : scoreFor(liftFor(z.heatCat, z.heatBase)),
+      };
+    });
 
     // Adjacent polygons — only paint zips that have real category heat
-    // and aren't dramatically under-indexed. This is what kills the
-    // "central Paris all reads 100" bleed: with lift, a population-dense
-    // zip with proportional category heat scores ~50, not 100.
+    // AND pass the baseline gate AND aren't dramatically under-indexed.
+    // With σ_cat=3km the cat heat dies off in ~9km so adjacents are
+    // naturally limited to the immediate surroundings of real hotspots.
     type AdjacentRaw = {
       zipCode: string; city: string; country: string;
       lat: number; lng: number; lift: number;
@@ -290,9 +338,10 @@ export async function computeAffinityReport(
             }
             if (!cLat || !cLng) continue;
 
-            const heatCat = heatAt(cLat, cLng);
+            const heatCat = catHeatAt(cLat, cLng);
             if (heatCat <= 0) continue;
             const heatBase = baseHeatAt(cLat, cLng);
+            if (heatBase < baseGate) continue;          // sample-size gate
             const lift = liftFor(heatCat, heatBase);
             // Drop adjacents under half the median lift — they'd just
             // clutter the map at 20-30 score and dilute the signal.
@@ -315,7 +364,7 @@ export async function computeAffinityReport(
       affinityIndex: scoreFor(a.lift),
     }));
 
-    console.log(`[AFFINITY-LIFT] ${subject}: ${hotCps.length} hot + ${adjacentCps.length} adjacent (medianLift=${medianLift.toExponential(2)})`);
+    console.log(`[AFFINITY-LIFT] ${subject}: ${hotCps.length} hot (${gatedCount} gated→0) + ${adjacentCps.length} adjacent (σ_cat=${SIGMA_CAT_KM}km, σ_base=${SIGMA_BASE_KM}km, medianLift=${medianLift.toExponential(2)})`);
 
     const allCps = [...hotCps, ...adjacentCps];
     allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
