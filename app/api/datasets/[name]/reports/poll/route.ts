@@ -17,7 +17,7 @@ import {
   buildTemporalTrends,
 } from '@/lib/mega-report-consolidation';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
-import { homeTableExists, homeTableName } from '@/lib/home-detector';
+import { homeTableExists, homeTableName, startHomeDetection, pollHomeDetection } from '@/lib/home-detector';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -42,8 +42,11 @@ function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFr
 // ── Types ─────────────────────────────────────────────────────────────
 
 interface ReportState {
-  phase: 'start' | 'polling' | 'parsing' | 'done' | 'error';
+  phase: 'start' | 'home_detection' | 'polling' | 'parsing' | 'done' | 'error';
   queries: Record<string, string>;  // name → queryId
+  /** Athena queryId of the TC-WK-19-7 home-detection CTAS that runs
+   *  before the 8 report queries when the home table is missing. */
+  homeDetectionQueryId?: string;
   datasetSizeGB?: number;
   minDwell?: number;
   maxDwell?: number;
@@ -856,6 +859,97 @@ export async function POST(
     if (state && Boolean(state.discardResidents) !== discardResidents) {
       console.log(`[DS-REPORT] discardResidents changed (${Boolean(state.discardResidents)} → ${discardResidents}), resetting`);
       state = null;
+    }
+
+    // ── Phase: home_detection (auto-trigger TC-WK-19-7 when missing) ──
+    //
+    // Catchment + affinity REQUIRE the per-dataset TC-WK-19-7 home-locations
+    // table (METHODOLOGY.md §2.3). If it is missing on first entry, kick
+    // off home detection here and poll it as its own state-machine phase
+    // before the 8 report queries launch. The CTAS auto-creates the Glue
+    // catalog entry on success, so a subsequent homeTableExists() returns
+    // true and we fall through into the existing "Phase: start" logic.
+    if (!state) {
+      if (!(await homeTableExists(datasetName))) {
+        console.log(`[DS-REPORT] Home table missing for ${datasetName} — auto-triggering home detection (TC-WK-19-7)`);
+        await ensureTableForDataset(datasetName);
+        const { queryId, outputTable } = await startHomeDetection(datasetName);
+        console.log(`[DS-REPORT] Home detection started for ${datasetName}: query=${queryId} → table=${outputTable}`);
+        state = {
+          phase: 'home_detection',
+          queries: {},
+          homeDetectionQueryId: queryId,
+          minDwell: minDwell || undefined,
+          maxDwell: maxDwell || undefined,
+          hourFrom: hourFrom > 0 ? hourFrom : undefined,
+          hourTo: hourTo < 23 ? hourTo : undefined,
+          minVisits: minVisits > 1 ? minVisits : undefined,
+          gpsOnly: gpsOnly || undefined,
+          maxCircleScore: maxCircleScore > 0 ? maxCircleScore : undefined,
+          daysOfWeek: (daysOfWeek.length > 0 && daysOfWeek.length < 7) ? daysOfWeek : undefined,
+          discardEmployees: discardEmployees || undefined,
+          discardResidents: discardResidents || undefined,
+        };
+        await saveState(datasetName, state);
+        return NextResponse.json({
+          phase: 'home_detection',
+          progress: {
+            step: 'home_detection_started',
+            percent: 2,
+            message: 'Detecting home locations (TC-WK-19-7)…',
+          },
+        });
+      }
+    }
+
+    if (state?.phase === 'home_detection') {
+      const qid = state.homeDetectionQueryId;
+      if (!qid) {
+        // Inconsistent saved state — reset and let the next call start fresh.
+        console.warn(`[DS-REPORT] home_detection state missing queryId for ${datasetName}, resetting`);
+        state = null;
+      } else {
+        let pollResult: { state: 'running' | 'done' | 'error'; error?: string };
+        try {
+          pollResult = await pollHomeDetection(qid);
+        } catch (err: any) {
+          // Athena occasionally loses metadata for old queries.
+          const msg = err?.message || String(err);
+          if (msg.includes('not found') || msg.includes('InvalidRequestException')) {
+            pollResult = { state: 'error', error: 'Home-detection query expired' };
+          } else {
+            pollResult = { state: 'error', error: msg };
+          }
+        }
+
+        if (pollResult.state === 'running') {
+          let scannedGB = 0;
+          let runtimeSec = 0;
+          try {
+            const status = await checkQueryStatus(qid);
+            if (status.statistics?.dataScannedBytes) scannedGB = status.statistics.dataScannedBytes / 1e9;
+            if (status.statistics?.engineExecutionTimeMs) runtimeSec = Math.round(status.statistics.engineExecutionTimeMs / 1000);
+          } catch { /* swallow — stats are best-effort */ }
+          return NextResponse.json({
+            phase: 'home_detection',
+            progress: {
+              step: 'home_detection',
+              percent: 5,
+              message: `Detecting home locations… ${scannedGB.toFixed(0)} GB scanned · ${runtimeSec}s`,
+            },
+          });
+        }
+        if (pollResult.state === 'error') {
+          state = { ...state, phase: 'error', error: `Home detection failed: ${pollResult.error || 'unknown'}` };
+          await saveState(datasetName, state);
+          return NextResponse.json({ phase: 'error', error: state.error });
+        }
+        // pollResult.state === 'done' — the CTAS finished. The Glue
+        // catalog entry should now exist; fall through to the start
+        // phase below by clearing state so the !state branch fires.
+        console.log(`[DS-REPORT] Home detection complete for ${datasetName} — launching report queries`);
+        state = null;
+      }
     }
 
     // ── Phase: start ────────────────────────────────────────────
