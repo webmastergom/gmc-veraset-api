@@ -1282,7 +1282,7 @@ export default function DatasetAnalysisPage() {
                 </Button>
                 </div>
                 <p className="text-xs text-muted-foreground/70 border-l-2 border-muted pl-3">
-                  Methodology: residence assigned by first ping of the day per device. A device is counted at a location only if its first daily signal appears at the same rounded coordinate (~11km) on 3 or more distinct days. Reverse-geocoded to postal code via local GeoJSON.
+                  Methodology: TC-WK-19-7 home detection (Pappalardo et al., EPJ Data Sci 2023 — see docs/METHODOLOGY.md §2.3). Each device&apos;s home is the most-frequent ~1.1 km bucket of its weekday nighttime pings (19:00–07:00 local), requiring ≥ 3 distinct nights and horizontal accuracy &lt; 1 km. Catchment groups POI visitors by their inferred home coordinate, reverse-geocoded to postal code via local GeoJSON. The legacy first-ping-of-day proxy is no longer used.
                 </p>
               </div>
               <CaptureRingsSummary
