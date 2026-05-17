@@ -531,24 +531,22 @@ export default function DatasetAnalysisPage() {
     if (!ok) return;
     setRedetectingHomes(true);
     try {
+      console.log('[reset] POST /home-detect/redetect …');
       const res = await fetch(`/api/datasets/${encodeURIComponent(datasetName)}/home-detect/redetect`, {
         method: 'POST',
         credentials: 'include',
       });
       const data = await res.json();
+      // Aggressive client-side log so the user can paste it back when
+      // diagnosing — survivors and per-step status are visible without
+      // needing to open the Network tab.
+      console.log('[reset] response', { status: res.status, data });
 
-      // The refactored endpoint returns 207 Multi-Status when the cleanup
-      // ran but at least one target survived or failed. Treat anything
-      // other than network-level failure / 4xx / 5xx as a result we
-      // should inspect rather than blanket-throw.
       if (res.status >= 400) {
         throw new Error(data?.error || `HTTP ${res.status}`);
       }
 
-      // Always clear React state — the S3 cleanup ran (even if partial),
-      // so any cached report is at best stale and at worst now lying.
-      // loadReportsForFilters only writes state on 200 responses and
-      // skips 404s as no-ops, so we have to clear by hand.
+      // Always clear React state — the S3 cleanup ran (even if partial).
       setAnalysis(null);
       setODReport(null);
       setHourlyReport(null);
@@ -560,7 +558,8 @@ export default function DatasetAnalysisPage() {
       setCategoryAffinityList([]);
       setCategoryAffinityData(null);
 
-      const totalDeleted: number = data?.totalDeleted ?? 0;
+      const totalCleared: number = data?.totalCleared ?? data?.totalDeleted ?? 0;
+      const totalSoftDeleted: number = data?.totalSoftDeleted ?? 0;
       const remaining: string[] = Array.isArray(data?.remaining) ? data.remaining : [];
       const failedSteps: Array<{ step: string; error?: string }> = Array.isArray(data?.steps)
         ? data.steps.filter((s: any) => s?.status === 'failed')
@@ -569,11 +568,11 @@ export default function DatasetAnalysisPage() {
       if (data?.ok && remaining.length === 0) {
         toast({
           title: 'Dataset reset',
-          description: `${totalDeleted} object(s) deleted. Click Analyze to rebuild from scratch.`,
+          description: `${totalCleared} object(s) cleared` +
+            (totalSoftDeleted ? ` (${totalSoftDeleted} via soft-delete)` : '') +
+            `. Click Analyze to rebuild from scratch.`,
         });
       } else {
-        // Partial cleanup. Surface what survived so the user can see it
-        // wasn't silent — better than the previous "no hace nada" UX.
         const failedSummary = failedSteps.length
           ? failedSteps.map((s) => `${s.step}${s.error ? ` (${s.error.slice(0, 80)})` : ''}`).join('; ')
           : 'none';
@@ -581,12 +580,11 @@ export default function DatasetAnalysisPage() {
         toast({
           title: 'Reset incomplete',
           description:
-            `${totalDeleted} deleted, ${remaining.length} survivor(s). ` +
+            `${totalCleared} cleared, ${remaining.length} survivor(s). ` +
             `Failed step(s): ${failedSummary}. ` +
             (remaining.length ? `Surviving keys: ${remainingSample}.` : ''),
           variant: 'destructive',
         });
-        console.warn('[reset]', data);
       }
       setReportVersion((v) => v + 1);
     } catch (e: any) {

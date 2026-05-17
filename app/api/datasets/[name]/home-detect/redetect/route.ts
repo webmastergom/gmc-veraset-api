@@ -5,7 +5,9 @@ import { s3Client, BUCKET } from '@/lib/s3-config';
 import {
   ListObjectsV2Command,
   DeleteObjectsCommand,
+  DeleteObjectCommand,
   HeadObjectCommand,
+  PutObjectCommand,
 } from '@aws-sdk/client-s3';
 
 export const dynamic = 'force-dynamic';
@@ -14,129 +16,156 @@ export const maxDuration = 60;
 /**
  * POST /api/datasets/[name]/home-detect/redetect
  *
- * Full dataset reset. Wipes every derived artifact for a dataset and
- * leaves only the Veraset-synced parquets and the job/UI config
- * untouched. After this returns, the next "Run analysis" click will
- * auto-trigger a fresh home detection and rebuild every report from
- * scratch.
+ * Full dataset reset. Each cleanup target runs independently and the
+ * result of every step is returned to the caller, so a partial failure
+ * is never silent.
  *
- * Targets (each independent, never aborts the others):
- *   • home_table     — Glue catalog entry for `home_{ds}` + parquets
- *                      under `home-locations/{ds}/`
- *   • home_parquets  — defensive re-sweep of `home-locations/{ds}/`
- *                      in case `home_table`'s S3 wipe partially failed
- *   • reports        — every object under `config/dataset-reports/{ds}/`
- *                      including subdirectories (category-affinity/,
- *                      zip-code-signals/, every filter variant)
- *   • report_cache   — staging area `dataset-report-cache/{ds}/` used
- *                      by the multiphase parsing path
- *   • dataset_analysis, report_state, catchment_state, analysis_state
- *                    — single-key per-dataset state JSONs
+ * Targets:
+ *   • home_table         — Glue catalog entry + `home-locations/{ds}/`
+ *   • home_parquets      — defensive re-sweep of `home-locations/{ds}/`
+ *   • reports            — `config/dataset-reports/{ds}/` (recursive)
+ *   • report_cache       — `dataset-report-cache/{ds}/` (recursive)
+ *   • dataset_analysis,
+ *     report_state,
+ *     catchment_state,
+ *     analysis_state     — single-key per-dataset state JSONs
  *
- * After every step runs, a verification scan re-lists every prefix
- * and HEADs every single-key, and any survivor is surfaced in the
- * response's `remaining` array. That guarantees the caller can tell
- * whether `ok: true` means "really clean" or "we tried and X survived".
+ * IAM resilience — the Vercel IAM user historically lacks
+ * `s3:DeleteObject` on some prefixes. When a hard delete fails we fall
+ * back to a 0-byte PutObject overwrite ("soft delete"). Downstream
+ * readers either fail to JSON-parse the empty file (catchment /
+ * affinity / etc.) or skip 0-byte parquets, so soft-deletes behave
+ * identically to hard deletes from the user's perspective. The
+ * response distinguishes the two so we can see when the IAM is the
+ * bottleneck.
  *
- * Idempotent: running it on a half-deleted state finishes the cleanup
- * rather than erroring out. Running it twice on a clean dataset is a
- * no-op that returns `{ ok: true, remaining: [] }`.
+ * Verification — after every step runs we re-HEAD/list the targets
+ * and report any object that is still present AND non-empty as a
+ * survivor. A 0-byte object counts as cleared, not as a survivor.
  */
 
-type StepStatus = 'deleted' | 'noop' | 'failed';
+type StepStatus = 'cleared' | 'noop' | 'failed';
 
 type StepResult = {
   step: string;
   status: StepStatus;
-  /** Items deleted in this step. 0 means noop or failed-before-any-delete. */
-  count: number;
+  /** How many keys ended up cleared (hard-deleted or soft-deleted). */
+  cleared: number;
+  /** Of `cleared`, how many were 0-byte soft-deletes (IAM fallback). */
+  softDeleted: number;
   /** Set when status === 'failed'. */
   error?: string;
 };
 
-async function listAllKeys(prefix: string): Promise<string[]> {
-  const out: string[] = [];
+async function listAllKeys(prefix: string): Promise<Array<{ key: string; size: number }>> {
+  const out: Array<{ key: string; size: number }> = [];
   let token: string | undefined;
   do {
     const r = await s3Client.send(new ListObjectsV2Command({
       Bucket: BUCKET, Prefix: prefix, ContinuationToken: token,
     }));
-    for (const o of r.Contents || []) if (o.Key) out.push(o.Key);
+    for (const o of r.Contents || []) {
+      if (o.Key) out.push({ key: o.Key, size: o.Size || 0 });
+    }
     token = r.IsTruncated ? r.NextContinuationToken : undefined;
   } while (token);
   return out;
 }
 
-async function deleteKeysBatched(keys: string[]): Promise<{ deleted: number; firstError?: string }> {
-  let deleted = 0;
-  let firstError: string | undefined;
-  for (let i = 0; i < keys.length; i += 1000) {
-    const batch = keys.slice(i, i + 1000).map((Key) => ({ Key }));
-    const r = await s3Client.send(new DeleteObjectsCommand({
-      Bucket: BUCKET,
-      Delete: { Objects: batch, Quiet: false },
-    }));
-    deleted += batch.length - (r.Errors?.length || 0);
-    if (r.Errors?.length && !firstError) {
-      const e = r.Errors[0];
-      firstError = `${e.Key}: ${e.Code} ${e.Message}`;
-    }
+/** Real S3 delete for one key. Returns null on success, error string on failure. */
+async function tryHardDelete(key: string): Promise<string | null> {
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+    return null;
+  } catch (e: any) {
+    return e?.name || e?.Code || e?.message || 'unknown delete error';
   }
-  return { deleted, firstError };
+}
+
+/** 0-byte PutObject overwrite. Same pattern as app/api/settings/staging/route.ts. */
+async function softDelete(key: string): Promise<string | null> {
+  try {
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      Body: '',
+      ContentType: 'application/octet-stream',
+    }));
+    return null;
+  } catch (e: any) {
+    return e?.name || e?.Code || e?.message || 'unknown soft-delete error';
+  }
+}
+
+/** Clear one key: hard-delete first, soft-delete on failure. */
+async function clearKey(key: string): Promise<'hard' | 'soft' | 'failed'> {
+  const hardErr = await tryHardDelete(key);
+  if (hardErr === null) return 'hard';
+  const softErr = await softDelete(key);
+  if (softErr === null) return 'soft';
+  return 'failed';
 }
 
 async function wipePrefix(stepName: string, prefix: string): Promise<StepResult> {
   try {
-    const keys = await listAllKeys(prefix);
-    if (keys.length === 0) return { step: stepName, status: 'noop', count: 0 };
-    const { deleted, firstError } = await deleteKeysBatched(keys);
-    if (firstError) {
-      return { step: stepName, status: 'failed', count: deleted, error: firstError };
+    const all = await listAllKeys(prefix);
+    const live = all.filter((o) => o.size > 0);
+    if (live.length === 0) return { step: stepName, status: 'noop', cleared: 0, softDeleted: 0 };
+    let hardCount = 0;
+    let softCount = 0;
+    let firstError: string | undefined;
+    // Parallel clears, capped at 10 concurrent (S3 is happy with this).
+    for (let i = 0; i < live.length; i += 10) {
+      const slice = live.slice(i, i + 10);
+      const outcomes = await Promise.all(slice.map((o) => clearKey(o.key).then((r) => ({ key: o.key, r }))));
+      for (const o of outcomes) {
+        if (o.r === 'hard') hardCount++;
+        else if (o.r === 'soft') softCount++;
+        else if (!firstError) firstError = `${o.key}: both hard and soft delete failed`;
+      }
     }
-    return { step: stepName, status: 'deleted', count: deleted };
+    const cleared = hardCount + softCount;
+    if (firstError) {
+      return { step: stepName, status: 'failed', cleared, softDeleted: softCount, error: firstError };
+    }
+    return { step: stepName, status: 'cleared', cleared, softDeleted: softCount };
   } catch (e: any) {
-    return { step: stepName, status: 'failed', count: 0, error: e?.message || String(e) };
+    return { step: stepName, status: 'failed', cleared: 0, softDeleted: 0, error: e?.message || String(e) };
   }
 }
 
 async function wipeSingleKey(stepName: string, key: string): Promise<StepResult> {
-  // HEAD first so we can distinguish 'already gone' (noop) from 'we deleted it'.
   try {
-    await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    const head = await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    if ((head.ContentLength || 0) === 0) {
+      return { step: stepName, status: 'noop', cleared: 0, softDeleted: 0 };
+    }
   } catch (e: any) {
     if (e?.$metadata?.httpStatusCode === 404 || e?.name === 'NotFound') {
-      return { step: stepName, status: 'noop', count: 0 };
+      return { step: stepName, status: 'noop', cleared: 0, softDeleted: 0 };
     }
-    return { step: stepName, status: 'failed', count: 0, error: e?.message || String(e) };
+    return { step: stepName, status: 'failed', cleared: 0, softDeleted: 0, error: e?.message || String(e) };
   }
-  try {
-    const r = await s3Client.send(new DeleteObjectsCommand({
-      Bucket: BUCKET,
-      Delete: { Objects: [{ Key: key }], Quiet: false },
-    }));
-    if (r.Errors?.length) {
-      const e = r.Errors[0];
-      return { step: stepName, status: 'failed', count: 0, error: `${e.Code} ${e.Message}` };
-    }
-    return { step: stepName, status: 'deleted', count: 1 };
-  } catch (e: any) {
-    return { step: stepName, status: 'failed', count: 0, error: e?.message || String(e) };
+  const r = await clearKey(key);
+  if (r === 'failed') {
+    return { step: stepName, status: 'failed', cleared: 0, softDeleted: 0, error: `${key}: both hard and soft delete failed` };
   }
+  return { step: stepName, status: 'cleared', cleared: 1, softDeleted: r === 'soft' ? 1 : 0 };
 }
 
 async function dropHome(stepName: string, ds: string): Promise<StepResult> {
   try {
     await dropHomeTable(ds);
-    return { step: stepName, status: 'deleted', count: 1 };
+    return { step: stepName, status: 'cleared', cleared: 1, softDeleted: 0 };
   } catch (e: any) {
-    return { step: stepName, status: 'failed', count: 0, error: e?.message || String(e) };
+    return { step: stepName, status: 'failed', cleared: 0, softDeleted: 0, error: e?.message || String(e) };
   }
 }
 
-async function keyExists(key: string): Promise<boolean> {
+async function liveKeyExists(key: string): Promise<boolean> {
   try {
-    await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
-    return true;
+    const head = await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    return (head.ContentLength || 0) > 0;
   } catch (e: any) {
     if (e?.$metadata?.httpStatusCode === 404 || e?.name === 'NotFound') return false;
     throw e;
@@ -165,47 +194,42 @@ export async function POST(
     { step: 'analysis_state', key: `config/analysis-state/${datasetName}.json` },
   ];
 
-  // Step 1: drop the Glue catalog entry + home parquets via the shared
-  // helper. We still run wipePrefix('home_parquets', ...) afterward as
-  // belt-and-suspenders for the case where Glue dropped fine but the
-  // S3 wipe inside dropHomeTable failed mid-way.
   const steps: StepResult[] = [];
+  // Glue + S3 in one shared helper. If Glue drop throws (IAM), we still
+  // run the home_parquets sweep below as a belt-and-suspenders.
   steps.push(await dropHome('home_table', datasetName));
-
-  // Step 2: wipe each prefix. Each runs in its own try/catch and never
-  // aborts the next one.
   for (const t of prefixTargets) {
     steps.push(await wipePrefix(t.step, t.prefix));
   }
-
-  // Step 3: delete each single state key.
   for (const t of singleKeyTargets) {
     steps.push(await wipeSingleKey(t.step, t.key));
   }
 
-  // Step 4: verification scan. Re-list every prefix and HEAD every
-  // single-key target. Anything still alive goes into `remaining` so
-  // the caller can tell the truth from the optimistic step status.
+  // Verification: re-list every prefix, re-HEAD every single key. Only
+  // objects with size > 0 count as survivors — 0-byte soft-deletes are
+  // treated as cleared.
   const remaining: string[] = [];
   try {
     for (const t of prefixTargets) {
-      const survivors = await listAllKeys(t.prefix);
-      remaining.push(...survivors);
+      const all = await listAllKeys(t.prefix);
+      for (const o of all) if (o.size > 0) remaining.push(o.key);
     }
     for (const t of singleKeyTargets) {
-      if (await keyExists(t.key)) remaining.push(t.key);
+      if (await liveKeyExists(t.key)) remaining.push(t.key);
     }
   } catch (e: any) {
     console.error(`[DATASET-RESET] ${datasetName} verification error:`, e?.message || e);
   }
 
-  const totalDeleted = steps.reduce((n, s) => n + s.count, 0);
+  const totalCleared = steps.reduce((n, s) => n + s.cleared, 0);
+  const totalSoftDeleted = steps.reduce((n, s) => n + s.softDeleted, 0);
   const anyStepFailed = steps.some((s) => s.status === 'failed');
   const ok = remaining.length === 0 && !anyStepFailed;
 
   console.log(
-    `[DATASET-RESET] ${datasetName}: ok=${ok} totalDeleted=${totalDeleted} ` +
-    `remaining=${remaining.length} failedSteps=${steps.filter((s) => s.status === 'failed').map((s) => s.step).join(',') || 'none'}`,
+    `[DATASET-RESET] ${datasetName}: ok=${ok} cleared=${totalCleared} ` +
+    `(soft=${totalSoftDeleted}) remaining=${remaining.length} ` +
+    `failedSteps=${steps.filter((s) => s.status === 'failed').map((s) => s.step).join(',') || 'none'}`,
   );
 
   return NextResponse.json({
@@ -213,9 +237,12 @@ export async function POST(
     dataset: datasetName,
     steps,
     remaining,
-    totalDeleted,
+    totalCleared,
+    totalSoftDeleted,
     summary: ok
-      ? `Dataset reset clean — ${totalDeleted} object(s) deleted. Click Analyze to rebuild.`
+      ? `Dataset reset clean — ${totalCleared} object(s) cleared` +
+        (totalSoftDeleted ? ` (${totalSoftDeleted} via IAM-fallback soft-delete)` : '') +
+        `. Click Analyze to rebuild.`
       : `Reset incomplete: ${remaining.length} survivor(s), ${steps.filter((s) => s.status === 'failed').length} step(s) failed. See steps[] and remaining[] for details.`,
-  }, { status: ok ? 200 : 207 /* Multi-Status */ });
+  }, { status: ok ? 200 : 207 });
 }
