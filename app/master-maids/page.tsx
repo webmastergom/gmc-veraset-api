@@ -24,6 +24,8 @@ import {
   Database,
   Tag,
   Calendar,
+  Users,
+  Info,
 } from 'lucide-react'
 
 const COUNTRY_FLAGS: Record<string, string> = {
@@ -95,6 +97,59 @@ function formatNumber(n: number | null): string {
   if (n === null || n === undefined) return '—'
   return n.toLocaleString()
 }
+
+/**
+ * Heuristic for the *real-person* audience behind a raw MAID count.
+ *
+ * A MAID is not a stable identifier:
+ *   - iOS post-ATT (2021+) ≈ 80% opt-out → IDFA becomes zeros or
+ *     session-random strings. Session-random ones inflate uniques.
+ *   - Android AAID can be reset (settings, factory reset, new phone).
+ *   - App reinstalls / multi-account → new MAIDs for the same person.
+ *
+ * Effective MAID lifespan in mobility data ≈ 4 months. Combined with
+ * a 60% cleanliness factor (accounts for randomized iOS strings,
+ * bot/test traffic, short-lived MAIDs):
+ *
+ *   churnFactor = 1 + max(0, spanMonths - 4) / 4
+ *   estimate    = round(totalMaids / churnFactor × 0.6)
+ *
+ * For Mexico (10.5mo span, 555M MAIDs):
+ *   churnFactor = 2.625  →  estimate ≈ 127M people
+ *
+ * For a 1-month category extraction (no churn beyond lifespan):
+ *   churnFactor = 1      →  estimate ≈ 60% of raw
+ *
+ * The constants are industry rule-of-thumb, not measured. Treat as a
+ * conservative upper bound for "people you could actually reach if
+ * you targeted this audience today".
+ */
+const MAID_LIFESPAN_MONTHS = 4
+const MAID_CLEANLINESS_FACTOR = 0.6
+
+function monthsBetween(from: string | null, to: string | null): number {
+  if (!from || !to) return MAID_LIFESPAN_MONTHS // fallback: assume one lifespan
+  const f = new Date(from).getTime()
+  const t = new Date(to).getTime()
+  if (!Number.isFinite(f) || !Number.isFinite(t) || t <= f) return MAID_LIFESPAN_MONTHS
+  return (t - f) / (1000 * 60 * 60 * 24 * 30.44)
+}
+
+function estimateRealAudience(
+  totalMaids: number | null,
+  dateRange: { from: string | null; to: string | null } | null,
+): number | null {
+  if (!totalMaids || totalMaids <= 0) return null
+  const span = monthsBetween(dateRange?.from ?? null, dateRange?.to ?? null)
+  const churnFactor = 1 + Math.max(0, span - MAID_LIFESPAN_MONTHS) / MAID_LIFESPAN_MONTHS
+  return Math.round((totalMaids / churnFactor) * MAID_CLEANLINESS_FACTOR)
+}
+
+const ESTIMATE_TOOLTIP =
+  'Heuristic estimate of real people behind the MAIDs, after accounting for ' +
+  '~4-month MAID lifespan (iOS opt-outs randomize IDFA; Android resets) and ' +
+  '~40% noise (iOS-zero strings, short-lived MAIDs, bot traffic). ' +
+  'Use as a conservative upper bound for activatable audience size — not as a precise count.'
 
 function formatDate(d: string | null): string {
   if (!d || d === 'unknown') return '—'
@@ -281,27 +336,52 @@ export default function MasterMaidsPage() {
           )}
         </div>
 
-        {!loading && globalTotal > 0 && (
-          <Card className="mb-6 bg-gradient-to-r from-theme-accent/10 to-transparent border-theme-accent/30">
-            <CardContent className="py-4 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <span className="text-2xl">🌍</span>
-                <div>
-                  <div className="text-sm text-muted-foreground">Global Total</div>
-                  <div className="text-sm text-muted-foreground">{countries.length} countries</div>
+        {!loading && globalTotal > 0 && (() => {
+          // Global "real audience" = sum of per-country estimates so each
+          // country's churn factor reflects its own span, not a global avg.
+          const globalRealAudience = countries.reduce(
+            (sum, c) => sum + (estimateRealAudience(c.totalMaids, c.dateRange) || 0),
+            0,
+          )
+          return (
+            <Card className="mb-6 bg-gradient-to-r from-theme-accent/10 to-transparent border-theme-accent/30">
+              <CardContent className="py-4 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <span className="text-2xl">🌍</span>
+                  <div>
+                    <div className="text-sm text-muted-foreground">Global Total</div>
+                    <div className="text-sm text-muted-foreground">{countries.length} countries</div>
+                  </div>
                 </div>
-              </div>
-              <div className="text-right">
-                <div className="text-3xl font-bold tabular-nums text-theme-accent">
-                  {hasEstimates ? '~' : ''}{formatNumber(globalTotal)}
+                <div className="flex items-center gap-6">
+                  <div className="text-right">
+                    <div className="text-3xl font-bold tabular-nums text-theme-accent">
+                      {hasEstimates ? '~' : ''}{formatNumber(globalTotal)}
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      {hasEstimates ? 'MAIDs worldwide (consolidate for exact count)' : 'unique MAIDs worldwide'}
+                    </div>
+                  </div>
+                  {globalRealAudience > 0 && (
+                    <div
+                      className="text-right border-l border-theme-accent/30 pl-6"
+                      title={ESTIMATE_TOOLTIP}
+                    >
+                      <div className="text-2xl font-bold tabular-nums text-amber-400 flex items-center gap-1.5 justify-end">
+                        <Users className="h-5 w-5" />
+                        ~{formatNumber(globalRealAudience)}
+                      </div>
+                      <div className="text-sm text-muted-foreground flex items-center gap-1 justify-end cursor-help">
+                        estimated real audience
+                        <Info className="h-3 w-3 opacity-60" />
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <div className="text-sm text-muted-foreground">
-                  {hasEstimates ? 'MAIDs worldwide (consolidate for exact count)' : 'unique MAIDs worldwide'}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        )}
+              </CardContent>
+            </Card>
+          )
+        })()}
 
         {loading ? (
           <div className="flex items-center gap-2 text-muted-foreground py-12 justify-center">
@@ -366,6 +446,19 @@ export default function MasterMaidsPage() {
                           <div className="text-xs text-muted-foreground">
                             {c.isEstimate ? 'MAIDs (not deduplicated)' : 'unique MAIDs'}
                           </div>
+                          {(() => {
+                            const est = estimateRealAudience(c.totalMaids, c.dateRange)
+                            if (!est) return null
+                            return (
+                              <div
+                                className="mt-1 text-sm font-semibold tabular-nums text-amber-400 flex items-center gap-1 justify-end"
+                                title={ESTIMATE_TOOLTIP}
+                              >
+                                <Users className="h-3.5 w-3.5" />
+                                ~{formatNumber(est)} real
+                              </div>
+                            )
+                          })()}
                         </div>
                       )}
                       {c.attributeCount > 0 && (
