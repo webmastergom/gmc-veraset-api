@@ -537,11 +537,26 @@ export default function DatasetAnalysisPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+      // Clear every cached report from React state. loadReportsForFilters
+      // only sets state on 200 responses (404 is a no-op), so without
+      // explicit clearing the UI would keep rendering the stale catchment /
+      // affinity / etc. even though the underlying S3 files were deleted.
+      setAnalysis(null);
+      setODReport(null);
+      setHourlyReport(null);
+      setDayhourReport(null);
+      setCatchmentReport(null);
+      setMobilityReport(null);
+      setTemporalReport(null);
+      setAffinityReport(null);
+      setCategoryAffinityList([]);
+      setCategoryAffinityData(null);
+
       toast({
         title: 'Dataset reset',
         description: `${data.deleted?.reports ?? 0} report file(s) removed. Click Analyze to rebuild from scratch.`,
       });
-      // Bump report version so map components re-fetch (and see the now-empty reports as 404 / blank).
       setReportVersion((v) => v + 1);
     } catch (e: any) {
       toast({ title: 'Reset failed', description: e.message, variant: 'destructive' });
