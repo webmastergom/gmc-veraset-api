@@ -536,12 +536,19 @@ export default function DatasetAnalysisPage() {
         credentials: 'include',
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-      // Clear every cached report from React state. loadReportsForFilters
-      // only sets state on 200 responses (404 is a no-op), so without
-      // explicit clearing the UI would keep rendering the stale catchment /
-      // affinity / etc. even though the underlying S3 files were deleted.
+      // The refactored endpoint returns 207 Multi-Status when the cleanup
+      // ran but at least one target survived or failed. Treat anything
+      // other than network-level failure / 4xx / 5xx as a result we
+      // should inspect rather than blanket-throw.
+      if (res.status >= 400) {
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+
+      // Always clear React state — the S3 cleanup ran (even if partial),
+      // so any cached report is at best stale and at worst now lying.
+      // loadReportsForFilters only writes state on 200 responses and
+      // skips 404s as no-ops, so we have to clear by hand.
       setAnalysis(null);
       setODReport(null);
       setHourlyReport(null);
@@ -553,10 +560,34 @@ export default function DatasetAnalysisPage() {
       setCategoryAffinityList([]);
       setCategoryAffinityData(null);
 
-      toast({
-        title: 'Dataset reset',
-        description: `${data.deleted?.reports ?? 0} report file(s) removed. Click Analyze to rebuild from scratch.`,
-      });
+      const totalDeleted: number = data?.totalDeleted ?? 0;
+      const remaining: string[] = Array.isArray(data?.remaining) ? data.remaining : [];
+      const failedSteps: Array<{ step: string; error?: string }> = Array.isArray(data?.steps)
+        ? data.steps.filter((s: any) => s?.status === 'failed')
+        : [];
+
+      if (data?.ok && remaining.length === 0) {
+        toast({
+          title: 'Dataset reset',
+          description: `${totalDeleted} object(s) deleted. Click Analyze to rebuild from scratch.`,
+        });
+      } else {
+        // Partial cleanup. Surface what survived so the user can see it
+        // wasn't silent — better than the previous "no hace nada" UX.
+        const failedSummary = failedSteps.length
+          ? failedSteps.map((s) => `${s.step}${s.error ? ` (${s.error.slice(0, 80)})` : ''}`).join('; ')
+          : 'none';
+        const remainingSample = remaining.slice(0, 3).join(', ') + (remaining.length > 3 ? `, +${remaining.length - 3} more` : '');
+        toast({
+          title: 'Reset incomplete',
+          description:
+            `${totalDeleted} deleted, ${remaining.length} survivor(s). ` +
+            `Failed step(s): ${failedSummary}. ` +
+            (remaining.length ? `Surviving keys: ${remainingSample}.` : ''),
+          variant: 'destructive',
+        });
+        console.warn('[reset]', data);
+      }
       setReportVersion((v) => v + 1);
     } catch (e: any) {
       toast({ title: 'Reset failed', description: e.message, variant: 'destructive' });
