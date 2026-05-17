@@ -167,10 +167,15 @@ export function buildHomeDetectionSQL(
              OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_M})
         AND (HOUR(utc_timestamp) >= 19 OR HOUR(utc_timestamp) < 7)
         AND DAY_OF_WEEK(utc_timestamp) BETWEEN 1 AND 5
-        -- Quality filter: prefer GPS-origin pings. NULL means the
-        -- BASIC schema doesn't carry quality_fields, so we accept it.
-        AND (TRY(quality_fields['ping_origin_type']) IS NULL
-             OR TRY(quality_fields['ping_origin_type']) = 'gps')
+        -- Quality: we deliberately do NOT filter by
+        -- quality_fields['ping_origin_type']. The previous "GPS only"
+        -- filter biased home detection against dense urban residents,
+        -- whose indoor pings are WiFi-based — restricting to GPS pings
+        -- left only their outdoor activity and pushed inferred "home"
+        -- to streets / parks / suburbs (Pappalardo et al. recommend
+        -- against single-origin filtering in mixed-density geographies).
+        -- We keep the horizontal_accuracy < 1 km bound, which is the
+        -- stronger signal of whether a ping is usable for home inference.
     ),
     bucketed AS (
       -- Quantize to a ~1.1 km grid (substitute for geohash6).
@@ -328,6 +333,21 @@ export async function attachHomeTable(datasetName: string): Promise<void> {
     LOCATION 's3://${BUCKET}/${prefix}/'
     TBLPROPERTIES ('parquet.compress'='SNAPPY')
   `);
+}
+
+/**
+ * Drop the home table for a dataset: removes the Glue catalog entry
+ * AND deletes the parquet shards in S3. Idempotent — succeeds whether
+ * or not the table currently exists. Used by the "Re-detect homes"
+ * admin endpoint so the next analysis click triggers a fresh CTAS
+ * with the current home-detection SQL (rather than reusing an old
+ * possibly-biased table).
+ */
+export async function dropHomeTable(datasetName: string): Promise<void> {
+  const table = homeTableName(datasetName);
+  const prefix = homeTableS3Prefix(datasetName);
+  await dropHomeTableSafely(table);
+  await wipeS3Prefix(prefix);
 }
 
 /** Fire-and-forget Glue catalog table drop; tolerates "table does not exist". */

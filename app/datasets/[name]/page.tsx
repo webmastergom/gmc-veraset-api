@@ -36,6 +36,7 @@ import {
   Timer,
   Play,
   Target,
+  Home,
 } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -143,6 +144,7 @@ export default function DatasetAnalysisPage() {
   const [activateMessage, setActivateMessage] = useState('');
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditResult, setAuditResult] = useState<any>(null);
+  const [redetectingHomes, setRedetectingHomes] = useState(false);
 
   // Reports (from /api/datasets/[name]/reports/poll)
   const [generatingReports, setGeneratingReports] = useState(false);
@@ -516,6 +518,37 @@ export default function DatasetAnalysisPage() {
     }
   };
 
+  const handleRedetectHomes = async () => {
+    const ok = window.confirm(
+      `Re-detect homes for "${datasetName}"?\n\n` +
+      `This will:\n` +
+      `  • Drop the existing home-locations table (home_${datasetName.replace(/[^a-zA-Z0-9_]/g, '_')})\n` +
+      `  • Clear all saved catchment + affinity reports\n` +
+      `  • Reset polling state\n\n` +
+      `Next click on "Analyze" will run a fresh home detection (TC-WK-19-7, no GPS-only filter) before launching report queries.`,
+    );
+    if (!ok) return;
+    setRedetectingHomes(true);
+    try {
+      const res = await fetch(`/api/datasets/${encodeURIComponent(datasetName)}/home-detect/redetect`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      toast({
+        title: 'Home table cleared',
+        description: `${data.deleted?.reports ?? 0} report file(s) removed. Click Analyze to run a fresh detection.`,
+      });
+      // Bump report version so map components re-fetch (and see the now-empty reports as 404 / blank).
+      setReportVersion((v) => v + 1);
+    } catch (e: any) {
+      toast({ title: 'Re-detect failed', description: e.message, variant: 'destructive' });
+    } finally {
+      setRedetectingHomes(false);
+    }
+  };
+
   const runAudit = async () => {
     setAuditLoading(true);
     setAuditResult(null);
@@ -840,6 +873,15 @@ export default function DatasetAnalysisPage() {
           <Button variant="outline" onClick={runAudit} disabled={auditLoading} title="Compare with Veraset source">
             {auditLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ShieldCheck className="mr-2 h-4 w-4" />}
             Audit
+          </Button>
+          <Button
+            variant="outline"
+            onClick={handleRedetectHomes}
+            disabled={redetectingHomes || generatingReports || loading}
+            title="Drop the existing home-locations table and saved catchment/affinity reports for this dataset. Next click on Analyze will run a fresh home detection."
+          >
+            {redetectingHomes ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Home className="mr-2 h-4 w-4" />}
+            Re-detect homes
           </Button>
         </div>
       </div>
