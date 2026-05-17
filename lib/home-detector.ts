@@ -268,12 +268,21 @@ export function buildHomeDetectionSQL(
  * Start a home-detection CTAS for `datasetName`. Returns immediately
  * with the Athena queryId; caller polls via `pollHomeDetection`.
  *
- * Idempotent w.r.t. S3 cleanup: any existing parquet under the output
- * prefix is deleted first (Athena CTAS refuses to write to a
- * non-empty location). The Glue catalog table is dropped via the SQL
- * `DROP TABLE IF EXISTS` — we don't pre-issue it here because that
- * would require a second blocking query. Instead, we use a fresh
- * outputTable name per run (timestamp suffix).
+ * S3 path strategy: Athena's CTAS refuses to write to a non-empty
+ * external_location with `HIVE_PATH_ALREADY_EXISTS`, and the check is
+ * sensitive to object *presence* regardless of size. When the Vercel
+ * IAM lacks `s3:DeleteObject` on `home-locations/{ds}/`, our Reset
+ * endpoint falls back to 0-byte soft-deletes — those tombstones still
+ * trip the Athena precondition. To stay robust against that we:
+ *   1. Drop the Glue table and best-effort wipe the canonical prefix.
+ *   2. If anything (incl. 0-byte tombstones) is still there, pivot to
+ *      a timestamped sub-prefix `home-locations/{ds}/_{ts}/` for this
+ *      run's CTAS output. The new Glue table's LOCATION points there,
+ *      so all the downstream JOIN consumers find the fresh data.
+ * The canonical prefix is never used to *store* data anymore — only as
+ * a parent under which sub-prefixes live. Existing legacy tables that
+ * were created directly at `home-locations/{ds}/` keep working because
+ * the Glue catalog already stores their exact LOCATION.
  */
 export async function startHomeDetection(
   datasetName: string,
@@ -282,13 +291,35 @@ export async function startHomeDetection(
   const sourceTable = getTableName(datasetName);
 
   const outputTable = homeTableName(datasetName);
-  const outputS3Prefix = homeTableS3Prefix(datasetName);
+  const rootPrefix = homeTableS3Prefix(datasetName);
 
-  // Idempotency: a CTAS to an existing Glue table fails ("table
-  // already exists"), and to a non-empty S3 prefix also fails. We
-  // clean both before kicking off the new query.
+  // Step 1: drop the Glue table and try to wipe the canonical prefix.
   await dropHomeTableForCTAS(outputTable);
-  await wipeS3Prefix(outputS3Prefix);
+  await wipeS3Prefix(rootPrefix);
+
+  // Step 2: count whatever survived (size doesn't matter — Athena's
+  // HIVE_PATH_ALREADY_EXISTS fires on tombstones too).
+  let survivors = 0;
+  try {
+    const list = await s3Client.send(new ListObjectsV2Command({
+      Bucket: BUCKET, Prefix: `${rootPrefix}/`, MaxKeys: 1,
+    }));
+    survivors = list.Contents?.length || 0;
+  } catch {
+    survivors = 0;
+  }
+
+  // Step 3: pivot to a timestamped sub-prefix if needed.
+  let outputS3Prefix = rootPrefix;
+  if (survivors > 0) {
+    const ts = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+    outputS3Prefix = `${rootPrefix}/_${ts}`;
+    console.warn(
+      `[HOME-DETECT] ${datasetName}: ${survivors}+ object(s) survived wipe of ` +
+      `canonical prefix (likely IAM-locked soft-delete tombstones); ` +
+      `redirecting CTAS to s3://${BUCKET}/${outputS3Prefix}/`,
+    );
+  }
 
   const sql = buildHomeDetectionSQL(sourceTable, outputTable, outputS3Prefix);
   const queryId = await startQueryAsync(sql);
@@ -304,17 +335,54 @@ export async function startHomeDetection(
  *
  * No-op if the table already exists.
  */
+/**
+ * Find where the actual home-table parquet shards live for a dataset.
+ * Supports two layouts:
+ *   (a) Legacy: directly under `home-locations/{ds}/`
+ *   (b) Soft-delete-pivoted: under `home-locations/{ds}/_{ts}/`
+ * Returns the prefix that should be used as the Athena LOCATION, or
+ * null if no sized parquets are found anywhere underneath.
+ */
+async function findLiveHomePrefix(rootPrefix: string): Promise<string | null> {
+  const top = await s3Client.send(new ListObjectsV2Command({
+    Bucket: BUCKET,
+    Prefix: `${rootPrefix}/`,
+    Delimiter: '/',
+  }));
+  // Layout (a): sized files directly under the root prefix.
+  const directSized = (top.Contents || []).filter((o) => (o.Size || 0) > 0);
+  if (directSized.length > 0) return rootPrefix;
+  // Layout (b): walk sub-prefixes newest-first (lexical order on `_{ts}/`
+  // matches chronological order because the timestamp is ISO without
+  // separators), return the first one with at least one sized file.
+  const subPrefixes = (top.CommonPrefixes || [])
+    .map((p) => p.Prefix!)
+    .filter((p): p is string => Boolean(p))
+    .sort()
+    .reverse();
+  for (const sub of subPrefixes) {
+    const r = await s3Client.send(new ListObjectsV2Command({
+      Bucket: BUCKET, Prefix: sub, MaxKeys: 100,
+    }));
+    if ((r.Contents || []).some((o) => (o.Size || 0) > 0)) {
+      return sub.replace(/\/$/, '');
+    }
+  }
+  return null;
+}
+
 export async function attachHomeTable(datasetName: string): Promise<void> {
   const table = homeTableName(datasetName);
-  const prefix = homeTableS3Prefix(datasetName);
-  // Pre-check: bail if S3 prefix is empty (no parquet to attach).
-  const list = await s3Client.send(new ListObjectsV2Command({
-    Bucket: BUCKET,
-    Prefix: `${prefix}/`,
-    MaxKeys: 1,
-  }));
-  if (!list.Contents || list.Contents.length === 0) {
-    throw new Error(`attachHomeTable(${datasetName}): no parquet at s3://${BUCKET}/${prefix}/`);
+  const rootPrefix = homeTableS3Prefix(datasetName);
+
+  // Discover where the actual parquet shards live. Two layouts to support:
+  //   (a) Legacy: parquets directly under `home-locations/{ds}/`
+  //   (b) Soft-delete-pivoted: parquets under `home-locations/{ds}/_{ts}/`
+  // We list one level deep, pick direct (sized) files first; if none,
+  // fall back to the most-recent sub-prefix that has sized files.
+  const prefix = await findLiveHomePrefix(rootPrefix);
+  if (!prefix) {
+    throw new Error(`attachHomeTable(${datasetName}): no parquet at s3://${BUCKET}/${rootPrefix}/ (root or any sub-prefix)`);
   }
   // Schema must exactly match the CTAS output (see buildHomeDetectionSQL).
   await runQuery(`
