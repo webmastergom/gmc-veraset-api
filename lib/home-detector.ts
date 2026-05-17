@@ -44,6 +44,7 @@ import {
   checkQueryStatus,
   ensureTableForDataset,
   getTableName,
+  runQuery,
 } from './athena';
 import { BUCKET, s3Client } from './s3-config';
 import { ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
@@ -80,6 +81,52 @@ export interface HomeDetectionResult {
   outputTable: string;
   /** S3 prefix where the parquet shards land. */
   outputS3Prefix: string;
+}
+
+/**
+ * Canonical Glue catalog table name for the home table of `datasetName`.
+ *
+ * Always `home_{sanitized}` — fixed, no timestamp suffix. This makes
+ * the table addressable from any future query (`SELECT … FROM
+ * home_{ds} JOIN …`) without needing to look up a per-run name. The
+ * trade-off is that recomputing replaces the existing table; we accept
+ * this because home location only needs to be computed once per
+ * dataset and is overwriteable on demand.
+ */
+export function homeTableName(datasetName: string): string {
+  const safe = datasetName.replace(/[^a-zA-Z0-9_]/g, '_');
+  return `home_${safe}`;
+}
+
+/** S3 prefix where the home table's parquet shards live. */
+export function homeTableS3Prefix(datasetName: string): string {
+  return `home-locations/${datasetName}`;
+}
+
+/**
+ * Returns true if the home table has been computed and is queryable
+ * (Glue catalog row exists + at least one parquet shard in S3).
+ *
+ * We require both checks because a partial state — Glue row but no
+ * data, or data but no Glue row — would silently return wrong results.
+ */
+export async function homeTableExists(datasetName: string): Promise<boolean> {
+  const table = homeTableName(datasetName);
+  // 1. Cheap probe of the S3 prefix.
+  const list = await s3Client.send(new ListObjectsV2Command({
+    Bucket: BUCKET,
+    Prefix: `${homeTableS3Prefix(datasetName)}/`,
+    MaxKeys: 1,
+  }));
+  if (!list.Contents || list.Contents.length === 0) return false;
+  // 2. Glue table is queryable: DESCRIBE is metadata-only and fails
+  //    fast if the table is unregistered.
+  try {
+    await runQuery(`DESCRIBE ${table}`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -229,19 +276,70 @@ export async function startHomeDetection(
   await ensureTableForDataset(datasetName);
   const sourceTable = getTableName(datasetName);
 
-  // Sanitize dataset name for the Glue catalog (alphanumeric + underscore only).
-  const safe = datasetName.replace(/[^a-zA-Z0-9_]/g, '_');
-  const stamp = Math.floor(Date.now() / 1000).toString(36);
-  const outputTable = `home_${safe}_${stamp}`;
-  const outputS3Prefix = `home-locations/${datasetName}`;
+  const outputTable = homeTableName(datasetName);
+  const outputS3Prefix = homeTableS3Prefix(datasetName);
 
-  // Wipe any prior parquet at the output prefix. Athena CTAS will
-  // otherwise fail with "external_location must be empty".
+  // Idempotency: a CTAS to an existing Glue table fails ("table
+  // already exists"), and to a non-empty S3 prefix also fails. We
+  // clean both before kicking off the new query.
+  await dropHomeTableSafely(outputTable);
   await wipeS3Prefix(outputS3Prefix);
 
   const sql = buildHomeDetectionSQL(sourceTable, outputTable, outputS3Prefix);
   const queryId = await startQueryAsync(sql);
   return { queryId, outputTable, outputS3Prefix };
+}
+
+/**
+ * Register an EXTERNAL TABLE pointing at an existing home-table parquet
+ * location, without re-running the (expensive) CTAS. Used when the
+ * parquet data was already produced — e.g. by a previous timestamped
+ * CTAS — and we just need the canonical Glue catalog entry to make it
+ * queryable as `home_{ds}`.
+ *
+ * No-op if the table already exists.
+ */
+export async function attachHomeTable(datasetName: string): Promise<void> {
+  const table = homeTableName(datasetName);
+  const prefix = homeTableS3Prefix(datasetName);
+  // Pre-check: bail if S3 prefix is empty (no parquet to attach).
+  const list = await s3Client.send(new ListObjectsV2Command({
+    Bucket: BUCKET,
+    Prefix: `${prefix}/`,
+    MaxKeys: 1,
+  }));
+  if (!list.Contents || list.Contents.length === 0) {
+    throw new Error(`attachHomeTable(${datasetName}): no parquet at s3://${BUCKET}/${prefix}/`);
+  }
+  // Schema must exactly match the CTAS output (see buildHomeDetectionSQL).
+  await runQuery(`
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${table} (
+      ad_id           STRING,
+      home_geohash6   STRING,
+      home_lat        DOUBLE,
+      home_lng        DOUBLE,
+      home_zip        STRING,
+      home_city       STRING,
+      home_region     STRING,
+      n_nights        INT,
+      home_confidence DOUBLE
+    )
+    STORED AS PARQUET
+    LOCATION 's3://${BUCKET}/${prefix}/'
+    TBLPROPERTIES ('parquet.compress'='SNAPPY')
+  `);
+}
+
+/** Fire-and-forget Glue catalog table drop; tolerates "table does not exist". */
+async function dropHomeTableSafely(table: string): Promise<void> {
+  try {
+    await runQuery(`DROP TABLE IF EXISTS ${table}`);
+  } catch (e: any) {
+    // Glue can transiently fail with permission-y errors; if so, the
+    // CTAS will fail downstream with a clearer message. We don't
+    // throw here so callers can still attempt the run.
+    console.warn(`[HOME-DETECTOR] DROP TABLE IF EXISTS ${table} warning:`, e?.message || e);
+  }
 }
 
 /**
