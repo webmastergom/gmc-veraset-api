@@ -42,6 +42,7 @@ import {
   cleanupTempS3,
 } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
+import { homeTableExists, startHomeDetection, pollHomeDetection } from '@/lib/home-detector';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -51,7 +52,11 @@ export const maxDuration = 60;
  * Tracks parallel Athena queries across phases.
  */
 interface ConsolidationState {
-  phase: 'starting' | 'launching' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'cleanup' | 'done';
+  phase: 'starting' | 'home_detection' | 'launching' | 'polling' | 'parsing_visits' | 'parsing_geocode' | 'parsing_od' | 'cleanup' | 'done';
+  /** Per-sub-job home-detection CTAS queryIds. Tracked while phase ===
+   *  'home_detection'. A missing entry means that sub-job's home table
+   *  already existed at consolidation start. */
+  homeDetectionQueries?: Record<string, string>;
   /** Unique per-consolidation run identifier — prevents CTAS table name collisions on re-consolidate. */
   runId?: string;
   /** When poiCoords > MAX_INLINE_POIS, the spatial-join queries reference this external table instead of inlining VALUES. */
@@ -244,7 +249,48 @@ export async function POST(
           }
         }
 
-        // Tables + VIEW ready → advance to launching phase (separate HTTP request)
+        // Tables + VIEW ready. Catchment + affinity require the
+        // TC-WK-19-7 home-locations table for every sub-job
+        // (METHODOLOGY.md §2.3). If any sub-job is missing it, auto-
+        // trigger home detection here as a separate phase before the
+        // 9 report queries launch.
+        const homeChecks = await Promise.all(
+          subDatasetNames.map(async (ds) => ({ ds, exists: await homeTableExists(ds) })),
+        );
+        const missingHomes = homeChecks.filter((c) => !c.exists).map((c) => c.ds);
+        if (missingHomes.length > 0) {
+          console.log(`[MEGA] Home table missing for ${missingHomes.length}/${subDatasetNames.length} sub-job(s) — auto-triggering home detection: ${missingHomes.slice(0, 5).join(', ')}${missingHomes.length > 5 ? `, +${missingHomes.length - 5} more` : ''}`);
+          const homeDetectionQueries: Record<string, string> = {};
+          await Promise.all(
+            missingHomes.map(async (ds) => {
+              try {
+                const { queryId } = await startHomeDetection(ds);
+                homeDetectionQueries[ds] = queryId;
+                console.log(`[MEGA] Home detection started for ${ds}: query=${queryId}`);
+              } catch (err: any) {
+                console.error(`[MEGA] Failed to start home detection for ${ds}:`, err.message);
+                throw err;
+              }
+            }),
+          );
+          state = {
+            phase: 'home_detection',
+            poiIds: effectivePoiIds,
+            dwellFilter: state.dwellFilter || dwellFilter,
+            homeDetectionQueries,
+          };
+          await putConf(CONSOLIDATION_KEY(id), state);
+          return NextResponse.json({
+            phase: 'home_detection',
+            progress: {
+              step: 'home_detection_started',
+              percent: 3,
+              message: `Detecting home locations (TC-WK-19-7) for ${missingHomes.length}/${subDatasetNames.length} sub-job(s)…`,
+            },
+          });
+        }
+
+        // All home tables present → advance directly to launching phase
         state = {
           phase: 'launching',
           poiIds: effectivePoiIds,
@@ -261,6 +307,83 @@ export async function POST(
         await putConf(CONSOLIDATION_KEY(id), state);
         return NextResponse.json({ error: err.message }, { status: 500 });
       }
+    }
+
+    // ── Phase 1a': Home detection (auto-triggered when sub-jobs missing TC-WK-19-7 table) ──
+    if (state.phase === 'home_detection') {
+      const queries = state.homeDetectionQueries || {};
+      const entries = Object.entries(queries);
+      if (entries.length === 0) {
+        // No queryIds tracked — treat as done, advance.
+        state = {
+          phase: 'launching',
+          poiIds: state.poiIds,
+          dwellFilter: state.dwellFilter,
+        };
+        await putConf(CONSOLIDATION_KEY(id), state);
+        return NextResponse.json({
+          phase: 'launching',
+          progress: { step: 'tables_ready', percent: 5, message: `Home tables ready. Launching queries...` },
+        });
+      }
+
+      const statuses = await Promise.all(
+        entries.map(async ([ds, qid]) => {
+          try {
+            const r = await pollHomeDetection(qid);
+            return { ds, ...r };
+          } catch (err: any) {
+            const msg = err?.message || String(err);
+            if (msg.includes('not found') || msg.includes('InvalidRequestException')) {
+              return { ds, state: 'error' as const, error: 'Home-detection query expired' };
+            }
+            return { ds, state: 'error' as const, error: msg };
+          }
+        }),
+      );
+
+      const failed = statuses.filter((s) => s.state === 'error');
+      if (failed.length > 0) {
+        const summary = failed.map((s) => `${s.ds}: ${s.error}`).slice(0, 3).join('; ');
+        state = { phase: 'starting', error: `Home detection failed for ${failed.length} sub-job(s): ${summary}${failed.length > 3 ? `, +${failed.length - 3} more` : ''}` };
+        await putConf(CONSOLIDATION_KEY(id), state);
+        return NextResponse.json({ error: state.error }, { status: 500 });
+      }
+
+      const stillRunning = statuses.filter((s) => s.state === 'running');
+      if (stillRunning.length > 0) {
+        // Get scan stats for nicer progress message (best-effort).
+        let totalScannedGB = 0;
+        await Promise.all(
+          stillRunning.map(async (s) => {
+            try {
+              const stat = await checkQueryStatus(queries[s.ds]);
+              if (stat.statistics?.dataScannedBytes) totalScannedGB += stat.statistics.dataScannedBytes / 1e9;
+            } catch { /* swallow */ }
+          }),
+        );
+        return NextResponse.json({
+          phase: 'home_detection',
+          progress: {
+            step: 'home_detection',
+            percent: 4,
+            message: `Detecting home locations… ${stillRunning.length}/${entries.length} sub-job(s) running · ${totalScannedGB.toFixed(0)} GB scanned`,
+          },
+        });
+      }
+
+      // All done → advance to launching.
+      console.log(`[MEGA] Home detection complete for all ${entries.length} sub-job(s) — launching report queries`);
+      state = {
+        phase: 'launching',
+        poiIds: state.poiIds,
+        dwellFilter: state.dwellFilter,
+      };
+      await putConf(CONSOLIDATION_KEY(id), state);
+      return NextResponse.json({
+        phase: 'launching',
+        progress: { step: 'tables_ready', percent: 5, message: `Home tables ready. Launching queries...` },
+      });
     }
 
     // ── Phase 1b: Extract POI coords + launch all 9 Athena queries ─────
