@@ -485,17 +485,23 @@ export async function POST(
           console.warn(`[MEGA-CATEGORY-POLL] Count query failed: ${e.message}`);
         }
 
-        // Register with master-maids using megajob id as the source dataset name
+        // Register with master-maids using megajob id as the source dataset name.
+        // AND-mode (intersection audience) gets a distinct attr type so it
+        // shows up as its own segment in Master MAIDs — never merged with
+        // the union-style OR contribution of the same categories.
         const attrValue = actualCategories.length > 0 ? actualCategories.join(',') : state.groupKey;
+        const attrType = state.matchMode === 'AND' && (state.categories?.length ?? 0) >= 2
+          ? 'category_and'
+          : 'category';
         const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
         const sourceName = `mega-${id}`;
         try {
           await registerAthenaContribution(
-            cc, sourceName, 'category', attrValue,
+            cc, sourceName, attrType, attrValue,
             ctasTable, `athena-temp/${ctasTable}/`,
             maidCount, dr,
           );
-          console.log(`[MEGA-CATEGORY-POLL] Registered CTAS contribution: ${ctasTable} (${attrValue}) for ${sourceName}`);
+          console.log(`[MEGA-CATEGORY-POLL] Registered CTAS contribution: ${ctasTable} (${attrType}=${attrValue}) for ${sourceName}`);
         } catch (e: any) {
           console.warn(`[MEGA-CATEGORY-POLL] Failed to register: ${e.message}`);
         }

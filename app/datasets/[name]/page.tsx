@@ -58,6 +58,7 @@ import { CatchmentPie } from '@/components/mega-jobs/catchment-pie';
 import { CaptureRingsSummary } from '@/components/analysis/capture-rings-summary';
 import { ExecutiveSummaryCard } from '@/components/analysis/executive-summary-card';
 import { buildExecutiveSummary } from '@/lib/executive-summary';
+import { estimateRealAudience, ESTIMATE_TOOLTIP } from '@/lib/audience-estimator';
 import { CatchmentMap } from '@/components/mega-jobs/catchment-map';
 import { NseModal } from './nse-modal';
 import { CategoryMaidModal } from './category-maid-modal';
@@ -918,6 +919,22 @@ export default function DatasetAnalysisPage() {
               </CardHeader>
               <CardContent>
                 <div className="text-2xl font-bold">{analysis.summary.uniqueDevices.toLocaleString()}</div>
+                {(() => {
+                  const est = estimateRealAudience({
+                    totalMaids: analysis.summary.uniqueDevices,
+                    dateFrom: datasetInfo?.dateRange?.from,
+                    dateTo: datasetInfo?.dateRange?.to,
+                  });
+                  if (!est) return null;
+                  return (
+                    <p
+                      className="text-xs text-amber-400 mt-1 cursor-help inline-flex items-center gap-1"
+                      title={ESTIMATE_TOOLTIP}
+                    >
+                      ~{est.toLocaleString()} estimated real
+                    </p>
+                  );
+                })()}
               </CardContent>
             </Card>
             <Card>

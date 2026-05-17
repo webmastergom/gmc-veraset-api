@@ -25,7 +25,7 @@ function normalizeCC(cc: string): string {
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export type AttributeType = 'plain' | 'nse' | 'category' | 'catchment' | 'persona' | 'persona_lookalike';
+export type AttributeType = 'plain' | 'nse' | 'category' | 'category_and' | 'catchment' | 'persona' | 'persona_lookalike';
 
 /**
  * Each contribution is an Athena table backed by Parquet.
@@ -323,6 +323,21 @@ export function buildConsolidationFromTables(
         case 'category':
           selects.push(`
             SELECT ad_id, 'category' as attr_type, category as attr_value,
+                   dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
+            FROM ${c.athenaTable}
+          `);
+          break;
+        case 'category_and':
+          // Same Parquet schema as 'category' (ad_id, category, dwell_minutes),
+          // but the attribute keeps a distinct type tag so AND-mode
+          // intersections never merge with OR-mode unions of the same
+          // category list. We carry the literal attributeValue (the comma-
+          // separated full intersection key) instead of the per-row category
+          // column — otherwise the intersection would split into its
+          // individual OR-category rows on download.
+          selects.push(`
+            SELECT ad_id, 'category_and' as attr_type,
+                   '${c.attributeValue.replace(/'/g, "''")}' as attr_value,
                    dwell_minutes, CAST(NULL AS VARCHAR) as postal_code
             FROM ${c.athenaTable}
           `);

@@ -482,18 +482,24 @@ export async function POST(
           console.warn(`[CATEGORY-POLL] Count query failed: ${e.message}`);
         }
 
-        // Register with actual category names from the data (not the parent group key)
+        // Register with actual category names from the data (not the parent group key).
+        // AND-mode (intersection audience) gets a distinct attr type so it
+        // shows up as its own segment in Master MAIDs — never merged with
+        // the union-style OR contribution of the same categories.
         const attrValue = actualCategories.length > 0
           ? actualCategories.join(',')
           : state.groupKey;
+        const attrType = state.matchMode === 'AND' && (state.categories?.length ?? 0) >= 2
+          ? 'category_and'
+          : 'category';
         const dr = state.dateRange || { from: 'unknown', to: 'unknown' };
         try {
           await registerAthenaContribution(
-            cc, datasetName, 'category', attrValue,
+            cc, datasetName, attrType, attrValue,
             ctasTable, `athena-temp/${ctasTable}/`,
             maidCount, dr,
           );
-          console.log(`[CATEGORY-POLL] Registered CTAS contribution: ${ctasTable} (${attrValue})`);
+          console.log(`[CATEGORY-POLL] Registered CTAS contribution: ${ctasTable} (${attrType}=${attrValue})`);
         } catch (e: any) {
           console.warn(`[CATEGORY-POLL] Failed to register: ${e.message}`);
         }

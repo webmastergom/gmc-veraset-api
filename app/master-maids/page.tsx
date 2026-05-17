@@ -27,6 +27,7 @@ import {
   Users,
   Info,
 } from 'lucide-react'
+import { estimateRealAudience, ESTIMATE_TOOLTIP } from '@/lib/audience-estimator'
 
 const COUNTRY_FLAGS: Record<string, string> = {
   ES: '🇪🇸', MX: '🇲🇽', FR: '🇫🇷', PA: '🇵🇦', CR: '🇨🇷',
@@ -48,6 +49,9 @@ const ATTR_COLORS: Record<string, string> = {
   plain: 'bg-gray-500/20 text-gray-400',
   nse_bracket: 'bg-purple-500/20 text-purple-400',
   category: 'bg-blue-500/20 text-blue-400',
+  // AND-mode intersection of multiple categories — visually distinct
+  // because it's a narrower / more valuable audience than OR.
+  category_and: 'bg-cyan-500/20 text-cyan-400',
   catchment: 'bg-green-500/20 text-green-400',
   persona: 'bg-amber-500/20 text-amber-400',
   persona_lookalike: 'bg-orange-500/20 text-orange-400',
@@ -98,58 +102,18 @@ function formatNumber(n: number | null): string {
   return n.toLocaleString()
 }
 
-/**
- * Heuristic for the *real-person* audience behind a raw MAID count.
- *
- * A MAID is not a stable identifier:
- *   - iOS post-ATT (2021+) ≈ 80% opt-out → IDFA becomes zeros or
- *     session-random strings. Session-random ones inflate uniques.
- *   - Android AAID can be reset (settings, factory reset, new phone).
- *   - App reinstalls / multi-account → new MAIDs for the same person.
- *
- * Effective MAID lifespan in mobility data ≈ 4 months. Combined with
- * a 60% cleanliness factor (accounts for randomized iOS strings,
- * bot/test traffic, short-lived MAIDs):
- *
- *   churnFactor = 1 + max(0, spanMonths - 4) / 4
- *   estimate    = round(totalMaids / churnFactor × 0.6)
- *
- * For Mexico (10.5mo span, 555M MAIDs):
- *   churnFactor = 2.625  →  estimate ≈ 127M people
- *
- * For a 1-month category extraction (no churn beyond lifespan):
- *   churnFactor = 1      →  estimate ≈ 60% of raw
- *
- * The constants are industry rule-of-thumb, not measured. Treat as a
- * conservative upper bound for "people you could actually reach if
- * you targeted this audience today".
- */
-const MAID_LIFESPAN_MONTHS = 4
-const MAID_CLEANLINESS_FACTOR = 0.6
-
-function monthsBetween(from: string | null, to: string | null): number {
-  if (!from || !to) return MAID_LIFESPAN_MONTHS // fallback: assume one lifespan
-  const f = new Date(from).getTime()
-  const t = new Date(to).getTime()
-  if (!Number.isFinite(f) || !Number.isFinite(t) || t <= f) return MAID_LIFESPAN_MONTHS
-  return (t - f) / (1000 * 60 * 60 * 24 * 30.44)
-}
-
-function estimateRealAudience(
+// Local adapter: master-maids page works in terms of dateRange={from,to}
+// objects; the shared lib takes flat strings.
+function estimateForCountry(
   totalMaids: number | null,
   dateRange: { from: string | null; to: string | null } | null,
 ): number | null {
-  if (!totalMaids || totalMaids <= 0) return null
-  const span = monthsBetween(dateRange?.from ?? null, dateRange?.to ?? null)
-  const churnFactor = 1 + Math.max(0, span - MAID_LIFESPAN_MONTHS) / MAID_LIFESPAN_MONTHS
-  return Math.round((totalMaids / churnFactor) * MAID_CLEANLINESS_FACTOR)
+  return estimateRealAudience({
+    totalMaids,
+    dateFrom: dateRange?.from,
+    dateTo: dateRange?.to,
+  })
 }
-
-const ESTIMATE_TOOLTIP =
-  'Heuristic estimate of real people behind the MAIDs, after accounting for ' +
-  '~4-month MAID lifespan (iOS opt-outs randomize IDFA; Android resets) and ' +
-  '~40% noise (iOS-zero strings, short-lived MAIDs, bot traffic). ' +
-  'Use as a conservative upper bound for activatable audience size — not as a precise count.'
 
 function formatDate(d: string | null): string {
   if (!d || d === 'unknown') return '—'
@@ -340,7 +304,7 @@ export default function MasterMaidsPage() {
           // Global "real audience" = sum of per-country estimates so each
           // country's churn factor reflects its own span, not a global avg.
           const globalRealAudience = countries.reduce(
-            (sum, c) => sum + (estimateRealAudience(c.totalMaids, c.dateRange) || 0),
+            (sum, c) => sum + (estimateForCountry(c.totalMaids, c.dateRange) || 0),
             0,
           )
           return (
@@ -447,7 +411,7 @@ export default function MasterMaidsPage() {
                             {c.isEstimate ? 'MAIDs (not deduplicated)' : 'unique MAIDs'}
                           </div>
                           {(() => {
-                            const est = estimateRealAudience(c.totalMaids, c.dateRange)
+                            const est = estimateForCountry(c.totalMaids, c.dateRange)
                             if (!est) return null
                             return (
                               <div
