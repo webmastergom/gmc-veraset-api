@@ -17,6 +17,7 @@ import { type Job } from './jobs';
 import { PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { s3Client, BUCKET } from './s3-config';
 import { localTimestamp } from './timezones';
+import { homeTableExists, homeTableName } from './home-detector';
 
 /**
  * Result returned by every consolidated query: the running queryId and the
@@ -966,20 +967,70 @@ export async function startConsolidatedCatchmentQuery(
     )`;
   }
 
-  // Pick exactly ONE home location per device — the rounded origin coord
-  // with the most distinct visit-days (ties broken by the lower-bounded coord
-  // for determinism). This guarantees every POI visitor is counted exactly
-  // once, so the catchment totals match the visitor population from visits/
-  // temporal/OD reports. The previous implementation HAD `HAVING COUNT(DISTINCT
-  // date) >= 3`, which silently dropped any visitor whose top home didn't
-  // accumulate 3+ days — for the GDL megajob that filtered out 87% of
-  // visitors and made catchment look like a different population.
-  //
-  // FULL-schema bypass: native_zip / native_city flow through aggregations so
-  // the Node-side geocoding phase can short-circuit when present.
-  const sql = `
-    WITH
-    ${visitorsCTE},
+  // ── Home-source selection ───────────────────────────────────
+  // If every sub-job has a pre-computed home table (Phase 2.A
+  // pipeline, METHODOLOGY.md §2.3 TC-WK-19-7), we replace the
+  // legacy first-ping logic with a JOIN against the UNION of
+  // those tables, dedup'd one-home-per-MAID by max nights. If
+  // any sub-job is missing its home table we fall back to the
+  // legacy SQL for the whole megajob (mixing methodologies
+  // within one megajob would produce inconsistent home detection
+  // across the sub-jobs).
+  const subDatasetNames = syncedJobs.map((j) => j.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+  const homeTableChecks = await Promise.all(subDatasetNames.map((ds) => homeTableExists(ds)));
+  const useHomeTable = homeTableChecks.every(Boolean);
+  const missingHomes = subDatasetNames.filter((_, i) => !homeTableChecks[i]);
+
+  let homesCTE: string;
+  let finalSelect: string;
+  if (useHomeTable) {
+    // UNION ALL of sub-job homes + dedup to single home per ad_id.
+    // The dedup picks the home with the most nights — across the
+    // megajob's full date range, this is the most stable inferred
+    // residence for each device.
+    const homesUnion = subDatasetNames
+      .map((ds) => `
+        SELECT ad_id, home_lat, home_lng, home_zip, home_city, n_nights
+        FROM ${homeTableName(ds)}
+      `)
+      .join('\n        UNION ALL\n        ');
+    homesCTE = `
+    all_sub_homes AS (
+      ${homesUnion}
+    ),
+    mega_homes AS (
+      -- One home per ad_id, dedup'd by n_nights DESC then
+      -- (lat, lng) for determinism.
+      SELECT ad_id, home_lat, home_lng, home_zip, home_city
+      FROM (
+        SELECT ad_id, home_lat, home_lng, home_zip, home_city, n_nights,
+               ROW_NUMBER() OVER (
+                 PARTITION BY ad_id
+                 ORDER BY n_nights DESC, home_lat, home_lng
+               ) AS rnk
+        FROM all_sub_homes
+      )
+      WHERE rnk = 1
+    )`;
+    finalSelect = `
+    SELECT
+      ROUND(h.home_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(h.home_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      0 as departure_hour,
+      MIN(h.home_zip) as native_zip,
+      MIN(h.home_city) as native_city,
+      COUNT(*) as device_days
+    FROM mega_homes h
+    INNER JOIN poi_visitors v ON h.ad_id = v.ad_id
+    GROUP BY ROUND(h.home_lat, ${COORDINATE_PRECISION}),
+             ROUND(h.home_lng, ${COORDINATE_PRECISION})
+    ORDER BY device_days DESC
+    LIMIT 100000`;
+  } else {
+    // Legacy path. The MIN_BY(first-ping-of-day) proxy is documented
+    // as biased against urban residents (METHODOLOGY.md §2.2). Run
+    // scripts/run-home-detection.ts on every sub-job to upgrade.
+    homesCTE = `
     first_pings AS (
       SELECT
         v.ad_id,
@@ -1016,7 +1067,8 @@ export async function startConsolidatedCatchmentQuery(
         FROM device_homes_agg
       )
       WHERE rn = 1
-    )
+    )`;
+    finalSelect = `
     SELECT
       home_lat as origin_lat,
       home_lng as origin_lng,
@@ -1027,10 +1079,22 @@ export async function startConsolidatedCatchmentQuery(
     FROM device_homes
     GROUP BY home_lat, home_lng
     ORDER BY device_days DESC
-    LIMIT 100000
+    LIMIT 100000`;
+  }
+
+  // FULL-schema bypass: native_zip / native_city flow through aggregations
+  // so the Node-side geocoding phase can short-circuit when present.
+  const sql = `
+    WITH
+    ${visitorsCTE},
+    ${homesCTE}
+    ${finalSelect}
   `;
 
-  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  const homeMode = useHomeTable
+    ? `home-tables (TC-WK-19-7, ${subDatasetNames.length} sub-jobs)`
+    : `legacy first-ping (missing home tables for: ${missingHomes.slice(0, 3).join(', ')}${missingHomes.length > 3 ? `, +${missingHomes.length - 3} more` : ''})`;
+  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'}, home-source=${homeMode})`);
   return await startAsCTAS(megaJobId, runId, 'catchment', sql);
 }
 
