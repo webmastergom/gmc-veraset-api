@@ -10,16 +10,28 @@ export const maxDuration = 60;
 /**
  * POST /api/datasets/[name]/home-detect/redetect
  *
- * Admin operation: drop the TC-WK-19-7 home-locations table for a
- * dataset and clear the catchment / affinity reports that were built
- * against it, plus the polling state files. After this returns, the
- * next click on "Run analysis" will auto-trigger a fresh home
- * detection (see /reports/poll's home_detection phase) using the
- * current home-detection SQL.
+ * Full dataset reset. Wipes every derived artifact for a dataset
+ * (home table, all reports, basic analysis, all polling state) and
+ * leaves only the Veraset-synced parquets and the job/UI config
+ * untouched. After this returns, the next "Run analysis" click will
+ * auto-trigger a fresh home detection (see /reports/poll's
+ * home_detection phase) and rebuild every report from scratch.
  *
- * Use this when you suspect the existing home table is biased — e.g.
- * a previous run with the GPS-only filter that pushed urban residents
- * out into the suburbs.
+ * What gets deleted:
+ *   1. Home table: Glue catalog entry + `home-locations/{ds}/` parquet
+ *   2. Every file under `config/dataset-reports/{ds}/` (all 6 report
+ *      types, every filter variant, and any subdirectories like
+ *      `category-affinity/*`)
+ *   3. `config/dataset-analysis/{ds}.json` — per-dataset basic analysis
+ *   4. All polling/state files keyed by the dataset:
+ *        - `config/dataset-report-state/{ds}.json`
+ *        - `config/catchment-state/{ds}.json`
+ *        - `config/analysis-state/{ds}.json`
+ *
+ * What stays:
+ *   • Raw parquet data under `{datasetName}/...`
+ *   • Job config, mega-jobs index, geocode caches, POI collections
+ *   • Exports under `exports/{ds}/`
  *
  * Returns: { ok: true, deleted: { homeTable, reports, state } }
  */
@@ -37,8 +49,9 @@ export async function POST(
     // 1. Drop the home table (Glue catalog entry + parquet under s3://.../home-locations/{ds}/)
     await dropHomeTable(datasetName);
 
-    // 2. Delete every saved catchment + affinity report (all filter variants:
-    //    catchment.json, catchment-gps-cs2.json, catchment-dwell-30-60.json, etc.)
+    // 2. Wipe EVERY object under config/dataset-reports/{ds}/ — all 6
+    //    report types, all filter variants, and any subdirectories
+    //    (category-affinity/*, zip-code-signals/*, etc).
     const reportsPrefix = `config/dataset-reports/${datasetName}/`;
     const reportKeysToDelete: string[] = [];
     let continuationToken: string | undefined;
@@ -49,13 +62,7 @@ export async function POST(
         ContinuationToken: continuationToken,
       }));
       for (const obj of list.Contents || []) {
-        const key = obj.Key!;
-        // Match either "catchment*.json" or "affinity*.json" right under the
-        // dataset prefix (do NOT touch deeper paths like category-affinity/*).
-        const tail = key.slice(reportsPrefix.length);
-        if (!tail.includes('/') && (tail.startsWith('catchment') || tail.startsWith('affinity')) && tail.endsWith('.json')) {
-          reportKeysToDelete.push(key);
-        }
+        if (obj.Key) reportKeysToDelete.push(obj.Key);
       }
       continuationToken = list.IsTruncated ? list.NextContinuationToken : undefined;
     } while (continuationToken);
@@ -66,23 +73,27 @@ export async function POST(
         const batch = reportKeysToDelete.slice(i, i + 1000).map((Key) => ({ Key }));
         await s3Client.send(new DeleteObjectsCommand({
           Bucket: BUCKET,
-          Delete: { Objects: batch },
+          Delete: { Objects: batch, Quiet: true },
         }));
       }
     }
 
-    // 3. Delete polling state files so the next /reports/poll call
-    //    re-enters from a clean slate (which triggers the home-detection phase).
+    // 3. Delete the per-dataset state + analysis files so the next
+    //    /reports/poll call re-enters from a clean slate (which
+    //    triggers the home-detection phase) and the next Analyze
+    //    click re-runs the basic dataset analysis.
     const stateKeys = [
+      `config/dataset-analysis/${datasetName}.json`,
       `config/dataset-report-state/${datasetName}.json`,
       `config/catchment-state/${datasetName}.json`,
+      `config/analysis-state/${datasetName}.json`,
     ];
     await s3Client.send(new DeleteObjectsCommand({
       Bucket: BUCKET,
       Delete: { Objects: stateKeys.map((Key) => ({ Key })), Quiet: true },
     }));
 
-    console.log(`[HOME-REDETECT] ${datasetName}: dropped home table, removed ${reportKeysToDelete.length} report file(s), cleared state`);
+    console.log(`[DATASET-RESET] ${datasetName}: dropped home table, removed ${reportKeysToDelete.length} report file(s), cleared ${stateKeys.length} state file(s)`);
 
     return NextResponse.json({
       ok: true,
@@ -91,12 +102,12 @@ export async function POST(
         reports: reportKeysToDelete.length,
         state: stateKeys.length,
       },
-      message: 'Home table cleared. Click "Run analysis" to trigger fresh home detection.',
+      message: 'Dataset reset to fresh-from-Veraset state. Click "Run analysis" to rebuild everything from scratch.',
     });
   } catch (err: any) {
-    console.error(`[HOME-REDETECT] ${datasetName} error:`, err.message);
+    console.error(`[DATASET-RESET] ${datasetName} error:`, err.message);
     return NextResponse.json(
-      { error: err.message || 'Re-detect home failed' },
+      { error: err.message || 'Dataset reset failed' },
       { status: 500 },
     );
   }

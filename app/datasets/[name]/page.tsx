@@ -520,12 +520,13 @@ export default function DatasetAnalysisPage() {
 
   const handleRedetectHomes = async () => {
     const ok = window.confirm(
-      `Re-detect homes for "${datasetName}"?\n\n` +
-      `This will:\n` +
-      `  • Drop the existing home-locations table (home_${datasetName.replace(/[^a-zA-Z0-9_]/g, '_')})\n` +
-      `  • Clear all saved catchment + affinity reports\n` +
-      `  • Reset polling state\n\n` +
-      `Next click on "Analyze" will run a fresh home detection (TC-WK-19-7, no GPS-only filter) before launching report queries.`,
+      `Reset "${datasetName}" to fresh-from-Veraset state?\n\n` +
+      `This will DELETE:\n` +
+      `  • The home-locations table (home_${datasetName.replace(/[^a-zA-Z0-9_]/g, '_')})\n` +
+      `  • Every saved report (visits, temporal, hourly, OD, catchment, mobility, affinity, category-affinity, etc.)\n` +
+      `  • The basic dataset analysis\n` +
+      `  • All polling / analysis state files\n\n` +
+      `It KEEPS the synced parquet data and job config. Next click on "Analyze" will rebuild everything from scratch (fresh TC-WK-19-7 home detection first).`,
     );
     if (!ok) return;
     setRedetectingHomes(true);
@@ -537,13 +538,13 @@ export default function DatasetAnalysisPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       toast({
-        title: 'Home table cleared',
-        description: `${data.deleted?.reports ?? 0} report file(s) removed. Click Analyze to run a fresh detection.`,
+        title: 'Dataset reset',
+        description: `${data.deleted?.reports ?? 0} report file(s) removed. Click Analyze to rebuild from scratch.`,
       });
       // Bump report version so map components re-fetch (and see the now-empty reports as 404 / blank).
       setReportVersion((v) => v + 1);
     } catch (e: any) {
-      toast({ title: 'Re-detect failed', description: e.message, variant: 'destructive' });
+      toast({ title: 'Reset failed', description: e.message, variant: 'destructive' });
     } finally {
       setRedetectingHomes(false);
     }
@@ -878,10 +879,10 @@ export default function DatasetAnalysisPage() {
             variant="outline"
             onClick={handleRedetectHomes}
             disabled={redetectingHomes || generatingReports || loading}
-            title="Drop the existing home-locations table and saved catchment/affinity reports for this dataset. Next click on Analyze will run a fresh home detection."
+            title="Wipe the home table, every saved report, the basic analysis, and all polling state for this dataset. Parquets and job config are preserved. Next click on Analyze will rebuild from scratch."
           >
             {redetectingHomes ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Home className="mr-2 h-4 w-4" />}
-            Re-detect homes
+            Reset dataset
           </Button>
         </div>
       </div>
