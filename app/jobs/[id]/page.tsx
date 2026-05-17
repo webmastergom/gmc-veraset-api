@@ -9,6 +9,7 @@ import { S3StorageSection } from "@/components/jobs/s3-storage-section"
 import { JobAuditDialog } from "@/components/jobs/job-audit-dialog"
 import { MainLayout } from "@/components/layout/main-layout"
 import { AudienceAgentToggle } from "@/components/jobs/audience-agent-toggle"
+import { AudienceSizeCard } from "@/components/jobs/audience-size-card"
 import { CountrySelector } from "@/components/jobs/country-selector"
 import { inferCountryFromName } from "@/lib/country-inference"
 import dynamic from "next/dynamic"
@@ -267,6 +268,17 @@ export default async function JobDetailPage({
           <RefreshStatusButton jobId={job.job_id} />
         </CardContent>
       </Card>
+
+      {/* Audience size — pulls cached basic-analysis from the dataset
+          that this job produced. Silently hides if no cached analysis
+          exists yet (user runs that on the Datasets page). */}
+      {job.status === 'SUCCESS' && job.s3_dest_path && (
+        <AudienceSizeCard
+          datasetName={job.s3_dest_path.replace(/\/$/, '').split('/').pop() || null}
+          dateFrom={job.actual_date_range?.from || job.config?.dateRange?.from}
+          dateTo={job.actual_date_range?.to || job.config?.dateRange?.to}
+        />
+      )}
 
       {/* Roamy Toggle */}
       {job.status === 'SUCCESS' && (
