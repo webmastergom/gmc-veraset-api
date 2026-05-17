@@ -287,7 +287,7 @@ export async function startHomeDetection(
   // Idempotency: a CTAS to an existing Glue table fails ("table
   // already exists"), and to a non-empty S3 prefix also fails. We
   // clean both before kicking off the new query.
-  await dropHomeTableSafely(outputTable);
+  await dropHomeTableForCTAS(outputTable);
   await wipeS3Prefix(outputS3Prefix);
 
   const sql = buildHomeDetectionSQL(sourceTable, outputTable, outputS3Prefix);
@@ -337,28 +337,55 @@ export async function attachHomeTable(datasetName: string): Promise<void> {
 
 /**
  * Drop the home table for a dataset: removes the Glue catalog entry
- * AND deletes the parquet shards in S3. Idempotent — succeeds whether
- * or not the table currently exists. Used by the "Re-detect homes"
+ * AND deletes the parquet shards in S3. Used by the "Re-detect homes"
  * admin endpoint so the next analysis click triggers a fresh CTAS
  * with the current home-detection SQL (rather than reusing an old
  * possibly-biased table).
+ *
+ * Throws with an actionable IAM message if `glue:DeleteTable` is
+ * denied — the caller should surface this to the user rather than
+ * silently leaving the Glue catalog inconsistent (which then blocks
+ * the next CTAS with a confusing "table already exists" error).
  */
 export async function dropHomeTable(datasetName: string): Promise<void> {
   const table = homeTableName(datasetName);
   const prefix = homeTableS3Prefix(datasetName);
-  await dropHomeTableSafely(table);
+  await dropHomeTableStrict(table);
   await wipeS3Prefix(prefix);
 }
 
-/** Fire-and-forget Glue catalog table drop; tolerates "table does not exist". */
-async function dropHomeTableSafely(table: string): Promise<void> {
+/** Drop a Glue table via Athena DDL. Throws with actionable IAM
+ *  guidance if the caller IAM user lacks glue:DeleteTable. Treats
+ *  "table not found" as success (DROP IF EXISTS semantics). */
+async function dropHomeTableStrict(table: string): Promise<void> {
   try {
     await runQuery(`DROP TABLE IF EXISTS ${table}`);
   } catch (e: any) {
-    // Glue can transiently fail with permission-y errors; if so, the
-    // CTAS will fail downstream with a clearer message. We don't
-    // throw here so callers can still attempt the run.
-    console.warn(`[HOME-DETECTOR] DROP TABLE IF EXISTS ${table} warning:`, e?.message || e);
+    const msg = e?.message || String(e);
+    if (/glue:DeleteTable|AccessDenied/i.test(msg)) {
+      throw new Error(
+        `Cannot drop Glue table "${table}": the IAM user lacks glue:DeleteTable. ` +
+        `Ask your AWS admin to add this action (resource: arn:aws:glue:us-west-2:*:catalog) ` +
+        `to the veraset_api IAM policy. Until then, "Re-detect homes" cannot replace ` +
+        `an existing home table — but new datasets without a home table still work via ` +
+        `the auto-trigger on Analyze.`,
+      );
+    }
+    // Any other failure (network, transient) is also surfaced — silent
+    // swallowing was what created the inconsistent state in the first place.
+    throw new Error(`DROP TABLE IF EXISTS ${table} failed: ${msg}`);
+  }
+}
+
+/** Internal helper used during startHomeDetection() for idempotency.
+ *  Tolerates the same IAM denial that dropHomeTableStrict surfaces —
+ *  during a fresh CTAS we'd rather try and fail at CREATE TABLE than
+ *  block before we even start. */
+async function dropHomeTableForCTAS(table: string): Promise<void> {
+  try {
+    await runQuery(`DROP TABLE IF EXISTS ${table}`);
+  } catch (e: any) {
+    console.warn(`[HOME-DETECTOR] DROP TABLE IF EXISTS ${table} warning (CTAS will fail if table exists):`, e?.message || e);
   }
 }
 
