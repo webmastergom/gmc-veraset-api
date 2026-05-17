@@ -82,7 +82,6 @@ export async function resetCatchmentState(datasetName: string): Promise<void> {
   } catch { /* ignore */ }
 }
 
-const ACCURACY_THRESHOLD_METERS = 500;
 const COORDINATE_PRECISION = 4; // ~11m resolution
 
 // ── Main entry ───────────────────────────────────────────────────────
@@ -126,107 +125,46 @@ export async function catchmentMultiPhase(
       poiFilter = `AND poi_id IN (${poiList})`;
     }
 
-    const minPings = filters?.minPings && filters.minPings > 1 ? filters.minPings : 0;
-    const havingClause = minPings > 0 ? `HAVING COUNT(*) >= ${minPings}` : '';
-
-    // Choose home detection path:
-    //   - If a pre-computed home table exists (Phase 2.A pipeline,
-    //     docs/METHODOLOGY.md §2.3 TC-WK-19-7), JOIN against it. This
-    //     gives a methodologically-correct nighttime/weekday inferred
-    //     home (Pappalardo et al. EPJ Data Sci 2023).
-    //   - Otherwise, fall back to the legacy "first ping of day" proxy
-    //     so existing flows don't break. The fallback is known to be
-    //     biased against urban residents (METHODOLOGY.md §2.2).
-    const useHomeTable = await homeTableExists(datasetName);
+    // Catchment ALWAYS uses the TC-WK-19-7 home-table path
+    // (METHODOLOGY.md §2.3, Pappalardo et al. EPJ Data Sci 2023). The
+    // legacy first-ping-of-day proxy is methodologically biased and is
+    // not an allowed fallback — if the home table is missing, fail loud
+    // so the caller runs home detection first.
+    if (!(await homeTableExists(datasetName))) {
+      throw new Error(
+        `Catchment requires the TC-WK-19-7 home-locations table for "${datasetName}", but it is missing. ` +
+        `Run home detection first (npx tsx scripts/run-home-detection.ts ${datasetName}) and retry.`,
+      );
+    }
     const homeTbl = homeTableName(datasetName);
 
-    const originsQuery = useHomeTable
-      ? `
-        -- ── METHODOLOGY: §2.3 TC-WK-19-7 (Pappalardo et al. 2023) ──
-        -- Catchment derives from the pre-computed home-locations
-        -- table, which already incorporates the nighttime + weekday
-        -- filter, ≥3-nights stability gate, and ~1.1km bucket. The
-        -- catchment is then "of all POI visitors, how many devices
-        -- live in each home bucket".
-        WITH poi_visitors AS (
-          SELECT DISTINCT ad_id
-          FROM ${tableName}
-          CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-          WHERE poi_id IS NOT NULL AND poi_id != ''
-            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-            ${dateWhere} ${poiFilter}
-        )
-        SELECT
-          ROUND(h.home_lat, ${COORDINATE_PRECISION}) AS origin_lat,
-          ROUND(h.home_lng, ${COORDINATE_PRECISION}) AS origin_lng,
-          COUNT(*) AS device_days
-        FROM ${homeTbl} h
-        INNER JOIN poi_visitors v ON h.ad_id = v.ad_id
-        GROUP BY ROUND(h.home_lat, ${COORDINATE_PRECISION}),
-                 ROUND(h.home_lng, ${COORDINATE_PRECISION})
-        ORDER BY device_days DESC
-        LIMIT 100000
-      `
-      : `
-        -- ── FALLBACK: legacy first-ping-of-day proxy ──
-        -- Active when the Phase 2.A home-locations table is missing.
-        -- Documented as biased (METHODOLOGY.md §2.2); run
-        -- scripts/run-home-detection.ts <ds> to upgrade this dataset
-        -- to the TC-WK-19-7 path.
-        WITH
-        poi_visitors AS (
-          SELECT DISTINCT ad_id
-          FROM ${tableName}
-          CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-          WHERE poi_id IS NOT NULL AND poi_id != ''
-            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-            ${dateWhere} ${poiFilter}
-        ),
-        valid_pings AS (
-          SELECT
-            t.ad_id,
-            t.date,
-            t.utc_timestamp,
-            TRY_CAST(t.latitude AS DOUBLE) as lat,
-            TRY_CAST(t.longitude AS DOUBLE) as lng
-          FROM ${tableName} t
-          INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
-          WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
-            AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-            AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD_METERS})
-            ${dateWhere}
-        ),
-        first_pings AS (
-          SELECT
-            ad_id,
-            date,
-            MIN_BY(lat, utc_timestamp) as origin_lat,
-            MIN_BY(lng, utc_timestamp) as origin_lng
-          FROM valid_pings
-          GROUP BY ad_id, date
-          ${havingClause}
-        ),
-        device_homes AS (
-          SELECT ad_id,
-            ROUND(origin_lat, ${COORDINATE_PRECISION}) as home_lat,
-            ROUND(origin_lng, ${COORDINATE_PRECISION}) as home_lng,
-            COUNT(DISTINCT date) as days_at_loc
-          FROM first_pings
-          GROUP BY ad_id,
-            ROUND(origin_lat, ${COORDINATE_PRECISION}),
-            ROUND(origin_lng, ${COORDINATE_PRECISION})
-          HAVING COUNT(DISTINCT date) >= 3
-        )
-        SELECT
-          home_lat as origin_lat,
-          home_lng as origin_lng,
-          COUNT(*) as device_days
-        FROM device_homes
-        GROUP BY home_lat, home_lng
-        ORDER BY device_days DESC
-        LIMIT 100000
-      `;
-    console.log(`[CATCHMENT] ${datasetName}: home-source = ${useHomeTable ? `home_table (${homeTbl}, METHODOLOGY §2.3)` : 'first-ping fallback (legacy)'}`);
+    const originsQuery = `
+      -- ── METHODOLOGY: §2.3 TC-WK-19-7 (Pappalardo et al. 2023) ──
+      -- Catchment derives from the pre-computed home-locations
+      -- table, which already incorporates the nighttime + weekday
+      -- filter, ≥3-nights stability gate, and ~1.1km bucket. The
+      -- catchment is then "of all POI visitors, how many devices
+      -- live in each home bucket".
+      WITH poi_visitors AS (
+        SELECT DISTINCT ad_id
+        FROM ${tableName}
+        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
+        WHERE poi_id IS NOT NULL AND poi_id != ''
+          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          ${dateWhere} ${poiFilter}
+      )
+      SELECT
+        ROUND(h.home_lat, ${COORDINATE_PRECISION}) AS origin_lat,
+        ROUND(h.home_lng, ${COORDINATE_PRECISION}) AS origin_lng,
+        COUNT(*) AS device_days
+      FROM ${homeTbl} h
+      INNER JOIN poi_visitors v ON h.ad_id = v.ad_id
+      GROUP BY ROUND(h.home_lat, ${COORDINATE_PRECISION}),
+               ROUND(h.home_lng, ${COORDINATE_PRECISION})
+      ORDER BY device_days DESC
+      LIMIT 100000
+    `;
+    console.log(`[CATCHMENT] ${datasetName}: home-source = home_table (${homeTbl}, METHODOLOGY §2.3)`);
 
     const totalQuery = `
       SELECT COUNT(DISTINCT ad_id) as total_devices

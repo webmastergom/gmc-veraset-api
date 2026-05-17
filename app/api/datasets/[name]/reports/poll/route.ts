@@ -17,6 +17,7 @@ import {
   buildTemporalTrends,
 } from '@/lib/mega-report-consolidation';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
+import { homeTableExists, homeTableName } from '@/lib/home-detector';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -438,174 +439,67 @@ function buildODSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hou
     LIMIT 100000`;
 }
 
-function buildCatchmentSQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
-  // FULL-schema bypass: TRY(geo_fields['zipcode'/'city']) returns NULL on BASIC
-  // (column populated by ALTER TABLE backfill but parquet has no value), so the
-  // query is safe across schemas. When non-NULL we surface it as native_zip /
-  // native_city; the geocoding phase then short-circuits batchReverseGeocode
-  // for those coords.
-  // Catchment uses an aliased `${table} t`, so the quality_fields predicates
-  // must reference t.quality_fields explicitly.
-  const gFilterT = gpsOnly
-    ? `AND (TRY(t.quality_fields['ping_origin_type']) IS NULL OR TRY(t.quality_fields['ping_origin_type']) = 'gps')`
-    : '';
-  const sFilterT = (maxCircleScore && maxCircleScore > 0)
-    ? `AND (TRY(t.quality_fields['ping_circle_score']) IS NULL OR TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) IS NULL OR TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) <= ${maxCircleScore})`
-    : '';
-  const dFilterT = dayOfWeekFilterSQL(daysOfWeek, 't.utc_timestamp');
+async function buildCatchmentSQL(datasetName: string, table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): Promise<string> {
+  // Catchment ALWAYS uses the TC-WK-19-7 home-table path
+  // (METHODOLOGY.md §2.3, Pappalardo et al. EPJ Data Sci 2023). The
+  // legacy first-ping-of-day proxy is methodologically biased and is
+  // not an allowed fallback — fail loud so the caller runs home
+  // detection first.
+  if (!(await homeTableExists(datasetName))) {
+    throw new Error(
+      `Catchment requires the TC-WK-19-7 home-locations table for "${datasetName}", but it is missing. ` +
+      `Run home detection first (npx tsx scripts/run-home-detection.ts ${datasetName}) and retry.`,
+    );
+  }
+  const homeTbl = homeTableName(datasetName);
+  // departure_hour comes from the home-detection methodology, which
+  // does not model per-day departure times — we surface 0 so the
+  // downstream "departure by hour" view degrades to a single bucket
+  // rather than fabricating a value.
   return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)},
-    poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi),
-    valid_pings AS (
-      SELECT t.ad_id, t.date, t.utc_timestamp,
-        TRY_CAST(t.latitude AS DOUBLE) as lat,
-        TRY_CAST(t.longitude AS DOUBLE) as lng,
-        TRY(t.geo_fields['zipcode']) as native_zip,
-        TRY(t.geo_fields['city']) as native_city
-      FROM ${table} t
-      INNER JOIN poi_visitors v ON t.ad_id = v.ad_id
-      WHERE TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
-        AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        ${gFilterT}
-        ${sFilterT}
-        ${dFilterT}
-    ),
-    first_pings AS (
-      SELECT ad_id, date,
-        MIN_BY(lat, utc_timestamp) as origin_lat,
-        MIN_BY(lng, utc_timestamp) as origin_lng,
-        MIN_BY(native_zip, utc_timestamp) as origin_native_zip,
-        MIN_BY(native_city, utc_timestamp) as origin_native_city,
-        HOUR(MIN(utc_timestamp)) as departure_hour
-      FROM valid_pings
-      GROUP BY ad_id, date
-    ),
-    device_homes_agg AS (
-      SELECT ad_id,
-        ROUND(origin_lat, ${PREC}) as home_lat,
-        ROUND(origin_lng, ${PREC}) as home_lng,
-        ARBITRARY(origin_native_zip) as native_zip,
-        ARBITRARY(origin_native_city) as native_city,
-        COUNT(DISTINCT date) as days_at_loc
-      FROM first_pings
-      WHERE origin_lat IS NOT NULL
-      GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
-    ),
-    -- One home per device — the rounded coord with the most visit-days.
-    -- Previously HAVING >= 3 silently dropped any visitor whose top home
-    -- didn't accumulate 3+ days, which made catchment under-count by 80%+.
-    device_homes AS (
-      SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc
-      FROM (
-        SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc,
-          ROW_NUMBER() OVER (
-            PARTITION BY ad_id
-            ORDER BY days_at_loc DESC, home_lat, home_lng
-          ) as rn
-        FROM device_homes_agg
-      )
-      WHERE rn = 1
-    ),
-    home_hours AS (
-      SELECT dh.ad_id, dh.home_lat, dh.home_lng, dh.native_zip, dh.native_city,
-        HOUR(MIN(fp.utc_timestamp)) as departure_hour
-      FROM device_homes dh
-      INNER JOIN valid_pings fp ON dh.ad_id = fp.ad_id
-      GROUP BY dh.ad_id, dh.home_lat, dh.home_lng, dh.native_zip, dh.native_city, fp.date
-    )
+    poi_visitors AS (SELECT DISTINCT ad_id FROM at_poi)
     SELECT
-      home_lat as origin_lat,
-      home_lng as origin_lng,
-      departure_hour,
-      MIN(native_zip) as native_zip,
-      MIN(native_city) as native_city,
+      ROUND(h.home_lat, ${PREC}) as origin_lat,
+      ROUND(h.home_lng, ${PREC}) as origin_lng,
+      0 as departure_hour,
+      MIN(h.home_zip) as native_zip,
+      MIN(h.home_city) as native_city,
       COUNT(*) as device_days
-    FROM home_hours
-    GROUP BY home_lat, home_lng, departure_hour
+    FROM ${homeTbl} h
+    INNER JOIN poi_visitors v ON h.ad_id = v.ad_id
+    GROUP BY ROUND(h.home_lat, ${PREC}), ROUND(h.home_lng, ${PREC})
     ORDER BY device_days DESC
     LIMIT 100000`;
 }
 
 /**
  * Affinity query: per-origin-cluster, compute total visits, unique devices,
- * avg dwell, and visit frequency. These feed the affinity index calculation
- * after reverse geocoding groups them by postal code.
+ * avg dwell, and visit frequency. Affinity ALWAYS uses the TC-WK-19-7
+ * home-table path so its per-device home assignment matches catchment;
+ * fails loud if the home table is missing.
  */
-function buildAffinitySQL(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): string {
-  // See buildCatchmentSQL — same FULL-schema zipcode bypass strategy.
-  const gFilter = gpsOnlyFilterSQL(gpsOnly);
-  const sFilter = circleScoreFilterSQL(maxCircleScore);
-  const dFilter = dayOfWeekFilterSQL(daysOfWeek);
-  const eFilter = employeeExclusionSQL(table, discardEmployees);
-  const rFilter = residentExclusionSQL(table, discardResidents);
+async function buildAffinitySQL(datasetName: string, table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourTo = 23, minVisits = 1, gpsOnly = false, maxCircleScore = 0, daysOfWeek: number[] = [], discardEmployees = false, discardResidents = false): Promise<string> {
+  if (!(await homeTableExists(datasetName))) {
+    throw new Error(
+      `Affinity requires the TC-WK-19-7 home-locations table for "${datasetName}", but it is missing. ` +
+      `Run home detection first (npx tsx scripts/run-home-detection.ts ${datasetName}) and retry.`,
+    );
+  }
+  const homeTbl = homeTableName(datasetName);
   return `WITH ${atPoiWithDwellCTE(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)},
-    all_pings AS (
-      SELECT ad_id, date, utc_timestamp,
-        TRY_CAST(latitude AS DOUBLE) as lat,
-        TRY_CAST(longitude AS DOUBLE) as lng,
-        TRY(geo_fields['zipcode']) as native_zip,
-        TRY(geo_fields['city']) as native_city
-      FROM ${table}
-      WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
-        AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
-        AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY})
-        ${gFilter}
-        ${sFilter}
-        ${dFilter}
-        ${eFilter}
-        ${rFilter}
-    ),
-    first_pings AS (
-      SELECT p.ad_id, p.date,
-        MIN_BY(p.lat, p.utc_timestamp) as origin_lat,
-        MIN_BY(p.lng, p.utc_timestamp) as origin_lng,
-        MIN_BY(p.native_zip, p.utc_timestamp) as origin_native_zip,
-        MIN_BY(p.native_city, p.utc_timestamp) as origin_native_city
-      FROM all_pings p
-      INNER JOIN (SELECT DISTINCT ad_id FROM at_poi) v ON p.ad_id = v.ad_id
-      GROUP BY p.ad_id, p.date
-    ),
-    device_homes_agg AS (
-      SELECT ad_id,
-        ROUND(origin_lat, ${PREC}) as home_lat,
-        ROUND(origin_lng, ${PREC}) as home_lng,
-        ARBITRARY(origin_native_zip) as native_zip,
-        ARBITRARY(origin_native_city) as native_city,
-        COUNT(DISTINCT date) as days_at_loc
-      FROM first_pings
-      WHERE origin_lat IS NOT NULL
-      GROUP BY ad_id, ROUND(origin_lat, ${PREC}), ROUND(origin_lng, ${PREC})
-    ),
-    -- Pick exactly one home per device (top by days_at_loc) so every POI
-    -- visitor contributes to the affinity stats. The previous HAVING >= 3
-    -- silently filtered out short-stay visitors and made affinity disagree
-    -- with the visits/temporal totals.
-    device_homes AS (
-      SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc
-      FROM (
-        SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc,
-          ROW_NUMBER() OVER (
-            PARTITION BY ad_id
-            ORDER BY days_at_loc DESC, home_lat, home_lng
-          ) as rn
-        FROM device_homes_agg
-      )
-      WHERE rn = 1
-    ),
     device_stats AS (
       SELECT
         a.ad_id,
-        dh.home_lat as origin_lat,
-        dh.home_lng as origin_lng,
-        dh.native_zip,
-        dh.native_city,
+        ROUND(h.home_lat, ${PREC}) as origin_lat,
+        ROUND(h.home_lng, ${PREC}) as origin_lng,
+        h.home_zip as native_zip,
+        h.home_city as native_city,
         COUNT(DISTINCT a.date) as visit_days,
         AVG(a.dwell_minutes) as avg_dwell,
         SUM(a.ping_count) as total_pings
       FROM at_poi a
-      INNER JOIN device_homes dh ON a.ad_id = dh.ad_id
-      GROUP BY a.ad_id, dh.home_lat, dh.home_lng, dh.native_zip, dh.native_city
+      INNER JOIN ${homeTbl} h ON a.ad_id = h.ad_id
+      GROUP BY a.ad_id, ROUND(h.home_lat, ${PREC}), ROUND(h.home_lng, ${PREC}), h.home_zip, h.home_city
     )
     SELECT
       origin_lat,
@@ -1006,11 +900,17 @@ export async function POST(
         startQueryAsync(buildODSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.od = id; }).catch(e => console.error('[DS-REPORT] od:', e.message)),
         startQueryAsync(buildHourlySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.hourly = id; }).catch(e => console.error('[DS-REPORT] hourly:', e.message)),
         startQueryAsync(buildDayHourSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.dayhour = id; }).catch(e => console.error('[DS-REPORT] dayhour:', e.message)),
-        startQueryAsync(buildCatchmentSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.catchment = id; }).catch(e => console.error('[DS-REPORT] catchment:', e.message)),
+        buildCatchmentSQL(datasetName, table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)
+          .then(sql => startQueryAsync(sql))
+          .then(id => { queries.catchment = id; })
+          .catch(e => console.error('[DS-REPORT] catchment:', e.message)),
         startQueryAsync(buildTemporalSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.temporal = id; }).catch(e => console.error('[DS-REPORT] temporal:', e.message)),
         startQueryAsync(buildTotalDevicesSQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.totalDevices = id; }).catch(e => console.error('[DS-REPORT] totalDevices:', e.message)),
         startQueryAsync(buildMobilitySQL(table, minDwell, maxDwell, poiCoords, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.mobility = id; }).catch(e => console.error('[DS-REPORT] mobility:', e.message)),
-        startQueryAsync(buildAffinitySQL(table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)).then(id => { queries.affinity = id; }).catch(e => console.error('[DS-REPORT] affinity:', e.message)),
+        buildAffinitySQL(datasetName, table, minDwell, maxDwell, hourFrom, hourTo, minVisits, gpsOnly, maxCircleScore, daysOfWeek, discardEmployees, discardResidents)
+          .then(sql => startQueryAsync(sql))
+          .then(id => { queries.affinity = id; })
+          .catch(e => console.error('[DS-REPORT] affinity:', e.message)),
       ]);
 
       // Get dataset size for progress estimation

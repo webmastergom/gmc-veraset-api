@@ -889,16 +889,18 @@ export async function startConsolidatedDayHourQuery(
   return await startAsCTAS(megaJobId, runId, 'dayhour', sql);
 }
 
-// ── Q3: Catchment Origins (first-ping-of-day) ──────────────────────────
+// ── Q3: Catchment Origins (TC-WK-19-7 home table) ──────────────────────
 
 /**
- * Build and start the catchment origins query (first ping of day per device).
- * Used for reverse geocoding → zip code aggregation.
- * Returns Athena queryId for polling.
+ * Build and start the catchment origins query using the TC-WK-19-7
+ * home-locations table per sub-job (METHODOLOGY.md §2.3,
+ * Pappalardo et al. EPJ Data Sci 2023). Identifies POI visitors,
+ * then resolves each one's inferred home from the per-sub-job home
+ * table. Throws if any sub-job is missing its home table — there is
+ * no legacy fallback.
  *
- * Note: Catchment is ✅ correct with poi_ids — it just identifies visitors
- * and gets their first ping of day (origin). But when poiCoords are provided,
- * we use spatial proximity for more accurate visitor identification.
+ * When poiCoords are provided, uses spatial proximity for more
+ * accurate visitor identification; otherwise falls back to poi_ids.
  */
 export async function startConsolidatedCatchmentQuery(
   megaJobId: string,
@@ -967,34 +969,33 @@ export async function startConsolidatedCatchmentQuery(
     )`;
   }
 
-  // ── Home-source selection ───────────────────────────────────
-  // If every sub-job has a pre-computed home table (Phase 2.A
-  // pipeline, METHODOLOGY.md §2.3 TC-WK-19-7), we replace the
-  // legacy first-ping logic with a JOIN against the UNION of
-  // those tables, dedup'd one-home-per-MAID by max nights. If
-  // any sub-job is missing its home table we fall back to the
-  // legacy SQL for the whole megajob (mixing methodologies
-  // within one megajob would produce inconsistent home detection
-  // across the sub-jobs).
+  // Megajob catchment ALWAYS uses the TC-WK-19-7 home-table path
+  // (METHODOLOGY.md §2.3, Pappalardo et al. EPJ Data Sci 2023). The
+  // legacy first-ping-of-day proxy is methodologically biased and is
+  // not an allowed fallback — if ANY sub-job is missing its home
+  // table, fail loud so the caller runs home detection first.
   const subDatasetNames = syncedJobs.map((j) => j.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
   const homeTableChecks = await Promise.all(subDatasetNames.map((ds) => homeTableExists(ds)));
-  const useHomeTable = homeTableChecks.every(Boolean);
   const missingHomes = subDatasetNames.filter((_, i) => !homeTableChecks[i]);
+  if (missingHomes.length > 0) {
+    const list = missingHomes.slice(0, 5).join(', ') + (missingHomes.length > 5 ? `, +${missingHomes.length - 5} more` : '');
+    throw new Error(
+      `Megajob catchment requires the TC-WK-19-7 home-locations table for every sub-job, but ${missingHomes.length} sub-job(s) are missing it: ${list}. ` +
+      `Run home detection on each missing sub-job (npx tsx scripts/run-home-detection.ts <datasetName>) and retry.`,
+    );
+  }
 
-  let homesCTE: string;
-  let finalSelect: string;
-  if (useHomeTable) {
-    // UNION ALL of sub-job homes + dedup to single home per ad_id.
-    // The dedup picks the home with the most nights — across the
-    // megajob's full date range, this is the most stable inferred
-    // residence for each device.
-    const homesUnion = subDatasetNames
-      .map((ds) => `
-        SELECT ad_id, home_lat, home_lng, home_zip, home_city, n_nights
-        FROM ${homeTableName(ds)}
-      `)
-      .join('\n        UNION ALL\n        ');
-    homesCTE = `
+  // UNION ALL of sub-job homes + dedup to single home per ad_id.
+  // The dedup picks the home with the most nights — across the
+  // megajob's full date range, this is the most stable inferred
+  // residence for each device.
+  const homesUnion = subDatasetNames
+    .map((ds) => `
+      SELECT ad_id, home_lat, home_lng, home_zip, home_city, n_nights
+      FROM ${homeTableName(ds)}
+    `)
+    .join('\n      UNION ALL\n      ');
+  const homesCTE = `
     all_sub_homes AS (
       ${homesUnion}
     ),
@@ -1012,7 +1013,7 @@ export async function startConsolidatedCatchmentQuery(
       )
       WHERE rnk = 1
     )`;
-    finalSelect = `
+  const finalSelect = `
     SELECT
       ROUND(h.home_lat, ${COORDINATE_PRECISION}) as origin_lat,
       ROUND(h.home_lng, ${COORDINATE_PRECISION}) as origin_lng,
@@ -1026,61 +1027,6 @@ export async function startConsolidatedCatchmentQuery(
              ROUND(h.home_lng, ${COORDINATE_PRECISION})
     ORDER BY device_days DESC
     LIMIT 100000`;
-  } else {
-    // Legacy path. The MIN_BY(first-ping-of-day) proxy is documented
-    // as biased against urban residents (METHODOLOGY.md §2.2). Run
-    // scripts/run-home-detection.ts on every sub-job to upgrade.
-    homesCTE = `
-    first_pings AS (
-      SELECT
-        v.ad_id,
-        vp.date,
-        MIN_BY(vp.lat, vp.utc_timestamp) as origin_lat,
-        MIN_BY(vp.lng, vp.utc_timestamp) as origin_lng,
-        MIN_BY(vp.native_zip, vp.utc_timestamp) as origin_native_zip,
-        MIN_BY(vp.native_city, vp.utc_timestamp) as origin_native_city,
-        HOUR(MIN(vp.utc_timestamp)) as departure_hour
-      FROM valid_pings vp
-      INNER JOIN poi_visitors v ON vp.ad_id = v.ad_id
-      GROUP BY v.ad_id, vp.date
-    ),
-    device_homes_agg AS (
-      SELECT ad_id,
-        ROUND(origin_lat, ${COORDINATE_PRECISION}) as home_lat,
-        ROUND(origin_lng, ${COORDINATE_PRECISION}) as home_lng,
-        ARBITRARY(origin_native_zip) as native_zip,
-        ARBITRARY(origin_native_city) as native_city,
-        COUNT(DISTINCT date) as days_at_loc
-      FROM first_pings
-      GROUP BY ad_id,
-        ROUND(origin_lat, ${COORDINATE_PRECISION}),
-        ROUND(origin_lng, ${COORDINATE_PRECISION})
-    ),
-    device_homes AS (
-      SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc
-      FROM (
-        SELECT ad_id, home_lat, home_lng, native_zip, native_city, days_at_loc,
-          ROW_NUMBER() OVER (
-            PARTITION BY ad_id
-            ORDER BY days_at_loc DESC, home_lat, home_lng
-          ) as rn
-        FROM device_homes_agg
-      )
-      WHERE rn = 1
-    )`;
-    finalSelect = `
-    SELECT
-      home_lat as origin_lat,
-      home_lng as origin_lng,
-      0 as departure_hour,
-      MIN(native_zip) as native_zip,
-      MIN(native_city) as native_city,
-      COUNT(*) as device_days
-    FROM device_homes
-    GROUP BY home_lat, home_lng
-    ORDER BY device_days DESC
-    LIMIT 100000`;
-  }
 
   // FULL-schema bypass: native_zip / native_city flow through aggregations
   // so the Node-side geocoding phase can short-circuit when present.
@@ -1091,10 +1037,7 @@ export async function startConsolidatedCatchmentQuery(
     ${finalSelect}
   `;
 
-  const homeMode = useHomeTable
-    ? `home-tables (TC-WK-19-7, ${subDatasetNames.length} sub-jobs)`
-    : `legacy first-ping (missing home tables for: ${missingHomes.slice(0, 3).join(', ')}${missingHomes.length > 3 ? `, +${missingHomes.length - 3} more` : ''})`;
-  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'}, home-source=${homeMode})`);
+  console.log(`[MEGA-CATCHMENT] Starting catchment query (CTAS) across ${syncedJobs.length} tables (spatial=${!!poiCoords?.length}, poiTableRef=${poiTableRef ?? 'inline'}, home-source=home-tables (TC-WK-19-7, ${subDatasetNames.length} sub-jobs))`);
   return await startAsCTAS(megaJobId, runId, 'catchment', sql);
 }
 
@@ -1613,9 +1556,15 @@ export async function startConsolidatedNseQuery(
 // ── Q8: Affinity data (per-origin visit metrics) ────────────────────────
 
 /**
- * Build and start the affinity data query.
- * Computes per-origin: total visits, unique devices, avg dwell, avg frequency.
- * Results are geocoded server-side to postal codes, then scored 0-100.
+ * Build and start the affinity data query. Computes per-origin:
+ * total visits, unique devices, avg dwell, avg frequency. Results
+ * are geocoded server-side to postal codes, then scored 0-100.
+ *
+ * Affinity ALWAYS uses the TC-WK-19-7 home-table path so its
+ * per-device home assignment matches catchment (METHODOLOGY.md §2.3).
+ * Throws if any sub-job is missing its home table — there is no
+ * legacy fallback.
+ *
  * Requires spatial path (poiCoords) since dwell time computation needs at_poi_pings.
  */
 export async function startConsolidatedAffinityQuery(
@@ -1630,10 +1579,21 @@ export async function startConsolidatedAffinityQuery(
   const syncedJobs = subJobs.filter((j) => j.s3DestPath && j.syncedAt);
   if (syncedJobs.length === 0) throw new Error('No synced sub-jobs for affinity query');
 
+  const subDatasetNames = syncedJobs.map((j) => j.s3DestPath!.replace(/\/$/, '').split('/').pop()!);
+  const homeTableChecks = await Promise.all(subDatasetNames.map((ds) => homeTableExists(ds)));
+  const missingHomes = subDatasetNames.filter((_, i) => !homeTableChecks[i]);
+  if (missingHomes.length > 0) {
+    const list = missingHomes.slice(0, 5).join(', ') + (missingHomes.length > 5 ? `, +${missingHomes.length - 5} more` : '');
+    throw new Error(
+      `Megajob affinity requires the TC-WK-19-7 home-locations table for every sub-job, but ${missingHomes.length} sub-job(s) are missing it: ${list}. ` +
+      `Run home detection on each missing sub-job (npx tsx scripts/run-home-detection.ts <datasetName>) and retry.`,
+    );
+  }
+
   // FULL-schema bypass: TRY(geo_fields[...]) returns NULL on BASIC.
   const allPingsUnion = buildUnionAll(
     syncedJobs,
-    `ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy, TRY(geo_fields['zipcode']) as native_zip, TRY(geo_fields['city']) as native_city`,
+    `ad_id, date, utc_timestamp, TRY_CAST(latitude AS DOUBLE) as lat, TRY_CAST(longitude AS DOUBLE) as lng, horizontal_accuracy`,
     `AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL AND (horizontal_accuracy IS NULL OR TRY_CAST(horizontal_accuracy AS DOUBLE) < ${ACCURACY_THRESHOLD})`,
     visitorFilter,
   );
@@ -1641,16 +1601,23 @@ export async function startConsolidatedAffinityQuery(
   const dwellCTEs = buildDwellFilterCTEs(dwell);
   const useDwell = hasDwellFilter(dwell);
 
-  // visit_metrics: per (ad_id, date) at the POI — dwell + origin coords
   const visitMetricsSource = useDwell
     ? `at_poi_pings a INNER JOIN dwell_filtered df ON a.ad_id = df.ad_id AND a.date = df.date`
     : `at_poi_pings a`;
-  const visitMetricsPrefix = 'a.';
+
+  // UNION ALL of sub-job home tables, dedup'd to one home per ad_id
+  // (max nights wins). Same pattern as megajob catchment.
+  const homesUnion = subDatasetNames
+    .map((ds) => `
+      SELECT ad_id, home_lat, home_lng, home_zip, home_city, n_nights
+      FROM ${homeTableName(ds)}
+    `)
+    .join('\n      UNION ALL\n      ');
 
   const sql = `
     WITH
     all_pings AS (
-      SELECT ad_id, date, utc_timestamp, lat, lng, native_zip, native_city
+      SELECT ad_id, date, utc_timestamp, lat, lng
       FROM (
         ${allPingsUnion}
       )
@@ -1658,40 +1625,43 @@ export async function startConsolidatedAffinityQuery(
     ${buildAtPoiPingsCTE('all_pings', poiCoords, poiTableRef)}${dwellCTEs},
     visit_metrics AS (
       SELECT
-        ${visitMetricsPrefix}ad_id,
-        ${visitMetricsPrefix}date,
-        ROUND(DATE_DIFF('second', MIN(${visitMetricsPrefix}utc_timestamp), MAX(${visitMetricsPrefix}utc_timestamp)) / 60.0, 1) as dwell_minutes
+        a.ad_id,
+        a.date,
+        ROUND(DATE_DIFF('second', MIN(a.utc_timestamp), MAX(a.utc_timestamp)) / 60.0, 1) as dwell_minutes
       FROM ${visitMetricsSource}
-      GROUP BY ${visitMetricsPrefix}ad_id, ${visitMetricsPrefix}date
+      GROUP BY a.ad_id, a.date
     ),
-    device_origins AS (
-      SELECT
-        vm.ad_id,
-        vm.date,
-        vm.dwell_minutes,
-        MIN_BY(ap.lat, ap.utc_timestamp) as origin_lat,
-        MIN_BY(ap.lng, ap.utc_timestamp) as origin_lng,
-        MIN_BY(ap.native_zip, ap.utc_timestamp) as origin_native_zip,
-        MIN_BY(ap.native_city, ap.utc_timestamp) as origin_native_city
-      FROM visit_metrics vm
-      JOIN all_pings ap ON vm.ad_id = ap.ad_id AND vm.date = ap.date
-      GROUP BY vm.ad_id, vm.date, vm.dwell_minutes
+    all_sub_homes AS (
+      ${homesUnion}
+    ),
+    mega_homes AS (
+      SELECT ad_id, home_lat, home_lng, home_zip, home_city
+      FROM (
+        SELECT ad_id, home_lat, home_lng, home_zip, home_city, n_nights,
+               ROW_NUMBER() OVER (
+                 PARTITION BY ad_id
+                 ORDER BY n_nights DESC, home_lat, home_lng
+               ) AS rnk
+        FROM all_sub_homes
+      )
+      WHERE rnk = 1
     )
     SELECT
-      ROUND(origin_lat, ${COORDINATE_PRECISION}) as origin_lat,
-      ROUND(origin_lng, ${COORDINATE_PRECISION}) as origin_lng,
-      MIN(origin_native_zip) as native_zip,
-      MIN(origin_native_city) as native_city,
+      ROUND(h.home_lat, ${COORDINATE_PRECISION}) as origin_lat,
+      ROUND(h.home_lng, ${COORDINATE_PRECISION}) as origin_lng,
+      MIN(h.home_zip) as native_zip,
+      MIN(h.home_city) as native_city,
       COUNT(*) as total_visits,
-      COUNT(DISTINCT ad_id) as unique_devices,
-      AVG(dwell_minutes) as avg_dwell,
-      CAST(COUNT(*) AS DOUBLE) / NULLIF(COUNT(DISTINCT ad_id), 0) as avg_frequency
-    FROM device_origins
-    GROUP BY ROUND(origin_lat, ${COORDINATE_PRECISION}), ROUND(origin_lng, ${COORDINATE_PRECISION})
+      COUNT(DISTINCT vm.ad_id) as unique_devices,
+      AVG(vm.dwell_minutes) as avg_dwell,
+      CAST(COUNT(*) AS DOUBLE) / NULLIF(COUNT(DISTINCT vm.ad_id), 0) as avg_frequency
+    FROM visit_metrics vm
+    INNER JOIN mega_homes h ON vm.ad_id = h.ad_id
+    GROUP BY ROUND(h.home_lat, ${COORDINATE_PRECISION}), ROUND(h.home_lng, ${COORDINATE_PRECISION})
     ORDER BY total_visits DESC
     LIMIT 100000
   `;
 
-  console.log(`[MEGA-AFFINITY] Starting affinity query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell}, poiTableRef=${poiTableRef ?? 'inline'})`);
+  console.log(`[MEGA-AFFINITY] Starting affinity query (CTAS) across ${syncedJobs.length} tables (dwell=${useDwell}, poiTableRef=${poiTableRef ?? 'inline'}, home-source=home-tables (TC-WK-19-7, ${subDatasetNames.length} sub-jobs))`);
   return await startAsCTAS(megaJobId, runId, 'affinity', sql);
 }
