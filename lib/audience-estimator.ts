@@ -1,34 +1,41 @@
 /**
  * Heuristic estimator for *real-person* audience behind a raw MAID count.
  *
- * Raw MAID counts in mobility data overstate reachable people by 3-5×
+ * Raw MAID counts in mobility data overstate reachable people by 5-10×
  * because MAIDs are not stable identifiers:
- *   - iOS post-ATT (≈80% opt-out): IDFA → zeros or session-random strings
+ *   - iOS post-ATT (≈80% opt-out): zeros dedupe, but session-randoms
+ *     inflate counts massively (often the dominant noise source)
  *   - Android AAID resets (settings, factory reset, new phone)
- *   - App reinstalls / multi-account → new MAID for same person
+ *   - Multi-device per real person (phone + tablet + work phone)
  *   - Bot/test traffic
  *
  * We model three multiplicative effects:
  *
  *   1. Churn during the observation window.
- *      The longer the dataset spans, the more times each person rotates
- *      MAIDs within it. churnFactor = 1 + max(0, span - lifespan) / lifespan.
+ *      AAID/IDFA effectively rotate on a ~12-month timescale (Android
+ *      resets, new-phone purchases). Spans shorter than that get no
+ *      churn discount: churnFactor = 1 + max(0, span - lifespan) / lifespan.
  *
- *   2. Cleanliness — flat 0.6 multiplier accounting for iOS-zeros,
- *      session-randoms, bots, short-lived test MAIDs.
+ *   2. Cleanliness — flat 0.20 multiplier capturing the structural
+ *      inflation present in spans of any length: session-randoms,
+ *      multi-device per person, bots. Tuned empirically against Mexico's
+ *      master (555M raw → ~109M plausible reach across ~85M smartphone
+ *      adults) and individual datasets (~52M for a 30-day extract).
  *
  *   3. Time-decay since the dataset ended.
- *      A 12-month-old MAID has likely rotated three times. We use
- *      exponential decay with the same lifespan as half-life.
- *      decayFactor = 0.5 ^ (monthsSinceEnd / lifespan).
+ *      Even a stable MAID becomes harder to reach as the underlying
+ *      person rotates devices. decayFactor = 0.5 ^ (monthsSinceEnd / lifespan).
  *
- * The constants are industry rule-of-thumb (not measured). Treat the
- * output as a conservative upper bound for "people you could actually
- * reach if you activated this audience today", not a precise count.
+ * Constants are still industry rule-of-thumb (not measured against
+ * ground truth). With a 12-month lifespan and 0.20 cleanliness, the
+ * function is monotonic-by-intuition: subset estimates rarely exceed
+ * their superset, and global totals stay within a country's plausible
+ * smartphone-adult population. Treat the output as a conservative
+ * upper bound for activatable audience size, not a precise count.
  */
 
-export const MAID_LIFESPAN_MONTHS = 4;
-export const MAID_CLEANLINESS_FACTOR = 0.6;
+export const MAID_LIFESPAN_MONTHS = 12;
+export const MAID_CLEANLINESS_FACTOR = 0.20;
 
 export function monthsBetween(
   fromIso: string | null | undefined,
@@ -103,7 +110,10 @@ export function estimateRealAudienceBreakdown(opts: EstimateInput) {
 
 export const ESTIMATE_TOOLTIP =
   'Heuristic estimate of real people behind the MAIDs. Accounts for: ' +
-  '(1) MAID churn during the observation window (~4-month effective lifespan); ' +
-  '(2) ~40% noise (iOS-zero strings, session-randoms, bots, short-lived MAIDs); ' +
-  '(3) exponential decay since the dataset ended (half-life ≈ 4 months). ' +
-  'Use as a conservative upper bound for activatable audience size — not a precise count.';
+  '(1) MAID churn during the observation window (~12-month effective lifespan, ' +
+  'mainly from AAID resets and new-phone purchases); ' +
+  '(2) ~80% structural inflation (iOS session-randomization, multi-device per ' +
+  'person, bots) — applied as a flat 0.20 multiplier; ' +
+  '(3) exponential decay since the dataset ended (half-life ≈ 12 months). ' +
+  'Rough heuristic — subset estimates may slightly exceed their superset due to ' +
+  'per-source noise; treat the master / parent estimate as the conservative upper bound.';
