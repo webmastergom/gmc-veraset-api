@@ -75,9 +75,6 @@ interface ReportState {
   parsingCache?: {
     /** Country detected for this dataset (used to scope geocoding). */
     detectedCountry?: string;
-    /** Number of coords that had a usable native_zip from geo_fields
-     *  and therefore skipped server-side geocoding entirely. */
-    nativeZipBypassCount?: number;
     /** Number of coords queued for reverse-geocoding. */
     coordsToGeocode?: number;
     /** Number of coords successfully geocoded (computed in parsing_geocode). */
@@ -1265,14 +1262,15 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] mobility parse:', e.message); }
       }
 
-      // FULL-schema bypass: coords with native_zip from geo_fields skip geocoding.
+      // Reverse-geocode every catchment/affinity coord via local GeoJSON.
+      // We deliberately do NOT use Veraset's geo_fields['zipcode'] anymore:
+      // the home table's home_zip is ARBITRARY(native_zip) per ~1.1 km bucket,
+      // which collapses all residents of a dense urban bucket onto a single
+      // zip code. Polygon lookup against the per-MAID centroid distributes
+      // residents across distinct postal codes within the same bucket, which
+      // is essential for dense German cities (München, Frankfurt, Stuttgart)
+      // where hundreds of MAIDs share one bucket.
       const coordToZip = new Map<string, { zipCode: string; city: string; country: string }>();
-      let detectedCountry: string | undefined;
-      try {
-        const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
-        detectedCountry = analysis?.country;
-      } catch {}
-      let nativeZipBypassCount = 0;
 
       // Parse OD
       let odClusters: any = null;
@@ -1287,7 +1285,7 @@ export async function POST(
         } catch (e: any) { console.error('[DS-REPORT] od parse:', e.message); }
       }
 
-      // Parse catchment — pre-populate coordToZip from native_zip when present.
+      // Parse catchment — queue every coord for polygon reverse-geocode.
       let catchmentRows: any[] | null = null;
       if (queries.catchment) {
         try {
@@ -1297,19 +1295,12 @@ export async function POST(
             const lat = parseFloat(row.origin_lat) || 0;
             const lng = parseFloat(row.origin_lng) || 0;
             const key = `${lat},${lng}`;
-            const nativeZip = String(row.native_zip || '').trim();
-            const nativeCity = String(row.native_city || '').trim();
-            if (nativeZip && !coordToZip.has(key)) {
-              coordToZip.set(key, { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: detectedCountry || 'UNKNOWN' });
-              nativeZipBypassCount++;
-            } else if (!nativeZip) {
-              coordsToGeocode.set(key, { lat, lng, deviceCount: parseInt(row.device_days, 10) || 0 });
-            }
+            coordsToGeocode.set(key, { lat, lng, deviceCount: parseInt(row.device_days, 10) || 0 });
           }
         } catch (e: any) { console.error('[DS-REPORT] catchment parse:', e.message); }
       }
 
-      // Parse affinity rows — same native_zip bypass.
+      // Parse affinity rows — queue every coord for polygon reverse-geocode.
       let affinityRows: any[] | null = null;
       if (queries.affinity) {
         try {
@@ -1319,25 +1310,23 @@ export async function POST(
             const lat = parseFloat(row.origin_lat) || 0;
             const lng = parseFloat(row.origin_lng) || 0;
             const key = `${lat},${lng}`;
-            const nativeZip = String(row.native_zip || '').trim();
-            const nativeCity = String(row.native_city || '').trim();
-            if (nativeZip && !coordToZip.has(key)) {
-              coordToZip.set(key, { zipCode: nativeZip, city: nativeCity || 'UNKNOWN', country: detectedCountry || 'UNKNOWN' });
-              nativeZipBypassCount++;
-            } else if (!nativeZip && !coordToZip.has(key)) {
+            if (!coordsToGeocode.has(key)) {
               coordsToGeocode.set(key, { lat, lng, deviceCount: parseInt(row.unique_devices, 10) || 0 });
             }
           }
         } catch (e: any) { console.error('[DS-REPORT] affinity parse:', e.message); }
       }
 
-      if (nativeZipBypassCount > 0) {
-        console.log(`[DS-REPORT] FULL-schema zipcode bypass: ${nativeZipBypassCount} coords resolved natively, ${coordsToGeocode.size} still need geocoding`);
-      }
+      // Stage the heavy rows + (empty) coord→zip map + coords-to-geocode
+      // in S3. The next sub-phase (parsing_geocode) reads them back so
+      // we don't re-fetch from Athena. coordToZip starts empty here and
+      // is fully populated by polygon lookup in parsing_geocode.
+      let detectedCountry: string | undefined;
+      try {
+        const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
+        detectedCountry = analysis?.country;
+      } catch {}
 
-      // Stage the heavy rows + the partial coord→zip map (from native_zip
-      // bypass) + the coords-still-to-geocode in S3. The next sub-phase
-      // (parsing_geocode) reads them back so we don't re-fetch from Athena.
       await Promise.all([
         odClusters
           ? putConfig(CACHE_KEY.odRows(datasetName), odClusters, { compact: true })
@@ -1349,8 +1338,6 @@ export async function POST(
           ? putConfig(CACHE_KEY.affinityRows(datasetName), affinityRows, { compact: true })
           : Promise.resolve(),
         putConfig(CACHE_KEY.coordsToGeocode(datasetName), Array.from(coordsToGeocode.entries()), { compact: true }),
-        // Seed coord→zip with the native_zip bypass hits so parsing_geocode
-        // doesn't redo that work either.
         putConfig(CACHE_KEY.coordToZip(datasetName), Array.from(coordToZip.entries()), { compact: true }),
       ]);
 
@@ -1359,7 +1346,6 @@ export async function POST(
         phase: 'parsing_geocode',
         parsingCache: {
           detectedCountry,
-          nativeZipBypassCount,
           coordsToGeocode: coordsToGeocode.size,
         },
       };
@@ -1380,9 +1366,17 @@ export async function POST(
     // ── Phase: parsing_geocode (reverse-geocode collected coords) ──
     //
     // Loads the staged coord set from S3, runs batchReverseGeocode once
-    // for the whole dataset (after 1-decimal rounding to keep the work
-    // bounded), and persists the resulting coord→zip map back to S3 for
-    // the parsing_save phase to consume.
+    // for the whole dataset (after 3-decimal rounding ≈ 110 m to share
+    // work across truly-co-located coords while still distinguishing
+    // distinct postal codes within a city), and persists the resulting
+    // coord→zip map back to S3 for the parsing_save phase to consume.
+    //
+    // Precision rationale: home_lat = AVG(lat) per-MAID inside a ~1.1 km
+    // bucket, so MAID centroids within the same bucket vary at the
+    // ~100–500 m scale. 1-decimal rounding (~11 km) destroyed that
+    // variance and collapsed dense German cities (München, Frankfurt,
+    // Stuttgart) onto 2–6 PLZs out of 40–85 real ones. 3-decimal lets
+    // the 8 k German PLZ polygons actually disambiguate.
     if (state.phase === 'parsing_geocode') {
       const detectedCountry = state.parsingCache?.detectedCountry;
       const coordsEntries = (await getConfig<Array<[string, { lat: number; lng: number; deviceCount: number }]>>(CACHE_KEY.coordsToGeocode(datasetName))) || [];
@@ -1390,32 +1384,30 @@ export async function POST(
       const coordToZip = new Map(coordToZipEntries);
 
       if (coordsEntries.length === 0) {
-        console.log(`[DS-REPORT] No coords to geocode for ${datasetName} (native_zip covered everything or no OD/catchment/affinity rows)`);
+        console.log(`[DS-REPORT] No coords to geocode for ${datasetName}`);
       } else {
         try {
           if (detectedCountry) setCountryFilter([detectedCountry]);
 
-          // Bucket to 1-decimal cells to share work across nearby coords.
-          // Without this, a dense metro can hit 100k+ unique points and the
-          // turf.js point-in-polygon scan dominates the request budget.
+          // Bucket to 3-decimal cells (~110 m) to deduplicate co-located
+          // coords without collapsing distinct PLZ-scale neighbours.
           const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
           for (const [, p] of coordsEntries) {
-            const rl = Math.round(p.lat * 10) / 10;
-            const rn = Math.round(p.lng * 10) / 10;
+            const rl = Math.round(p.lat * 1000) / 1000;
+            const rn = Math.round(p.lng * 1000) / 1000;
             const key = `${rl},${rn}`;
             const ex = roundedMap.get(key);
             if (ex) ex.deviceCount += p.deviceCount;
             else roundedMap.set(key, { lat: rl, lng: rn, deviceCount: p.deviceCount });
           }
-          console.log(`[DS-REPORT] Geocoding ${coordsEntries.length.toLocaleString()} coords (${roundedMap.size.toLocaleString()} unique buckets at 1-decimal precision)`);
+          console.log(`[DS-REPORT] Geocoding ${coordsEntries.length.toLocaleString()} coords (${roundedMap.size.toLocaleString()} unique buckets at 3-decimal precision)`);
 
           const geocoded = await batchReverseGeocode(Array.from(roundedMap.values()));
           const rKeys = Array.from(roundedMap.keys());
 
           for (const [key, p] of coordsEntries) {
-            // Don't overwrite native_zip from FULL schema bypass
             if (coordToZip.has(key)) continue;
-            const roundKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            const roundKey = `${Math.round(p.lat * 1000) / 1000},${Math.round(p.lng * 1000) / 1000}`;
             const idx = rKeys.indexOf(roundKey);
             if (idx >= 0 && idx < geocoded.length) {
               const g = geocoded[idx];

@@ -728,9 +728,11 @@ export async function POST(
           }
         }
 
-        // Fetch catchment results from CTAS table.
-        // FULL-schema bypass: rows with native_zip skip the batch reverse-geocode.
-        let catchmentNativeZipBypassed = 0;
+        // Fetch catchment results from CTAS table. Every coord is queued
+        // for polygon reverse-geocode — the native_zip column on each row
+        // is ignored (see buildCatchmentReport docstring for the rationale:
+        // ARBITRARY(geo_fields['zipcode']) in the home table collapses
+        // dense urban buckets onto a single zip code).
         if (state.queries.catchment) {
           try {
             const queryResult = await runQueryViaS3(`SELECT * FROM ${state.queries.catchment.ctasTable}`);
@@ -739,16 +741,8 @@ export async function POST(
               const lng = parseFloat(row.origin_lng) || 0;
               const dd = parseInt(row.device_days, 10) || 0;
               const key = `${lat},${lng}`;
-              const nativeZip = String(row.native_zip || '').trim();
-              if (nativeZip) {
-                catchmentNativeZipBypassed++;
-                continue; // Don't queue for batch geocode — parser will use native_zip directly.
-              }
               const existing = coordsToGeocode.get(key);
               coordsToGeocode.set(key, { lat, lng, deviceCount: (existing?.deviceCount || 0) + dd });
-            }
-            if (catchmentNativeZipBypassed > 0) {
-              console.log(`[MEGA] FULL-schema zipcode bypass: ${catchmentNativeZipBypassed} catchment rows resolved natively`);
             }
           } catch (err: any) {
             console.error('[MEGA] Error fetching catchment results:', err.message);
@@ -770,13 +764,18 @@ export async function POST(
             setCountryFilter([detectedCountry]);
           }
 
-          // Use 1-decimal precision for geocoding (×10 performance)
+          // 3-decimal precision (~110 m) — deduplicates co-located coords
+          // while still distinguishing distinct PLZ-scale neighbours within
+          // a city. 1-decimal (~11 km) used to collapse dense German cities
+          // onto 1–2 cells and made the 8 k PLZ polygon catalog useless.
           const uniqueRounded = new Map<string, { lat: number; lng: number; deviceCount: number }>();
           for (const p of coordsToGeocode.values()) {
-            const key = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            const rl = Math.round(p.lat * 1000) / 1000;
+            const rn = Math.round(p.lng * 1000) / 1000;
+            const key = `${rl},${rn}`;
             const ex = uniqueRounded.get(key);
             if (ex) ex.deviceCount += p.deviceCount;
-            else uniqueRounded.set(key, { lat: Math.round(p.lat * 10) / 10, lng: Math.round(p.lng * 10) / 10, deviceCount: p.deviceCount });
+            else uniqueRounded.set(key, { lat: rl, lng: rn, deviceCount: p.deviceCount });
           }
 
           console.log(`[MEGA] Geocoding ${uniqueRounded.size} unique rounded coords (from ${coordsToGeocode.size} original)`);
@@ -795,8 +794,9 @@ export async function POST(
           }
 
           // Map original coords to geocoded results via rounded key
+          // (must match the 3-decimal rounding used when building uniqueRounded).
           for (const [key, p] of coordsToGeocode.entries()) {
-            const roundedKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
+            const roundedKey = `${Math.round(p.lat * 1000) / 1000},${Math.round(p.lng * 1000) / 1000}`;
             const zip = roundedToZip.get(roundedKey);
             if (zip) coordToZipEntries.push([key, zip]);
           }
