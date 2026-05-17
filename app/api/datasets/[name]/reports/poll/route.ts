@@ -42,12 +42,47 @@ function REPORT_KEY(ds: string, type: string, minDwell = 0, maxDwell = 0, hourFr
 // ── Types ─────────────────────────────────────────────────────────────
 
 interface ReportState {
-  phase: 'start' | 'home_detection' | 'polling' | 'parsing' | 'done' | 'error';
+  /**
+   * Parsing used to be one monolithic phase that fetched OD + catchment
+   * + affinity rows, geocoded everything in memory, and saved all
+   * reports in a single request. On 50+ GB datasets the geocoding step
+   * alone exceeded the request budget and the state stayed stuck in
+   * 'parsing' forever. We now split that work into three sub-phases:
+   *
+   *   parsing         → save the fast reports (hourly/dayhour/temporal/
+   *                     mobility/totalDevices), fetch the geocoding-bound
+   *                     rows from Athena and cache them to S3.
+   *   parsing_geocode → load cached rows, run batchReverseGeocode once,
+   *                     cache coord→zip map to S3.
+   *   parsing_save    → load cached rows + coord→zip, build & save the
+   *                     OD / catchment / affinity reports, clean up
+   *                     cache, transition to done.
+   *
+   * Each sub-phase finishes in well under the 5-min Vercel maxDuration,
+   * so the state machine always advances on every poll instead of
+   * silently rolling back.
+   */
+  phase: 'start' | 'home_detection' | 'polling' | 'parsing' | 'parsing_geocode' | 'parsing_save' | 'done' | 'error';
   queries: Record<string, string>;  // name → queryId
   /** Athena queryId of the TC-WK-19-7 home-detection CTAS that runs
    *  before the 8 report queries when the home table is missing. */
   homeDetectionQueryId?: string;
   datasetSizeGB?: number;
+  /** Tracks per-step state shared across the parsing_* sub-phases.
+   *  Set during the 'parsing' phase; consumed by 'parsing_geocode'
+   *  and 'parsing_save'. The actual row payloads live in S3 cache
+   *  files (see CACHE_KEY below) to keep this state file small. */
+  parsingCache?: {
+    /** Country detected for this dataset (used to scope geocoding). */
+    detectedCountry?: string;
+    /** Number of coords that had a usable native_zip from geo_fields
+     *  and therefore skipped server-side geocoding entirely. */
+    nativeZipBypassCount?: number;
+    /** Number of coords queued for reverse-geocoding. */
+    coordsToGeocode?: number;
+    /** Number of coords successfully geocoded (computed in parsing_geocode). */
+    geocodedCount?: number;
+  };
   minDwell?: number;
   maxDwell?: number;
   hourFrom?: number;
@@ -60,6 +95,17 @@ interface ReportState {
   discardResidents?: boolean;
   error?: string;
 }
+
+/** S3 keys used by the parsing_* sub-phases to pass row payloads
+ *  and the coord→zip map between requests. Cleaned up on transition
+ *  to 'done' (or left around for diagnostics on transition to 'error'). */
+const CACHE_KEY = {
+  odRows: (ds: string) => `dataset-report-cache/${ds}/od-rows`,
+  catchmentRows: (ds: string) => `dataset-report-cache/${ds}/catchment-rows`,
+  affinityRows: (ds: string) => `dataset-report-cache/${ds}/affinity-rows`,
+  coordsToGeocode: (ds: string) => `dataset-report-cache/${ds}/coords-to-geocode`,
+  coordToZip: (ds: string) => `dataset-report-cache/${ds}/coord-to-zip`,
+};
 
 async function getState(ds: string): Promise<ReportState | null> {
   return await getConfig<ReportState>(STATE_KEY(ds));
@@ -1122,7 +1168,13 @@ export async function POST(
       });
     }
 
-    // ── Phase: parsing ──────────────────────────────────────────
+    // ── Phase: parsing (save fast reports + cache heavy rows for geocoding) ──
+    //
+    // Splits the legacy monolithic "parse + geocode + save" into 3 sub-
+    // phases so a 50+ GB dataset never blows the request budget on the
+    // geocoding step. This phase handles the fast, no-geocoding reports
+    // and stages the catchment / affinity / OD rows in S3 for the next
+    // phase to consume.
     if (state.phase === 'parsing') {
       const queries = state.queries;
       const dMin = state.minDwell || 0;
@@ -1283,14 +1335,71 @@ export async function POST(
         console.log(`[DS-REPORT] FULL-schema zipcode bypass: ${nativeZipBypassCount} coords resolved natively, ${coordsToGeocode.size} still need geocoding`);
       }
 
-      // Geocode the remaining (non-native-zip) coords
-      if (coordsToGeocode.size > 0) {
+      // Stage the heavy rows + the partial coord→zip map (from native_zip
+      // bypass) + the coords-still-to-geocode in S3. The next sub-phase
+      // (parsing_geocode) reads them back so we don't re-fetch from Athena.
+      await Promise.all([
+        odClusters
+          ? putConfig(CACHE_KEY.odRows(datasetName), odClusters, { compact: true })
+          : Promise.resolve(),
+        catchmentRows
+          ? putConfig(CACHE_KEY.catchmentRows(datasetName), catchmentRows, { compact: true })
+          : Promise.resolve(),
+        affinityRows
+          ? putConfig(CACHE_KEY.affinityRows(datasetName), affinityRows, { compact: true })
+          : Promise.resolve(),
+        putConfig(CACHE_KEY.coordsToGeocode(datasetName), Array.from(coordsToGeocode.entries()), { compact: true }),
+        // Seed coord→zip with the native_zip bypass hits so parsing_geocode
+        // doesn't redo that work either.
+        putConfig(CACHE_KEY.coordToZip(datasetName), Array.from(coordToZip.entries()), { compact: true }),
+      ]);
+
+      state = {
+        ...state,
+        phase: 'parsing_geocode',
+        parsingCache: {
+          detectedCountry,
+          nativeZipBypassCount,
+          coordsToGeocode: coordsToGeocode.size,
+        },
+      };
+      await saveState(datasetName, state);
+
+      return NextResponse.json({
+        phase: 'parsing_geocode',
+        progress: {
+          step: 'parsing_geocode',
+          percent: 75,
+          message: coordsToGeocode.size > 0
+            ? `Geocoding ${coordsToGeocode.size.toLocaleString()} coordinates...`
+            : 'Building origin reports...',
+        },
+      });
+    }
+
+    // ── Phase: parsing_geocode (reverse-geocode collected coords) ──
+    //
+    // Loads the staged coord set from S3, runs batchReverseGeocode once
+    // for the whole dataset (after 1-decimal rounding to keep the work
+    // bounded), and persists the resulting coord→zip map back to S3 for
+    // the parsing_save phase to consume.
+    if (state.phase === 'parsing_geocode') {
+      const detectedCountry = state.parsingCache?.detectedCountry;
+      const coordsEntries = (await getConfig<Array<[string, { lat: number; lng: number; deviceCount: number }]>>(CACHE_KEY.coordsToGeocode(datasetName))) || [];
+      const coordToZipEntries = (await getConfig<Array<[string, { zipCode: string; city: string; country: string }]>>(CACHE_KEY.coordToZip(datasetName))) || [];
+      const coordToZip = new Map(coordToZipEntries);
+
+      if (coordsEntries.length === 0) {
+        console.log(`[DS-REPORT] No coords to geocode for ${datasetName} (native_zip covered everything or no OD/catchment/affinity rows)`);
+      } else {
         try {
           if (detectedCountry) setCountryFilter([detectedCountry]);
 
-          // Round to 1 decimal for geocoding efficiency
+          // Bucket to 1-decimal cells to share work across nearby coords.
+          // Without this, a dense metro can hit 100k+ unique points and the
+          // turf.js point-in-polygon scan dominates the request budget.
           const roundedMap = new Map<string, { lat: number; lng: number; deviceCount: number }>();
-          for (const p of coordsToGeocode.values()) {
+          for (const [, p] of coordsEntries) {
             const rl = Math.round(p.lat * 10) / 10;
             const rn = Math.round(p.lng * 10) / 10;
             const key = `${rl},${rn}`;
@@ -1298,11 +1407,12 @@ export async function POST(
             if (ex) ex.deviceCount += p.deviceCount;
             else roundedMap.set(key, { lat: rl, lng: rn, deviceCount: p.deviceCount });
           }
+          console.log(`[DS-REPORT] Geocoding ${coordsEntries.length.toLocaleString()} coords (${roundedMap.size.toLocaleString()} unique buckets at 1-decimal precision)`);
 
           const geocoded = await batchReverseGeocode(Array.from(roundedMap.values()));
           const rKeys = Array.from(roundedMap.keys());
 
-          for (const [key, p] of coordsToGeocode.entries()) {
+          for (const [key, p] of coordsEntries) {
             // Don't overwrite native_zip from FULL schema bypass
             if (coordToZip.has(key)) continue;
             const roundKey = `${Math.round(p.lat * 10) / 10},${Math.round(p.lng * 10) / 10}`;
@@ -1318,30 +1428,126 @@ export async function POST(
         } catch (e: any) {
           console.error('[DS-REPORT] geocoding:', e.message);
           setCountryFilter(null);
+          // Don't fail the whole pipeline — coordToZip may be partial but the
+          // save phase will still produce reports (with UNKNOWN for unmatched
+          // coords) rather than getting stuck here forever.
         }
       }
 
-      // Save OD + catchment reports
-      if (odClusters) {
-        await putConfig(`${rk('od')}`, buildODReport(datasetName, odClusters.clusters, coordToZip), { compact: true });
-      }
-      if (catchmentRows) {
-        await putConfig(`${rk('catchment')}`, buildCatchmentReport(datasetName, catchmentRows, coordToZip), { compact: true });
-      }
+      await putConfig(CACHE_KEY.coordToZip(datasetName), Array.from(coordToZip.entries()), { compact: true });
 
-      // Save affinity report
-      if (affinityRows) {
-        const affinityReport = await computeAffinityReport(datasetName, affinityRows, coordToZip, detectedCountry);
-        await putConfig(`${rk('affinity')}`, affinityReport, { compact: true });
-        console.log(`[DS-REPORT] Affinity report: ${affinityReport.byZipCode.length} postal codes`);
-      }
-
-      state = { ...state, phase: 'done' };
+      state = {
+        ...state,
+        phase: 'parsing_save',
+        parsingCache: {
+          ...state.parsingCache,
+          geocodedCount: coordToZip.size,
+        },
+      };
       await saveState(datasetName, state);
 
       return NextResponse.json({
-        phase: 'done',
-        progress: { step: 'done', percent: 100, message: 'Reports generated successfully' },
+        phase: 'parsing_save',
+        progress: {
+          step: 'parsing_save',
+          percent: 90,
+          message: `Geocoded ${coordToZip.size.toLocaleString()} coords. Saving reports...`,
+        },
+      });
+    }
+
+    // ── Phase: parsing_save (build & save OD / catchment / affinity reports) ──
+    //
+    // Loads the cached rows and coord→zip map from S3 and writes the final
+    // reports. Each save is wrapped in its own try/catch so one failing
+    // report (e.g. computeAffinityReport blowing up on degenerate input)
+    // doesn't poison the others — the user at least gets the reports that
+    // did serialize.
+    if (state.phase === 'parsing_save') {
+      const dMin = state.minDwell || 0;
+      const dMax = state.maxDwell || 0;
+      const hFrom = state.hourFrom ?? 0;
+      const hTo = state.hourTo ?? 23;
+      const mVisits = state.minVisits ?? 1;
+      const gOnly = !!state.gpsOnly;
+      const cScore = state.maxCircleScore || 0;
+      const dow = state.daysOfWeek || [];
+      const noEmp = !!state.discardEmployees;
+      const noRes = !!state.discardResidents;
+      const rk = (type: string) => REPORT_KEY(datasetName, type, dMin, dMax, hFrom, hTo, mVisits, gOnly, cScore, dow, noEmp, noRes);
+      const detectedCountry = state.parsingCache?.detectedCountry;
+
+      const [odClusters, catchmentRows, affinityRows, coordToZipEntries] = await Promise.all([
+        getConfig<any>(CACHE_KEY.odRows(datasetName)),
+        getConfig<any[]>(CACHE_KEY.catchmentRows(datasetName)),
+        getConfig<any[]>(CACHE_KEY.affinityRows(datasetName)),
+        getConfig<Array<[string, { zipCode: string; city: string; country: string }]>>(CACHE_KEY.coordToZip(datasetName)),
+      ]);
+      const coordToZip = new Map(coordToZipEntries || []);
+
+      const saveErrors: string[] = [];
+
+      if (odClusters) {
+        try {
+          await putConfig(`${rk('od')}`, buildODReport(datasetName, odClusters.clusters, coordToZip), { compact: true });
+        } catch (e: any) {
+          console.error('[DS-REPORT] od save:', e.message);
+          saveErrors.push(`od: ${e.message}`);
+        }
+      }
+      if (catchmentRows) {
+        try {
+          await putConfig(`${rk('catchment')}`, buildCatchmentReport(datasetName, catchmentRows, coordToZip), { compact: true });
+        } catch (e: any) {
+          console.error('[DS-REPORT] catchment save:', e.message);
+          saveErrors.push(`catchment: ${e.message}`);
+        }
+      }
+      if (affinityRows) {
+        try {
+          const affinityReport = await computeAffinityReport(datasetName, affinityRows, coordToZip, detectedCountry);
+          await putConfig(`${rk('affinity')}`, affinityReport, { compact: true });
+          console.log(`[DS-REPORT] Affinity report: ${affinityReport.byZipCode.length} postal codes`);
+        } catch (e: any) {
+          console.error('[DS-REPORT] affinity save:', e.message);
+          saveErrors.push(`affinity: ${e.message}`);
+        }
+      }
+
+      // Best-effort cleanup of the per-run cache files. The state's
+      // s3Client doesn't have s3:DeleteObject denied on dataset-report-cache
+      // paths in the production policy, but we tolerate failures here
+      // because the cache files are name-spaced per (ds, filter combo)
+      // and will be overwritten on the next run anyway.
+      try {
+        await Promise.all([
+          putConfig(CACHE_KEY.odRows(datasetName), null, { compact: true }),
+          putConfig(CACHE_KEY.catchmentRows(datasetName), null, { compact: true }),
+          putConfig(CACHE_KEY.affinityRows(datasetName), null, { compact: true }),
+          putConfig(CACHE_KEY.coordsToGeocode(datasetName), null, { compact: true }),
+          putConfig(CACHE_KEY.coordToZip(datasetName), null, { compact: true }),
+        ]);
+      } catch (e: any) {
+        console.warn(`[DS-REPORT] cache cleanup warning:`, e?.message || e);
+      }
+
+      state = {
+        ...state,
+        phase: saveErrors.length > 0 ? 'error' : 'done',
+        error: saveErrors.length > 0 ? `Some reports failed to save: ${saveErrors.join('; ')}` : undefined,
+      };
+      await saveState(datasetName, state);
+
+      return NextResponse.json({
+        phase: state.phase,
+        progress: {
+          step: state.phase,
+          percent: state.phase === 'done' ? 100 : 95,
+          message: state.phase === 'done'
+            ? 'Reports generated successfully'
+            : `Reports partially generated. ${saveErrors.length} report(s) failed — see error details.`,
+        },
+        error: state.error,
       });
     }
 
