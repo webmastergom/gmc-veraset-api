@@ -323,21 +323,29 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
   const sFilterT = (maxCircleScore && maxCircleScore > 0)
     ? `AND (TRY(t.quality_fields['ping_circle_score']) IS NULL OR TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) IS NULL OR TRY_CAST(t.quality_fields['ping_circle_score'] AS DOUBLE) <= ${maxCircleScore})`
     : '';
+  // Membership test "is this ping at any POI" used to be expressed as
+  // `CROSS JOIN UNNEST(poi_ids) AS t(poi_id) WHERE poi_id IS NOT NULL
+  //  AND poi_id != ''` followed by `SELECT DISTINCT` to fold the
+  // resulting (ping × N_pois) inflation back to one row per ping.
+  // That worked at small scale but on Mexico (~200 GB, ~5 POIs/ping
+  // average) it ran ~1780s and hit Athena's 30-minute query timeout
+  // for hourly / dayhour / temporal / totalDevices. Switching to
+  // `CARDINALITY(poi_ids) > 0` skips the row inflation entirely —
+  // same set of pings, ~5× less intermediate work, ~5× faster.
+  // (The downstream aggregators don't need per-POI granularity; they
+  // aggregate by time bucket or by home location.)
   const visitFilterCTE = minVisits > 1 ? `visit_day_filter AS (
-      SELECT ad_id FROM (
-        SELECT ad_id, COUNT(DISTINCT date) as vd
-        FROM ${table}
-        CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-        WHERE poi_id IS NOT NULL AND poi_id != ''
-          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-          ${gFilter}
-          ${sFilter}
-          ${dFilter}
-          ${eFilter}
-        ${rFilter}
-        GROUP BY ad_id
-        HAVING COUNT(DISTINCT date) >= ${minVisits}
-      ) t_vc
+      SELECT ad_id, COUNT(DISTINCT date) as vd
+      FROM ${table}
+      WHERE CARDINALITY(poi_ids) > 0
+        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+        ${gFilter}
+        ${sFilter}
+        ${dFilter}
+        ${eFilter}
+      ${rFilter}
+      GROUP BY ad_id
+      HAVING COUNT(DISTINCT date) >= ${minVisits}
     ),
     ` : '';
   const visitWhere = minVisits > 1 ? `AND ad_id IN (SELECT ad_id FROM visit_day_filter)` : '';
@@ -350,8 +358,7 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
     return `${visitFilterCTE}poi_device_days AS (
       SELECT ad_id, date
       FROM ${table}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
+      WHERE CARDINALITY(poi_ids) > 0
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         ${hFilter}
@@ -365,13 +372,12 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
       HAVING ${havingParts.join(' AND ')}
     ),
     at_poi AS (
-      SELECT DISTINCT t.ad_id, t.date, t.utc_timestamp,
+      SELECT t.ad_id, t.date, t.utc_timestamp,
         TRY_CAST(t.latitude AS DOUBLE) as lat,
         TRY_CAST(t.longitude AS DOUBLE) as lng
       FROM ${table} t
       INNER JOIN poi_device_days dd ON t.ad_id = dd.ad_id AND t.date = dd.date
-      CROSS JOIN UNNEST(t.poi_ids) AS x(poi_id)
-      WHERE x.poi_id IS NOT NULL AND x.poi_id != ''
+      WHERE CARDINALITY(t.poi_ids) > 0
         AND TRY_CAST(t.latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(t.longitude AS DOUBLE) IS NOT NULL
         AND (t.horizontal_accuracy IS NULL OR TRY_CAST(t.horizontal_accuracy AS DOUBLE) < ${ACCURACY})
@@ -382,12 +388,11 @@ function atPoiCTE(table: string, minDwell = 0, maxDwell = 0, hourFrom = 0, hourT
     )`;
   }
   return `${visitFilterCTE}at_poi AS (
-      SELECT DISTINCT ad_id, date, utc_timestamp,
+      SELECT ad_id, date, utc_timestamp,
         TRY_CAST(latitude AS DOUBLE) as lat,
         TRY_CAST(longitude AS DOUBLE) as lng
       FROM ${table}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
+      WHERE CARDINALITY(poi_ids) > 0
         AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
         AND TRY_CAST(latitude AS DOUBLE) IS NOT NULL
         AND TRY_CAST(longitude AS DOUBLE) IS NOT NULL
