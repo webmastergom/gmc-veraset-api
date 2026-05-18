@@ -27,7 +27,7 @@ import {
   Users,
   Info,
 } from 'lucide-react'
-import { estimateRealAudience, ESTIMATE_TOOLTIP } from '@/lib/audience-estimator'
+import { estimateRealAudience, estimateTooltipFor, ESTIMATE_TOOLTIP } from '@/lib/audience-estimator'
 
 const COUNTRY_FLAGS: Record<string, string> = {
   ES: '🇪🇸', MX: '🇲🇽', FR: '🇫🇷', PA: '🇵🇦', CR: '🇨🇷',
@@ -103,15 +103,18 @@ function formatNumber(n: number | null): string {
 }
 
 // Local adapter: master-maids page works in terms of dateRange={from,to}
-// objects; the shared lib takes flat strings.
+// objects; the shared lib takes flat strings. Country is required for
+// the per-country κ_md multi-device factor (lib/country-params.ts).
 function estimateForCountry(
   totalMaids: number | null,
   dateRange: { from: string | null; to: string | null } | null,
+  country: string | null | undefined,
 ): number | null {
   return estimateRealAudience({
     totalMaids,
     dateFrom: dateRange?.from,
     dateTo: dateRange?.to,
+    country,
   })
 }
 
@@ -304,7 +307,7 @@ export default function MasterMaidsPage() {
           // Global "real audience" = sum of per-country estimates so each
           // country's churn factor reflects its own span, not a global avg.
           const globalRealAudience = countries.reduce(
-            (sum, c) => sum + (estimateForCountry(c.totalMaids, c.dateRange) || 0),
+            (sum, c) => sum + (estimateForCountry(c.totalMaids, c.dateRange, c.country) || 0),
             0,
           )
           return (
@@ -411,12 +414,12 @@ export default function MasterMaidsPage() {
                             {c.isEstimate ? 'MAIDs (not deduplicated)' : 'unique MAIDs'}
                           </div>
                           {(() => {
-                            const est = estimateForCountry(c.totalMaids, c.dateRange)
+                            const est = estimateForCountry(c.totalMaids, c.dateRange, c.country)
                             if (!est) return null
                             return (
                               <div
                                 className="mt-1 text-sm font-semibold tabular-nums text-amber-400 flex items-center gap-1 justify-end"
-                                title={ESTIMATE_TOOLTIP}
+                                title={estimateTooltipFor(c.country)}
                               >
                                 <Users className="h-3.5 w-3.5" />
                                 ~{formatNumber(est)} real

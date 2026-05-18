@@ -223,21 +223,70 @@ methodology defect. Our current `audience-estimator.ts` returns ~109 M
 for the master, which is above this ceiling — confirming that the
 empirical-constant approach is over-generous.
 
-### 3.5 Multi-device factor — rationale for 0.80
+### 3.5 Multi-device factor κ_md — per-country calibration
 
-Given approximately 1.25 mobile connections per smartphone-owning adult
-(phones plus a fraction owning tablets and/or work phones), the inverse
-yields `κ_md = 1 / 1.25 = 0.80`. This is the only empirical constant
-that survives in our model after adopting §3.3. Sensitivity analysis:
+κ_md is no longer a single global constant. It depends on (a) the share
+of the population that owns ≥1 mobile device — the "subscriber
+penetration" — and (b) how many MAID-emitting devices that subscriber
+owns on average (smartphone + tablet + dual-phone). The single global
+0.80 from earlier drafts was the inverse of the Bankmycell global
+average 1.25 connections per smartphone-owning adult; in practice that
+number varies between developed-market 1.45 (UK / DE) and emerging-
+market 1.10 (MX) territory, so we now carry one row per country.
 
-| Multi-device value | κ_md | Mexico Resident (preliminary) |
-|---|---|---|
-| 1.10 (conservative) | 0.91 | 77 M |
-| 1.25 (baseline) | 0.80 | 68 M |
-| 1.50 (high) | 0.67 | 57 M |
+Per-country parameters live in
+[`lib/country-params.ts`](../lib/country-params.ts) (single source of
+truth, expandable). The five markets currently calibrated:
 
-Calibration improvements will require ground-truth overlap data
-(panel survey or CRM cross-reference) which we do not currently have.
+| Country | Pop (M) | Subscriber pen | Devices / subscriber | κ_md | MAID ceiling (M) |
+|---|---:|---:|---:|---:|---:|
+| MX | 131  | 73 % | 1.15 | 0.87 | 110 |
+| ES | 47.9 | 85 % | 1.27 | 0.79 |  52 |
+| FR | 66.6 | 85 % | 1.35 | 0.74 |  76 |
+| DE | 83.9 | 85 % | 1.43 | 0.70 | 102 |
+| UK | 69.4 | 85 % | 1.45 | 0.69 |  86 |
+
+`maid_ceiling = pop × subscriber_pen × devices_per_subscriber` — the
+upper-bound MAID universe in the country. `Unique_MAIDs(c) >
+maid_ceiling(c)` indicates bot inflation / IDFA churn / methodology
+drift and is flagged in the estimator before any client-facing
+number is shown.
+
+#### Sources (cited inline in `lib/country-params.ts`)
+
+- **MX subscriber penetration (73 %, direct)**: GSMA *Mobile Economy
+  Latin America 2025*, p. 6 (Mexico panel).
+  → https://www.gsma.com/solutions-and-impact/connectivity-for-good/mobile-economy/wp-content/uploads/2025/05/GSMA_Latam_ME2025_R_Web.pdf
+- **EU subscriber penetration (~85 %, regional aggregate)**: GSMA
+  *Mobile Economy Europe 2025* (89 % forecast for 2030, current ≈ 85 %).
+  → https://www.gsma.com/solutions-and-impact/connectivity-for-good/mobile-economy/europe/
+- **Population + mobile connections per country**: DataReportal
+  *Digital 2025* / *Digital 2026* country reports.
+  → https://datareportal.com/reports/digital-2025-mexico
+  → https://datareportal.com/reports/digital-2025-spain
+  → https://datareportal.com/reports/digital-2025-france
+  → https://datareportal.com/reports/digital-2026-germany
+  → https://datareportal.com/reports/digital-2025-united-kingdom
+- **Tablet penetration among smartphone owners** (EU5): Comscore —
+  UK 17.7 %, ES 16.9 %, DE 12.8 %; FR interpolated; MX extrapolated.
+  → https://www.comscore.com/Insights/Infographics/15-5-percent-of-European-Smartphone-Owners-Have-a-Tablet
+- **Dual-phone / work-phone share**: developed-market typical 25–30 %,
+  emerging-market 5–10 %. Not directly measured per country yet —
+  listed under `calibration_debt` in `country-params.ts`.
+
+#### Calibration debt (be honest with the client)
+
+- EU subscriber penetration is a regional aggregate; ES / FR / DE / UK
+  specific numbers would tighten the ceiling by ±5 %.
+- MX tablet share is extrapolated from EU5, not measured. Could be off
+  by ±5 percentage points.
+- Dual-phone share is industry-typical, not market-measured for any of
+  the five countries.
+- Ofcom *Mobile Matters 2025* likely carries UK-direct subscriber
+  numbers — fetch pending (PDF blocked at 403 from headless tools).
+
+Adding a country is a one-row append to `COUNTRY_PARAMS` in
+`lib/country-params.ts` plus its citations; no code changes elsewhere.
 
 ---
 
