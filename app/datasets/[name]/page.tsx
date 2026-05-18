@@ -184,6 +184,25 @@ export default function DatasetAnalysisPage() {
   const [categoryAffinityData, setCategoryAffinityData] = useState<any>(null);
   const [loadingCategoryAffinity, setLoadingCategoryAffinity] = useState(false);
   const [reportVersion, setReportVersion] = useState(0);
+
+  // Resident audience (METHODOLOGY §3.3). Lazy — only fetched / computed
+  // when the user clicks "Count residents". Returns the 3-tier audience
+  // breakdown (MAIDs → Users → Residents) keyed to the dataset's country.
+  const [residentReport, setResidentReport] = useState<{
+    residentMaids: number;
+    residentUsers: number;
+    uniqueMaids: number | null;
+    uniqueUsers: number | null;
+    kappaMd: number;
+    maidCeilingM: number;
+    overCeiling: boolean;
+    weeksInWindow: number;
+    activeWeeksFloor: number;
+    country: string;
+    analyzedAt: string;
+  } | null>(null);
+  const [residentLoading, setResidentLoading] = useState(false);
+  const [residentProgress, setResidentProgress] = useState<string>('');
   const [selectedPoiIds, setSelectedPoiIds] = useState<string[]>([]);
   const [nseModalOpen, setNseModalOpen] = useState(false);
   const [categoryMaidModalOpen, setCategoryMaidModalOpen] = useState(false);
@@ -515,6 +534,59 @@ export default function DatasetAnalysisPage() {
       toast({ title: 'Activation failed', description: e.message, variant: 'destructive' });
     } finally {
       setActivating(false);
+    }
+  };
+
+  // Auto-load cached resident report on mount + when reset bumps version.
+  useEffect(() => {
+    let cancelled = false;
+    setResidentReport(null);
+    setResidentProgress('');
+    fetch(`/api/datasets/${encodeURIComponent(datasetName)}/audience-counter`, {
+      method: 'GET', credentials: 'include',
+    })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (cancelled) return;
+        if (data?.phase === 'done' && data.report) setResidentReport(data.report);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [datasetName, reportVersion]);
+
+  // Trigger / poll the Resident audience-counter endpoint. Multiphase:
+  // each POST advances one phase server-side; we poll every 3 s until
+  // we hit either 'done' or 'error'.
+  const handleCountResidents = async () => {
+    if (residentLoading) return;
+    setResidentLoading(true);
+    setResidentProgress('Starting…');
+    setResidentReport(null);
+    try {
+      for (let i = 0; i < 60; i++) {
+        const res = await fetch(`/api/datasets/${encodeURIComponent(datasetName)}/audience-counter`, {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(i === 0 ? { force: true } : {}),
+        });
+        const data = await res.json();
+        if (!res.ok || data?.phase === 'error') {
+          throw new Error(data?.error || `HTTP ${res.status}`);
+        }
+        if (data.phase === 'done' && data.report) {
+          setResidentReport(data.report);
+          setResidentProgress('');
+          return;
+        }
+        if (data.progress?.message) setResidentProgress(data.progress.message);
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+      throw new Error('Timed out waiting for Athena (3 minutes).');
+    } catch (e: any) {
+      toast({ title: 'Resident count failed', description: e.message, variant: 'destructive' });
+      setResidentProgress('');
+    } finally {
+      setResidentLoading(false);
     }
   };
 
@@ -1020,8 +1092,51 @@ export default function DatasetAnalysisPage() {
                       className="text-xs text-amber-400 mt-1 cursor-help inline-flex items-center gap-1"
                       title={estimateTooltipFor(country)}
                     >
-                      ~{est.toLocaleString()} estimated real{country ? ` (${country})` : ''}
+                      ~{est.toLocaleString()} unique users{country ? ` (${country})` : ''}
                     </p>
+                  );
+                })()}
+                {/* Tier 3 (METHODOLOGY §3.3) — Resident audience. Either
+                    the cached count + ceiling check, or a button to
+                    trigger the Athena query on demand. */}
+                {(() => {
+                  const country = datasetInfo?.country;
+                  if (!country) return null;
+                  if (residentReport) {
+                    return (
+                      <div
+                        className="mt-1 text-xs text-emerald-400 cursor-help"
+                        title={
+                          `Resident audience (METHODOLOGY §3.3): MAIDs with a stable home in ${residentReport.country} ` +
+                          `(home_confidence ≥ 0.5, n_nights ≥ 3) AND active in ≥ ${residentReport.activeWeeksFloor} / ${residentReport.weeksInWindow} ISO weeks of the window. ` +
+                          `× κ_md = ${residentReport.kappaMd.toFixed(2)} → unique users. ` +
+                          `MAID ceiling for ${residentReport.country}: ${residentReport.maidCeilingM}M.`
+                        }
+                      >
+                        ~{residentReport.residentUsers.toLocaleString()} residents
+                        {residentReport.overCeiling ? ' ⚠ over ceiling' : ''}
+                        <span className="text-muted-foreground/70 ml-1">
+                          ({residentReport.residentMaids.toLocaleString()} MAIDs)
+                        </span>
+                      </div>
+                    );
+                  }
+                  if (residentLoading) {
+                    return (
+                      <div className="mt-1 text-xs text-muted-foreground inline-flex items-center gap-1">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        {residentProgress || 'Counting residents…'}
+                      </div>
+                    );
+                  }
+                  return (
+                    <button
+                      className="mt-1 text-xs text-muted-foreground hover:text-emerald-400 underline decoration-dotted underline-offset-2 transition-colors"
+                      onClick={handleCountResidents}
+                      title="Run the Resident audience query (METHODOLOGY §3.3). Requires the home table — Analyze must have run first."
+                    >
+                      Count residents →
+                    </button>
                   );
                 })()}
               </CardContent>

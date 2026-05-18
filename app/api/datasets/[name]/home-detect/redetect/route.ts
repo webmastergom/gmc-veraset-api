@@ -192,6 +192,7 @@ export async function POST(
     { step: 'report_state', key: `config/dataset-report-state/${datasetName}.json` },
     { step: 'catchment_state', key: `config/catchment-state/${datasetName}.json` },
     { step: 'analysis_state', key: `config/analysis-state/${datasetName}.json` },
+    { step: 'audience_counter_state', key: `config/audience-counter-state/${datasetName}.json` },
   ];
 
   const steps: StepResult[] = [];
