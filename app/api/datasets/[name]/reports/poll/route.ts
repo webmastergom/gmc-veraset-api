@@ -1556,7 +1556,17 @@ export async function POST(
 
     return NextResponse.json({ phase: state?.phase || 'unknown' });
   } catch (err: any) {
-    console.error(`[DS-REPORT] ${datasetName}:`, err.message);
-    return NextResponse.json({ error: err.message, phase: 'error' }, { status: 500 });
+    // The previous version logged only `err.message`, which is `undefined`
+    // for non-Error throws (string literals, plain objects, etc.) — in
+    // those cases the API returned `{phase:"error"}` with no error field
+    // and the browser showed "Server error 500" with zero diagnostic
+    // signal. Stringify the whole thing so the next 500 surfaces what
+    // actually went wrong.
+    const msg = err?.message
+      || (err?.toString && err.toString())
+      || (() => { try { return JSON.stringify(err); } catch { return 'unknown error'; } })();
+    const stack = err?.stack || '';
+    console.error(`[DS-REPORT] ${datasetName}:`, msg, stack);
+    return NextResponse.json({ error: msg, phase: 'error' }, { status: 500 });
   }
 }

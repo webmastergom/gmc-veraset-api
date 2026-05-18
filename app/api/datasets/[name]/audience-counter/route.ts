@@ -89,12 +89,33 @@ export async function POST(
     }
   }
 
-  // Resolve country from the basic dataset analysis if the caller didn't
-  // override it. Without a country we can't apply κ_md, so we refuse.
+  // Resolve country with a 3-tier fallback. Without a country we can't
+  // apply κ_md, so we refuse — but we try every place it might live.
+  //
+  //   1. Explicit override in the request body (caller knows best).
+  //   2. The basic dataset analysis blob — populated when Analyze runs.
+  //      This is the historical source and is the FIRST thing we look at
+  //      because it's local + cheap.
+  //   3. The job's `country` field — set by the user via the per-job
+  //      country selector. The previous version of this route only
+  //      checked (1) + (2), which produced a recurring "Country is not
+  //      set" false negative whenever the user assigned a country AFTER
+  //      Analyze had run (so `dataset-analysis.country` was undefined
+  //      while `job.country` was already correct).
   let country = overrideCountry || '';
   if (!country) {
     const analysis = await getConfig<any>(`dataset-analysis/${datasetName}`);
     country = (analysis?.country || '').toUpperCase();
+  }
+  if (!country) {
+    try {
+      const { getAllJobsSummary } = await import('@/lib/jobs');
+      const jobs = await getAllJobsSummary();
+      const job = jobs.find(j => j.s3DestPath?.includes(datasetName));
+      country = (job?.country || '').toUpperCase();
+    } catch (e: any) {
+      console.warn(`[AUDIENCE-COUNTER] job.country fallback failed: ${e.message}`);
+    }
   }
   if (!country) {
     return NextResponse.json({
