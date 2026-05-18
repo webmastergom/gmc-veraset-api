@@ -1096,16 +1096,17 @@ export default function DatasetAnalysisPage() {
                     </p>
                   );
                 })()}
-                {/* Tier 3 (METHODOLOGY §3.3) — Resident audience. Either
-                    the cached count + ceiling check, or a button to
-                    trigger the Athena query on demand. */}
+                {/* Tier 3 (METHODOLOGY §3.3) — Resident audience.
+                    Always rendered when analysis exists so the user
+                    can find the feature; shows the cached count, the
+                    in-progress spinner, the run-button, or a hint that
+                    a country must be assigned, depending on state. */}
                 {(() => {
                   const country = datasetInfo?.country;
-                  if (!country) return null;
                   if (residentReport) {
                     return (
                       <div
-                        className="mt-1 text-xs text-emerald-400 cursor-help"
+                        className="mt-2 text-sm font-semibold tabular-nums text-emerald-400 cursor-help inline-flex items-center gap-1"
                         title={
                           `Resident audience (METHODOLOGY §3.3): MAIDs with a stable home in ${residentReport.country} ` +
                           `(home_confidence ≥ 0.5, n_nights ≥ 3) AND active in ≥ ${residentReport.activeWeeksFloor} / ${residentReport.weeksInWindow} ISO weeks of the window. ` +
@@ -1115,7 +1116,7 @@ export default function DatasetAnalysisPage() {
                       >
                         ~{residentReport.residentUsers.toLocaleString()} residents
                         {residentReport.overCeiling ? ' ⚠ over ceiling' : ''}
-                        <span className="text-muted-foreground/70 ml-1">
+                        <span className="text-xs text-muted-foreground/70 ml-1 font-normal">
                           ({residentReport.residentMaids.toLocaleString()} MAIDs)
                         </span>
                       </div>
@@ -1123,19 +1124,26 @@ export default function DatasetAnalysisPage() {
                   }
                   if (residentLoading) {
                     return (
-                      <div className="mt-1 text-xs text-muted-foreground inline-flex items-center gap-1">
-                        <Loader2 className="h-3 w-3 animate-spin" />
+                      <div className="mt-2 text-sm text-muted-foreground inline-flex items-center gap-1.5">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         {residentProgress || 'Counting residents…'}
                       </div>
                     );
                   }
+                  if (!country) {
+                    return (
+                      <p className="mt-2 text-xs text-muted-foreground italic">
+                        Assign a country on the job to count residents.
+                      </p>
+                    );
+                  }
                   return (
                     <button
-                      className="mt-1 text-xs text-muted-foreground hover:text-emerald-400 underline decoration-dotted underline-offset-2 transition-colors"
+                      className="mt-2 text-sm font-medium text-emerald-400 hover:text-emerald-300 underline decoration-dotted underline-offset-2 transition-colors inline-flex items-center gap-1"
                       onClick={handleCountResidents}
-                      title="Run the Resident audience query (METHODOLOGY §3.3). Requires the home table — Analyze must have run first."
+                      title={`Run the Resident audience query for ${country} (METHODOLOGY §3.3). Requires the home table — Analyze must have run first.`}
                     >
-                      Count residents →
+                      Count residents ({country}) →
                     </button>
                   );
                 })()}
