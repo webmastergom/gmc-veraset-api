@@ -18,6 +18,7 @@ import { s3Client, BUCKET } from './s3-config';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getAllJobsSummary } from './jobs';
 import { registerAthenaContribution, masterTableName } from './master-maids';
+import { qualifiedAdIdsCTE } from './bot-filter';
 import type { AnalysisResult, DailyData, VisitByPoi } from './dataset-analysis';
 
 // ── State ────────────────────────────────────────────────────────────
@@ -165,30 +166,41 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
     const dateFrom = allDates[0];
     const dateTo = allDates[allDates.length - 1];
 
-    // Start the 3 analysis queries in parallel
+    // All counts below restrict to the qualified MAID set — ad_ids
+    // observed on ≥ MIN_DISTINCT_DAYS distinct dates inside the
+    // window. Strips ~30-70 % bot / IDFA-churn / ad-fraud-SDK noise
+    // that otherwise inflates "Unique devices" beyond the country
+    // ceiling. See lib/bot-filter.ts.
+    const qualifiedCTE = qualifiedAdIdsCTE(tableName, dateFrom, dateTo);
+
     const dailySql = `
-      SELECT date, COUNT(*) as pings, COUNT(DISTINCT ad_id) as devices
-      FROM ${tableName}
-      WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-      GROUP BY date ORDER BY date ASC
+      WITH ${qualifiedCTE}
+      SELECT t.date, COUNT(*) as pings, COUNT(DISTINCT t.ad_id) as devices
+      FROM ${tableName} t
+      INNER JOIN qualified_ad_ids q ON t.ad_id = q.ad_id
+      WHERE t.date >= '${dateFrom}' AND t.date <= '${dateTo}'
+      GROUP BY t.date ORDER BY t.date ASC
     `;
 
     const summarySql = `
-      SELECT COUNT(*) as total_pings, COUNT(DISTINCT ad_id) as unique_devices,
+      WITH ${qualifiedCTE}
+      SELECT COUNT(*) as total_pings, COUNT(DISTINCT t.ad_id) as unique_devices,
         COUNT(DISTINCT poi_id) as unique_pois
-      FROM ${tableName} CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+      FROM ${tableName} t
+      INNER JOIN qualified_ad_ids q ON t.ad_id = q.ad_id
+      CROSS JOIN UNNEST(t.poi_ids) AS u(poi_id)
+      WHERE t.date >= '${dateFrom}' AND t.date <= '${dateTo}'
         AND poi_id IS NOT NULL AND poi_id != ''
     `;
 
     const visitsByPoiSql = `
-      SELECT poi_id, COUNT(*) as visits, COUNT(DISTINCT ad_id) as devices
-      FROM ${tableName} CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
+      WITH ${qualifiedCTE}
+      SELECT poi_id, COUNT(*) as visits, COUNT(DISTINCT t.ad_id) as devices
+      FROM ${tableName} t
+      INNER JOIN qualified_ad_ids q ON t.ad_id = q.ad_id
+      CROSS JOIN UNNEST(t.poi_ids) AS u(poi_id)
+      WHERE t.date >= '${dateFrom}' AND t.date <= '${dateTo}'
         AND poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
       GROUP BY poi_id ORDER BY visits DESC
     `;
 
@@ -209,11 +221,9 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
           CREATE TABLE ${plainTable}
           WITH (format='PARQUET', parquet_compression='SNAPPY',
                 external_location='s3://${BUCKET}/athena-temp/${plainTable}/')
-          AS SELECT DISTINCT ad_id FROM ${tableName}
-          CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-          WHERE date >= '${dateFrom}' AND date <= '${dateTo}'
-            AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-            AND poi_id IS NOT NULL AND poi_id != ''
+          AS
+          WITH ${qualifiedAdIdsCTE(tableName, dateFrom, dateTo)}
+          SELECT ad_id FROM qualified_ad_ids
         `;
 
         const catchmentCtas = `
@@ -221,13 +231,13 @@ export async function analyzeMultiPhase(datasetName: string): Promise<AnalysisSt
           WITH (format='PARQUET', parquet_compression='SNAPPY',
                 external_location='s3://${BUCKET}/athena-temp/${catchmentTable}/')
           AS
-          WITH poi_visitors AS (
-            SELECT ad_id, date FROM ${tableName}
-            CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-            WHERE poi_id IS NOT NULL AND poi_id != ''
-              AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-              AND date >= '${dateFrom}' AND date <= '${dateTo}'
-            GROUP BY ad_id, date
+          WITH ${qualifiedAdIdsCTE(tableName, dateFrom, dateTo)},
+          poi_visitors AS (
+            SELECT t.ad_id, t.date FROM ${tableName} t
+            INNER JOIN qualified_ad_ids q ON t.ad_id = q.ad_id
+            WHERE CARDINALITY(t.poi_ids) > 0
+              AND t.date >= '${dateFrom}' AND t.date <= '${dateTo}'
+            GROUP BY t.ad_id, t.date
           ),
           origins AS (
             SELECT pv.ad_id,

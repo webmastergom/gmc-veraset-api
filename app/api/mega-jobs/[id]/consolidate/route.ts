@@ -43,6 +43,7 @@ import {
 } from '@/lib/athena';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { homeTableExists, startHomeDetection, pollHomeDetection } from '@/lib/home-detector';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from '@/lib/bot-filter';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -142,7 +143,11 @@ export async function POST(
     let dwellFilter: DwellFilter | undefined;
     let hourFrom: number | undefined;
     let hourTo: number | undefined;
-    let minVisits: number | undefined;
+    // Bot-filter floor: never let mega-job consolidation count 1-day
+    // ghost MAIDs (ad fraud, IDFA rotation, web pixels). Empirical
+    // audit (2026-05-18) shows ≥30 % of distinct ad_ids per market
+    // are 1-day-1-cell garbage. See lib/bot-filter.ts.
+    let minVisits: number = MIN_DISTINCT_DAYS_FOR_HUMAN_MAID;
     let gpsOnly: boolean | undefined;
     let maxCircleScore: number | undefined;
     let daysOfWeek: number[] | undefined;
@@ -154,7 +159,7 @@ export async function POST(
       if (body?.dwellFilter) dwellFilter = body.dwellFilter;
       if (typeof body?.hourFrom === 'number' && body.hourFrom >= 0 && body.hourFrom <= 23) hourFrom = body.hourFrom;
       if (typeof body?.hourTo === 'number' && body.hourTo >= 0 && body.hourTo <= 23) hourTo = body.hourTo;
-      if (typeof body?.minVisits === 'number' && body.minVisits > 1) minVisits = body.minVisits;
+      if (typeof body?.minVisits === 'number') minVisits = Math.max(body.minVisits, MIN_DISTINCT_DAYS_FOR_HUMAN_MAID);
       if (body?.gpsOnly === true) gpsOnly = true;
       if (typeof body?.maxCircleScore === 'number' && body.maxCircleScore > 0) maxCircleScore = body.maxCircleScore;
       if (Array.isArray(body?.daysOfWeek)) {

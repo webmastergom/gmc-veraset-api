@@ -18,6 +18,7 @@ import {
 } from '@/lib/mega-report-consolidation';
 import { batchReverseGeocode, setCountryFilter } from '@/lib/reverse-geocode';
 import { homeTableExists, homeTableName, startHomeDetection, pollHomeDetection } from '@/lib/home-detector';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from '@/lib/bot-filter';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -844,7 +845,12 @@ export async function POST(
     let maxDwell = 0;
     let hourFrom = 0;
     let hourTo = 23;
-    let minVisits = 1;
+    // Bot-filter floor: never show 1-day ghost MAIDs (ad fraud, IDFA
+    // rotation, web pixels). Empirical audit (2026-05-18) shows ≥30 %
+    // of distinct ad_ids per market are 1-day, 1-3 ping, 1-cell. See
+    // lib/bot-filter.ts. The user can still set a stricter minVisits
+    // via the UI (e.g. 5 for "regulars") but cannot go below 2.
+    let minVisits = MIN_DISTINCT_DAYS_FOR_HUMAN_MAID;
     let gpsOnly = false;
     let maxCircleScore = 0;
     let daysOfWeek: number[] = [];
@@ -856,7 +862,7 @@ export async function POST(
       if (body?.maxDwell) maxDwell = parseInt(body.maxDwell, 10) || 0;
       if (body?.hourFrom != null) hourFrom = Math.max(0, Math.min(23, parseInt(body.hourFrom, 10) || 0));
       if (body?.hourTo != null) hourTo = Math.max(0, Math.min(23, parseInt(body.hourTo, 10) || 23));
-      if (body?.minVisits) minVisits = parseInt(body.minVisits, 10) || 1;
+      if (body?.minVisits) minVisits = Math.max(parseInt(body.minVisits, 10) || MIN_DISTINCT_DAYS_FOR_HUMAN_MAID, MIN_DISTINCT_DAYS_FOR_HUMAN_MAID);
       if (body?.gpsOnly === true) gpsOnly = true;
       if (typeof body?.maxCircleScore === 'number' && body.maxCircleScore > 0) {
         maxCircleScore = body.maxCircleScore;
