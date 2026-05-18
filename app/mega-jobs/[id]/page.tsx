@@ -110,7 +110,11 @@ export default function MegaJobDetailPage() {
   const [hourFrom, setHourFrom] = useState<number>(0)
   const [hourTo, setHourTo] = useState<number>(23)
   // Minimum number of distinct visit-days per ad_id
-  const [minVisits, setMinVisits] = useState<number>(1)
+  // Bot-filter floor: the mega-job consolidation route enforces ≥ 2
+  // distinct visit-days per ad_id (METHODOLOGY §3.6, lib/bot-filter.ts).
+  // UI default matches the server floor so the dropdown is not out
+  // of sync with what consolidation will count.
+  const [minVisits, setMinVisits] = useState<number>(2)
   // FULL-schema GPS-only filter (no-op on BASIC datasets)
   const [gpsOnly, setGpsOnly] = useState<boolean>(false)
   // FULL-schema ping_circle_score threshold (0 = off; lower = tighter)
@@ -600,14 +604,17 @@ export default function MegaJobDetailPage() {
                   ))}
                 </select>
               </div>
-              <div className="flex items-center gap-1">
+              <div
+                className="flex items-center gap-1"
+                title="Minimum distinct visit-days per device. The consolidation route floors this at 2 (anti-bot filter — see METHODOLOGY §3.6)."
+              >
                 <label className="text-xs text-muted-foreground whitespace-nowrap">Min Visits:</label>
                 <select
                   value={minVisits}
                   onChange={(e) => setMinVisits(parseInt(e.target.value, 10))}
                   className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
                 >
-                  {[1, 2, 3, 5, 10, 15, 20].map((n) => (
+                  {[2, 3, 5, 10, 15, 20].map((n) => (
                     <option key={n} value={n}>{n}+</option>
                   ))}
                 </select>

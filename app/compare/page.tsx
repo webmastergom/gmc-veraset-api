@@ -267,7 +267,7 @@ export default function ComparePage() {
   const [maxDwellA, setMaxDwellA] = useState(0);
   const [hourFromA, setHourFromA] = useState(0);
   const [hourToA, setHourToA] = useState(23);
-  const [minVisitsA, setMinVisitsA] = useState(1);
+  const [minVisitsA, setMinVisitsA] = useState(2);  // bot-filter floor (lib/bot-filter.ts)
   const [exportFileA, setExportFileA] = useState('');
   const [exportsA, setExportsA] = useState<ExportOption[]>([]);
   const [loadingExportsA, setLoadingExportsA] = useState(false);
@@ -279,7 +279,7 @@ export default function ComparePage() {
   const [maxDwellB, setMaxDwellB] = useState(0);
   const [hourFromB, setHourFromB] = useState(0);
   const [hourToB, setHourToB] = useState(23);
-  const [minVisitsB, setMinVisitsB] = useState(1);
+  const [minVisitsB, setMinVisitsB] = useState(2);  // bot-filter floor (lib/bot-filter.ts)
   const [exportFileB, setExportFileB] = useState('');
   const [exportsB, setExportsB] = useState<ExportOption[]>([]);
   const [loadingExportsB, setLoadingExportsB] = useState(false);

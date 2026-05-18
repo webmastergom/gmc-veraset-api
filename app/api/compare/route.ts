@@ -9,6 +9,7 @@ import {
   runQuery,
 } from '@/lib/athena';
 import { getConfig, putConfig, s3Client, BUCKET } from '@/lib/s3-config';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from '@/lib/bot-filter';
 // NOTE: @/lib/jobs, @/lib/reverse-geocode, @/lib/poi-storage are imported dynamically
 // inside the specific phases that need them. Keeping them out of the module-level
 // import graph reduces the Lambda cold-start bundle. @/lib/poi-storage in particular
@@ -199,7 +200,11 @@ function maidSubquery(side: DatasetSide, tableName: string, keptCoords?: KeptCoo
   const maxDwell = side.maxDwell || 0;
   const hourFrom = side.hourFrom ?? 0;
   const hourTo = side.hourTo ?? 23;
-  const minVisits = Math.max(1, side.minVisits || 1);
+  // Bot-filter floor: ≥ 2 distinct visit-days (lib/bot-filter.ts).
+  // Strips 30-70 % of raw MAIDs that are 1-day ad-fraud / IDFA-churn
+  // ghosts. Compare numbers were inflating the "shared MAIDs"
+  // overlap on both sides; floor brings them back inside κ_md ceiling.
+  const minVisits = Math.max(MIN_DISTINCT_DAYS_FOR_HUMAN_MAID, side.minVisits || MIN_DISTINCT_DAYS_FOR_HUMAN_MAID);
   const hasHourFilter = hourFrom > 0 || hourTo < 23;
   const hasDwellFilter = minDwell > 0 || maxDwell > 0;
   const hasVisitFilter = minVisits > 1;

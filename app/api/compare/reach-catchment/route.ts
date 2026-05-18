@@ -26,6 +26,7 @@ import {
   getTableName,
 } from '@/lib/athena';
 import { getConfig, putConfig, BUCKET, s3Client } from '@/lib/s3-config';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from '@/lib/bot-filter';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 
 export const dynamic = 'force-dynamic';
@@ -112,7 +113,8 @@ function buildSourceFilterSQL(f?: SourceFilters): { hourClause: string; dwellHav
   if (minDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) >= ${minDwell}`);
   if (maxDwell > 0) dwellParts.push(`DATE_DIFF('minute', MIN(utc_timestamp), MAX(utc_timestamp)) <= ${maxDwell}`);
   const dwellHaving = dwellParts.length > 0 ? `HAVING ${dwellParts.join(' AND ')}` : '';
-  const minVisits = Math.max(1, f?.minVisits ?? 1);
+  // Bot-filter floor (lib/bot-filter.ts) — strips 1-day ghost MAIDs.
+  const minVisits = Math.max(MIN_DISTINCT_DAYS_FOR_HUMAN_MAID, f?.minVisits ?? MIN_DISTINCT_DAYS_FOR_HUMAN_MAID);
   return { hourClause, dwellHaving, minVisits };
 }
 

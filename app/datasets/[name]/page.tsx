@@ -156,7 +156,12 @@ export default function DatasetAnalysisPage() {
   // Hour filter
   const [hourFrom, setHourFrom] = useState<number>(0);
   const [hourTo, setHourTo] = useState<number>(23);
-  const [minVisits, setMinVisits] = useState<number>(1);
+  // Bot-filter floor: the reports/poll route enforces ≥ 2 distinct
+  // visit-days per ad_id (METHODOLOGY §3.6, lib/bot-filter.ts) to
+  // strip ad-fraud SDKs and IDFA-churn ghosts (30-70 % of raw MAIDs
+  // depending on market). UI defaults match the server floor so the
+  // dropdown is never out of sync with what the backend will return.
+  const [minVisits, setMinVisits] = useState<number>(2);
   const [gpsOnly, setGpsOnly] = useState<boolean>(false);
   const [maxCircleScore, setMaxCircleScore] = useState<number>(0);
   // Day-of-week filter (ISO 8601: 1=Mon..7=Sun). Empty = all days.
@@ -808,7 +813,10 @@ export default function DatasetAnalysisPage() {
               ))}
             </select>
           </div>
-          <div className="flex items-center gap-1 mr-2">
+          <div
+            className="flex items-center gap-1 mr-2"
+            title="Minimum distinct visit-days per device. The server floor is 2 (anti-bot filter — see METHODOLOGY §3.6). Bumping higher narrows to regulars / residents."
+          >
             <label className="text-xs text-muted-foreground whitespace-nowrap">Min Visits:</label>
             <select
               value={minVisits}
@@ -818,7 +826,7 @@ export default function DatasetAnalysisPage() {
               }}
               className="h-8 w-16 rounded-md border border-input bg-background px-1 text-sm text-center"
             >
-              {[1, 2, 3, 5, 10, 15, 20].map(n => (
+              {[2, 3, 5, 10, 15, 20].map(n => (
                 <option key={n} value={n}>{n}+</option>
               ))}
             </select>

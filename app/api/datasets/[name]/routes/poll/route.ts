@@ -18,6 +18,7 @@ import {
   runQuery,
 } from '@/lib/athena';
 import { getConfig, putConfig } from '@/lib/s3-config';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from '@/lib/bot-filter';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -359,7 +360,7 @@ export async function POST(
       maxDwell: parseInt(body.maxDwell, 10) || 0,
       hourFrom: parseInt(body.hourFrom, 10) || 0,
       hourTo: body.hourTo != null ? parseInt(body.hourTo, 10) : 23,
-      minVisits: parseInt(body.minVisits, 10) || 1,
+      minVisits: Math.max(parseInt(body.minVisits, 10) || MIN_DISTINCT_DAYS_FOR_HUMAN_MAID, MIN_DISTINCT_DAYS_FOR_HUMAN_MAID),
     };
 
     const fKey = filtersKey(filters);

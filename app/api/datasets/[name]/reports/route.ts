@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { getConfig } from '@/lib/s3-config';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from '@/lib/bot-filter';
 
 export const dynamic = 'force-dynamic';
 
@@ -48,7 +49,9 @@ export async function GET(
   const effectiveDwellMin = dwellMin || legacyBucket;
   const hourFrom = parseInt(request.nextUrl.searchParams.get('hourFrom') || '0', 10) || 0;
   const hourTo = parseInt(request.nextUrl.searchParams.get('hourTo') || '23', 10);
-  const minVisits = parseInt(request.nextUrl.searchParams.get('minVisits') || '1', 10) || 1;
+  // Bot-filter floor (lib/bot-filter.ts) — match what the poll route writes.
+  const rawMinVisits = parseInt(request.nextUrl.searchParams.get('minVisits') || '0', 10);
+  const minVisits = Math.max(MIN_DISTINCT_DAYS_FOR_HUMAN_MAID, rawMinVisits || MIN_DISTINCT_DAYS_FOR_HUMAN_MAID);
   const gpsOnly = request.nextUrl.searchParams.get('gpsOnly') === 'true';
   const maxCircleScore = parseFloat(request.nextUrl.searchParams.get('maxCircleScore') || '0') || 0;
   const daysOfWeekParam = request.nextUrl.searchParams.get('daysOfWeek') || '';
