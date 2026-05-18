@@ -967,6 +967,52 @@ export default function DatasetAnalysisPage() {
               <><Play className="mr-2 h-4 w-4" />Analyze</>
             )}
           </Button>
+          {/* Resident audience counter — METHODOLOGY §3.3. Always visible
+              (no longer gated on `analysis` being loaded) so the user can
+              run the Tier-3 count without first sitting through a 60-90 s
+              basic Analyze pass. */}
+          {(() => {
+            const country = datasetInfo?.country;
+            if (residentReport) {
+              return (
+                <Button
+                  variant="outline"
+                  onClick={handleCountResidents}
+                  disabled={residentLoading}
+                  className="border-emerald-500/40 text-emerald-300 hover:text-emerald-200 hover:bg-emerald-500/10"
+                  title={
+                    `Resident audience (METHODOLOGY §3.3): MAIDs with a stable home in ${residentReport.country} ` +
+                    `(home_confidence ≥ 0.5, n_nights ≥ 3) AND active in ≥ ${residentReport.activeWeeksFloor} / ${residentReport.weeksInWindow} ISO weeks of the window. ` +
+                    `× κ_md = ${residentReport.kappaMd.toFixed(2)} → unique users. ` +
+                    `MAID ceiling for ${residentReport.country}: ${residentReport.maidCeilingM}M. ` +
+                    `Click to re-run.`
+                  }
+                >
+                  <Home className="mr-2 h-4 w-4" />
+                  ~{residentReport.residentUsers.toLocaleString()} residents
+                  {residentReport.overCeiling ? ' ⚠' : ''}
+                </Button>
+              );
+            }
+            return (
+              <Button
+                variant="outline"
+                onClick={handleCountResidents}
+                disabled={residentLoading || !country}
+                title={
+                  !country
+                    ? 'Assign a country on the job first (job detail page → country selector).'
+                    : `Run the Resident audience query for ${country} (METHODOLOGY §3.3). Requires the home-detection table — will auto-trigger Analyze if missing.`
+                }
+              >
+                {residentLoading ? (
+                  <><Loader2 className="mr-2 h-4 w-4 animate-spin" />{residentProgress || 'Counting residents…'}</>
+                ) : (
+                  <><Home className="mr-2 h-4 w-4" />Count residents{country ? ` (${country})` : ''}</>
+                )}
+              </Button>
+            );
+          })()}
           <Button variant="outline" onClick={handleDownloadFull} disabled={downloadingFull}>
             {downloadingFull ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}
             Download full dataset
