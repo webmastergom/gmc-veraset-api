@@ -25,6 +25,29 @@
 import fs from 'fs';
 import path from 'path';
 import { CATEGORY_GROUPS, CATEGORY_LABELS } from './laboratory-types';
+import { computeAffinityIndexV2 } from './affinity-index-v2';
+
+/**
+ * Apply the v2 percentile-rank composite score onto a set of
+ * AffinityByZip rows. Adapts the row field names (zipCode /
+ * totalVisitDays / avgDwellMinutes) to the v2 helper's canonical shape
+ * (postalCode / totalVisits / avgDwell) and writes affinityIndexV2
+ * back in place.
+ */
+function applyAffinityV2(rows: AffinityByZip[]): void {
+  const v2 = rows.map((r) => ({
+    postalCode: r.zipCode,
+    totalVisits: r.totalVisitDays,
+    uniqueDevices: r.uniqueDevices,
+    avgDwell: r.avgDwellMinutes,
+    avgFrequency: r.avgFrequency,
+    affinityIndexV2: 0,
+  }));
+  computeAffinityIndexV2(v2, { filterPlaceholders: true });
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].affinityIndexV2 = v2[i].affinityIndexV2 || 0;
+  }
+}
 
 /**
  * Human-readable label for a category-affinity export. Used both at
@@ -68,7 +91,8 @@ export interface AffinityByZip {
   totalVisitDays: number;
   avgDwellMinutes: number;
   avgFrequency: number;
-  affinityIndex: number;  // 0-100
+  affinityIndex: number;     // 0-100 (v1 — lift-over-baseline / log-heat)
+  affinityIndexV2: number;   // 1-100 (v2 — percentile-rank composite, uniform spread)
 }
 
 export interface AffinityReport {
@@ -297,6 +321,7 @@ export async function computeAffinityReport(
         avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
         avgFrequency: Math.round(z.avgFreq * 100) / 100,
         affinityIndex: gated ? 0 : scoreFor(liftFor(z.heatCat, z.heatBase)),
+        affinityIndexV2: 0,
       };
     });
 
@@ -362,11 +387,13 @@ export async function computeAffinityReport(
       uniqueDevices: 0, totalVisitDays: 0,
       avgDwellMinutes: 0, avgFrequency: 0,
       affinityIndex: scoreFor(a.lift),
+      affinityIndexV2: 0,
     }));
 
     console.log(`[AFFINITY-LIFT] ${subject}: ${hotCps.length} hot (${gatedCount} gated→0) + ${adjacentCps.length} adjacent (σ_cat=${SIGMA_CAT_KM}km, σ_base=${SIGMA_BASE_KM}km, medianLift=${medianLift.toExponential(2)})`);
 
     const allCps = [...hotCps, ...adjacentCps];
+    applyAffinityV2(allCps);
     allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
 
     return {
@@ -439,6 +466,7 @@ export async function computeAffinityReport(
     avgDwellMinutes: Math.round(z.avgDwell * 10) / 10,
     avgFrequency: Math.round(z.avgFreq * 100) / 100,
     affinityIndex: scoreFor(z.heat),
+    affinityIndexV2: 0,
   }));
 
   const adjacentCps: AffinityByZip[] = adjacentRaw.map(a => ({
@@ -447,11 +475,13 @@ export async function computeAffinityReport(
     uniqueDevices: 0, totalVisitDays: 0,
     avgDwellMinutes: 0, avgFrequency: 0,
     affinityIndex: scoreFor(a.heat),
+    affinityIndexV2: 0,
   }));
 
   console.log(`[AFFINITY] ${subject}: ${hotCps.length} hot + ${adjacentCps.length} adjacent (maxHeat=${maxHeat.toFixed(0)})`);
 
   const allCps = [...hotCps, ...adjacentCps];
+  applyAffinityV2(allCps);
   allCps.sort((a, b) => b.affinityIndex - a.affinityIndex);
 
   return {
@@ -461,13 +491,16 @@ export async function computeAffinityReport(
   };
 }
 
-/** Serialize an AffinityReport as the canonical 8-column CSV used by
- *  the dataset & megajob affinity downloads. Sorted desc by affinity. */
+/** Serialize an AffinityReport as the canonical CSV used by the
+ *  dataset & megajob affinity downloads. Sorted desc by v1 affinity
+ *  for backward compatibility; consumers wanting the uniform-spread
+ *  ranking can sort by affinity_index_v2 client-side. */
 export function affinityReportToCsv(report: AffinityReport): string {
-  const header = 'zip_code,city,country,affinity_index,avg_dwell_min,avg_frequency,unique_devices,total_visit_days';
+  const header = 'zip_code,city,country,affinity_index,affinity_index_v2,avg_dwell_min,avg_frequency,unique_devices,total_visit_days';
   const esc = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   const rows = report.byZipCode.map(r =>
-    [esc(r.zipCode), esc(r.city || ''), esc(r.country || ''), r.affinityIndex,
+    [esc(r.zipCode), esc(r.city || ''), esc(r.country || ''),
+     r.affinityIndex, r.affinityIndexV2,
      r.avgDwellMinutes, r.avgFrequency, r.uniqueDevices, r.totalVisitDays].join(',')
   );
   return [header, ...rows].join('\n');

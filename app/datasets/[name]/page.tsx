@@ -1611,8 +1611,8 @@ export default function DatasetAnalysisPage() {
                   size="sm"
                   onClick={() => {
                     const sorted = [...affinityReport.byZipCode].sort((a: any, b: any) => b.affinityIndex - a.affinityIndex);
-                    const csv = 'zip_code,city,country,affinity_index,avg_dwell_min,avg_frequency,unique_devices,total_visit_days\n' +
-                      sorted.map((z: any) => `${z.zipCode},${z.city},${z.country},${z.affinityIndex},${z.avgDwellMinutes},${z.avgFrequency},${z.uniqueDevices},${z.totalVisitDays}`).join('\n');
+                    const csv = 'zip_code,city,country,affinity_index,affinity_index_v2,avg_dwell_min,avg_frequency,unique_devices,total_visit_days\n' +
+                      sorted.map((z: any) => `${z.zipCode},${z.city},${z.country},${z.affinityIndex},${z.affinityIndexV2 ?? ''},${z.avgDwellMinutes},${z.avgFrequency},${z.uniqueDevices},${z.totalVisitDays}`).join('\n');
                     const blob = new Blob([csv], { type: 'text/csv' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');

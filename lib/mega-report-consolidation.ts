@@ -18,6 +18,7 @@ import {
 } from './mega-consolidation-queries';
 import { getConfig, putConfig } from './s3-config';
 import { megaReportKey } from './mega-jobs';
+import { computeAffinityIndexV2 } from './affinity-index-v2';
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -131,6 +132,10 @@ export interface ConsolidatedAffinityReport {
     city: string;
     country: string;
     affinityIndex: number;
+    /** Percentile-rank composite, integer 1..100 with uniform spread.
+     *  See lib/affinity-index-v2.ts for the algorithm. Prefer this over
+     *  `affinityIndex` for any new surface — v1 bunches in the middle. */
+    affinityIndexV2: number;
     totalVisits: number;
     uniqueDevices: number;
     avgDwell: number;
@@ -820,6 +825,10 @@ export function buildAffinityReport(
     return {
       postalCode: e.postalCode, city: e.city, country: e.country,
       affinityIndex,
+      // affinityIndexV2 is filled in by computeAffinityIndexV2 below.
+      // Initialise to 0 so the type system + JSON consumers are happy
+      // before the post-processing step has run.
+      affinityIndexV2: 0,
       totalVisits: e.totalVisits,
       uniqueDevices: e.uniqueDevices,
       avgDwell: Math.round(e.avgDwell * 10) / 10,
@@ -827,7 +836,16 @@ export function buildAffinityReport(
       lat: Math.round(e.lat * 10000) / 10000,
       lng: Math.round(e.lng * 10000) / 10000,
     };
-  }).sort((a, b) => b.affinityIndex - a.affinityIndex);
+  });
+
+  // Compute the v2 score (percentile-rank composite, re-ranked to a
+  // uniform 1..100 spread). The v1 affinityIndex is kept so existing
+  // consumers (heatmap colour ramps, downstream exports) don't break;
+  // v2 is the right number to use for new surfaces because it doesn't
+  // bunch in the middle of the distribution.
+  computeAffinityIndexV2(scored, { filterPlaceholders: true });
+
+  scored.sort((a, b) => b.affinityIndex - a.affinityIndex);
 
   return {
     megaJobId,
