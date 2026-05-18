@@ -80,7 +80,8 @@ const HOUR_OPTIONS = Array.from({ length: 24 }, (_, i) => ({
   label: `${i.toString().padStart(2, '0')}:00`,
 }));
 
-const VISIT_OPTIONS = [1, 2, 3, 5, 10, 15, 20];
+// "1+" intentionally absent — the server floor is 2 (lib/bot-filter.ts).
+const VISIT_OPTIONS = [2, 3, 5, 10, 15, 20];
 
 type SourceType = 'all' | 'category-export' | 'nse-export';
 

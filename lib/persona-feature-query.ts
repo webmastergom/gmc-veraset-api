@@ -40,6 +40,7 @@ import {
   type DwellFilter,
 } from './mega-consolidation-queries';
 import { localTimestamp } from './timezones';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from './bot-filter';
 
 const ACCURACY_THRESHOLD = 500;
 
@@ -158,8 +159,15 @@ export function buildVisitorPingsCTAS(args: {
       ${allPingsUnion}
     ),
     ${buildAtPoiPingsCTE('all_pings', poiCoords)},
+    -- Bot-filter floor (lib/bot-filter.ts): only devices observed at
+    -- some POI on ≥ MIN_DISTINCT_DAYS_FOR_HUMAN_MAID distinct days
+    -- enter persona feature extraction. Strips 1-day ad-fraud / IDFA-
+    -- churn ghosts (30-70 % of raw MAIDs) before they pollute cluster
+    -- centroids with "single-visit" pseudo-personas.
     visitor_ad_ids AS (
-      SELECT DISTINCT ad_id FROM at_poi_pings
+      SELECT ad_id FROM at_poi_pings
+      GROUP BY ad_id
+      HAVING COUNT(DISTINCT date) >= ${MIN_DISTINCT_DAYS_FOR_HUMAN_MAID}
     )
     SELECT
       p.ad_id, p.date, p.utc_timestamp,
@@ -356,10 +364,17 @@ export function buildFeatureCTAS(args: {
       SELECT * FROM daily_visits_raw
       WHERE ping_count >= 2 AND dwell_seconds >= 120
     ),
-    -- visitor_ad_ids: only devices with at least one qualified visit-day
-    -- enter clustering. Devices whose visits are ALL single-ping → out.
+    -- visitor_ad_ids: only devices with at least MIN_DISTINCT_DAYS_FOR_HUMAN_MAID
+    -- qualified visit-days enter clustering. Combines:
+    --   1. The pre-existing ≥2 pings + ≥120 s dwell floor (Foursquare /
+    --      SafeGraph / Placer-grade qualified-visit definition).
+    --   2. The bot-filter floor (lib/bot-filter.ts) — ≥2 distinct days of
+    --      qualified visits. A single-day visitor cannot have a
+    --      "persona" (a persona is a habit, not a one-shot drop-in).
     visitor_ad_ids AS (
-      SELECT DISTINCT ad_id FROM daily_visits
+      SELECT ad_id FROM daily_visits
+      GROUP BY ad_id
+      HAVING COUNT(DISTINCT date) >= ${MIN_DISTINCT_DAYS_FOR_HUMAN_MAID}
     ),
     -- Home zipcode (FULL only): mode of geo_fields['zipcode'] during night hours (22-06).
     -- Tagged with a priority so we can fall back to all-hour mode when night data is sparse.

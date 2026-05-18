@@ -33,6 +33,7 @@ import {
 import { s3Client, BUCKET, getConfig, putConfig } from './s3-config';
 import { batchReverseGeocode, setCountryFilter } from './reverse-geocode';
 import { localTimestamp, tzForCountry } from './timezones';
+import { MIN_DISTINCT_DAYS_FOR_HUMAN_MAID } from './bot-filter';
 import type {
   PostalMaidFilters,
   PostalMaidResult,
@@ -524,13 +525,20 @@ async function prepareSingleDataset(state: ZcsState): Promise<ZcsState> {
       WHERE geo_fields['zipcode'] IS NOT NULL AND geo_fields['zipcode'] != ''
       LIMIT 1
     `).catch(() => ({ rows: [] as Record<string, string>[] })),
+    // Bot-filter floor (lib/bot-filter.ts) — require ≥ MIN_DISTINCT_DAYS_FOR_HUMAN_MAID
+    // distinct visit-days. Pre-filter strips 30-70 % of 1-day ghost
+    // MAIDs that otherwise made "POI visitors" headline counts look
+    // 2-5× too big.
     runQuery(`
-      SELECT COUNT(DISTINCT ad_id) as total_devices
-      FROM ${tableName}
-      CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-      WHERE poi_id IS NOT NULL AND poi_id != ''
-        AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-        ${dateWhere}
+      WITH qualified AS (
+        SELECT ad_id FROM ${tableName}
+        WHERE CARDINALITY(poi_ids) > 0
+          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
+          ${dateWhere}
+        GROUP BY ad_id
+        HAVING COUNT(DISTINCT date) >= ${MIN_DISTINCT_DAYS_FOR_HUMAN_MAID}
+      )
+      SELECT COUNT(*) as total_devices FROM qualified
     `),
   ]);
   const isFull = sniffRes.rows.length > 0 && !!sniffRes.rows[0]?.z;
@@ -583,15 +591,22 @@ export async function phaseLaunchQueries(state: ZcsState): Promise<ZcsState> {
 
   // poi_visitors CTE varies by mode:
   //   - megajob: SELECT ad_id FROM <maids table>
-  //   - single-dataset: SELECT DISTINCT ad_id FROM ... CROSS JOIN UNNEST(poi_ids)
+  //     (the upstream mega-job MAIDs CTAS already applies the bot
+  //     filter — see app/api/mega-jobs/[id]/consolidate/route.ts and
+  //     lib/bot-filter.ts).
+  //   - single-dataset: SELECT ad_id ... GROUP BY ad_id HAVING
+  //     COUNT(DISTINCT date) >= MIN_DISTINCT_DAYS_FOR_HUMAN_MAID
+  //     — the bot-filter floor inline, so the downstream zip / h3 /
+  //     home-zone aggregations only see real-mobility devices.
   const poiVisitorsCte = maidsTableName
     ? `SELECT ad_id FROM ${maidsTableName} WHERE ad_id IS NOT NULL AND TRIM(ad_id) != ''`
-    : `SELECT DISTINCT ad_id
+    : `SELECT ad_id
        FROM ${singleTable}
-       CROSS JOIN UNNEST(poi_ids) AS t(poi_id)
-       WHERE poi_id IS NOT NULL AND poi_id != ''
+       WHERE CARDINALITY(poi_ids) > 0
          AND ad_id IS NOT NULL AND TRIM(ad_id) != ''
-         ${dateWhere}`;
+         ${dateWhere}
+       GROUP BY ad_id
+       HAVING COUNT(DISTINCT date) >= ${MIN_DISTINCT_DAYS_FOR_HUMAN_MAID}`;
   const fromExpr = tableExpr || singleTable;
 
   const queryIds: Record<string, string> = {};
